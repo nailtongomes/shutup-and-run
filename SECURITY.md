@@ -12,6 +12,8 @@ What the operator must do, and which defaults a request cannot turn off, is [doc
 
 The intended install listens on a public IP and port and terminates HTTPS in the binary (rustls). The installer writes a self-signed certificate and prints its SHA-256 fingerprint. Pin that fingerprint, or point clients at the cert file. Kestra can set `options.ssl.insecureTrustAllCertificates: true`. n8n can set `allowUnauthorizedCerts: true`. Check the fingerprint out of band before you do either.
 
+The HTTPS listener speaks HTTP/1.1 only. A connection that does not send a request within 10 seconds is closed, and so is a kept-alive connection that does not send its next request headers within 10 seconds. That bounds how long a silent client can hold a file descriptor. It does not stop a client that keeps reconnecting, and such a client is never banned because it never sends a token. If that matters, allow only your orchestrator's address in the firewall ([docs/RECIPES.md](docs/RECIPES.md)).
+
 Plain HTTP exists only when `http = true`. That is for localhost or a network you already trust. The process warns if plaintext is bound to every interface, because the token would travel in clear text.
 
 ## Bans
@@ -21,9 +23,11 @@ Three failed authentications from the same TCP peer (defaults, both configurable
 From the machine, over SSH:
 
 ```bash
-shutup-and-run bans
-shutup-and-run bans lift 203.0.113.5
+sudo shutup-and-run bans
+sudo shutup-and-run bans lift 203.0.113.5
 ```
+
+These read only `history_path` from the config, so they work in a shell that does not have the token.
 
 Bans are logged.
 

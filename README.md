@@ -4,15 +4,158 @@ shutup-and-run is a single static binary. One machine with Docker starts an allo
 
 A slot is a running container labeled `shutup-and-run=1`. Restarting the process does not forget them. Finished jobs stay in one SQLite file so `GET /v1/jobs/{id}` still works after a restart.
 
+## Quickstart
+
+Everything here is copy and paste. Replace `ghcr.io/you/worker` with an image you own, and `203.0.113.10` with the machine's address.
+
+**1. Install, on the machine.** Needs a published release (`v*` tag).
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.sh | sudo SHUTUP_AND_RUN_ALLOWLIST=ghcr.io/you/worker bash
+```
+
+It prints the URL and the certificate fingerprint. The token is not printed. Read it with:
+
+```bash
+sudo sed -n 's/^SHUTUP_AND_RUN_TOKEN=//p' /etc/shutup-and-run/env
+```
+
+**2. First job, from anywhere.** `202` started, `429` full, `503` draining: on the last two, try the next machine.
+
+```bash
+export SAR=https://203.0.113.10:8787
+```
+
+```bash
+export SAR_TOKEN=paste-the-token-here
+```
+
+```bash
+curl -sk -X POST "$SAR/v1/jobs" -H "Authorization: Bearer $SAR_TOKEN" -H 'Content-Type: application/json' -d '{"image":"ghcr.io/you/worker","timeout_secs":600,"env":{"JOB_NAME":"hello"}}'
+```
+
+The answer has an `id`. Status and the last log lines:
+
+```bash
+curl -sk -H "Authorization: Bearer $SAR_TOKEN" "$SAR/v1/jobs/PASTE_ID?logs=true"
+```
+
+`-k` skips certificate verification. To pin the installer's certificate instead, see [docs/RECIPES.md](docs/RECIPES.md).
+
+**3. Kestra.** Secret `SHUTUP_AND_RUN_TOKEN`. One task per machine. The second runs only when the first said full or draining. The full flow with retries is `examples/kestra-dispatch.yml`.
+
+```yaml
+id: push_job
+namespace: example.jobs
+
+tasks:
+  - id: host_1
+    type: io.kestra.plugin.core.http.Request
+    uri: https://203.0.113.10:8787/v1/jobs
+    method: POST
+    contentType: application/json
+    allowFailure: true
+    options:
+      allowFailed: true
+      ssl:
+        insecureTrustAllCertificates: true
+    headers:
+      Authorization: "Bearer {{ secret('SHUTUP_AND_RUN_TOKEN') }}"
+    body: |
+      {{ { "image": "ghcr.io/you/worker", "job_key": execution.id, "timeout_secs": 3600 } }}
+
+  - id: host_2
+    type: io.kestra.plugin.core.http.Request
+    runIf: "{{ outputs.host_1.code == 429 or outputs.host_1.code == 503 }}"
+    uri: https://203.0.113.11:8787/v1/jobs
+    method: POST
+    contentType: application/json
+    options:
+      ssl:
+        insecureTrustAllCertificates: true
+    headers:
+      Authorization: "Bearer {{ secret('SHUTUP_AND_RUN_TOKEN') }}"
+    body: |
+      {{ { "image": "ghcr.io/you/worker", "job_key": execution.id, "timeout_secs": 3600 } }}
+```
+
+**4. n8n.** Copy this and paste it onto the canvas. It is one HTTP Request node. Set `SHUTUP_AND_RUN_TOKEN` on the n8n process, or swap the header for a Header Auth credential. The two-machine workflow is `examples/n8n-dispatch.json`.
+
+```json
+{
+  "nodes": [
+    {
+      "name": "Push job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [260, 300],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "parameters": {
+        "method": "POST",
+        "url": "https://203.0.113.10:8787/v1/jobs",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SHUTUP_AND_RUN_TOKEN }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ image: 'ghcr.io/you/worker', job_key: $execution.id, timeout_secs: 3600 }) }}",
+        "options": {
+          "allowUnauthorizedCerts": true,
+          "timeout": 20000,
+          "response": { "response": { "fullResponse": true, "neverError": true } }
+        }
+      }
+    }
+  ],
+  "connections": {}
+}
+```
+
+The node's output has `statusCode`. Route `429` and `503` to a copy of the node that points at the next machine.
+
+**5. Locked out.** Three wrong tokens ban the caller's address for 48 hours. On the machine, over SSH:
+
+```bash
+sudo shutup-and-run bans
+```
+
+```bash
+sudo shutup-and-run bans lift 203.0.113.5
+```
+
+**6. Check the machine.** On the machine, with an allowlisted image that has `sh`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/smoke.sh | sudo SMOKE_LOCAL=1 SMOKE_IMAGE=ghcr.io/you/worker bash
+```
+
+**7. Stop everything.** The service, then every job it started:
+
+```bash
+sudo systemctl stop shutup-and-run
+```
+
+```bash
+sudo docker ps -q --filter label=shutup-and-run=1 | xargs -r sudo docker kill
+```
+
+More cases (firewall, a machine behind NAT, a client's machine, draining, rotating the token) are in [docs/RECIPES.md](docs/RECIPES.md).
+
 ## Security
 
 This process speaks to the Docker socket. Anyone with the token can run any allowlisted image with any environment. Treat the token as a root password. Every route, including `/health` and `/metrics`, requires it. See [SECURITY.md](SECURITY.md). What you are accepting by deploying it is [docs/CONVENTIONS.md](docs/CONVENTIONS.md). The binary does not try to enforce those conventions.
 
-The installer listens on `0.0.0.0` and serves HTTPS from a self-signed certificate it generates. It prints the certificate's SHA-256 fingerprint. Plain HTTP is only `http = true`, meant for localhost. Three bad tokens from one IP ban that IP for 48 hours (`403` with an empty body). Lift it over SSH with `shutup-and-run bans lift <ip>`.
+The installer listens on `0.0.0.0` and serves HTTPS from a self-signed certificate it generates. It prints the certificate's SHA-256 fingerprint. Plain HTTP is only `http = true`, meant for localhost. The HTTPS listener speaks HTTP/1.1 only and closes a connection that sends no request within 10 seconds. Three bad tokens from one IP ban that IP for 48 hours (`403` with an empty body). Lift it over SSH with `shutup-and-run bans lift <ip>`.
 
 ## Install
 
-One command on a new Ubuntu machine. A tag `v*` builds the musl binary and attaches it to the GitHub release, which is what this downloads.
+One command on a new Ubuntu machine. A tag `v*` builds the musl binary and attaches it to the GitHub release, which is what this downloads. With `SHUTUP_AND_RUN_ALLOWLIST` (comma-separated) the first `config.toml` gets your images, as in the quickstart. Without it the allowlist is a placeholder you must edit.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.sh | sudo bash
@@ -24,7 +167,7 @@ Offline, with a binary you already copied onto the machine:
 sudo SHUTUP_AND_RUN_BIN=./shutup-and-run bash scripts/install.sh
 ```
 
-The script installs Docker if it is missing, checks the downloaded binary against `SHA256SUMS` from the same release, picks `max_slots` from CPU and RAM (about one CPU and 2 GiB per slot, leaving one CPU free), writes a token to `/etc/shutup-and-run/env` without printing it, generates a self-signed cert if you do not have one, installs the systemd unit, and opens the port in ufw when ufw is already active. A mismatch stops the install. `SHUTUP_AND_RUN_BIN` skips the download and the check. Running it again upgrades the binary and restarts the service. It does not rotate an existing token or certificate. `SHUTUP_AND_RUN_SHOW_TOKEN=1` prints the token. `sudo bash scripts/install.sh --uninstall` removes the unit and the binary; add `--purge` to delete `/etc/shutup-and-run` and `/var/lib/shutup-and-run`.
+The script installs Docker if it is missing, checks the downloaded binary against `SHA256SUMS` from the same release, picks `max_slots` from CPU and RAM (about one CPU and 2 GiB per slot, leaving one CPU free), writes a token to `/etc/shutup-and-run/env` without printing it, generates a self-signed cert if you do not have one, installs the systemd unit, and opens the port in ufw when ufw is already active. A mismatch stops the install. `SHUTUP_AND_RUN_BIN` skips the download and the check. Running it again upgrades the binary and restarts the service. It does not rotate an existing token or certificate. `SHUTUP_AND_RUN_SHOW_TOKEN=1` prints the token. `SHUTUP_AND_RUN_MAX_SLOTS` overrides the suggested slot count. `sudo bash scripts/install.sh --uninstall` removes the unit and the binary; add `--purge` to delete `/etc/shutup-and-run` and `/var/lib/shutup-and-run`.
 
 Image names are lowercase. An allowlist entry without a tag allows any tag of that repository; `ghcr.io/owner/selenium-worker` does not allow `ghcr.io/owner/selenium-worker-evil`. Edit the allowlist after install. To rotate the token, edit the env file and `sudo systemctl restart shutup-and-run`.
 
@@ -197,7 +340,7 @@ When the job ends, shutup-and-run POSTs the same fields (without logs) to `callb
 ### `POST /v1/drain`
 
 ```bash
-curl -sS -X POST http://192.0.2.11:8787/v1/drain \
+curl -sS --cacert /etc/shutup-and-run/cert.pem -X POST https://192.0.2.11:8787/v1/drain \
   -H "Authorization: Bearer $SHUTUP_AND_RUN_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"draining":true}'
@@ -207,86 +350,11 @@ curl -sS -X POST http://192.0.2.11:8787/v1/drain \
 
 ## Kestra
 
+The quickstart has the short version. `examples/kestra-dispatch.yml` is the full flow.
+
 Create the secret `SHUTUP_AND_RUN_TOKEN`. The task `timeout` is how long Kestra waits for shutup-and-run to answer, not how long the container may run. That duration is `timeout_secs` in the JSON.
 
 `job_key` is `execution.id`, and POST transport errors are retried on the same URL, so a lost response does not start a second container on that machine. The next machine is used only for `429` and `503`. A machine that never answers fails the flow instead of failing over, because a request that actually landed would be duplicated on the other host (keys are not shared).
-
-The same file is `examples/kestra-dispatch.yml`.
-
-```yaml
-id: dispatch_job
-namespace: example.jobs
-
-inputs:
-  - id: job_name
-    type: STRING
-    defaults: example-job
-
-tasks:
-  - id: host_1
-    type: io.kestra.plugin.core.http.Request
-    uri: https://192.0.2.11:8787/v1/jobs
-    method: POST
-    contentType: application/json
-    timeout: PT20S
-    allowFailure: true
-    options:
-      allowFailed: true
-      ssl:
-        insecureTrustAllCertificates: true
-      retryableTransportFailureMethods:
-        - POST
-      retry:
-        type: constant
-        interval: PT2S
-        maxAttempts: 3
-    headers:
-      Authorization: "Bearer {{ secret('SHUTUP_AND_RUN_TOKEN') }}"
-    body: |
-      {{ {
-        "image": "ghcr.io/owner/selenium-worker:latest",
-        "job_key": execution.id,
-        "env": { "JOB_NAME": inputs.job_name },
-        "timeout_secs": 3600,
-        "shm": "2g",
-        "callback_url": "https://kestra.example/api/v1/executions/webhook/example/jobs/dispatch_job/finish"
-      } }}
-
-  - id: host_2
-    type: io.kestra.plugin.core.http.Request
-    runIf: "{{ outputs.host_1 is defined and (outputs.host_1.code == 429 or outputs.host_1.code == 503) }}"
-    uri: https://192.0.2.12:8787/v1/jobs
-    method: POST
-    contentType: application/json
-    timeout: PT20S
-    allowFailure: true
-    options:
-      allowFailed: true
-      ssl:
-        insecureTrustAllCertificates: true
-      retryableTransportFailureMethods:
-        - POST
-      retry:
-        type: constant
-        interval: PT2S
-        maxAttempts: 3
-    headers:
-      Authorization: "Bearer {{ secret('SHUTUP_AND_RUN_TOKEN') }}"
-    body: |
-      {{ {
-        "image": "ghcr.io/owner/selenium-worker:latest",
-        "job_key": execution.id,
-        "env": { "JOB_NAME": inputs.job_name },
-        "timeout_secs": 3600,
-        "shm": "2g",
-        "callback_url": "https://kestra.example/api/v1/executions/webhook/example/jobs/dispatch_job/finish"
-      } }}
-
-  - id: none_accepted
-    type: io.kestra.plugin.core.execution.Fail
-    runIf: "{{ (outputs.host_1 is not defined or (outputs.host_1.code != 200 and outputs.host_1.code != 202)) and (outputs.host_2 is not defined or (outputs.host_2.code != 200 and outputs.host_2.code != 202)) }}"
-    errorMessage: "No machine accepted the job (full, draining, or unreachable)."
-```
 
 ## n8n
 
@@ -326,6 +394,47 @@ Any other outcome (connection failure, timeout, a redirect, any status other tha
 
 `examples/n8n-poll.json` is an n8n Webhook plus Respond to Webhook. A matching bearer token returns one static task so you can see the shape. Replace that object with your queue, and return `{}` when the queue is empty. Set `SHUTUP_AND_RUN_POLL_TOKEN` on the n8n process (`N8N_BLOCK_ENV_ACCESS_IN_NODE=false`).
 
+## Smoke test
+
+`scripts/smoke.sh` checks a running instance through its API. It needs `curl` and `python3`, and an allowlisted image that has `sh`, `echo` and `sleep` (`SMOKE_IMAGE`, default `busybox`). Its jobs only echo and sleep, each with a `timeout_secs` of 120 at most. It never sends wrong tokens from your address.
+
+From another machine:
+
+```bash
+SMOKE_URL=https://203.0.113.10:8787 SMOKE_TOKEN=... SMOKE_FINGERPRINT=AA:BB:... SMOKE_IMAGE=ghcr.io/you/worker bash scripts/smoke.sh
+```
+
+On the machine, as root. `SMOKE_LOCAL=1` reads the URL, token and fingerprint from `/etc/shutup-and-run`:
+
+```bash
+sudo SMOKE_LOCAL=1 SMOKE_IMAGE=ghcr.io/you/worker SMOKE_RESTART_CMD="systemctl restart shutup-and-run" bash scripts/smoke.sh
+```
+
+One job with every field set, and nothing else:
+
+```bash
+SMOKE_URL=... SMOKE_TOKEN=... SMOKE_IMAGE=ghcr.io/you/worker bash scripts/smoke.sh preflight
+```
+
+A scenario that needs something you did not give is `SKIP` with the reason. From another machine that is the restart (8), the ban (9), and, unless `SMOKE_STUB_HOST` is an address the instance can reach, the callback (11). Poll (10) needs `SMOKE_POLL=1` and an instance whose `poll_url` is `http://<stub host>:18790/poll`. On a live machine, scenario 3 fills every free slot for a few seconds and scenario 7 drains for about a second. The header of the script lists every variable.
+
+```text
+PASS: 1 health returns slot counts; 401 without a token
+PASS: 2 job accepted, running, exited 0, logs returned
+PASS: 3 3 slots filled, then 429, then 202 after one job ended
+PASS: 4 job past timeout_secs was killed, reason timeout_kill
+PASS: 5 image off the allowlist is 403 and nothing started
+PASS: 6 same job_key is 202 then 200 with the same id
+PASS: 7 drain is 503 for new jobs; undrain is 202 again
+PASS: 8 restart kept history, kept the running job, and freed its slot when it ended
+PASS: 9 three wrong tokens from 127.0.0.2 is 403 even with the right token; bans lift restores it
+PASS: 10 poll took one task, started exactly one container, then got empty answers
+PASS: 11 callback_url received the final job JSON once
+PASS: 12 preflight: one job end to end (env, cpu, memory, shm, job_key, callback), slot freed
+
+RESULT: 12 passed, 0 failed, 0 skipped
+```
+
 ## Acceptance test
 
 On Ubuntu with Docker, preferably with no other shutup-and-run and no container already labeled `shutup-and-run=1`:
@@ -335,7 +444,7 @@ sudo bash scripts/accept.sh
 sudo bash scripts/accept.sh /path/to/shutup-and-run-x86_64-unknown-linux-musl
 ```
 
-With systemd it installs `/usr/local/bin/shutup-and-run`, starts `shutup-and-run-accept.service`, and removes that unit at the end. The binary stays. It does not touch a production `shutup-and-run.service`. You want:
+With systemd it installs `/usr/local/bin/shutup-and-run`, starts `shutup-and-run-accept.service`, and removes that unit at the end. The binary stays. It does not touch a production `shutup-and-run.service`. `SHUTUP_AND_RUN_SMOKE=1` runs `scripts/smoke.sh` against the same instance afterwards, which is what CI does. You want:
 
 ```text
 PASS: accepted until full
@@ -381,4 +490,4 @@ CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --target x86_64-unkn
 
 SQLite is bundled, so the musl build needs a C compiler. The socket is `DOCKER_HOST` when it is `unix://...`, otherwise `/var/run/docker.sock`.
 
-License: MIT. See [CONTRIBUTING.md](CONTRIBUTING.md). Decisions: [docs/DECISIONS.md](docs/DECISIONS.md). Operator conventions: [docs/CONVENTIONS.md](docs/CONVENTIONS.md). A future Windows and macOS client: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md). Notes for a reviewer: [docs/HANDOFF.md](docs/HANDOFF.md).
+License: MIT. See [CONTRIBUTING.md](CONTRIBUTING.md). Decisions: [docs/DECISIONS.md](docs/DECISIONS.md). Operator conventions: [docs/CONVENTIONS.md](docs/CONVENTIONS.md). Recipes: [docs/RECIPES.md](docs/RECIPES.md). A future Windows and macOS client: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md). Notes for a reviewer: [docs/HANDOFF.md](docs/HANDOFF.md).

@@ -38,6 +38,14 @@ Three `401`s from the same TCP peer ban that IP for 48 hours. Both numbers are c
 
 One owner, one host, a public address. The token must not cross the internet in clear text, so the binary serves HTTPS with rustls. The installer makes a self-signed certificate and prints its SHA-256 fingerprint. Clients pin it or skip verification on purpose. Plain HTTP is an explicit `http = true`, for localhost or a network that is already private.
 
+## Connection deadlines on the TLS listener
+
+The 2026-11-11 review held about a thousand idle TLS connections open from one host. The process ran out of file descriptors, stopped answering, and could not reach Docker to enforce timeouts. No token was sent, so nothing was banned.
+
+The TLS listener now speaks HTTP/1.1 only. The first request must arrive within 10 seconds, and so must the headers of each later request on a kept-alive connection. HTTP/2 is off because an idle HTTP/2 connection has no such deadline in the server library. The systemd unit sets `LimitNOFILE=65536`.
+
+The cost is no HTTP/2, which no caller here needs, and a client that waits more than 10 seconds between requests reconnects. A flood that keeps reconnecting is still possible. The answer to that is a firewall rule, not more code. The plain HTTP listener is unchanged, because it is for localhost.
+
 ## One owner
 
 There is no user database and no per-tenant token. One token is the whole ACL.
@@ -91,6 +99,14 @@ Some work has to run on a person's computer, including a Windows machine that ma
 [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md) describes a future client: a small program, or on Windows possibly only a script, that polls or waits and then starts a container or, on Windows, runs a Python script fetched from a URL. The simplest behavior to mirror is an existing `.bat` bootstrap (config at the top, a per-task lock with an orphan TTL, Python via `py -3` then `python`, downloads with cache and backoff, `.tmp` then replace, offline fallback, exit codes 0, 1, and 2). That bootstrap does not check integrity. The roadmap requires a sha256 or a signature before a downloaded script runs. Open questions are listed there and are not decided here. There is no client code in this change.
 
 The cost is a document that can drift, and a known gap (no integrity check) that stays open until someone builds the client.
+
+## Smoke test against a running instance
+
+`scripts/accept.sh` starts its own instance. `scripts/smoke.sh` tests one that is already installed, through the API only, with the URL and token from the environment. It is safe on a live machine: its jobs echo and sleep under a short `timeout_secs`, it undrains what it drained, and it sends wrong tokens from `127.0.0.2`, never from the caller. What it cannot do from where it runs, it skips and says why.
+
+CI runs it twice: after `accept.sh` on the same instance, and against a service that `install.sh` installed from a local copy of the release assets. The release workflow runs it a third time after the real one-line install.
+
+The cost is that the instance must allowlist an image with a shell for the test. [CONVENTIONS.md](CONVENTIONS.md) says to allowlist only images you own, so point `SMOKE_IMAGE` at one of yours. `busybox` is the default because CI uses it. There is no cancel call in the API, so cleanup is waiting for the test's jobs to end.
 
 ## The name
 
