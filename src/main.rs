@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -43,14 +45,21 @@ shutup-and-run bans lift <ip>
 }
 
 fn bans_cli(args: &[String]) -> ExitCode {
-    let settings = match Settings::load() {
-        Ok(settings) => settings,
+    let history_path = match Settings::history_path() {
+        Ok(path) => path,
         Err(err) => {
             eprintln!("shutup-and-run: {err}");
             return ExitCode::from(1);
         }
     };
-    let store = match Store::open(&settings.history_path) {
+    if !history_path.exists() {
+        eprintln!(
+            "shutup-and-run: {} does not exist. Run as root, with the same SHUTUP_AND_RUN_CONFIG as the service.",
+            history_path.display()
+        );
+        return ExitCode::from(1);
+    }
+    let store = match Store::open(&history_path) {
         Ok(store) => store,
         Err(err) => {
             eprintln!("shutup-and-run: {err}");
@@ -213,11 +222,23 @@ async fn serve() -> ExitCode {
         shutdown.graceful_shutdown(None);
     });
     tracing::info!(%listen, max_slots = slots, "shutup-and-run is up (https)");
-    if let Err(err) = axum_server::bind_rustls(listen, config)
-        .handle(handle)
-        .serve(app)
-        .await
-    {
+    // HTTP/1.1 only, with a deadline for the first request and for the headers
+    // of every later one. axum-server leaves both off. A client that finished
+    // the TLS handshake and then said nothing kept its descriptor for as long
+    // as it liked, and about a thousand of those stopped the process from
+    // reaching Docker. HTTP/2 is off because an idle HTTP/2 connection has no
+    // such deadline. The handshake itself already times out after 10 seconds.
+    let mut tls = (*config.get_inner()).clone();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls));
+    let mut server = axum_server::bind_rustls(listen, config)
+        .http1_only()
+        .first_request_timeout(HEADER_READ_TIMEOUT);
+    server
+        .http_builder()
+        .http1()
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    if let Err(err) = server.handle(handle).serve(app).await {
         eprintln!("shutup-and-run: {err}");
         return ExitCode::from(1);
     }

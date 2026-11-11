@@ -166,6 +166,7 @@ Environment=HOME=/root
 EnvironmentFile=-${ETC}/env
 Restart=on-failure
 RestartSec=2
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
