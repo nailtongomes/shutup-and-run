@@ -102,6 +102,8 @@ GitHub-hosted Ubuntu installs packages from `azure.archive.ubuntu.com`, sometime
 
 A `v*` tag builds `shutup-and-run-x86_64-unknown-linux-musl`, writes `SHA256SUMS`, and attaches both to the GitHub release. `install.sh` downloads that exact asset from `releases/latest` and checks it against `SHA256SUMS` before installing. `SHUTUP_AND_RUN_BIN` skips the download. No release tag, no one-line install.
 
+v0.1.0's `SHA256SUMS` names the file `dist/shutup-and-run-x86_64-unknown-linux-musl`, because `sha256sum` was run on that path. The installer matches the base name, so that release still installs, and a different hash still refuses. Later tags hash from inside `dist/` and record the base name only. The tag was not moved.
+
 ## Pull, optional
 
 Some machines cannot accept an inbound connection. The orchestrator already has the list of hosts for the ones that can. Adding a queue inside this process would throw away the "accept or refuse" decision above.

@@ -31,7 +31,8 @@ jobs:
         run: |
           mkdir -p dist
           cp target/x86_64-unknown-linux-musl/release/shutup-and-run dist/shutup-and-run-x86_64-unknown-linux-musl
-          sha256sum dist/shutup-and-run-x86_64-unknown-linux-musl > dist/SHA256SUMS
+          # Hash from inside dist so the line names the asset, not dist/<asset>.
+          (cd dist && sha256sum shutup-and-run-x86_64-unknown-linux-musl > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
           name: shutup-and-run-x86_64-unknown-linux-musl

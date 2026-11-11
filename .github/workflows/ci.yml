@@ -66,7 +66,10 @@ jobs:
         run: |
           mkdir -p dist
           cp target/x86_64-unknown-linux-musl/release/shutup-and-run dist/shutup-and-run-x86_64-unknown-linux-musl
-          (cd dist && sha256sum shutup-and-run-x86_64-unknown-linux-musl > SHA256SUMS)
+          # Same shape as the published v0.1.0 file: "hash  dist/<asset>".
+          # A basename-only line still matches. A wrong hash is the next step.
+          sha256sum dist/shutup-and-run-x86_64-unknown-linux-musl > dist/SHA256SUMS
+          grep -q ' dist/shutup-and-run-x86_64-unknown-linux-musl$' dist/SHA256SUMS
           (cd dist && nohup python3 -m http.server 8099 --bind 127.0.0.1 >/dev/null 2>&1 &)
           sleep 1
       - name: install.sh refuses a wrong checksum
