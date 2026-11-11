@@ -88,6 +88,12 @@ The license is MIT. It is short, it is what operators expect to copy onto a serv
 
 The repo is public at github.com/nailtongomes/shutup-and-run. GitHub Actions runs `cargo fmt --check`, `clippy -D warnings`, `cargo test`, and shellcheck, and a separate job runs `scripts/accept.sh` against the runner's Docker daemon. A musl job checks that the release binary stays static. The cost is minutes of CI, and the acceptance job needs sudo and a real dockerd.
 
+## Apt in CI does not depend on one mirror
+
+GitHub-hosted Ubuntu installs packages from `azure.archive.ubuntu.com`, sometimes through `mirror+file:/etc/apt/apt-mirrors.txt`. When that name does not resolve, `apt-get` retries for many minutes and the ci, image, and release jobs die before they compile. `Acquire::Retries` made the wait longer. It did not add a mirror that could succeed.
+
+`scripts/ci-apt.sh` caps each `apt-get` at 90 seconds. If that fails, it rewrites the Azure mirror and the mirror list to `https://archive.ubuntu.com/ubuntu` and tries once more. The workflow step itself is capped at 8 minutes. The compiler stays `musl-gcc` from Ubuntu, the same one a local release build uses. The cost is about a minute when Azure's mirror is down, and one script the three workflows share. A different musl toolchain would have avoided apt, and would also have made the release binary something we do not build locally.
+
 ## GHCR image
 
 `ghcr.io/nailtongomes/shutup-and-run` is the static musl binary on `scratch`. `:edge` tracks `main`. A `v*` tag is pushed under that tag name. linux/amd64 only. The systemd installer stays the way to put it on a machine. The image exists for people who already run everything under Docker. Publishing uses `GITHUB_TOKEN` with `packages: write`. The first push may create a private package; the owner has to switch it to public once if anonymous pulls should work.
