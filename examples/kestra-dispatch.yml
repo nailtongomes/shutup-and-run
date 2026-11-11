@@ -1,0 +1,77 @@
+id: dispatch_job
+namespace: example.jobs
+
+description: >
+  POST a job to the first shutup-and-run with a free slot.
+  Retries of the same URL are safe because job_key is the execution id.
+  The next machine is tried only on 429 (full) or 503 (draining).
+
+inputs:
+  - id: job_name
+    type: STRING
+    defaults: example-job
+
+tasks:
+  - id: host_1
+    type: io.kestra.plugin.core.http.Request
+    uri: https://192.0.2.11:8787/v1/jobs
+    method: POST
+    contentType: application/json
+    timeout: PT20S
+    allowFailure: true
+    options:
+      allowFailed: true
+      ssl:
+        insecureTrustAllCertificates: true
+      retryableTransportFailureMethods:
+        - POST
+      retry:
+        type: constant
+        interval: PT2S
+        maxAttempts: 3
+    headers:
+      Authorization: "Bearer {{ secret('SHUTUP_AND_RUN_TOKEN') }}"
+    body: |
+      {{ {
+        "image": "ghcr.io/owner/selenium-worker:latest",
+        "job_key": execution.id,
+        "env": { "JOB_NAME": inputs.job_name },
+        "timeout_secs": 3600,
+        "shm": "2g",
+        "callback_url": "https://kestra.example/api/v1/executions/webhook/example/jobs/dispatch_job/finish"
+      } }}
+
+  - id: host_2
+    type: io.kestra.plugin.core.http.Request
+    runIf: "{{ outputs.host_1 is defined and (outputs.host_1.code == 429 or outputs.host_1.code == 503) }}"
+    uri: https://192.0.2.12:8787/v1/jobs
+    method: POST
+    contentType: application/json
+    timeout: PT20S
+    allowFailure: true
+    options:
+      allowFailed: true
+      ssl:
+        insecureTrustAllCertificates: true
+      retryableTransportFailureMethods:
+        - POST
+      retry:
+        type: constant
+        interval: PT2S
+        maxAttempts: 3
+    headers:
+      Authorization: "Bearer {{ secret('SHUTUP_AND_RUN_TOKEN') }}"
+    body: |
+      {{ {
+        "image": "ghcr.io/owner/selenium-worker:latest",
+        "job_key": execution.id,
+        "env": { "JOB_NAME": inputs.job_name },
+        "timeout_secs": 3600,
+        "shm": "2g",
+        "callback_url": "https://kestra.example/api/v1/executions/webhook/example/jobs/dispatch_job/finish"
+      } }}
+
+  - id: none_accepted
+    type: io.kestra.plugin.core.execution.Fail
+    runIf: "{{ (outputs.host_1 is not defined or (outputs.host_1.code != 200 and outputs.host_1.code != 202)) and (outputs.host_2 is not defined or (outputs.host_2.code != 200 and outputs.host_2.code != 202)) }}"
+    errorMessage: "No machine accepted the job (full, draining, or unreachable)."

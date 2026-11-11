@@ -1,0 +1,4 @@
+/target
+/shutup-and-run
+**/*.rs.bk
+.DS_Store

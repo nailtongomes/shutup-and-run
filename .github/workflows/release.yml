@@ -1,0 +1,40 @@
+# On tag v*, attach the musl binary and SHA256SUMS to the GitHub release.
+# install.sh downloads that asset from releases/latest.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools build-essential
+      - name: static musl binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: pack
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/shutup-and-run dist/shutup-and-run-x86_64-unknown-linux-musl
+          sha256sum dist/shutup-and-run-x86_64-unknown-linux-musl > dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shutup-and-run-x86_64-unknown-linux-musl
+          path: |
+            dist/shutup-and-run-x86_64-unknown-linux-musl
+            dist/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/shutup-and-run-x86_64-unknown-linux-musl
+            dist/SHA256SUMS

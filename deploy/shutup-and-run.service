@@ -1,0 +1,16 @@
+[Unit]
+Description=shutup-and-run — on-demand container slots
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/shutup-and-run
+Environment=SHUTUP_AND_RUN_CONFIG=/etc/shutup-and-run/config.toml
+Environment=HOME=/root
+EnvironmentFile=-/etc/shutup-and-run/env
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
