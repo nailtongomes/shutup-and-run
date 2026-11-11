@@ -63,8 +63,16 @@ install_bin() {
   tmp="$dir/$asset"
   curl -fsSL "$url" -o "$tmp"
   curl -fsSL "${url%/*}/SHA256SUMS" -o "$dir/SHA256SUMS"
-  # GNU sha256sum writes "<hash>  <filename>". Match the asset name, not every line.
-  expected=$(awk -v asset="$asset" '$2 == asset { print $1; exit }' "$dir/SHA256SUMS")
+  # GNU sha256sum writes "<hash>  <filename>". v0.1.0 recorded the path
+  # dist/<filename> because the hash was taken from outside dist/. Match the
+  # base name so that release still installs. A wrong hash still stops us.
+  expected=$(awk -v asset="$asset" '
+    {
+      name = $2
+      sub(/^.*\//, "", name)
+      if (name == asset) { print $1; exit }
+    }
+  ' "$dir/SHA256SUMS")
   actual=$(sha256sum "$tmp" | awk '{ print $1 }')
   if [[ -z "$expected" || "$expected" != "$actual" ]]; then
     echo "checksum mismatch for ${asset}" >&2
