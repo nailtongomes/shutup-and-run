@@ -43,3 +43,9 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.tag.outputs.name }}
+      # The job scripts/smoke.sh runs by default. See examples/smoke-image.
+      - uses: docker/build-push-action@v6
+        with:
+          context: examples/smoke-image
+          push: true
+          tags: ghcr.io/nailtongomes/shutup-and-run-smoke:latest

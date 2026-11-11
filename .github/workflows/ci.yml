@@ -82,8 +82,13 @@ jobs:
           test ! -e /usr/local/bin/shutup-and-run
       - name: install.sh from the local release
         run: |
+          # The smoke image is built here. The instance fails to pull it and
+          # uses this local copy, which is how a machine without registry
+          # access behaves.
+          docker build -t ghcr.io/nailtongomes/shutup-and-run-smoke examples/smoke-image
+          docker pull hello-world
           sudo SHUTUP_AND_RUN_URL=http://127.0.0.1:8099/shutup-and-run-x86_64-unknown-linux-musl \
-            SHUTUP_AND_RUN_ALLOWLIST=busybox bash scripts/install.sh
+            SHUTUP_AND_RUN_ALLOWLIST=ghcr.io/nailtongomes/shutup-and-run-smoke,hello-world bash scripts/install.sh
       - name: smoke the installed service
         timeout-minutes: 15
         run: |
@@ -91,6 +96,8 @@ jobs:
           sudo systemctl restart shutup-and-run
           sudo SMOKE_LOCAL=1 SMOKE_POLL=1 SMOKE_STRICT=1 \
             SMOKE_RESTART_CMD="systemctl restart shutup-and-run" bash scripts/smoke.sh
+          # The image without a shell: the reduced set must pass, the rest skip.
+          sudo SMOKE_LOCAL=1 SMOKE_IMAGE=hello-world bash scripts/smoke.sh 1 2 5 6 7 9 11
       - name: service log
         if: always()
         run: sudo journalctl -u shutup-and-run -n 100 --no-pager || true

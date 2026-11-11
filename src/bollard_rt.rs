@@ -20,9 +20,8 @@ use bollard::Docker;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 pub struct BollardRuntime {
     docker: Docker,
@@ -129,7 +128,7 @@ impl Runtime for BollardRuntime {
         Ok(list.iter().filter(|c| is_ours(&c.labels)).count())
     }
 
-    async fn start(&self, spec: &StartSpec) -> Result<String, RuntimeError> {
+    async fn start(&self, id: &str, spec: &StartSpec) -> Result<(), RuntimeError> {
         let mut labels = HashMap::new();
         labels.insert(LABEL_KEY.to_string(), LABEL_VALUE.to_string());
         labels.insert(DEADLINE_KEY.to_string(), spec.deadline_unix.to_string());
@@ -157,7 +156,7 @@ impl Runtime for BollardRuntime {
             ..Default::default()
         };
         let options = CreateContainerOptionsBuilder::new()
-            .name(&next_name())
+            .name(&container_ref(id))
             .build();
         let created = self
             .docker
@@ -182,13 +181,13 @@ impl Runtime for BollardRuntime {
             }
             return Err(docker_err(err));
         }
-        Ok(created.id)
+        Ok(())
     }
 
     async fn inspect(&self, id: &str) -> Result<Inspected, RuntimeError> {
         match self
             .docker
-            .inspect_container(id, None::<InspectContainerOptions>)
+            .inspect_container(&container_ref(id), None::<InspectContainerOptions>)
             .await
         {
             Ok(info) => Ok(map_state(info.state)),
@@ -204,7 +203,9 @@ impl Runtime for BollardRuntime {
             if !is_ours(&container.labels) {
                 continue;
             }
-            let Some(id) = container.id else { continue };
+            let Some(id) = job_id_of(&container) else {
+                continue;
+            };
             let deadline = container
                 .labels
                 .as_ref()
@@ -222,7 +223,11 @@ impl Runtime for BollardRuntime {
         // shortcut: SIGKILL, no SIGTERM grace. A hung Chrome will not flush.
         // Upgrade to stop-then-kill if jobs need a chance to write their result.
         let options = KillContainerOptionsBuilder::new().signal("SIGKILL").build();
-        match self.docker.kill_container(id, Some(options)).await {
+        match self
+            .docker
+            .kill_container(&container_ref(id), Some(options))
+            .await
+        {
             Ok(()) => Ok(()),
             Err(err) if is_status(&err, 404) || is_status(&err, 409) => Ok(()),
             Err(err) => Err(docker_err(err)),
@@ -256,7 +261,7 @@ impl Runtime for BollardRuntime {
             .stderr(true)
             .tail(&tail)
             .build();
-        let mut stream = self.docker.logs(id, Some(options));
+        let mut stream = self.docker.logs(&container_ref(id), Some(options));
         let mut buf = String::new();
         while let Some(item) = stream.next().await {
             match item {
@@ -270,7 +275,11 @@ impl Runtime for BollardRuntime {
 
     async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
         let options = RemoveContainerOptionsBuilder::new().force(true).build();
-        match self.docker.remove_container(id, Some(options)).await {
+        match self
+            .docker
+            .remove_container(&container_ref(id), Some(options))
+            .await
+        {
             Ok(()) => Ok(()),
             Err(err) if is_status(&err, 404) => Ok(()),
             Err(err) => Err(docker_err(err)),
@@ -284,7 +293,7 @@ impl Runtime for BollardRuntime {
                 if !is_ours(&container.labels) {
                     continue;
                 }
-                if let Some(id) = container.id {
+                if let Some(id) = job_id_of(&container) {
                     ids.push(id);
                 }
             }
@@ -355,13 +364,14 @@ fn exit_from_event(event: &EventMessage) -> Option<(String, i64)> {
     let by_label = attrs
         .get(LABEL_KEY)
         .is_some_and(|value| value == LABEL_VALUE);
-    let by_name = attrs
-        .get("name")
-        .is_some_and(|name| name.trim_start_matches('/').starts_with(NAME_PREFIX));
+    let name = attrs.get("name").map(|name| name.trim_start_matches('/'));
+    let by_name = name.is_some_and(|name| name.starts_with(NAME_PREFIX));
     if !by_label && !by_name {
         return None;
     }
-    let id = actor.id.clone().filter(|id| valid_container_id(id))?;
+    let id = name
+        .and_then(job_id_from_name)
+        .or_else(|| actor.id.clone().filter(|id| valid_container_id(id)))?;
     let code = attrs.get("exitCode")?.parse().ok()?;
     Some((id, code))
 }
@@ -449,14 +459,31 @@ fn run_helper(helper: &str, server: &str) -> Result<RegistryAuth, String> {
     auth_from_helper_output(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn next_name() -> String {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{NAME_PREFIX}{secs}-{n}")
+/// The job id is chosen before the image is pulled, so the container is named
+/// after it and addressed by that name. A 64 character id is a row written
+/// before this change, when the job id was the container id itself.
+fn container_ref(id: &str) -> String {
+    if id.len() == 64 {
+        id.to_string()
+    } else {
+        format!("{NAME_PREFIX}{id}")
+    }
+}
+
+fn job_id_from_name(name: &str) -> Option<String> {
+    name.trim_start_matches('/')
+        .strip_prefix(NAME_PREFIX)
+        .filter(|id| valid_container_id(id))
+        .map(str::to_string)
+}
+
+fn job_id_of(container: &ContainerSummary) -> Option<String> {
+    container
+        .names
+        .iter()
+        .flatten()
+        .find_map(|name| job_id_from_name(name))
+        .or_else(|| container.id.clone())
 }
 
 fn is_status(err: &bollard::errors::Error, code: u16) -> bool {

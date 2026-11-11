@@ -60,7 +60,8 @@ jobs:
       - name: smoke the installed service
         timeout-minutes: 15
         run: |
-          sudo sed -i 's#"ghcr.io/owner/selenium-worker"#"busybox"#' /etc/shutup-and-run/config.toml
+          docker build -t ghcr.io/nailtongomes/shutup-and-run-smoke examples/smoke-image
+          sudo sed -i 's#"ghcr.io/owner/selenium-worker"#"ghcr.io/nailtongomes/shutup-and-run-smoke"#' /etc/shutup-and-run/config.toml
           printf 'SHUTUP_AND_RUN_POLL_URL=http://127.0.0.1:18790/poll\nSHUTUP_AND_RUN_POLL_INTERVAL_SECS=2\n' | sudo tee -a /etc/shutup-and-run/env >/dev/null
           sudo systemctl restart shutup-and-run
           sudo SMOKE_LOCAL=1 SMOKE_POLL=1 SMOKE_STRICT=1 \

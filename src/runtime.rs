@@ -32,7 +32,9 @@ impl RuntimeError {
 pub trait Runtime: Send + Sync {
     async fn pull(&self, image: &str) -> Result<(), RuntimeError>;
     async fn running_count(&self) -> Result<usize, RuntimeError>;
-    async fn start(&self, spec: &StartSpec) -> Result<String, RuntimeError>;
+    /// `id` is the job id. The container is named after it, and every other
+    /// call takes that same id.
+    async fn start(&self, id: &str, spec: &StartSpec) -> Result<(), RuntimeError>;
     async fn inspect(&self, id: &str) -> Result<Inspected, RuntimeError>;
     async fn list_expired(&self, now_unix: u64) -> Result<Vec<String>, RuntimeError>;
     async fn kill(&self, id: &str) -> Result<(), RuntimeError>;

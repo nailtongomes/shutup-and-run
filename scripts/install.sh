@@ -140,6 +140,9 @@ fingerprint=$(openssl x509 -in "$ETC/cert.pem" -noout -fingerprint -sha256 | sed
 
 if [[ ! -f "$ETC/config.toml" ]]; then
   # The service does not see this variable. It only fills the first config.toml.
+  if [[ -z "${SHUTUP_AND_RUN_ALLOWLIST:-}" ]]; then
+    placeholder=1
+  fi
   allow=
   IFS=',' read -ra images <<<"${SHUTUP_AND_RUN_ALLOWLIST:-ghcr.io/owner/selenium-worker}"
   for image in "${images[@]}"; do
@@ -221,6 +224,12 @@ if [[ "$health" == 1 ]]; then
 else
   echo "  health:        not answering (journalctl -u ${NAME} -n 40)"
   exit 1
+fi
+if [[ "${placeholder:-}" == 1 ]]; then
+  echo
+  echo "WARNING: SHUTUP_AND_RUN_ALLOWLIST was not set. The allowlist is the placeholder"
+  echo "  ghcr.io/owner/selenium-worker, which is not yours. No job of yours will start."
+  echo "  Edit ${ETC}/config.toml, then: sudo systemctl restart ${NAME}"
 fi
 if [[ "${SHUTUP_AND_RUN_SHOW_TOKEN:-}" == 1 ]]; then
   echo "  token:         ${token}"

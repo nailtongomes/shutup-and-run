@@ -81,7 +81,7 @@ pub(crate) fn next_wait(current: Duration, interval: Duration, failed: bool) -> 
 }
 
 pub(crate) async fn poll_once(
-    launcher: &Launcher,
+    launcher: &Arc<Launcher>,
     client: &reqwest::Client,
 ) -> Result<PollOutcome, PollError> {
     let Some(url) = launcher.settings().poll_url.clone() else {
@@ -329,6 +329,7 @@ mod tests {
         let http = client().unwrap();
         let outcome = poll_once(&launcher, &http).await.unwrap();
         assert_eq!(outcome, PollOutcome::Started);
+        launcher.settled().await;
         assert_eq!(mock.start_count().await, 1);
         assert_eq!(
             server.auth.lock().unwrap().as_deref(),

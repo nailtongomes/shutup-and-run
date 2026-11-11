@@ -46,7 +46,7 @@ cleanup() {
     kill "$(cat "$WORK/pid")" >/dev/null 2>&1 || true
   fi
   if ((${#IDS[@]} > 0)); then
-    docker rm -f "${IDS[@]}" >/dev/null 2>&1 || true
+    docker rm -f "${IDS[@]/#/shutup-and-run-}" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -311,7 +311,12 @@ else
   fail "idempotent job_key (codes ${long_code}/${replay_code}, ids ${LONG:-?}/${REPLAY:-?}, slots_used=${used_after:-?})"
 fi
 
-log_code=$(get_job "$LONG" "?logs=true")
+# 202 comes before the image pull. Give the container a moment to exist.
+for _ in $(seq 1 60); do
+  log_code=$(get_job "$LONG" "?logs=true")
+  grep -q 'shutup-and-run-log-marker' "$WORK/status.json" && break
+  sleep 0.5
+done
 if [[ "$log_code" == 200 ]] && grep -q 'shutup-and-run-log-marker' "$WORK/status.json"; then
   pass "logs returned"
 else
@@ -379,7 +384,7 @@ fi
 if [[ "$timeout_ok" == 1 ]]; then
   pass "timeout kill"
 else
-  state=$(docker inspect -f '{{.State.Status}}' "$TID" 2>/dev/null || echo gone)
+  state=$(docker inspect -f '{{.State.Status}}' "shutup-and-run-$TID" 2>/dev/null || echo gone)
   if [[ "$state" != "running" && "$state" != "restarting" && "$state" != "paused" ]]; then
     pass "timeout kill"
   else
@@ -446,7 +451,7 @@ fi
 if [[ "${SHUTUP_AND_RUN_SMOKE:-}" == 1 ]]; then
   echo
   if ((${#IDS[@]} > 0)); then
-    docker rm -f "${IDS[@]}" >/dev/null 2>&1 || true
+    docker rm -f "${IDS[@]/#/shutup-and-run-}" >/dev/null 2>&1 || true
   fi
   sed -i 's/^history_days = 0$/history_days = 30/' "$WORK/config.toml"
   cat >>"$WORK/config.toml" <<EOF

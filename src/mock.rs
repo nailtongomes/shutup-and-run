@@ -13,7 +13,6 @@ struct Inner {
     removed_images: Vec<String>,
     pulls: Vec<String>,
     starts: u64,
-    next: u64,
     fail_list: bool,
     fail_start: bool,
 }
@@ -41,7 +40,6 @@ impl MockRuntime {
                 removed_images: Vec::new(),
                 pulls: Vec::new(),
                 starts: 0,
-                next: 1,
                 fail_list: false,
                 fail_start: false,
             }),
@@ -100,7 +98,7 @@ impl Runtime for MockRuntime {
         Ok(inner.running.len())
     }
 
-    async fn start(&self, spec: &StartSpec) -> Result<String, RuntimeError> {
+    async fn start(&self, id: &str, spec: &StartSpec) -> Result<(), RuntimeError> {
         // Yield so a launcher that drops the slot lock between count and start
         // can be caught by the concurrent test.
         tokio::task::yield_now().await;
@@ -110,12 +108,11 @@ impl Runtime for MockRuntime {
             return Err(RuntimeError::new("start failed"));
         }
         inner.starts += 1;
-        inner.next += 1;
-        let id = format!("{:064x}", inner.next);
+        let id = id.to_string();
         inner.running.insert(id.clone(), spec.deadline_unix);
         inner.logs.insert(id.clone(), format!("log {id}\n"));
-        inner.image_of.insert(id.clone(), spec.image.clone());
-        Ok(id)
+        inner.image_of.insert(id, spec.image.clone());
+        Ok(())
     }
 
     async fn inspect(&self, id: &str) -> Result<Inspected, RuntimeError> {

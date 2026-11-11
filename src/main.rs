@@ -177,6 +177,7 @@ async fn serve() -> ExitCode {
         }
     };
     launcher.reconcile().await;
+    let pending = launcher.clone();
     spawn_exit_watcher(docker, launcher.clone());
     spawn_maintenance(launcher.clone());
     spawn_poller(launcher.clone());
@@ -199,6 +200,7 @@ async fn serve() -> ExitCode {
             eprintln!("shutup-and-run: {err}");
             return ExitCode::from(1);
         }
+        finish_starts(&pending).await;
         return ExitCode::SUCCESS;
     }
 
@@ -242,7 +244,20 @@ async fn serve() -> ExitCode {
         eprintln!("shutup-and-run: {err}");
         return ExitCode::from(1);
     }
+    finish_starts(&pending).await;
     ExitCode::SUCCESS
+}
+
+/// A job answered with 202 may still be pulling its image. Give those up to
+/// 30 seconds to become containers, which then outlive this process.
+async fn finish_starts(launcher: &Launcher) {
+    let wait = std::time::Duration::from_secs(30);
+    if tokio::time::timeout(wait, launcher.settled())
+        .await
+        .is_err()
+    {
+        tracing::warn!("stopping with a job still pulling its image; it will be recorded as ended");
+    }
 }
 
 fn connect_docker() -> Result<bollard::Docker, String> {

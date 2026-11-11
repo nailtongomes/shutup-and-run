@@ -19,7 +19,12 @@
 #   SMOKE_FINGERPRINT    SHA-256 certificate fingerprint the installer printed.
 #                        When set, the certificate is checked and its key is
 #                        pinned for every request. When unset, TLS is not verified.
-#   SMOKE_IMAGE          allowlisted image with sh, echo and sleep. Default busybox.
+#   SMOKE_IMAGE          an image on the instance's allowlist. Default
+#                        ghcr.io/nailtongomes/shutup-and-run-smoke, a small Python
+#                        image built from examples/smoke-image. Any image with
+#                        sh, echo and sleep works. hello-world works too, but it
+#                        has no shell, so the scenarios that need a job to stay
+#                        up (3, 4, 8, 10, 12) are skipped.
 #   SMOKE_STUB_HOST      address the instance can use to reach this machine, for
 #                        the callback and poll stub. Default 127.0.0.1 when
 #                        SMOKE_URL is a loopback address. Otherwise unset, and
@@ -66,7 +71,11 @@ if [[ "${SMOKE_LOCAL:-}" == 1 ]]; then
 fi
 URL="${SMOKE_URL:-}"
 TOKEN="${SMOKE_TOKEN:-}"
-IMAGE="${SMOKE_IMAGE:-busybox}"
+SMOKE_DEFAULT_IMAGE=ghcr.io/nailtongomes/shutup-and-run-smoke
+IMAGE="${SMOKE_IMAGE:-$SMOKE_DEFAULT_IMAGE}"
+# hello-world is one static binary. It cannot run a command we choose.
+SHELL_OK=1
+[[ "${IMAGE%%:*}" == hello-world ]] && SHELL_OK=0
 STUB_PORT="${SMOKE_STUB_PORT:-18790}"
 BAN_SOURCE="${SMOKE_BAN_SOURCE:-127.0.0.2}"
 POLL_WAIT="${SMOKE_POLL_WAIT:-90}"
@@ -180,10 +189,31 @@ elif value is not None: print(value)
 used() { api GET /health; field slots_used; }
 
 # sh_job SHELL_COMMAND TIMEOUT [EXTRA_JSON_FIELDS]. POSTs a job. Sets CODE and ID.
+# An image without a shell runs its own entrypoint and the command is dropped.
 sh_job() {
-  local extra="${3:-}"
-  api POST /v1/jobs "{\"image\":\"${IMAGE}\",\"command\":[\"sh\",\"-c\",\"$1\"],\"timeout_secs\":$2${extra:+,$extra}}"
+  local extra="${3:-}" command="\"command\":[\"sh\",\"-c\",\"$1\"],"
+  [[ "$SHELL_OK" == 1 ]] || command=
+  api POST /v1/jobs "{\"image\":\"${IMAGE}\",${command}\"timeout_secs\":$2${extra:+,$extra}}"
   ID=$(field id)
+}
+
+# needs_shell NUMBER NAME. Skips the scenario and returns 1 when the image has no shell.
+needs_shell() {
+  [[ "$SHELL_OK" == 1 ]] && return 0
+  skip "$1 $2 (${IMAGE} has no shell; use an image with sh and sleep)"
+  return 1
+}
+
+# wait_log ID TEXT SECONDS. Returns 0 once the job's logs contain TEXT, which
+# means the image was pulled and the container is up.
+wait_log() {
+  local deadline=$((SECONDS + $3))
+  while ((SECONDS < deadline)); do
+    api GET "/v1/jobs/$1?logs=true"
+    [[ "$(field logs)" == *"$2"* ]] && return 0
+    sleep 0.5
+  done
+  return 1
 }
 
 # wait_exit ID SECONDS. Returns 0 once the job is exited; the row is in $TMP/body.
@@ -362,20 +392,25 @@ if wants 2; then
   id=$ID
   api GET "/v1/jobs/${id}"
   running=$(field status)
+  # hello-world can be gone before the first GET.
+  [[ "$SHELL_OK" == 0 && "$running" == exited ]] && running=running
+  expect="${RUN}-two"
+  [[ "$SHELL_OK" == 1 ]] || expect="Hello from Docker"
   if [[ "$first" == 202 && "$running" == running ]] && wait_exit "$id" 60 && [[ "$(field exit_code)" == 0 ]]; then
     api GET "/v1/jobs/${id}?logs=true"
-    if [[ "$(field logs)" == *"${RUN}-two"* ]]; then
+    if [[ "$(field logs)" == *"$expect"* ]]; then
       pass "2 job accepted, running, exited 0, logs returned"
     else
       fail "2 job ran but ?logs=true did not return its output"
     fi
   else
     [[ "$first" == 403 ]] && echo "NOTE: 403 means ${IMAGE} is not on the instance's allowlist. Set SMOKE_IMAGE."
+    [[ "$(field reason)" == start_failed ]] && echo "NOTE: the job did not start. The instance could not pull or run ${IMAGE}."
     fail "2 job (post ${first}, first status ${running:-none}, last http ${CODE}, exit_code $(field exit_code))"
   fi
 fi
 
-if wants 3; then
+if wants 3 && needs_shell 3 slots; then
   wait_used "$USED0" 60
   api GET /health
   free=$(field slots_free)
@@ -407,7 +442,7 @@ if wants 3; then
   fi
 fi
 
-if wants 4; then
+if wants 4 && needs_shell 4 timeout; then
   wait_used "$USED0" 60
   sh_job "sleep 100" 2
   id=$ID
@@ -460,7 +495,7 @@ if wants 7; then
   fi
 fi
 
-if wants 8; then
+if wants 8 && needs_shell 8 restart; then
   if [[ -z "${SMOKE_RESTART_CMD:-}" ]]; then
     skip "8 restart (set SMOKE_RESTART_CMD, for example \"sudo systemctl restart shutup-and-run\")"
   else
@@ -468,8 +503,11 @@ if wants 8; then
     sh_job "echo ${RUN}-eight" 30
     done_id=$ID
     wait_exit "$done_id" 30
-    sh_job "sleep 12" 60
+    sh_job "echo ${RUN}-up; sleep 12" 60
     live_id=$ID
+    # A job that is still pulling its image has no container yet, and a
+    # restart would end it. Wait until it is really up.
+    wait_log "$live_id" "${RUN}-up" 60
     bash -c "$SMOKE_RESTART_CMD" </dev/null >/dev/null 2>"$TMP/restart.err"
     up=0
     for _ in $(seq 1 60); do
@@ -516,7 +554,7 @@ if wants 9; then
   fi
 fi
 
-if wants 10; then
+if wants 10 && needs_shell 10 poll; then
   if [[ "${SMOKE_POLL:-}" != 1 ]]; then
     skip "10 poll (set SMOKE_POLL=1 when the instance has poll_url = http://<this machine>:${STUB_PORT}/poll)"
   elif [[ -z "$STUB_PID" ]]; then
@@ -581,7 +619,7 @@ fi
 
 # Preflight: one harmless job with every request field set, followed from POST
 # to the freed slot. Run it alone with: smoke.sh preflight
-if wants 12; then
+if wants 12 && needs_shell 12 preflight; then
   wait_used "$USED0" 60
   extra="\"job_key\":\"${RUN}-preflight\",\"env\":{\"SMOKE_MARK\":\"${RUN}-preflight\"},\"cpu\":0.5,\"memory\":\"64m\",\"shm\":\"16m\""
   with_callback=0
@@ -589,8 +627,17 @@ if wants 12; then
     with_callback=1
     extra+=",\"callback_url\":\"http://${STUB_HOST}:${STUB_PORT}/callback/${RUN}\""
   fi
-  # shellcheck disable=SC2016
-  sh_job 'echo preflight $SMOKE_MARK; sleep 2' 60 "$extra"
+  if [[ "$IMAGE" == "$SMOKE_DEFAULT_IMAGE"* ]]; then
+    # No command: the image's own entrypoint runs, as a real worker's would.
+    # It prints "python ok <version> <SMOKE_MARK>" and stays up two seconds.
+    api POST /v1/jobs "{\"image\":\"${IMAGE}\",\"timeout_secs\":60,${extra}}"
+    ID=$(field id)
+    said="python ok"
+  else
+    # shellcheck disable=SC2016
+    sh_job 'echo preflight $SMOKE_MARK; sleep 2' 60 "$extra"
+    said="preflight"
+  fi
   first=$CODE
   id=$ID
   taken=$(used)
@@ -604,7 +651,7 @@ if wants 12; then
       if wait_exit "$id" 60 && [[ "$(field exit_code)" == 0 && "$(field reason)" == exited ]]; then
         api GET "/v1/jobs/${id}?logs=true"
         why="logs do not show the env value"
-        if [[ "$(field logs)" == *"preflight ${RUN}-preflight"* ]]; then
+        if [[ "$(field logs)" == *"$said"* && "$(field logs)" == *"${RUN}-preflight"* ]]; then
           sh_job "true" 60 "\"job_key\":\"${RUN}-preflight\""
           why="same job_key returned ${CODE}"
           if [[ "$CODE" == 200 && "$ID" == "$id" ]]; then

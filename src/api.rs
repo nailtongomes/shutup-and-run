@@ -180,11 +180,6 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
             "draining",
             Some(json!({"draining": true})),
         ),
-        Err(LaunchError::StartFailed { id }) => error_body(
-            StatusCode::BAD_GATEWAY,
-            "failed to start container",
-            Some(json!({"id": id, "reason": "start_failed"})),
-        ),
         Err(LaunchError::Unavailable(msg)) => error_body(StatusCode::BAD_GATEWAY, &msg, None),
     }
 }
@@ -522,6 +517,7 @@ mod tests {
         assert_eq!(got["status"], "running");
         assert!(got.get("logs").is_none());
 
+        h.launcher.settled().await;
         let (status, with_logs) = json_of(
             h.app
                 .clone()
@@ -600,6 +596,7 @@ mod tests {
         }
         assert_eq!(accepted, 2);
         assert_eq!(rejected, 6);
+        h.launcher.settled().await;
         assert_eq!(h.mock.running_ids().await.len(), 2);
     }
 
@@ -649,6 +646,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(second["id"], id);
+        h.launcher.settled().await;
         assert_eq!(h.mock.start_count().await, 1);
 
         let (status, _) = json_of(
