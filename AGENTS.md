@@ -19,7 +19,7 @@ sudo apt-get install -y musl-tools build-essential
 CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked --target x86_64-unknown-linux-musl
 ```
 
-CI installs those packages, and shellcheck, with `scripts/ci-apt.sh`. Each `apt-get` is capped. If it fails, the script leaves `azure.archive.ubuntu.com` and retries against `archive.ubuntu.com`.
+The GitHub-hosted image already has shellcheck. CI installs `musl-tools` with `scripts/ci-apt.sh`. Each `apt-get` is capped. If it fails, the script leaves `azure.archive.ubuntu.com` and retries against `archive.ubuntu.com`, then `mirrors.kernel.org`.
 
 ## Accept and smoke
 

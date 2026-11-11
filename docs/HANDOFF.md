@@ -52,7 +52,7 @@ Pull mode is `spawn_poller` in `src/poll.rs`. It is not started when `poll_url` 
 | `src/clock.rs` | Clock, plus a fake clock for tests. |
 | `src/mock.rs` | In-memory runtime for tests. |
 | `scripts/install.sh` | Ubuntu install: Docker, token, self-signed cert, systemd, optional ufw. |
-| `scripts/ci-apt.sh` | CI only. Bounded `apt-get`, then `archive.ubuntu.com` if the Azure mirror fails. |
+| `scripts/ci-apt.sh` | CI only. Bounded `apt-get`, then `archive.ubuntu.com`, then `mirrors.kernel.org`. |
 | `scripts/size.sh` | Measures launcher RSS and CPU. Not run in CI. |
 | `scripts/accept.sh` | End-to-end test against a real Docker daemon. Starts its own instance. `SHUTUP_AND_RUN_SMOKE=1` then runs `smoke.sh` on it. |
 | `scripts/smoke.sh` | Twelve scenarios against an instance that is already running, through the API only. |
@@ -122,7 +122,7 @@ Run the service: `shutup-and-run` or `shutup-and-run serve`. Config errors print
 
 `ci.yml` runs on every push and pull request:
 
-- `check`: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked`, `shellcheck scripts/*.sh`. `shellcheck` and the musl job's `musl-tools` come from `scripts/ci-apt.sh` (90s cap per `apt-get`, then `archive.ubuntu.com`). The image and release workflows use the same script. The step timeout is 8 minutes.
+- `check`: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked`, `shellcheck scripts/*.sh`. The runner image already has `shellcheck`, so this job does not call apt. The musl job's `musl-tools` come from `scripts/ci-apt.sh` (90s cap per `apt-get`, then `archive.ubuntu.com`, then `mirrors.kernel.org`). The image and release workflows use the same script. The step timeout is 10 minutes.
 - `accept`: release binary, then `sudo SHUTUP_AND_RUN_SMOKE=1 bash scripts/accept.sh` against the runner's Docker, which also runs `smoke.sh` with every scenario on. Timeout 30 minutes.
 - `musl`: static `x86_64-unknown-linux-musl` binary, then `file` and `ldd` must show it is static. The same job builds the scratch image and runs it, serves the binary and `SHA256SUMS` on localhost as a stand-in for a release, checks that `install.sh` refuses a wrong checksum, installs from it, runs `smoke.sh` against the installed HTTPS service, and uninstalls.
 

@@ -4,11 +4,12 @@
 # ubuntu-latest resolves Ubuntu archives through azure.archive.ubuntu.com
 # (directly, or via mirror+file:/etc/apt/apt-mirrors.txt). When that name does
 # not resolve, apt retries for many minutes and the job fails. Each apt
-# invocation is capped, and on failure the Azure mirror is removed so the
-# retry talks to archive.ubuntu.com only.
+# invocation is capped. On failure the Azure mirror is dropped and the same
+# install is tried against archive.ubuntu.com, then mirrors.kernel.org.
+# One dead Ubuntu host is not enough to fail the job.
 #
 # CI_APT_TIMEOUT_SECS   per apt-get invocation (default 90)
-# CI_APT_FORCE_FALLBACK set to 1 to skip the default mirror
+# CI_APT_FORCE_FALLBACK set to 1 to skip the runner's default mirror
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -33,45 +34,36 @@ try_install() {
   apt_get install -y "$@" || return $?
 }
 
-# Point every Ubuntu source at archive.ubuntu.com and drop the Azure mirror
-# list. A runner that never mentioned Azure is left as apt already had it,
-# plus a direct archive line if we had to rewrite something.
-fallback_mirror() {
-  echo "apt failed or timed out; installing from archive.ubuntu.com" >&2
-  if [[ -f /etc/apt/apt-mirrors.txt ]]; then
-    echo 'https://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
-  fi
+# Rewrite Ubuntu sources so they fetch $1 and nothing else we were stuck on.
+point_apt_at() {
+  local uri=$1
   local f
   local changed=0
-  if [[ -f /etc/apt/sources.list ]]; then
-    if grep -qE 'azure\.archive\.ubuntu\.com|apt-mirrors\.txt' /etc/apt/sources.list; then
-      sudo sed -i \
-        -e 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-        -e 's|https://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-        -e 's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
-        /etc/apt/sources.list
-      changed=1
-    fi
+  echo "apt failed or timed out; installing from ${uri}" >&2
+  if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+    printf '%s/\n' "$uri" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
   fi
-  for f in /etc/apt/sources.list.d/*; do
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
     [[ -f "$f" ]] || continue
-    if grep -qE 'azure\.archive\.ubuntu\.com|apt-mirrors\.txt' "$f"; then
+    if grep -qE 'azure\.archive\.ubuntu\.com|apt-mirrors\.txt|archive\.ubuntu\.com/ubuntu|mirrors\.kernel\.org/ubuntu' "$f"; then
       sudo sed -i \
-        -e 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-        -e 's|https://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-        -e 's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' \
+        -e "s|http://azure.archive.ubuntu.com/ubuntu|${uri}|g" \
+        -e "s|https://azure.archive.ubuntu.com/ubuntu|${uri}|g" \
+        -e "s|http://archive.ubuntu.com/ubuntu|${uri}|g" \
+        -e "s|https://archive.ubuntu.com/ubuntu|${uri}|g" \
+        -e "s|http://mirrors.kernel.org/ubuntu|${uri}|g" \
+        -e "s|https://mirrors.kernel.org/ubuntu|${uri}|g" \
+        -e "s|mirror+file:/etc/apt/apt-mirrors.txt|${uri}|g" \
         "$f"
       changed=1
     fi
   done
-  if [[ "$changed" -eq 0 && ! -f /etc/apt/sources.list.d/ci-direct.sources ]]; then
-    # The failure was not a mirror name we know. Add one direct source so the
-    # retry is not stuck on whatever just timed out.
+  if [[ "$changed" -eq 0 ]]; then
     local codename
     codename=$(awk -F= '/^VERSION_CODENAME=/ { print $2 }' /etc/os-release)
     sudo tee /etc/apt/sources.list.d/ci-direct.sources >/dev/null <<EOF
 Types: deb
-URIs: https://archive.ubuntu.com/ubuntu
+URIs: ${uri}
 Suites: ${codename} ${codename}-updates ${codename}-backports ${codename}-security
 Components: main universe restricted multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
@@ -84,5 +76,11 @@ if [[ "${CI_APT_FORCE_FALLBACK:-}" != 1 ]]; then
     exit 0
   fi
 fi
-fallback_mirror
-try_install "$@"
+
+for uri in https://archive.ubuntu.com/ubuntu https://mirrors.kernel.org/ubuntu; do
+  point_apt_at "$uri"
+  if try_install "$@"; then
+    exit 0
+  fi
+done
+exit 1

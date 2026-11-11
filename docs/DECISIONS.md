@@ -92,7 +92,7 @@ The repo is public at github.com/nailtongomes/shutup-and-run. GitHub Actions run
 
 GitHub-hosted Ubuntu installs packages from `azure.archive.ubuntu.com`, sometimes through `mirror+file:/etc/apt/apt-mirrors.txt`. When that name does not resolve, `apt-get` retries for many minutes and the ci, image, and release jobs die before they compile. `Acquire::Retries` made the wait longer. It did not add a mirror that could succeed.
 
-`scripts/ci-apt.sh` caps each `apt-get` at 90 seconds. If that fails, it rewrites the Azure mirror and the mirror list to `https://archive.ubuntu.com/ubuntu` and tries once more. The workflow step itself is capped at 8 minutes. The compiler stays `musl-gcc` from Ubuntu, the same one a local release build uses. The cost is about a minute when Azure's mirror is down, and one script the three workflows share. A different musl toolchain would have avoided apt, and would also have made the release binary something we do not build locally.
+`scripts/ci-apt.sh` caps each `apt-get` at 90 seconds. If that fails, it leaves the Azure mirror and tries `https://archive.ubuntu.com/ubuntu`, then `https://mirrors.kernel.org/ubuntu`. The workflow step itself is capped at 10 minutes. The compiler stays `musl-gcc` from Ubuntu, the same one a local release build uses. The check job does not call apt: `shellcheck` is already on the GitHub-hosted image, and installing it was the step that died when every Ubuntu mirror was quiet. The cost is a couple of minutes when the Azure mirror is down, and one script the musl jobs share. A different musl toolchain would have avoided apt, and would also have made the release binary something we do not build locally.
 
 ## GHCR image
 
