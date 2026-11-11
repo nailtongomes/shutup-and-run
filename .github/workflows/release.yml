@@ -1,5 +1,8 @@
 # On tag v*, attach the musl binary and SHA256SUMS to the GitHub release.
 # install.sh downloads that asset from releases/latest and checks SHA256SUMS.
+# A second job then runs the README one-liner on a fresh runner and smokes
+# the service it installed. Tag from main: the one-liner fetches install.sh
+# from main.
 name: release
 
 on:
@@ -38,3 +41,30 @@ jobs:
           files: |
             dist/shutup-and-run-x86_64-unknown-linux-musl
             dist/SHA256SUMS
+
+  install:
+    needs: musl
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: the README one-liner
+        run: curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.sh | sudo bash
+      - name: installed binary is this release's asset
+        run: |
+          curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/SHA256SUMS" -o SHA256SUMS
+          test "$(awk '{ print $1; exit }' SHA256SUMS)" = "$(sha256sum /usr/local/bin/shutup-and-run | awk '{ print $1 }')"
+      - name: smoke the installed service
+        timeout-minutes: 15
+        run: |
+          sudo sed -i 's#"ghcr.io/owner/selenium-worker"#"busybox"#' /etc/shutup-and-run/config.toml
+          printf 'SHUTUP_AND_RUN_POLL_URL=http://127.0.0.1:18790/poll\nSHUTUP_AND_RUN_POLL_INTERVAL_SECS=2\n' | sudo tee -a /etc/shutup-and-run/env >/dev/null
+          sudo systemctl restart shutup-and-run
+          sudo SMOKE_LOCAL=1 SMOKE_POLL=1 SMOKE_STRICT=1 \
+            SMOKE_RESTART_CMD="systemctl restart shutup-and-run" bash scripts/smoke.sh
+      - name: service log
+        if: always()
+        run: sudo journalctl -u shutup-and-run -n 100 --no-pager || true

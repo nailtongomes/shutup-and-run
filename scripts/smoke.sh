@@ -6,7 +6,12 @@
 #   SMOKE_URL=... SMOKE_TOKEN=... bash scripts/smoke.sh preflight   # scenario 12 only
 #   SMOKE_URL=... SMOKE_TOKEN=... bash scripts/smoke.sh 1 2 6       # chosen scenarios
 #
-# Required:
+# On the machine itself, as root, SMOKE_LOCAL=1 fills in the URL, the token,
+# the fingerprint and the ban lift command from /etc/shutup-and-run:
+#
+#   sudo SMOKE_LOCAL=1 SMOKE_IMAGE=ghcr.io/you/worker bash scripts/smoke.sh
+#
+# Required (unless SMOKE_LOCAL=1):
 #   SMOKE_URL            base URL, http or https
 #   SMOKE_TOKEN          the bearer token
 #
@@ -29,6 +34,7 @@
 #   SMOKE_BAN_SOURCE     source address for the ban test. Default 127.0.0.2.
 #   SMOKE_POLL=1         the instance has poll_url = http://<stub host>:<stub port>/poll
 #   SMOKE_POLL_WAIT      seconds to wait for the instance to poll. Default 90.
+#   SMOKE_STRICT=1       a skipped scenario counts as a failure.
 #
 # What it does to a live machine, so you can decide when to run it:
 #   - Every job is the tiny image running echo or sleep, with timeout_secs of
@@ -50,6 +56,14 @@
 # auth_failures = 1, set SMOKE_SKIP_UNAUTH=1.
 set -uo pipefail
 
+if [[ "${SMOKE_LOCAL:-}" == 1 ]]; then
+  etc=/etc/shutup-and-run
+  port=$(sed -n 's/^listen = ".*:\([0-9][0-9]*\)"$/\1/p' "$etc/config.toml" 2>/dev/null | head -n 1)
+  : "${SMOKE_URL:=https://127.0.0.1:${port:-8787}}"
+  : "${SMOKE_TOKEN:=$(sed -n 's/^SHUTUP_AND_RUN_TOKEN=//p' "$etc/env" 2>/dev/null | head -n 1)}"
+  : "${SMOKE_FINGERPRINT:=$(openssl x509 -in "$etc/cert.pem" -noout -fingerprint -sha256 2>/dev/null | sed 's/^[^=]*=//')}"
+  : "${SMOKE_BAN_LIFT_CMD:=shutup-and-run bans lift}"
+fi
 URL="${SMOKE_URL:-}"
 TOKEN="${SMOKE_TOKEN:-}"
 IMAGE="${SMOKE_IMAGE:-busybox}"
@@ -86,7 +100,11 @@ TOTAL=0
 
 pass() { echo "PASS: $1"; PASSED=$((PASSED + 1)); }
 fail() { echo "FAIL: $1"; FAILED=$((FAILED + 1)); }
-skip() { echo "SKIP: $1"; SKIPPED=$((SKIPPED + 1)); }
+skip() {
+  echo "SKIP: $1"
+  SKIPPED=$((SKIPPED + 1))
+  [[ "${SMOKE_STRICT:-}" == 1 ]] && FAILED=$((FAILED + 1))
+}
 wants() { [[ "$ONLY" == *" $1 "* ]]; }
 
 hostport="${URL#*://}"
@@ -198,7 +216,7 @@ cleanup() {
     [[ "$CODE" == 200 ]] || echo "WARNING: could not undrain (http ${CODE}). POST /v1/drain {\"draining\":false} by hand."
   fi
   if [[ "$BANNED" == 1 && -n "${SMOKE_BAN_LIFT_CMD:-}" ]]; then
-    bash -c "${SMOKE_BAN_LIFT_CMD} ${BAN_SOURCE}" >/dev/null 2>&1 || echo "WARNING: could not lift the ban on ${BAN_SOURCE}"
+    bash -c "${SMOKE_BAN_LIFT_CMD} ${BAN_SOURCE}" </dev/null >/dev/null 2>&1 || echo "WARNING: could not lift the ban on ${BAN_SOURCE}"
   fi
   if [[ "$TOTAL" != 0 ]]; then
     if wait_used "$USED0" 130; then
@@ -255,7 +273,7 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 ThreadingHTTPServer((bind, port), H).serve_forever()
-' "$TMP" "$STUB_BIND" "$STUB_PORT" &
+' "$TMP" "$STUB_BIND" "$STUB_PORT" </dev/null &
   STUB_PID=$!
   sleep 0.5
   if ! kill -0 "$STUB_PID" 2>/dev/null; then
@@ -283,10 +301,17 @@ wait_callback() {
 
 echo "== shutup-and-run smoke: ${URL}, image ${IMAGE} =="
 
-api GET /health
+# A service that was just restarted needs a moment. A wrong token would be
+# 401 at once, so only a refused connection is retried.
+for _ in $(seq 1 20); do
+  api GET /health
+  [[ "$CODE" != 000 ]] && break
+  sleep 0.5
+done
 if [[ "$CODE" != 200 ]]; then
   echo "FAIL: GET /health with the token returned ${CODE}. $(cat "$TMP/curl.err" 2>/dev/null)"
   [[ "$CODE" == 403 ]] && echo "403 with an empty body means this address is banned: shutup-and-run bans lift <ip>"
+  [[ "$CODE" == 401 ]] && echo "401 is a wrong token. Each wrong token counts toward a ban of your address."
   exit 1
 fi
 if [[ "$(field draining)" == true ]]; then
@@ -345,6 +370,7 @@ if wants 2; then
       fail "2 job ran but ?logs=true did not return its output"
     fi
   else
+    [[ "$first" == 403 ]] && echo "NOTE: 403 means ${IMAGE} is not on the instance's allowlist. Set SMOKE_IMAGE."
     fail "2 job (post ${first}, first status ${running:-none}, last http ${CODE}, exit_code $(field exit_code))"
   fi
 fi
@@ -444,7 +470,7 @@ if wants 8; then
     wait_exit "$done_id" 30
     sh_job "sleep 12" 60
     live_id=$ID
-    bash -c "$SMOKE_RESTART_CMD" >/dev/null 2>"$TMP/restart.err"
+    bash -c "$SMOKE_RESTART_CMD" </dev/null >/dev/null 2>"$TMP/restart.err"
     up=0
     for _ in $(seq 1 60); do
       api GET /health
@@ -479,7 +505,7 @@ if wants 9; then
     done
     blocked=$(code_from "$ALT" "$TOKEN")
     mine=$(code_from "" "$TOKEN")
-    bash -c "${SMOKE_BAN_LIFT_CMD} ${ALT}" >/dev/null 2>"$TMP/lift.err"
+    bash -c "${SMOKE_BAN_LIFT_CMD} ${ALT}" </dev/null >/dev/null 2>"$TMP/lift.err"
     restored=$(code_from "$ALT" "$TOKEN")
     [[ "$restored" == 200 ]] && BANNED=0
     if [[ "$bad" == "401 401 401 " && "$blocked" == 403 && "$mine" == 200 && "$restored" == 200 ]]; then
@@ -570,6 +596,7 @@ if wants 12; then
   taken=$(used)
   ok=0
   why="post ${first}"
+  [[ "$first" == 403 ]] && why+=": ${IMAGE} is not on the instance's allowlist, set SMOKE_IMAGE"
   if [[ "$first" == 202 && -n "$id" ]]; then
     why="slots_used ${taken:-?} while running, expected $((USED0 + 1))"
     if [[ "$taken" == $((USED0 + 1)) ]]; then

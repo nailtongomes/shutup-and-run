@@ -52,3 +52,50 @@ jobs:
             exit 1
           fi
           grep -E 'statically linked|not a dynamic executable' /tmp/ldd.txt
+      - name: the scratch image starts
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/shutup-and-run ./shutup-and-run
+          docker build -t shutup-and-run:ci .
+          docker run --rm shutup-and-run:ci --help
+          rm ./shutup-and-run
+      # What a release does, with the binary just built: install.sh downloads
+      # the asset and SHA256SUMS, checks them, and starts the systemd service
+      # over HTTPS. Then every smoke scenario runs against that service.
+      - name: serve a local release
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/shutup-and-run dist/shutup-and-run-x86_64-unknown-linux-musl
+          (cd dist && sha256sum shutup-and-run-x86_64-unknown-linux-musl > SHA256SUMS)
+          (cd dist && nohup python3 -m http.server 8099 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sleep 1
+      - name: install.sh refuses a wrong checksum
+        run: |
+          mkdir -p bad
+          cp dist/shutup-and-run-x86_64-unknown-linux-musl bad/
+          echo "$(printf '0%.0s' {1..64})  shutup-and-run-x86_64-unknown-linux-musl" > bad/SHA256SUMS
+          (cd bad && nohup python3 -m http.server 8098 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sleep 1
+          if sudo SHUTUP_AND_RUN_URL=http://127.0.0.1:8098/shutup-and-run-x86_64-unknown-linux-musl bash scripts/install.sh; then
+            echo "install.sh accepted a binary that does not match SHA256SUMS"
+            exit 1
+          fi
+          test ! -e /usr/local/bin/shutup-and-run
+      - name: install.sh from the local release
+        run: |
+          sudo SHUTUP_AND_RUN_URL=http://127.0.0.1:8099/shutup-and-run-x86_64-unknown-linux-musl \
+            SHUTUP_AND_RUN_ALLOWLIST=busybox bash scripts/install.sh
+      - name: smoke the installed service
+        timeout-minutes: 15
+        run: |
+          printf 'SHUTUP_AND_RUN_POLL_URL=http://127.0.0.1:18790/poll\nSHUTUP_AND_RUN_POLL_INTERVAL_SECS=2\n' | sudo tee -a /etc/shutup-and-run/env >/dev/null
+          sudo systemctl restart shutup-and-run
+          sudo SMOKE_LOCAL=1 SMOKE_POLL=1 SMOKE_STRICT=1 \
+            SMOKE_RESTART_CMD="systemctl restart shutup-and-run" bash scripts/smoke.sh
+      - name: service log
+        if: always()
+        run: sudo journalctl -u shutup-and-run -n 100 --no-pager || true
+      - name: uninstall
+        run: |
+          sudo bash scripts/install.sh --uninstall --purge
+          test ! -e /usr/local/bin/shutup-and-run
+          test ! -e /etc/shutup-and-run

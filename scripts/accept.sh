@@ -442,7 +442,7 @@ else
 fi
 
 # Optional second pass: the smoke test, against this same instance, with every
-# scenario switched on. A skipped scenario counts as a failure here.
+# scenario switched on. SMOKE_STRICT makes a skipped scenario a failure.
 if [[ "${SHUTUP_AND_RUN_SMOKE:-}" == 1 ]]; then
   echo
   if ((${#IDS[@]} > 0)); then
@@ -455,13 +455,10 @@ poll_interval_secs = 2
 EOF
   bash "$WORK/restart.sh"
   wait_ready
-  SMOKE_URL="$BASE" SMOKE_TOKEN="$TOKEN" SMOKE_IMAGE=alpine SMOKE_POLL=1 SMOKE_STUB_PORT=18790 \
+  SMOKE_URL="$BASE" SMOKE_TOKEN="$TOKEN" SMOKE_IMAGE=alpine SMOKE_POLL=1 SMOKE_STRICT=1 \
     SMOKE_RESTART_CMD="bash $WORK/restart.sh" \
     SMOKE_BAN_LIFT_CMD="env SHUTUP_AND_RUN_CONFIG=$WORK/config.toml $BIN bans lift" \
-    bash "$ROOT/scripts/smoke.sh" 2>&1 | tee "$WORK/smoke.out"
-  if [[ "${PIPESTATUS[0]}" -ne 0 ]] || grep -q '^SKIP:' "$WORK/smoke.out"; then
-    fail "smoke.sh"
-  fi
+    bash "$ROOT/scripts/smoke.sh" || fail "smoke.sh"
 fi
 
 echo
