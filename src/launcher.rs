@@ -60,7 +60,7 @@ pub struct Launcher {
     clock: Arc<dyn Clock>,
     store: Arc<Store>,
     /// shortcut: one process mutex around list+create. The count itself is the
-    /// Docker list, so a restart does not forget running jobs. Two fairlead
+    /// Docker list, so a restart does not forget running jobs. Two shutup-and-run
     /// processes on the same daemon can still exceed max_slots. Upgrade to a
     /// shared lock if you ever run more than one process.
     slots: Mutex<()>,
@@ -96,6 +96,37 @@ impl Launcher {
 
     pub fn token_matches(&self, provided: &str) -> bool {
         self.settings.token.matches(provided)
+    }
+
+    pub fn ban_until(&self, ip: &str) -> Result<Option<i64>, LaunchError> {
+        self.store
+            .active_ban(ip, self.clock.now_unix() as i64)
+            .map_err(store_err)
+    }
+
+    pub fn note_auth_failure(&self, ip: &str) -> Result<crate::store::Strike, LaunchError> {
+        self.store
+            .record_failure(
+                ip,
+                self.clock.now_unix() as i64,
+                self.settings.auth_failures,
+                self.settings.ban_secs as i64,
+            )
+            .map_err(store_err)
+    }
+
+    pub fn clear_auth_failures(&self, ip: &str) -> Result<(), LaunchError> {
+        self.store.clear_failures(ip).map_err(store_err)
+    }
+
+    pub fn list_bans(&self) -> Result<Vec<crate::store::Ban>, LaunchError> {
+        self.store
+            .list_bans(self.clock.now_unix() as i64)
+            .map_err(store_err)
+    }
+
+    pub fn lift_ban(&self, ip: &str) -> Result<bool, LaunchError> {
+        self.store.lift_ban(ip).map_err(store_err)
     }
 
     pub fn draining(&self) -> Result<bool, LaunchError> {
@@ -495,27 +526,27 @@ pub fn callback_body(job: &JobRecord) -> Value {
 pub fn metrics_text(slots: Slots, counts: crate::store::JobCounts) -> String {
     format!(
         "\
-# HELP fairlead_slots_total Configured slot capacity.
-# TYPE fairlead_slots_total gauge
-fairlead_slots_total {total}
-# HELP fairlead_slots_used Running containers labeled fairlead=1.
-# TYPE fairlead_slots_used gauge
-fairlead_slots_used {used}
-# HELP fairlead_slots_free Slots not currently taken. Not offered while draining.
-# TYPE fairlead_slots_free gauge
-fairlead_slots_free {free}
-# HELP fairlead_draining 1 while new jobs are refused.
-# TYPE fairlead_draining gauge
-fairlead_draining {draining}
-# HELP fairlead_jobs_started_total Jobs recorded in SQLite, including those still running.
-# TYPE fairlead_jobs_started_total counter
-fairlead_jobs_started_total {started}
-# HELP fairlead_jobs_finished_total Jobs that have ended.
-# TYPE fairlead_jobs_finished_total counter
-fairlead_jobs_finished_total {finished}
-# HELP fairlead_jobs_timeout_total Jobs ended with reason timeout_kill.
-# TYPE fairlead_jobs_timeout_total counter
-fairlead_jobs_timeout_total {timeouts}
+# HELP shutup_and_run_slots_total Configured slot capacity.
+# TYPE shutup_and_run_slots_total gauge
+shutup_and_run_slots_total {total}
+# HELP shutup_and_run_slots_used Running containers labeled shutup-and-run=1.
+# TYPE shutup_and_run_slots_used gauge
+shutup_and_run_slots_used {used}
+# HELP shutup_and_run_slots_free Slots not currently taken. Not offered while draining.
+# TYPE shutup_and_run_slots_free gauge
+shutup_and_run_slots_free {free}
+# HELP shutup_and_run_draining 1 while new jobs are refused.
+# TYPE shutup_and_run_draining gauge
+shutup_and_run_draining {draining}
+# HELP shutup_and_run_jobs_started_total Jobs recorded in SQLite, including those still running.
+# TYPE shutup_and_run_jobs_started_total counter
+shutup_and_run_jobs_started_total {started}
+# HELP shutup_and_run_jobs_finished_total Jobs that have ended.
+# TYPE shutup_and_run_jobs_finished_total counter
+shutup_and_run_jobs_finished_total {finished}
+# HELP shutup_and_run_jobs_timeout_total Jobs ended with reason timeout_kill.
+# TYPE shutup_and_run_jobs_timeout_total counter
+shutup_and_run_jobs_timeout_total {timeouts}
 ",
         total = slots.total,
         used = slots.used,
@@ -683,7 +714,8 @@ mod tests {
     fn settings(slots: usize) -> Settings {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("fairlead-launch-{n}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("shutup-and-run-launch-{n}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Settings::from_toml_and_env(

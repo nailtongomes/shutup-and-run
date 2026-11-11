@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# End-to-end check for fairlead on an Ubuntu machine with Docker.
+# End-to-end check for shutup-and-run on an Ubuntu machine with Docker.
 #
 #   sudo bash scripts/accept.sh
-#   sudo bash scripts/accept.sh /path/to/fairlead
+#   sudo bash scripts/accept.sh /path/to/shutup-and-run
 #
 # Do not run this on a machine that is already serving jobs. Test containers
-# use the label fairlead=1 and count against every fairlead on this Docker.
+# use the label shutup-and-run=1 and count against every shutup-and-run on this Docker.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -24,10 +24,10 @@ fail() { echo "FAIL: $1"; FAILURES=$((FAILURES + 1)); }
 
 dump_logs() {
   if [[ "$MODE" == systemd ]]; then
-    journalctl -u fairlead-accept.service -n 80 --no-pager || true
-  elif [[ -n "$WORK" && -f "$WORK/fairlead.log" ]]; then
-    echo "---- $WORK/fairlead.log ----"
-    cat "$WORK/fairlead.log" || true
+    journalctl -u shutup-and-run-accept.service -n 80 --no-pager || true
+  elif [[ -n "$WORK" && -f "$WORK/shutup-and-run.log" ]]; then
+    echo "---- $WORK/shutup-and-run.log ----"
+    cat "$WORK/shutup-and-run.log" || true
   fi
 }
 
@@ -37,8 +37,8 @@ cleanup() {
     wait "$CB_PID" >/dev/null 2>&1 || true
   fi
   if [[ "$MODE" == systemd ]]; then
-    systemctl stop fairlead-accept.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/fairlead-accept.service
+    systemctl stop shutup-and-run-accept.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/shutup-and-run-accept.service
     systemctl daemon-reload >/dev/null 2>&1 || true
   elif [[ -n "${PID}" ]]; then
     kill "$PID" >/dev/null 2>&1 || true
@@ -70,18 +70,18 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 if [[ $# -gt 1 ]]; then
-  echo "usage: sudo bash scripts/accept.sh [path-to-fairlead]"
+  echo "usage: sudo bash scripts/accept.sh [path-to-shutup-and-run]"
   exit 1
 fi
 
 if [[ -n "${1:-}" ]]; then
   BIN=$(readlink -f "$1")
-elif [[ -x "$ROOT/target/release/fairlead" ]]; then
-  BIN=$ROOT/target/release/fairlead
+elif [[ -x "$ROOT/target/release/shutup-and-run" ]]; then
+  BIN=$ROOT/target/release/shutup-and-run
 elif command -v cargo >/dev/null 2>&1; then
   echo "compiling (cargo build --release)..."
   (cd "$ROOT" && cargo build --release)
-  BIN=$ROOT/target/release/fairlead
+  BIN=$ROOT/target/release/shutup-and-run
 else
   echo "FAIL: no binary. Pass a path, or install Rust and let the script compile."
   exit 1
@@ -91,9 +91,9 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-echo "== fairlead acceptance =="
+echo "== shutup-and-run acceptance =="
 echo "binary: $BIN"
-echo "NOTE: test containers use the label fairlead=1 on this Docker."
+echo "NOTE: test containers use the label shutup-and-run=1 on this Docker."
 
 if ! docker pull alpine:latest >/dev/null; then
   if docker image inspect alpine:latest >/dev/null 2>&1; then
@@ -105,9 +105,9 @@ if ! docker pull alpine:latest >/dev/null; then
 fi
 
 if [[ $(id -u) -eq 0 ]]; then
-  WORK=/var/lib/fairlead-accept
+  WORK=/var/lib/shutup-and-run-accept
 else
-  WORK=/tmp/fairlead-accept-${UID}
+  WORK=/tmp/shutup-and-run-accept-${UID}
 fi
 mkdir -p "$WORK" || { echo "FAIL: could not create $WORK"; exit 1; }
 chmod 700 "$WORK"
@@ -131,6 +131,8 @@ history_path = "${WORK}/jobs.sqlite"
 history_days = 0
 purge_interval_secs = 15
 log_lines = 200
+http = true
+auth_failures = 3
 EOF
 BODY=$WORK/body.json
 
@@ -140,18 +142,18 @@ if [[ $(id -u) -eq 0 ]] && [[ -d /run/systemd/system ]] && command -v systemctl 
 fi
 
 if [[ "$HAVE_SYSTEMD" -eq 1 ]]; then
-  systemctl stop fairlead-accept.service >/dev/null 2>&1 || true
-  install -m 0755 "$BIN" /usr/local/bin/fairlead || { echo "FAIL: could not install the binary"; exit 1; }
-  cat >/etc/systemd/system/fairlead-accept.service <<EOF
+  systemctl stop shutup-and-run-accept.service >/dev/null 2>&1 || true
+  install -m 0755 "$BIN" /usr/local/bin/shutup-and-run || { echo "FAIL: could not install the binary"; exit 1; }
+  cat >/etc/systemd/system/shutup-and-run-accept.service <<EOF
 [Unit]
-Description=fairlead acceptance
+Description=shutup-and-run acceptance
 After=docker.service
 Requires=docker.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/fairlead
-Environment=FAIRLEAD_CONFIG=${WORK}/config.toml
+ExecStart=/usr/local/bin/shutup-and-run
+Environment=SHUTUP_AND_RUN_CONFIG=${WORK}/config.toml
 Environment=HOME=/root
 Restart=no
 
@@ -159,30 +161,31 @@ Restart=no
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  if ! systemctl start fairlead-accept.service; then
-    echo "FAIL: systemctl did not start fairlead-accept.service"
+  if ! systemctl start shutup-and-run-accept.service; then
+    echo "FAIL: systemctl did not start shutup-and-run-accept.service"
     MODE=systemd
     dump_logs
     exit 1
   fi
   MODE=systemd
-  echo "mode: systemd (unit fairlead-accept.service, binary /usr/local/bin/fairlead)"
+  echo "mode: systemd (unit shutup-and-run-accept.service, binary /usr/local/bin/shutup-and-run)"
 else
   if [[ $(id -u) -eq 0 ]]; then
-    install -m 0755 "$BIN" /usr/local/bin/fairlead || { echo "FAIL: could not install the binary"; exit 1; }
-    BIN_RUN=/usr/local/bin/fairlead
+    install -m 0755 "$BIN" /usr/local/bin/shutup-and-run || { echo "FAIL: could not install the binary"; exit 1; }
+    BIN_RUN=/usr/local/bin/shutup-and-run
   else
     BIN_RUN=$BIN
   fi
-  FAIRLEAD_CONFIG="$WORK/config.toml" HOME="${HOME:-/tmp}" "$BIN_RUN" >"$WORK/fairlead.log" 2>&1 &
+  SHUTUP_AND_RUN_CONFIG="$WORK/config.toml" HOME="${HOME:-/tmp}" "$BIN_RUN" >"$WORK/shutup-and-run.log" 2>&1 &
   PID=$!
   MODE=background
   echo "mode: background pid ${PID} (no systemd here; on Ubuntu with sudo the script installs the unit)"
 fi
 
+SHUTUP_AND_RUN_CONFIG="$WORK/config.toml" "$BIN" bans lift 127.0.0.1 >/dev/null 2>&1 || true
 ready=0
 for _ in $(seq 1 50); do
-  if curl -sf -m 2 "$BASE/health" >/dev/null; then
+  if curl -sf -m 2 -H "Authorization: Bearer ${TOKEN}" "$BASE/health" >/dev/null; then
     ready=1
     break
   fi
@@ -194,12 +197,12 @@ if [[ "$ready" -ne 1 ]]; then
   exit 1
 fi
 
-health=$(curl -sS -m 5 "$BASE/health")
+health=$(curl -sS -m 5 -H "Authorization: Bearer ${TOKEN}" "$BASE/health")
 total=$(printf '%s' "$health" | sed -n 's/.*"slots_total"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
 used=$(printf '%s' "$health" | sed -n 's/.*"slots_used"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
 if [[ "$total" != 2 || "$used" != 0 ]]; then
   echo "FAIL: unexpected initial health: $health"
-  echo "If slots_used is not 0, a container labeled fairlead=1 is already running."
+  echo "If slots_used is not 0, a container labeled shutup-and-run=1 is already running."
   exit 1
 fi
 
@@ -217,7 +220,7 @@ job_id() {
 
 slots_free() {
   local h
-  h=$(curl -sS -m 5 "$BASE/health" || true)
+  h=$(curl -sS -m 5 -H "Authorization: Bearer ${TOKEN}" "$BASE/health" || true)
   printf '%s' "$h" | sed -n 's/.*"slots_free"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1
 }
 
@@ -266,21 +269,21 @@ else
   fail "slot freed after a job ends (code ${CODE})"
 fi
 
-if curl -sf -m 5 "$BASE/metrics" | grep -q 'fairlead_slots_total 2'; then
+if curl -sf -m 5 -H "Authorization: Bearer ${TOKEN}" "$BASE/metrics" | grep -q 'shutup_and_run_slots_total 2'; then
   pass "metrics exposed"
 else
   fail "metrics exposed"
 fi
 
 sleep 3
-post '{"image":"alpine","command":["sh","-c","echo fairlead-log-marker; sleep 40"],"job_key":"accept-key"}'
+post '{"image":"alpine","command":["sh","-c","echo shutup-and-run-log-marker; sleep 40"],"job_key":"accept-key"}'
 long_code=$CODE
 LONG=$(job_id || true)
 remember "$LONG"
-post '{"image":"alpine","command":["sh","-c","echo fairlead-log-marker; sleep 40"],"job_key":"accept-key"}'
+post '{"image":"alpine","command":["sh","-c","echo shutup-and-run-log-marker; sleep 40"],"job_key":"accept-key"}'
 replay_code=$CODE
 REPLAY=$(job_id || true)
-used_after=$(curl -sS -m 5 "$BASE/health" | sed -n 's/.*"slots_used"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
+used_after=$(curl -sS -m 5 -H "Authorization: Bearer ${TOKEN}" "$BASE/health" | sed -n 's/.*"slots_used"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
 if [[ "$long_code" == 202 && "$replay_code" == 200 && -n "$LONG" && "$LONG" == "$REPLAY" && "$used_after" == 1 ]]; then
   pass "idempotent job_key"
 else
@@ -288,23 +291,23 @@ else
 fi
 
 log_code=$(get_job "$LONG" "?logs=true")
-if [[ "$log_code" == 200 ]] && grep -q 'fairlead-log-marker' "$WORK/status.json"; then
+if [[ "$log_code" == 200 ]] && grep -q 'shutup-and-run-log-marker' "$WORK/status.json"; then
   pass "logs returned"
 else
   fail "logs returned (http ${log_code})"
 fi
 
 if [[ "$MODE" == systemd ]]; then
-  systemctl restart fairlead-accept.service
+  systemctl restart shutup-and-run-accept.service
 else
   kill "$PID" >/dev/null 2>&1 || true
   wait "$PID" >/dev/null 2>&1 || true
-  FAIRLEAD_CONFIG="$WORK/config.toml" HOME="${HOME:-/tmp}" "$BIN_RUN" >"$WORK/fairlead.log" 2>&1 &
+  SHUTUP_AND_RUN_CONFIG="$WORK/config.toml" HOME="${HOME:-/tmp}" "$BIN_RUN" >"$WORK/shutup-and-run.log" 2>&1 &
   PID=$!
 fi
 ready=0
 for _ in $(seq 1 50); do
-  if curl -sf -m 2 "$BASE/health" >/dev/null; then
+  if curl -sf -m 2 -H "Authorization: Bearer ${TOKEN}" "$BASE/health" >/dev/null; then
     ready=1
     break
   fi
@@ -379,7 +382,7 @@ drain_code=$(curl -sS -m 10 -o "$WORK/drain.json" -w '%{http_code}' \
   -H 'Content-Type: application/json' \
   --data '{"draining":true}' || echo 000)
 post '{"image":"alpine","command":["sleep","30"],"job_key":"while-draining"}'
-health=$(curl -sS -m 5 "$BASE/health" || true)
+health=$(curl -sS -m 5 -H "Authorization: Bearer ${TOKEN}" "$BASE/health" || true)
 if [[ "$drain_code" == 200 && "$CODE" == 503 ]] && printf '%s' "$health" | grep -q '"draining"[[:space:]]*:[[:space:]]*true'; then
   pass "drain rejects new jobs"
 else
@@ -406,6 +409,25 @@ if [[ "$purged" == 1 ]]; then
   pass "history purged"
 else
   fail "history purged (finished job still present, or the running job disappeared)"
+fi
+
+bad=0
+for _ in 1 2 3; do
+  code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer not-the-token" "$BASE/health" || echo 000)
+  [[ "$code" == 401 ]] && bad=$((bad + 1))
+done
+blocked=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" "$BASE/health" || echo 000)
+if [[ "$bad" == 3 && "$blocked" == 403 ]]; then
+  pass "banned after 3 failures"
+else
+  fail "banned after 3 failures (401s=${bad}, next=${blocked})"
+fi
+SHUTUP_AND_RUN_CONFIG="$WORK/config.toml" "$BIN" bans lift 127.0.0.1 >/dev/null
+restored=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" "$BASE/health" || echo 000)
+if [[ "$restored" == 200 ]]; then
+  pass "ban lifted"
+else
+  fail "ban lifted (health ${restored})"
 fi
 
 echo

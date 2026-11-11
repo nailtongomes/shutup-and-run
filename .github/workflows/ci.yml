@@ -27,7 +27,7 @@ jobs:
         run: cargo build --release --locked --target x86_64-unknown-linux-musl
       - name: binary is static
         run: |
-          bin=target/x86_64-unknown-linux-musl/release/fairlead
+          bin=target/x86_64-unknown-linux-musl/release/shutup-and-run
           file "$bin" | grep -E 'statically linked|static-pie linked'
           ldd "$bin" >/tmp/ldd.txt 2>&1 || true
           cat /tmp/ldd.txt

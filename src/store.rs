@@ -97,6 +97,14 @@ impl Store {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS auth_failures (
+                ip TEXT PRIMARY KEY,
+                failures INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bans (
+                ip TEXT PRIMARY KEY,
+                banned_until INTEGER NOT NULL
+            );
             ",
         )
         .map_err(sql)?;
@@ -136,7 +144,9 @@ impl Store {
         );
         match result {
             Ok(_) => Ok(()),
-            Err(err) if is_constraint(&err) => Err(StoreError::Conflict),
+            Err(err) if is_constraint(&err) && err.to_string().contains("job_key") => {
+                Err(StoreError::Conflict)
+            }
             Err(err) => Err(sql(err)),
         }
     }
@@ -276,6 +286,115 @@ impl Store {
         .map_err(sql)?;
         Ok(())
     }
+
+    /// `Some(until)` when `ip` is banned at `now`. Expired rows are deleted.
+    pub fn active_ban(&self, ip: &str, now: i64) -> Result<Option<i64>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let until: Option<i64> = conn
+            .query_row("SELECT banned_until FROM bans WHERE ip = ?1", [ip], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(sql)?;
+        match until {
+            Some(until) if until > now => Ok(Some(until)),
+            Some(_) => {
+                conn.execute("DELETE FROM bans WHERE ip = ?1", [ip])
+                    .map_err(sql)?;
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Count one failed authentication. At `limit` the IP is banned and the counter resets.
+    pub fn record_failure(
+        &self,
+        ip: &str,
+        now: i64,
+        limit: u32,
+        ban_secs: i64,
+    ) -> Result<Strike, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let current: i64 = conn
+            .query_row(
+                "SELECT failures FROM auth_failures WHERE ip = ?1",
+                [ip],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .unwrap_or(0);
+        let next = current + 1;
+        if next >= i64::from(limit) {
+            let until = now.saturating_add(ban_secs);
+            conn.execute(
+                "INSERT INTO bans (ip, banned_until) VALUES (?1, ?2)
+                 ON CONFLICT(ip) DO UPDATE SET banned_until = excluded.banned_until",
+                params![ip, until],
+            )
+            .map_err(sql)?;
+            conn.execute("DELETE FROM auth_failures WHERE ip = ?1", [ip])
+                .map_err(sql)?;
+            return Ok(Strike::Banned { until });
+        }
+        conn.execute(
+            "INSERT INTO auth_failures (ip, failures) VALUES (?1, ?2)
+             ON CONFLICT(ip) DO UPDATE SET failures = excluded.failures",
+            params![ip, next],
+        )
+        .map_err(sql)?;
+        Ok(Strike::Failed { count: next as u32 })
+    }
+
+    pub fn clear_failures(&self, ip: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute("DELETE FROM auth_failures WHERE ip = ?1", [ip])
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub fn list_bans(&self, now: i64) -> Result<Vec<Ban>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute("DELETE FROM bans WHERE banned_until <= ?1", [now])
+            .map_err(sql)?;
+        let mut stmt = conn
+            .prepare("SELECT ip, banned_until FROM bans ORDER BY ip")
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Ban {
+                    ip: row.get(0)?,
+                    banned_until: row.get(1)?,
+                })
+            })
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)?;
+        Ok(rows)
+    }
+
+    pub fn lift_ban(&self, ip: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let removed = conn
+            .execute("DELETE FROM bans WHERE ip = ?1", [ip])
+            .map_err(sql)?;
+        conn.execute("DELETE FROM auth_failures WHERE ip = ?1", [ip])
+            .map_err(sql)?;
+        Ok(removed > 0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ban {
+    pub ip: String,
+    pub banned_until: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Strike {
+    Failed { count: u32 },
+    Banned { until: i64 },
 }
 
 fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
@@ -313,7 +432,8 @@ mod tests {
     fn temp_store() -> Store {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("fairlead-store-{n}-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("shutup-and-run-store-{n}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         Store::open(&path.join("jobs.sqlite")).unwrap()
@@ -389,7 +509,8 @@ mod tests {
     fn drain_flag_survives_reopen() {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("fairlead-drain-{n}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("shutup-and-run-drain-{n}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("jobs.sqlite");

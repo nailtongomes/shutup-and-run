@@ -1,47 +1,33 @@
-# fairlead
+# shutup-and-run
 
-fairlead is a single static binary. One machine with Docker receives an HTTP POST, and if it has a free slot it starts an allowlisted container and returns immediately. If it does not, it refuses, and the caller tries the next machine on its own list. There is no queue, no scheduler, and no UI. The container writes its own result wherever it already does.
+shutup-and-run is a single static binary. One machine with Docker receives an HTTP POST, and if it has a free slot it starts an allowlisted container and returns immediately. If it does not, it refuses, and the caller tries the next machine on its own list. There is no queue, no scheduler, and no UI. The container writes its own result wherever it already does.
 
-A slot is a running container labeled `fairlead=1`. Restarting the process does not forget them. Finished jobs stay in one SQLite file so `GET /v1/jobs/{id}` still works after a restart.
+A slot is a running container labeled `shutup-and-run=1`. Restarting the process does not forget them. Finished jobs stay in one SQLite file so `GET /v1/jobs/{id}` still works after a restart.
 
 ## Security
 
-This process speaks to the Docker socket. Anyone with the token can run any allowlisted image with any environment. Treat the token as a root password.
+This process speaks to the Docker socket. Anyone with the token can run any allowlisted image with any environment. Treat the token as a root password. Every route, including `/health` and `/metrics`, requires it. See [SECURITY.md](SECURITY.md).
 
-**Bind `listen` to a private interface or a Tailscale address.** Do not use `0.0.0.0`. If you omit `listen`, the default is `127.0.0.1:8787`. See [SECURITY.md](SECURITY.md).
-
-The token is not in the source. Comparison is a SHA-256 digest checked in constant time. Registry credentials come from the machine's existing `docker login`, never from the request.
+The installer listens on `0.0.0.0` and serves HTTPS from a self-signed certificate it generates. It prints the certificate's SHA-256 fingerprint. Plain HTTP is only `http = true`, meant for localhost. Three bad tokens from one IP ban that IP for 48 hours (`403` with an empty body). Lift it over SSH with `shutup-and-run bans lift <ip>`.
 
 ## Install
 
-The release workflow builds `fairlead-x86_64-unknown-linux-musl` and, on a GitHub-compatible forge, attaches it to the release for tag `v*`. Check `SHA256SUMS` from the same release. The compile does not require GitHub; publishing the file to a Release does. See the note in `.github/workflows/release.yml`.
-
-On the machine, as root, with Docker already running:
+One command on a new Ubuntu machine. Replace `OWNER` with the repository, and point `SHUTUP_AND_RUN_URL` at the musl asset from the release. The release workflow builds that asset; attaching it assumes a GitHub-compatible Releases API. See `.github/workflows/release.yml`.
 
 ```bash
-sudo install -m 0755 fairlead-x86_64-unknown-linux-musl /usr/local/bin/fairlead
-sudo mkdir -p /etc/fairlead /var/lib/fairlead
-sudo tee /etc/fairlead/config.toml >/dev/null <<'EOF'
-listen = "192.0.2.11:8787"
-max_slots = 2
-allowlist = [
-  "ghcr.io/owner/selenium-worker",
-]
-default_timeout_secs = 3600
-max_timeout_secs = 21600
-history_path = "/var/lib/fairlead/jobs.sqlite"
-EOF
-echo "FAIRLEAD_TOKEN=$(openssl rand -hex 32)" | sudo tee /etc/fairlead/env >/dev/null
-sudo chmod 600 /etc/fairlead/env /etc/fairlead/config.toml
-sudo cp deploy/fairlead.service /etc/systemd/system/fairlead.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now fairlead
-curl -sS http://192.0.2.11:8787/health
+curl -fsSL https://raw.githubusercontent.com/OWNER/shutup-and-run/main/scripts/install.sh \
+  | sudo SHUTUP_AND_RUN_URL=https://github.com/OWNER/shutup-and-run/releases/latest/download/shutup-and-run-x86_64-unknown-linux-musl bash
 ```
 
-`192.0.2.11` is a documentation address. Replace it with this machine's private address. Image names are lowercase. An allowlist entry without a tag allows any tag of that repository; `ghcr.io/owner/selenium-worker` does not allow `ghcr.io/owner/selenium-worker-evil`.
+Offline, with a binary you already copied onto the machine:
 
-`openssl rand` prints the token once. Put the same value in the orchestrator's secret. To rotate it, edit the env file and `sudo systemctl restart fairlead`.
+```bash
+sudo SHUTUP_AND_RUN_BIN=./shutup-and-run bash scripts/install.sh
+```
+
+The script installs Docker if it is missing, picks `max_slots` from CPU and RAM (about one CPU and 2 GiB per slot, leaving one CPU free), writes a token to `/etc/shutup-and-run/env` without printing it, generates a self-signed cert if you do not have one, installs the systemd unit, and opens the port in ufw when ufw is already active. Running it again upgrades the binary and restarts the service. It does not rotate an existing token or certificate. `SHUTUP_AND_RUN_SHOW_TOKEN=1` prints the token. `sudo bash scripts/install.sh --uninstall` removes the unit and the binary; add `--purge` to delete `/etc/shutup-and-run` and `/var/lib/shutup-and-run`.
+
+Image names are lowercase. An allowlist entry without a tag allows any tag of that repository; `ghcr.io/owner/selenium-worker` does not allow `ghcr.io/owner/selenium-worker-evil`. Edit the allowlist after install. To rotate the token, edit the env file and `sudo systemctl restart shutup-and-run`.
 
 ### Private registries
 
@@ -49,40 +35,46 @@ curl -sS http://192.0.2.11:8787/health
 sudo docker login ghcr.io -u USER
 ```
 
-That writes `/root/.docker/config.json` because the unit sets `HOME=/root`. A desktop credential helper will not work on a headless server. The file is read on every pull, so a new login applies without a restart. This login is not `FAIRLEAD_TOKEN`.
+That writes `/root/.docker/config.json` because the unit sets `HOME=/root`. A desktop credential helper will not work on a headless server. The file is read on every pull, so a new login applies without a restart. This login is not `SHUTUP_AND_RUN_TOKEN`.
 
 ## Configuration
 
-TOML from `FAIRLEAD_CONFIG`, or `/etc/fairlead/config.toml` when that variable is unset. Environment variables override the file. An unknown TOML field refuses to start.
+TOML from `SHUTUP_AND_RUN_CONFIG`, or `/etc/shutup-and-run/config.toml` when that variable is unset. Environment variables override the file. An unknown TOML field refuses to start.
 
 | toml | environment | meaning |
 | --- | --- | --- |
-| `listen` | `FAIRLEAD_LISTEN` | `ip:port`. Default `127.0.0.1:8787`. |
-| `token` | `FAIRLEAD_TOKEN` | Required, at least 16 characters, no spaces. |
-| `max_slots` | `FAIRLEAD_MAX_SLOTS` | Required, 1 to 256. |
-| `allowlist` | `FAIRLEAD_ALLOWLIST` | Images. Comma-separated in the environment. |
-| `default_timeout_secs` | `FAIRLEAD_DEFAULT_TIMEOUT_SECS` | Used when the request omits a timeout. Default 3600. |
-| `max_timeout_secs` | `FAIRLEAD_MAX_TIMEOUT_SECS` | Ceiling. Default 21600. At most 7 days. |
-| `reaper_interval_secs` | `FAIRLEAD_REAPER_INTERVAL_SECS` | How often expired containers are killed. Default 2. |
-| `history_path` | `FAIRLEAD_HISTORY_PATH` | SQLite file. Default `/var/lib/fairlead/jobs.sqlite`. |
-| `history_days` | `FAIRLEAD_HISTORY_DAYS` | Delete finished rows older than this. Default 30. `0` deletes them on the next purge. |
-| `purge_interval_secs` | `FAIRLEAD_PURGE_INTERVAL_SECS` | How often that delete runs. Default 3600. |
-| `log_lines` | `FAIRLEAD_LOG_LINES` | Log lines kept per job. Default 200. |
-| `prune_interval_secs` | `FAIRLEAD_PRUNE_INTERVAL_SECS` | `0` (default) disables pruning. |
-| `docker_config` | `FAIRLEAD_DOCKER_CONFIG` | Path to Docker's `config.json`. |
+| `listen` | `SHUTUP_AND_RUN_LISTEN` | `ip:port`. Default `127.0.0.1:8787`. |
+| `token` | `SHUTUP_AND_RUN_TOKEN` | Required, at least 16 characters, no spaces. |
+| `max_slots` | `SHUTUP_AND_RUN_MAX_SLOTS` | Required, 1 to 256. |
+| `allowlist` | `SHUTUP_AND_RUN_ALLOWLIST` | Images. Comma-separated in the environment. |
+| `default_timeout_secs` | `SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS` | Used when the request omits a timeout. Default 3600. |
+| `max_timeout_secs` | `SHUTUP_AND_RUN_MAX_TIMEOUT_SECS` | Ceiling. Default 21600. At most 7 days. |
+| `reaper_interval_secs` | `SHUTUP_AND_RUN_REAPER_INTERVAL_SECS` | How often expired containers are killed. Default 2. |
+| `history_path` | `SHUTUP_AND_RUN_HISTORY_PATH` | SQLite file. Default `/var/lib/shutup-and-run/jobs.sqlite`. |
+| `history_days` | `SHUTUP_AND_RUN_HISTORY_DAYS` | Delete finished rows older than this. Default 30. `0` deletes them on the next purge. |
+| `purge_interval_secs` | `SHUTUP_AND_RUN_PURGE_INTERVAL_SECS` | How often that delete runs. Default 3600. |
+| `log_lines` | `SHUTUP_AND_RUN_LOG_LINES` | Log lines kept per job. Default 200. |
+| `prune_interval_secs` | `SHUTUP_AND_RUN_PRUNE_INTERVAL_SECS` | `0` (default) disables pruning. |
+| `docker_config` | `SHUTUP_AND_RUN_DOCKER_CONFIG` | Path to Docker's `config.json`. |
+| `http` | `SHUTUP_AND_RUN_HTTP` | `true` serves plaintext. Default is HTTPS, which then requires the cert paths. |
+| `tls_cert` | `SHUTUP_AND_RUN_TLS_CERT` | PEM certificate. |
+| `tls_key` | `SHUTUP_AND_RUN_TLS_KEY` | PEM private key. |
+| `auth_failures` | `SHUTUP_AND_RUN_AUTH_FAILURES` | Failed auths from one IP before a ban. Default 3. |
+| `ban_hours` | `SHUTUP_AND_RUN_BAN_HOURS` | How long a ban lasts. Default 48. |
+| `trust_x_forwarded_for` | `SHUTUP_AND_RUN_TRUST_X_FORWARDED_FOR` | Use the first `X-Forwarded-For` address. Default false. |
 
-Logs: `journalctl -u fairlead -f`. Level comes from `RUST_LOG` (default `info`). The token and job environment are not logged.
+Logs: `journalctl -u shutup-and-run -f`. Level comes from `RUST_LOG` (default `info`). The token and job environment are not logged.
 
 ## API
 
-`Authorization: Bearer <token>` except for `/health` and `/metrics`.
+Every route requires `Authorization: Bearer <token>`.
 
 ### `GET /health`
 
-No token.
-
 ```bash
-curl -sS http://192.0.2.11:8787/health
+curl -fsS --cacert /etc/shutup-and-run/cert.pem \
+  -H "Authorization: Bearer $(sudo sed -n 's/^SHUTUP_AND_RUN_TOKEN=//p' /etc/shutup-and-run/env)" \
+  https://127.0.0.1:8787/health
 ```
 
 ```json
@@ -93,37 +85,37 @@ While draining, `status` is `"draining"` and `draining` is `true`. `503` if Dock
 
 ### `GET /metrics`
 
-No token. Prometheus text, so Uptime Kuma or Prometheus can scrape it on the private interface.
+Prometheus text. Uptime Kuma or Prometheus must send the bearer token. The installer does not leave this open without TLS.
 
 ```text
-# HELP fairlead_slots_total Configured slot capacity.
-# TYPE fairlead_slots_total gauge
-fairlead_slots_total 2
-# HELP fairlead_slots_used Running containers labeled fairlead=1.
-# TYPE fairlead_slots_used gauge
-fairlead_slots_used 1
-# HELP fairlead_slots_free Slots not currently taken. Not offered while draining.
-# TYPE fairlead_slots_free gauge
-fairlead_slots_free 1
-# HELP fairlead_draining 1 while new jobs are refused.
-# TYPE fairlead_draining gauge
-fairlead_draining 0
-# HELP fairlead_jobs_started_total Jobs recorded in SQLite, including those still running.
-# TYPE fairlead_jobs_started_total counter
-fairlead_jobs_started_total 4
-# HELP fairlead_jobs_finished_total Jobs that have ended.
-# TYPE fairlead_jobs_finished_total counter
-fairlead_jobs_finished_total 3
-# HELP fairlead_jobs_timeout_total Jobs ended with reason timeout_kill.
-# TYPE fairlead_jobs_timeout_total counter
-fairlead_jobs_timeout_total 1
+# HELP shutup_and_run_slots_total Configured slot capacity.
+# TYPE shutup_and_run_slots_total gauge
+shutup_and_run_slots_total 2
+# HELP shutup_and_run_slots_used Running containers labeled shutup-and-run=1.
+# TYPE shutup_and_run_slots_used gauge
+shutup_and_run_slots_used 1
+# HELP shutup_and_run_slots_free Slots not currently taken. Not offered while draining.
+# TYPE shutup_and_run_slots_free gauge
+shutup_and_run_slots_free 1
+# HELP shutup_and_run_draining 1 while new jobs are refused.
+# TYPE shutup_and_run_draining gauge
+shutup_and_run_draining 0
+# HELP shutup_and_run_jobs_started_total Jobs recorded in SQLite, including those still running.
+# TYPE shutup_and_run_jobs_started_total counter
+shutup_and_run_jobs_started_total 4
+# HELP shutup_and_run_jobs_finished_total Jobs that have ended.
+# TYPE shutup_and_run_jobs_finished_total counter
+shutup_and_run_jobs_finished_total 3
+# HELP shutup_and_run_jobs_timeout_total Jobs ended with reason timeout_kill.
+# TYPE shutup_and_run_jobs_timeout_total counter
+shutup_and_run_jobs_timeout_total 1
 ```
 
 ### `POST /v1/jobs`
 
 ```bash
-curl -sS -D - -o - -X POST http://192.0.2.11:8787/v1/jobs \
-  -H "Authorization: Bearer $FAIRLEAD_TOKEN" \
+curl -sS --cacert /etc/shutup-and-run/cert.pem -D - -o - -X POST https://192.0.2.11:8787/v1/jobs \
+  -H "Authorization: Bearer $SHUTUP_AND_RUN_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
     "image": "ghcr.io/owner/selenium-worker:latest",
@@ -133,7 +125,7 @@ curl -sS -D - -o - -X POST http://192.0.2.11:8787/v1/jobs \
     "cpu": 1,
     "memory": "2g",
     "shm": "2g",
-    "callback_url": "https://n8n.example/webhook/fairlead"
+    "callback_url": "https://n8n.example/webhook/shutup-and-run"
   }'
 ```
 
@@ -170,8 +162,9 @@ Other responses:
 ### `GET /v1/jobs/{id}`
 
 ```bash
-curl -sS -H "Authorization: Bearer $FAIRLEAD_TOKEN" \
-  "http://192.0.2.11:8787/v1/jobs/0123abcd?logs=true"
+curl -sS --cacert /etc/shutup-and-run/cert.pem \
+  -H "Authorization: Bearer $SHUTUP_AND_RUN_TOKEN" \
+  "https://192.0.2.11:8787/v1/jobs/0123abcd?logs=true"
 ```
 
 The row is in SQLite, so this survives a process restart. `?logs=true` adds `logs` (the last `log_lines` lines). While the container is still running those lines are read from Docker; after it exits they are the copy stored before the container is removed.
@@ -182,13 +175,13 @@ The row is in SQLite, so this survives a process restart. `?logs=true` adds `log
 
 `reason` is `exited`, `timeout_kill`, `launcher_kill`, or `start_failed`. `404` is `{"id":"...","status":"not_found"}` for an unknown id or a row that purge has deleted.
 
-When the job ends, fairlead POSTs the same fields (without logs) to `callback_url`. It tries three times, does not follow redirects, and does not hold a slot. Point it at the Kestra or n8n webhook.
+When the job ends, shutup-and-run POSTs the same fields (without logs) to `callback_url`. It tries three times, does not follow redirects, and does not hold a slot. Point it at the Kestra or n8n webhook.
 
 ### `POST /v1/drain`
 
 ```bash
 curl -sS -X POST http://192.0.2.11:8787/v1/drain \
-  -H "Authorization: Bearer $FAIRLEAD_TOKEN" \
+  -H "Authorization: Bearer $SHUTUP_AND_RUN_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"draining":true}'
 ```
@@ -197,7 +190,7 @@ curl -sS -X POST http://192.0.2.11:8787/v1/drain \
 
 ## Kestra
 
-Create the secret `FAIRLEAD_TOKEN`. The task `timeout` is how long Kestra waits for fairlead to answer, not how long the container may run. That duration is `timeout_secs` in the JSON.
+Create the secret `SHUTUP_AND_RUN_TOKEN`. The task `timeout` is how long Kestra waits for shutup-and-run to answer, not how long the container may run. That duration is `timeout_secs` in the JSON.
 
 `job_key` is `execution.id`, and POST transport errors are retried on the same URL, so a lost response does not start a second container on that machine. The next machine is used only for `429` and `503`. A machine that never answers fails the flow instead of failing over, because a request that actually landed would be duplicated on the other host (keys are not shared).
 
@@ -215,13 +208,15 @@ inputs:
 tasks:
   - id: host_1
     type: io.kestra.plugin.core.http.Request
-    uri: http://192.0.2.11:8787/v1/jobs
+    uri: https://192.0.2.11:8787/v1/jobs
     method: POST
     contentType: application/json
     timeout: PT20S
     allowFailure: true
     options:
       allowFailed: true
+      ssl:
+        insecureTrustAllCertificates: true
       retryableTransportFailureMethods:
         - POST
       retry:
@@ -229,7 +224,7 @@ tasks:
         interval: PT2S
         maxAttempts: 3
     headers:
-      Authorization: "Bearer {{ secret('FAIRLEAD_TOKEN') }}"
+      Authorization: "Bearer {{ secret('SHUTUP_AND_RUN_TOKEN') }}"
     body: |
       {{ {
         "image": "ghcr.io/owner/selenium-worker:latest",
@@ -243,13 +238,15 @@ tasks:
   - id: host_2
     type: io.kestra.plugin.core.http.Request
     runIf: "{{ outputs.host_1 is defined and (outputs.host_1.code == 429 or outputs.host_1.code == 503) }}"
-    uri: http://192.0.2.12:8787/v1/jobs
+    uri: https://192.0.2.12:8787/v1/jobs
     method: POST
     contentType: application/json
     timeout: PT20S
     allowFailure: true
     options:
       allowFailed: true
+      ssl:
+        insecureTrustAllCertificates: true
       retryableTransportFailureMethods:
         - POST
       retry:
@@ -257,7 +254,7 @@ tasks:
         interval: PT2S
         maxAttempts: 3
     headers:
-      Authorization: "Bearer {{ secret('FAIRLEAD_TOKEN') }}"
+      Authorization: "Bearer {{ secret('SHUTUP_AND_RUN_TOKEN') }}"
     body: |
       {{ {
         "image": "ghcr.io/owner/selenium-worker:latest",
@@ -278,18 +275,18 @@ tasks:
 
 Import `examples/n8n-dispatch.json`. Each HTTP Request node retries the same URL (`retryOnFail`, 3 tries). `200` and `202` stop the chain. `429` and `503` go to the next host. Anything else stops with an error, so a connection failure is not treated as "try the other machine" after the retries are spent.
 
-Set `FAIRLEAD_TOKEN` on the n8n process and allow environment access (`N8N_BLOCK_ENV_ACCESS_IN_NODE=false`), or replace the header expression with a Header Auth credential. `job_key` is `$execution.id`. Put your webhook URL in `callback_url`.
+Set `SHUTUP_AND_RUN_TOKEN` on the n8n process and allow environment access (`N8N_BLOCK_ENV_ACCESS_IN_NODE=false`), or replace the header expression with a Header Auth credential. `job_key` is `$execution.id`. Put your webhook URL in `callback_url`. The exported nodes set `allowUnauthorizedCerts` for the installer's self-signed certificate; turn that off if you replace the cert with one n8n already trusts, and compare the fingerprint the installer printed.
 
 ## Acceptance test
 
-On Ubuntu with Docker, preferably with no other fairlead and no container already labeled `fairlead=1`:
+On Ubuntu with Docker, preferably with no other shutup-and-run and no container already labeled `shutup-and-run=1`:
 
 ```bash
 sudo bash scripts/accept.sh
-sudo bash scripts/accept.sh /path/to/fairlead-x86_64-unknown-linux-musl
+sudo bash scripts/accept.sh /path/to/shutup-and-run-x86_64-unknown-linux-musl
 ```
 
-With systemd it installs `/usr/local/bin/fairlead`, starts `fairlead-accept.service`, and removes that unit at the end. The binary stays. It does not touch a production `fairlead.service`. You want:
+With systemd it installs `/usr/local/bin/shutup-and-run`, starts `shutup-and-run-accept.service`, and removes that unit at the end. The binary stays. It does not touch a production `shutup-and-run.service`. You want:
 
 ```text
 PASS: accepted until full
@@ -303,6 +300,8 @@ PASS: callback delivered
 PASS: timeout kill
 PASS: drain rejects new jobs
 PASS: history purged
+PASS: banned after 3 failures
+PASS: ban lifted
 RESULT: all passed
 ```
 
@@ -312,7 +311,7 @@ RESULT: all passed
 - Stopping the service does not kill containers.
 - A timeout is SIGKILL, with no SIGTERM.
 - `job_key` does not cross machines.
-- Pruning is off unless `prune_interval_secs` is set. It removes stopped containers with the fairlead label, and images recorded in this SQLite file that no container is using. It does not delete images fairlead never launched.
+- Pruning is off unless `prune_interval_secs` is set. It removes stopped containers with the shutup-and-run label, and images recorded in this SQLite file that no container is using. It does not delete images shutup-and-run never launched.
 - Container JSON logs can still fill the disk. Turn on rotation in the Docker daemon.
 - There is no queue, no cross-machine coordination, and no restart of a container that exits on its own.
 

@@ -7,27 +7,33 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const ENV_KEYS: &[&str] = &[
-    "FAIRLEAD_CONFIG",
-    "FAIRLEAD_LISTEN",
-    "FAIRLEAD_TOKEN",
-    "FAIRLEAD_MAX_SLOTS",
-    "FAIRLEAD_ALLOWLIST",
-    "FAIRLEAD_DEFAULT_TIMEOUT_SECS",
-    "FAIRLEAD_MAX_TIMEOUT_SECS",
-    "FAIRLEAD_REAPER_INTERVAL_SECS",
-    "FAIRLEAD_DOCKER_CONFIG",
-    "FAIRLEAD_HISTORY_PATH",
-    "FAIRLEAD_HISTORY_DAYS",
-    "FAIRLEAD_PURGE_INTERVAL_SECS",
-    "FAIRLEAD_LOG_LINES",
-    "FAIRLEAD_PRUNE_INTERVAL_SECS",
+    "SHUTUP_AND_RUN_CONFIG",
+    "SHUTUP_AND_RUN_LISTEN",
+    "SHUTUP_AND_RUN_TOKEN",
+    "SHUTUP_AND_RUN_MAX_SLOTS",
+    "SHUTUP_AND_RUN_ALLOWLIST",
+    "SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS",
+    "SHUTUP_AND_RUN_MAX_TIMEOUT_SECS",
+    "SHUTUP_AND_RUN_REAPER_INTERVAL_SECS",
+    "SHUTUP_AND_RUN_DOCKER_CONFIG",
+    "SHUTUP_AND_RUN_HISTORY_PATH",
+    "SHUTUP_AND_RUN_HISTORY_DAYS",
+    "SHUTUP_AND_RUN_PURGE_INTERVAL_SECS",
+    "SHUTUP_AND_RUN_LOG_LINES",
+    "SHUTUP_AND_RUN_PRUNE_INTERVAL_SECS",
+    "SHUTUP_AND_RUN_HTTP",
+    "SHUTUP_AND_RUN_TLS_CERT",
+    "SHUTUP_AND_RUN_TLS_KEY",
+    "SHUTUP_AND_RUN_AUTH_FAILURES",
+    "SHUTUP_AND_RUN_BAN_HOURS",
+    "SHUTUP_AND_RUN_TRUST_X_FORWARDED_FOR",
 ];
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 const DEFAULT_TIMEOUT: u64 = 3600;
 const DEFAULT_MAX_TIMEOUT: u64 = 21_600;
 const DEFAULT_REAPER: u64 = 2;
-const DEFAULT_HISTORY: &str = "/var/lib/fairlead/jobs.sqlite";
+const DEFAULT_HISTORY: &str = "/var/lib/shutup-and-run/jobs.sqlite";
 const DEFAULT_HISTORY_DAYS: u64 = 30;
 const DEFAULT_PURGE: u64 = 3600;
 const DEFAULT_LOG_LINES: u64 = 200;
@@ -51,6 +57,13 @@ pub struct Settings {
     pub log_lines: usize,
     /// Zero disables pruning.
     pub prune_interval: Duration,
+    /// Plain HTTP. Off unless set. Required only for localhost or a private network.
+    pub http_plain: bool,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub auth_failures: u32,
+    pub ban_secs: u64,
+    pub trust_forwarded: bool,
     pub token: TokenChecker,
 }
 
@@ -70,6 +83,12 @@ struct FileConfig {
     purge_interval_secs: Option<u64>,
     log_lines: Option<u64>,
     prune_interval_secs: Option<u64>,
+    http: Option<bool>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    auth_failures: Option<u64>,
+    ban_hours: Option<u64>,
+    trust_x_forwarded_for: Option<bool>,
 }
 
 impl Settings {
@@ -103,32 +122,42 @@ impl Settings {
                 purge_interval_secs: None,
                 log_lines: None,
                 prune_interval_secs: None,
+                http: None,
+                tls_cert: None,
+                tls_key: None,
+                auth_failures: None,
+                ban_hours: None,
+                trust_x_forwarded_for: None,
             }
         } else {
             toml::from_str(toml_text).map_err(|err| ConfigError(format!("config.toml: {err}")))?
         };
 
-        let listen = take_string(env, "FAIRLEAD_LISTEN", file.listen)
+        let listen = take_string(env, "SHUTUP_AND_RUN_LISTEN", file.listen)
             .unwrap_or_else(|| DEFAULT_LISTEN.to_string());
         let listen: SocketAddr = listen
             .parse()
             .map_err(|_| ConfigError(format!("invalid listen address: {listen}")))?;
 
-        let token = take_string(env, "FAIRLEAD_TOKEN", file.token).unwrap_or_default();
+        let token = take_string(env, "SHUTUP_AND_RUN_TOKEN", file.token).unwrap_or_default();
         if token.chars().any(|c| c.is_whitespace()) || token.len() < 16 {
             return Err(ConfigError(
-                "token is missing or shorter than 16 characters. Set FAIRLEAD_TOKEN or token in the file.".into(),
+                "token is missing or shorter than 16 characters. Set SHUTUP_AND_RUN_TOKEN or token in the file.".into(),
             ));
         }
 
-        let max_slots = take_u64(env, "FAIRLEAD_MAX_SLOTS", file.max_slots.map(|n| n as u64))?
-            .ok_or_else(|| ConfigError("max_slots is required".into()))?
+        let max_slots = take_u64(
+            env,
+            "SHUTUP_AND_RUN_MAX_SLOTS",
+            file.max_slots.map(|n| n as u64),
+        )?
+        .ok_or_else(|| ConfigError("max_slots is required".into()))?
             as usize;
         if !(1..=256).contains(&max_slots) {
             return Err(ConfigError("max_slots must be between 1 and 256".into()));
         }
 
-        let allowlist = if let Some(raw) = env.get("FAIRLEAD_ALLOWLIST") {
+        let allowlist = if let Some(raw) = env.get("SHUTUP_AND_RUN_ALLOWLIST") {
             split_allowlist(raw)?
         } else {
             file.allowlist.unwrap_or_default()
@@ -144,12 +173,16 @@ impl Settings {
 
         let default_timeout_secs = take_u64(
             env,
-            "FAIRLEAD_DEFAULT_TIMEOUT_SECS",
+            "SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS",
             file.default_timeout_secs,
         )?
         .unwrap_or(DEFAULT_TIMEOUT);
-        let max_timeout_secs = take_u64(env, "FAIRLEAD_MAX_TIMEOUT_SECS", file.max_timeout_secs)?
-            .unwrap_or(DEFAULT_MAX_TIMEOUT);
+        let max_timeout_secs = take_u64(
+            env,
+            "SHUTUP_AND_RUN_MAX_TIMEOUT_SECS",
+            file.max_timeout_secs,
+        )?
+        .unwrap_or(DEFAULT_MAX_TIMEOUT);
         if default_timeout_secs == 0 || max_timeout_secs == 0 {
             return Err(ConfigError("timeouts must be greater than zero".into()));
         }
@@ -164,7 +197,7 @@ impl Settings {
 
         let reaper = take_u64(
             env,
-            "FAIRLEAD_REAPER_INTERVAL_SECS",
+            "SHUTUP_AND_RUN_REAPER_INTERVAL_SECS",
             file.reaper_interval_secs,
         )?
         .unwrap_or(DEFAULT_REAPER);
@@ -174,7 +207,7 @@ impl Settings {
             ));
         }
 
-        let history_days = take_u64(env, "FAIRLEAD_HISTORY_DAYS", file.history_days)?
+        let history_days = take_u64(env, "SHUTUP_AND_RUN_HISTORY_DAYS", file.history_days)?
             .unwrap_or(DEFAULT_HISTORY_DAYS);
         if history_days > 3650 {
             return Err(ConfigError(
@@ -183,7 +216,7 @@ impl Settings {
         }
         let purge = take_u64(
             env,
-            "FAIRLEAD_PURGE_INTERVAL_SECS",
+            "SHUTUP_AND_RUN_PURGE_INTERVAL_SECS",
             file.purge_interval_secs,
         )?
         .unwrap_or(DEFAULT_PURGE);
@@ -193,13 +226,13 @@ impl Settings {
             ));
         }
         let log_lines =
-            take_u64(env, "FAIRLEAD_LOG_LINES", file.log_lines)?.unwrap_or(DEFAULT_LOG_LINES);
+            take_u64(env, "SHUTUP_AND_RUN_LOG_LINES", file.log_lines)?.unwrap_or(DEFAULT_LOG_LINES);
         if !(1..=5000).contains(&log_lines) {
             return Err(ConfigError("log_lines must be between 1 and 5000".into()));
         }
         let prune = take_u64(
             env,
-            "FAIRLEAD_PRUNE_INTERVAL_SECS",
+            "SHUTUP_AND_RUN_PRUNE_INTERVAL_SECS",
             file.prune_interval_secs,
         )?
         .unwrap_or(0);
@@ -209,10 +242,29 @@ impl Settings {
             ));
         }
 
-        let history_path = take_string(env, "FAIRLEAD_HISTORY_PATH", file.history_path)
+        let history_path = take_string(env, "SHUTUP_AND_RUN_HISTORY_PATH", file.history_path)
             .unwrap_or_else(|| DEFAULT_HISTORY.to_string());
         let docker_config =
-            take_string(env, "FAIRLEAD_DOCKER_CONFIG", file.docker_config).map(PathBuf::from);
+            take_string(env, "SHUTUP_AND_RUN_DOCKER_CONFIG", file.docker_config).map(PathBuf::from);
+
+        let http_plain = take_bool(env, "SHUTUP_AND_RUN_HTTP", file.http)?.unwrap_or(false);
+        let auth_failures =
+            take_u64(env, "SHUTUP_AND_RUN_AUTH_FAILURES", file.auth_failures)?.unwrap_or(3);
+        if !(1..=100).contains(&auth_failures) {
+            return Err(ConfigError(
+                "auth_failures must be between 1 and 100".into(),
+            ));
+        }
+        let ban_hours = take_u64(env, "SHUTUP_AND_RUN_BAN_HOURS", file.ban_hours)?.unwrap_or(48);
+        if !(1..=24 * 365).contains(&ban_hours) {
+            return Err(ConfigError("ban_hours must be between 1 and 8760".into()));
+        }
+        let trust_forwarded = take_bool(
+            env,
+            "SHUTUP_AND_RUN_TRUST_X_FORWARDED_FOR",
+            file.trust_x_forwarded_for,
+        )?
+        .unwrap_or(false);
 
         Ok(Settings {
             listen,
@@ -227,17 +279,23 @@ impl Settings {
             purge_interval: Duration::from_secs(purge),
             log_lines: log_lines as usize,
             prune_interval: Duration::from_secs(prune),
+            http_plain,
+            tls_cert: take_string(env, "SHUTUP_AND_RUN_TLS_CERT", file.tls_cert).map(PathBuf::from),
+            tls_key: take_string(env, "SHUTUP_AND_RUN_TLS_KEY", file.tls_key).map(PathBuf::from),
+            auth_failures: auth_failures as u32,
+            ban_secs: ban_hours.saturating_mul(3600),
+            trust_forwarded,
             token: TokenChecker::new(&token),
         })
     }
 }
 
 fn read_config_file(env: &HashMap<String, String>) -> Result<String, ConfigError> {
-    if let Some(path) = env.get("FAIRLEAD_CONFIG") {
+    if let Some(path) = env.get("SHUTUP_AND_RUN_CONFIG") {
         return std::fs::read_to_string(path)
             .map_err(|err| ConfigError(format!("could not read {path}: {err}")));
     }
-    let default = Path::new("/etc/fairlead/config.toml");
+    let default = Path::new("/etc/shutup-and-run/config.toml");
     if default.exists() {
         return std::fs::read_to_string(default)
             .map_err(|err| ConfigError(format!("could not read {}: {err}", default.display())));
@@ -250,6 +308,21 @@ fn take_string(env: &HashMap<String, String>, key: &str, file: Option<String>) -
         .filter(|value| !value.is_empty())
         .cloned()
         .or(file)
+}
+
+fn take_bool(
+    env: &HashMap<String, String>,
+    key: &str,
+    file: Option<bool>,
+) -> Result<Option<bool>, ConfigError> {
+    if let Some(raw) = env.get(key) {
+        return match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Ok(Some(true)),
+            "0" | "false" | "no" => Ok(Some(false)),
+            _ => Err(ConfigError(format!("{key} must be true or false"))),
+        };
+    }
+    Ok(file)
 }
 
 fn take_u64(
@@ -276,7 +349,7 @@ fn split_allowlist(raw: &str) -> Result<Vec<String>, ConfigError> {
         .filter(|s| !s.is_empty())
         .collect();
     if items.is_empty() {
-        return Err(ConfigError("FAIRLEAD_ALLOWLIST is empty".into()));
+        return Err(ConfigError("SHUTUP_AND_RUN_ALLOWLIST is empty".into()));
     }
     Ok(items)
 }
@@ -305,14 +378,14 @@ mod tests {
         let settings = Settings::from_toml_and_env(
             toml_text,
             &env(&[
-                ("FAIRLEAD_MAX_SLOTS", "4"),
-                ("FAIRLEAD_TOKEN", "token-from-the-env"),
+                ("SHUTUP_AND_RUN_MAX_SLOTS", "4"),
+                ("SHUTUP_AND_RUN_TOKEN", "token-from-the-env"),
                 (
-                    "FAIRLEAD_ALLOWLIST",
+                    "SHUTUP_AND_RUN_ALLOWLIST",
                     "alpine, ghcr.io/owner/selenium-worker",
                 ),
-                ("FAIRLEAD_HISTORY_DAYS", "0"),
-                ("FAIRLEAD_LOG_LINES", "50"),
+                ("SHUTUP_AND_RUN_HISTORY_DAYS", "0"),
+                ("SHUTUP_AND_RUN_LOG_LINES", "50"),
             ]),
         )
         .unwrap();

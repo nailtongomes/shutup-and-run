@@ -1,15 +1,17 @@
 use crate::bytesize::ByteQty;
 use crate::launcher::{metrics_text, LaunchError, LaunchOutcome, LaunchRequest, Launcher};
 use crate::store::JobRecord;
-use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
+use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 const MAX_BODY: usize = 64 * 1024;
@@ -22,7 +24,69 @@ pub fn router(launcher: Arc<Launcher>) -> Router {
         .route("/v1/jobs/{id}", get(job_status))
         .route("/v1/drain", post(set_drain))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
+        .layer(from_fn_with_state(launcher.clone(), require_auth))
         .with_state(launcher)
+}
+
+async fn require_auth(
+    State(launcher): State<Arc<Launcher>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let ip = client_ip(&request, launcher.settings().trust_forwarded);
+    match launcher.ban_until(&ip) {
+        Ok(Some(_)) => return StatusCode::FORBIDDEN.into_response(),
+        Ok(None) => {}
+        Err(_) => {
+            return error_body(StatusCode::BAD_GATEWAY, "job history is unavailable", None);
+        }
+    }
+    if !authorized(request.headers(), &launcher) {
+        match launcher.note_auth_failure(&ip) {
+            Ok(crate::store::Strike::Banned { until }) => {
+                tracing::warn!(%ip, until, "banned after repeated authentication failures");
+            }
+            Ok(crate::store::Strike::Failed { count }) => {
+                tracing::warn!(%ip, count, "authentication failed");
+            }
+            Err(err) => tracing::warn!(error = %err, "could not record an authentication failure"),
+        }
+        return unauthorized();
+    }
+    if let Err(err) = launcher.clear_auth_failures(&ip) {
+        tracing::warn!(error = %err, "could not clear authentication failures");
+    }
+    next.run(request).await
+}
+
+fn client_ip(request: &Request<Body>, trust_forwarded: bool) -> String {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| normalize_ip(info.0.ip()))
+        .unwrap_or_else(|| "0.0.0.0".into());
+    if !trust_forwarded {
+        return peer;
+    }
+    let Some(raw) = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return peer;
+    };
+    let first = raw.split(',').next().unwrap_or("").trim();
+    first.parse::<IpAddr>().map(normalize_ip).unwrap_or(peer)
+}
+
+fn normalize_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|v4| v4.to_string())
+            .unwrap_or_else(|| v6.to_string()),
+        other => other.to_string(),
+    }
 }
 
 async fn health(State(launcher): State<Arc<Launcher>>) -> Response {
@@ -86,14 +150,7 @@ async fn metrics(State(launcher): State<Arc<Launcher>>) -> Response {
         .into_response()
 }
 
-async fn create_job(
-    State(launcher): State<Arc<Launcher>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if !authorized(&headers, &launcher) {
-        return unauthorized();
-    }
+async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Response {
     let parsed: RunBody = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => return error_body(StatusCode::BAD_REQUEST, "invalid JSON", None),
@@ -145,13 +202,9 @@ async fn create_job(
 
 async fn job_status(
     State(launcher): State<Arc<Launcher>>,
-    headers: HeaderMap,
     Path(id): Path<String>,
     Query(query): Query<LogsQuery>,
 ) -> Response {
-    if !authorized(&headers, &launcher) {
-        return unauthorized();
-    }
     let with_logs = query
         .logs
         .as_deref()
@@ -168,14 +221,7 @@ async fn job_status(
     }
 }
 
-async fn set_drain(
-    State(launcher): State<Arc<Launcher>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if !authorized(&headers, &launcher) {
-        return unauthorized();
-    }
+async fn set_drain(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Response {
     let parsed: DrainBody = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => return error_body(StatusCode::BAD_REQUEST, "invalid JSON", None),
@@ -286,9 +332,14 @@ mod tests {
     }
 
     fn settings(slots: usize) -> Settings {
+        settings_extra(slots, "auth_failures = 30")
+    }
+
+    fn settings_extra(slots: usize, extra: &str) -> Settings {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("fairlead-api-{n}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("shutup-and-run-api-{n}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Settings::from_toml_and_env(
@@ -300,6 +351,7 @@ mod tests {
                 default_timeout_secs = 30
                 max_timeout_secs = 60
                 history_path = "{}"
+                {extra}
                 "#,
                 dir.join("jobs.sqlite").display()
             ),
@@ -323,6 +375,10 @@ mod tests {
     }
 
     fn post(body: &str, token: Option<&str>) -> Request<Body> {
+        post_from(body, token, [203, 0, 113, 10])
+    }
+
+    fn post_from(body: &str, token: Option<&str>, ip: [u8; 4]) -> Request<Body> {
         let mut builder = Request::builder()
             .method("POST")
             .uri("/v1/jobs")
@@ -330,7 +386,24 @@ mod tests {
         if let Some(token) = token {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
-        builder.body(Body::from(body.to_string())).unwrap()
+        stamp(builder.body(Body::from(body.to_string())).unwrap(), ip)
+    }
+
+    fn get_from(uri: &str, token: Option<&str>, ip: [u8; 4]) -> Request<Body> {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        stamp(builder.body(Body::empty()).unwrap(), ip)
+    }
+
+    fn stamp(mut request: Request<Body>, ip: [u8; 4]) -> Request<Body> {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                ip, 9,
+            ))));
+        request
     }
 
     async fn json_of(response: Response) -> (StatusCode, Value) {
@@ -351,6 +424,16 @@ mod tests {
     #[tokio::test]
     async fn auth_allowlist_health_and_metrics() {
         let h = harness(2);
+
+        let (status, _) = json_of(
+            h.app
+                .clone()
+                .oneshot(get_from("/health", None, [203, 0, 113, 11]))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         let (status, body) =
             json_of(h.app.clone().oneshot(post(ALPINE, None)).await.unwrap()).await;
@@ -451,12 +534,7 @@ mod tests {
         let (status, health) = json_of(
             h.app
                 .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/health")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(get_from("/health", Some(TOKEN), [203, 0, 113, 10]))
                 .await
                 .unwrap(),
         )
@@ -468,22 +546,17 @@ mod tests {
         let (status, text) = json_of(
             h.app
                 .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/metrics")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(get_from("/metrics", Some(TOKEN), [203, 0, 113, 10]))
                 .await
                 .unwrap(),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         let text = text.as_str().unwrap();
-        assert!(text.contains("fairlead_slots_total 2"));
-        assert!(text.contains("fairlead_slots_used 1"));
-        assert!(text.contains("fairlead_draining 0"));
-        assert!(text.contains("fairlead_jobs_started_total 1"));
+        assert!(text.contains("shutup_and_run_slots_total 2"));
+        assert!(text.contains("shutup_and_run_slots_used 1"));
+        assert!(text.contains("shutup_and_run_draining 0"));
+        assert!(text.contains("shutup_and_run_jobs_started_total 1"));
 
         let too_long = r#"{"image":"alpine","timeout_secs":61}"#;
         let (status, _) = json_of(
@@ -600,12 +673,7 @@ mod tests {
         let (status, health) = json_of(
             h.app
                 .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/health")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(get_from("/health", Some(TOKEN), [203, 0, 113, 10]))
                 .await
                 .unwrap(),
         )
@@ -632,12 +700,7 @@ mod tests {
 
         let (status, metrics) = json_of(
             h.app
-                .oneshot(
-                    Request::builder()
-                        .uri("/metrics")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(get_from("/metrics", Some(TOKEN), [203, 0, 113, 10]))
                 .await
                 .unwrap(),
         )
@@ -646,7 +709,69 @@ mod tests {
         assert!(metrics
             .as_str()
             .unwrap()
-            .contains("fairlead_jobs_timeout_total 1"));
-        assert!(metrics.as_str().unwrap().contains("fairlead_draining 1"));
+            .contains("shutup_and_run_jobs_timeout_total 1"));
+        assert!(metrics
+            .as_str()
+            .unwrap()
+            .contains("shutup_and_run_draining 1"));
+    }
+
+    #[tokio::test]
+    async fn ban_after_three_failures_persists_and_expires() {
+        let cfg = settings_extra(1, "auth_failures = 3\nban_hours = 1");
+        let clock = Arc::new(FakeClock::new(1_700_000_000));
+        let runtime: Arc<dyn Runtime> = Arc::new(MockRuntime::new());
+        let launcher = Launcher::with_clock(cfg, runtime, clock.clone()).unwrap();
+        let app = router(launcher.clone());
+        let ip = [203, 0, 113, 77];
+        for _ in 0..3 {
+            let (status, body) = json_of(
+                app.clone()
+                    .oneshot(post_from(ALPINE, Some("wrong-token-value"), ip))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body["error"], "unauthorized");
+        }
+        let (status, body) = json_of(
+            app.clone()
+                .oneshot(post_from(ALPINE, Some(TOKEN), ip))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.is_null(), "a ban is an empty 403");
+
+        let mut other = get_from("/health", Some(TOKEN), [203, 0, 113, 78]);
+        other
+            .headers_mut()
+            .insert("x-forwarded-for", "203.0.113.77".parse().unwrap());
+        let (status, _) = json_of(app.clone().oneshot(other).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let runtime2: Arc<dyn Runtime> = Arc::new(MockRuntime::new());
+        let restarted =
+            Launcher::with_clock(launcher.settings().clone(), runtime2, clock.clone()).unwrap();
+        let app2 = router(restarted);
+        let (status, _) = json_of(
+            app2.clone()
+                .oneshot(post_from(ALPINE, Some(TOKEN), ip))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        clock.set(1_700_000_000 + 3600 + 1);
+        let (status, body) = json_of(
+            app2.oneshot(get_from("/health", Some(TOKEN), ip))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 }

@@ -1,5 +1,5 @@
 [package]
-name = "fairlead"
+name = "shutup-and-run"
 version = "0.2.0"
 edition = "2021"
 description = "Start allowlisted containers on one machine, up to a fixed number of slots."
@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 async-trait = "0.1"
 axum = "0.8"
+axum-server = { version = "0.9.2", default-features = false, features = ["tls-rustls-ring"] }
 base64 = "0.22"
 bollard = { version = "0.21", default-features = false, features = ["pipe"] }
 futures-util = "0.3"

@@ -1,6 +1,6 @@
 # Contributing
 
-Fairlead stays a single static binary: one machine, a slot limit, no queue, no scheduler, and no UI.
+shutup-and-run stays a single static binary: one machine, a slot limit, no queue, no scheduler, and no UI.
 
 - Run `cargo test` and `cargo fmt` before sending a change.
 - Prefer a smaller patch. If a behavior needs a shortcut, mark it in the code as `// shortcut: <limit>, <when to upgrade>`.

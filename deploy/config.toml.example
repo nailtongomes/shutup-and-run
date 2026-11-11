@@ -16,8 +16,8 @@ max_timeout_secs = 21600
 # How often a container past its deadline is killed. Default 2.
 # reaper_interval_secs = 2
 
-# SQLite job history. Default /var/lib/fairlead/jobs.sqlite
-# history_path = "/var/lib/fairlead/jobs.sqlite"
+# SQLite job history. Default /var/lib/shutup-and-run/jobs.sqlite
+# history_path = "/var/lib/shutup-and-run/jobs.sqlite"
 # Finished rows older than this many days are deleted. 0 purges on the next pass.
 # history_days = 30
 # purge_interval_secs = 3600
@@ -33,5 +33,5 @@ max_timeout_secs = 21600
 # or $HOME/.docker/config.json (HOME=/root in the unit file).
 # docker_config = "/root/.docker/config.json"
 
-# Prefer the token in /etc/fairlead/env (mode 600):
-#   FAIRLEAD_TOKEN=...
+# Prefer the token in /etc/shutup-and-run/env (mode 600):
+#   SHUTUP_AND_RUN_TOKEN=...

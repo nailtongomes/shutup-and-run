@@ -28,16 +28,16 @@ jobs:
       - name: pack
         run: |
           mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/fairlead dist/fairlead-x86_64-unknown-linux-musl
-          sha256sum dist/fairlead-x86_64-unknown-linux-musl > dist/SHA256SUMS
+          cp target/x86_64-unknown-linux-musl/release/shutup-and-run dist/shutup-and-run-x86_64-unknown-linux-musl
+          sha256sum dist/shutup-and-run-x86_64-unknown-linux-musl > dist/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: fairlead-x86_64-unknown-linux-musl
+          name: shutup-and-run-x86_64-unknown-linux-musl
           path: |
-            dist/fairlead-x86_64-unknown-linux-musl
+            dist/shutup-and-run-x86_64-unknown-linux-musl
             dist/SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/fairlead-x86_64-unknown-linux-musl
+            dist/shutup-and-run-x86_64-unknown-linux-musl
             dist/SHA256SUMS

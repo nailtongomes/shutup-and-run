@@ -1,5 +1,5 @@
 {
-  "name": "fairlead — dispatch job",
+  "name": "shutup-and-run — dispatch job",
   "nodes": [
     {
       "parameters": {},
@@ -12,13 +12,13 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://192.0.2.11:8787/v1/jobs",
+        "url": "https://192.0.2.11:8787/v1/jobs",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
             {
               "name": "Authorization",
-              "value": "={{ 'Bearer ' + $env.FAIRLEAD_TOKEN }}"
+              "value": "={{ 'Bearer ' + $env.SHUTUP_AND_RUN_TOKEN }}"
             },
             {
               "name": "Content-Type",
@@ -28,8 +28,9 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ image: 'ghcr.io/owner/selenium-worker:latest', job_key: $execution.id, env: { JOB_NAME: 'example' }, timeout_secs: 3600, shm: '2g', callback_url: 'https://n8n.example/webhook/fairlead' }) }}",
+        "jsonBody": "={{ JSON.stringify({ image: 'ghcr.io/owner/selenium-worker:latest', job_key: $execution.id, env: { JOB_NAME: 'example' }, timeout_secs: 3600, shm: '2g', callback_url: 'https://n8n.example/webhook/shutup-and-run' }) }}",
         "options": {
+          "allowUnauthorizedCerts": true,
           "timeout": 20000,
           "response": {
             "response": {
@@ -116,13 +117,13 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://192.0.2.12:8787/v1/jobs",
+        "url": "https://192.0.2.12:8787/v1/jobs",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
             {
               "name": "Authorization",
-              "value": "={{ 'Bearer ' + $env.FAIRLEAD_TOKEN }}"
+              "value": "={{ 'Bearer ' + $env.SHUTUP_AND_RUN_TOKEN }}"
             },
             {
               "name": "Content-Type",
@@ -132,8 +133,9 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ image: 'ghcr.io/owner/selenium-worker:latest', job_key: $execution.id, env: { JOB_NAME: 'example' }, timeout_secs: 3600, shm: '2g', callback_url: 'https://n8n.example/webhook/fairlead' }) }}",
+        "jsonBody": "={{ JSON.stringify({ image: 'ghcr.io/owner/selenium-worker:latest', job_key: $execution.id, env: { JOB_NAME: 'example' }, timeout_secs: 3600, shm: '2g', callback_url: 'https://n8n.example/webhook/shutup-and-run' }) }}",
         "options": {
+          "allowUnauthorizedCerts": true,
           "timeout": 20000,
           "response": {
             "response": {
