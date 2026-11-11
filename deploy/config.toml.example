@@ -1,0 +1,25 @@
+# IP privado ou Tailscale desta máquina. Não use 0.0.0.0.
+listen = "100.64.0.11:8787"
+
+# Quantos containers nossos podem rodar ao mesmo tempo.
+max_slots = 2
+
+# Sem tag: qualquer tag ou digest daquele repositório.
+# Com tag: só aquela tag (e o digest dela).
+allowlist = [
+  "ghcr.io/nailtongomes/rpa-worker-selenium",
+]
+
+# Usados quando o pedido não traz timeout_secs, e como teto do pedido.
+default_timeout_secs = 3600
+max_timeout_secs = 21600
+
+# De quanto em quanto tempo um container vencido é morto. Padrão: 2.
+# reaper_interval_secs = 2
+
+# Caminho do config.json do `docker login`. Padrão: $HOME/.docker/config.json
+# (com HOME=/root no unit, isso é /root/.docker/config.json).
+# docker_config = "/root/.docker/config.json"
+
+# O token NÃO fica aqui. Ponha em /etc/n3-launcher/env:
+#   N3_TOKEN=...

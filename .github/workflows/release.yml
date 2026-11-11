@@ -1,0 +1,29 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: pack
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/n3-launcher dist/n3-launcher-x86_64-unknown-linux-musl
+          sha256sum dist/n3-launcher-x86_64-unknown-linux-musl > dist/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/n3-launcher-x86_64-unknown-linux-musl
+            dist/SHA256SUMS

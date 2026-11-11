@@ -1,0 +1,16 @@
+[Unit]
+Description=n3-launcher — slots de containers RPA sob demanda
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/n3-launcher
+Environment=N3_CONFIG=/etc/n3-launcher/config.toml
+Environment=HOME=/root
+EnvironmentFile=-/etc/n3-launcher/env
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
