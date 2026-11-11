@@ -20,13 +20,13 @@ When `poll_url` is set, the same process also asks that URL for one task on an i
 
 ## Architecture
 
-`serve` (the default command) loads config, connects to a local Docker unix socket, opens SQLite, and serves HTTPS (or plain HTTP when `http = true`). Every route goes through middleware that bans the peer after repeated bad tokens and then checks `Authorization: Bearer`.
+`serve` (the default command) loads config, connects to a local Docker unix socket, opens SQLite, and serves HTTPS (or plain HTTP when `http = true`). The HTTPS listener is HTTP/1.1 only and closes a connection that sends no request within 10 seconds. Every route goes through middleware that bans the peer after repeated bad tokens and then checks `Authorization: Bearer`.
 
-`POST /v1/jobs` parses a body with `deny_unknown_fields` and calls `Launcher::launch`. Launch checks the image name, the allowlist, timeout, env, command, `job_key`, and `callback_url`. It pulls the image, then holds one process mutex while it rechecks drain, the key, and the running count, and creates the container. The host config sets cpu, memory, memory swap equal to memory, and shm. It does not set mounts, ports, or privileged.
+`POST /v1/jobs` parses a body with `deny_unknown_fields` and calls `Launcher::launch`. Launch checks the image name, the allowlist, timeout, env, command, `job_key`, and `callback_url`. Then it holds one process mutex while it checks drain, the key, and the slot count, writes the row, and answers `202`. A spawned task pulls the image and creates the container, named `shutup-and-run-<job id>`. A pull or start that fails closes the row with `start_failed`. The ids of jobs between `202` and a running container are in `Launcher::starting`; they count as used slots. The host config sets cpu, memory, memory swap equal to memory, and shm. It does not set mounts, ports, or privileged.
 
 A background task reaps containers past the deadline label with SIGKILL, purges old rows, and optionally prunes. Docker events and a reconcile pass on startup close rows when a container exits. An optional `callback_url` is POSTed three times with no redirects and does not hold a slot.
 
-`shutup-and-run bans` and `shutup-and-run bans lift <ip>` read the same SQLite file over SSH. They do not open the HTTP port.
+`shutup-and-run bans` and `shutup-and-run bans lift <ip>` read the same SQLite file over SSH. They do not open the HTTP port. They load only `history_path`, not the full settings, because the token is in the systemd env file and an SSH shell does not have it.
 
 Pull mode is `spawn_poller` in `src/poll.rs`. It is not started when `poll_url` is unset. Errors back off. They do not end the process.
 
@@ -39,9 +39,9 @@ Pull mode is `spawn_poller` in `src/poll.rs`. It is not started when `poll_url` 
 | `src/config.rs` | TOML plus env. Unknown TOML fields refuse startup. `PollToken` redacts Debug. |
 | `src/api.rs` | Routes, auth middleware, client IP, shared job JSON parse (`launch_request_from_slice`). |
 | `src/auth.rs` | SHA-256 of the token, compared with `subtle`. Bearer parsing. |
-| `src/launcher.rs` | Slot mutex, `launch`, reaper, purge, prune, reconcile, metrics text. |
+| `src/launcher.rs` | Slot mutex, `launch` (answers, then pulls and starts in a task), reaper, purge, prune, reconcile, metrics text. |
 | `src/poll.rs` | Optional outbound poll. Same launch path. |
-| `src/allowlist.rs` | Image name check and repository match (`repo` allows `repo:tag` and `repo@digest`, not `repo-evil`). |
+| `src/allowlist.rs` | Image name check and repository match (`repo` allows `repo:tag` and `repo@digest`, not `repo-evil` and not `repo:5000/x`; a pinned entry is exact). |
 | `src/runtime.rs` | `Runtime` trait and `StartSpec`. |
 | `src/bollard_rt.rs` | Docker create/start/kill/logs/prune. Host config is built here. |
 | `src/registry.rs` | Pull credentials from the machine's Docker config. The request cannot supply them. |
@@ -52,11 +52,15 @@ Pull mode is `spawn_poller` in `src/poll.rs`. It is not started when `poll_url` 
 | `src/clock.rs` | Clock, plus a fake clock for tests. |
 | `src/mock.rs` | In-memory runtime for tests. |
 | `scripts/install.sh` | Ubuntu install: Docker, token, self-signed cert, systemd, optional ufw. |
-| `scripts/accept.sh` | End-to-end test against a real Docker daemon. |
+| `scripts/accept.sh` | End-to-end test against a real Docker daemon. Starts its own instance. `SHUTUP_AND_RUN_SMOKE=1` then runs `smoke.sh` on it. |
+| `scripts/smoke.sh` | Twelve scenarios against an instance that is already running, through the API only. |
+| `examples/smoke-image/` | The Python image `smoke.sh` runs by default. `image.yml` publishes it. |
+| `docs/RECIPES.md` | Copy-and-paste answers: firewall, pinning, NAT, a client's machine, stop everything. |
+| `docs/REVIEW-2026-11-11.md` | The last run of the review prompt below, with issue text for what was deferred. |
 | `deploy/` | Example config and the systemd unit. |
-| `.github/workflows/ci.yml` | fmt, clippy, test, shellcheck, accept.sh, musl static check. |
-| `.github/workflows/image.yml` | GHCR image on `main` (`:edge`) and on `v*` tags. |
-| `.github/workflows/release.yml` | `v*` tag attaches the musl binary and `SHA256SUMS`. |
+| `.github/workflows/ci.yml` | fmt, clippy, test, shellcheck, accept.sh with smoke.sh, musl static check, scratch image, install.sh from a local release with smoke.sh. |
+| `.github/workflows/image.yml` | GHCR image on `main` (`:edge`) and on `v*` tags, and the smoke image. |
+| `.github/workflows/release.yml` | `v*` tag attaches the musl binary and `SHA256SUMS`, then runs the one-line install and smoke.sh on a fresh runner. |
 
 ## Config
 
@@ -99,7 +103,16 @@ sudo bash scripts/accept.sh
 sudo bash scripts/accept.sh /path/to/shutup-and-run-x86_64-unknown-linux-musl
 ```
 
-It installs a throwaway `shutup-and-run-accept.service` when systemd is present, and does not touch a production `shutup-and-run.service`. The expected lines are in the README. It does not set `poll_url`.
+It installs a throwaway `shutup-and-run-accept.service` when systemd is present, and does not touch a production `shutup-and-run.service`. The expected lines are in the README. It does not set `poll_url` until the optional smoke pass, which adds it and restarts.
+
+Smoke, against any running instance (the variables are in the header of the script and in the README):
+
+```bash
+SMOKE_URL=https://203.0.113.10:8787 SMOKE_TOKEN=... bash scripts/smoke.sh
+sudo SMOKE_LOCAL=1 bash scripts/smoke.sh
+```
+
+There is no systemd in some sandboxes. `accept.sh` then runs the binary in the background, and `SHUTUP_AND_RUN_SMOKE=1` still runs all twelve scenarios.
 
 Run the service: `shutup-and-run` or `shutup-and-run serve`. Config errors print to stderr and exit 1. `RUST_LOG` defaults to `info`.
 
@@ -108,12 +121,14 @@ Run the service: `shutup-and-run` or `shutup-and-run serve`. Config errors print
 `ci.yml` runs on every push and pull request:
 
 - `check`: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked`, `shellcheck scripts/*.sh`.
-- `accept`: release binary, then `sudo bash scripts/accept.sh` against the runner's Docker. Timeout 30 minutes.
-- `musl`: static `x86_64-unknown-linux-musl` binary, then `file` and `ldd` must show it is static.
+- `accept`: release binary, then `sudo SHUTUP_AND_RUN_SMOKE=1 bash scripts/accept.sh` against the runner's Docker, which also runs `smoke.sh` with every scenario on. Timeout 30 minutes.
+- `musl`: static `x86_64-unknown-linux-musl` binary, then `file` and `ldd` must show it is static. The same job builds the scratch image and runs it, serves the binary and `SHA256SUMS` on localhost as a stand-in for a release, checks that `install.sh` refuses a wrong checksum, installs from it, runs `smoke.sh` against the installed HTTPS service, and uninstalls.
 
 `image.yml` runs on `main` and on `v*` tags. It builds the musl binary, wraps it in `Dockerfile` (`FROM scratch`), and pushes `ghcr.io/nailtongomes/shutup-and-run:edge` or `:vX.Y.Z`. Permissions: `contents: read`, `packages: write`. linux/amd64 only. The first push can create a private package; someone has to make it public if anonymous pulls should work.
 
-`release.yml` runs on `v*` tags. Permissions: `contents: write`. It attaches `shutup-and-run-x86_64-unknown-linux-musl` and `SHA256SUMS` to the GitHub release. `scripts/install.sh` downloads that asset from `releases/latest` and refuses to install it when the hash does not match `SHA256SUMS`. `SHUTUP_AND_RUN_BIN` skips the download.
+`release.yml` runs on `v*` tags. Permissions: `contents: write`. It attaches `shutup-and-run-x86_64-unknown-linux-musl` and `SHA256SUMS` to the GitHub release. `scripts/install.sh` downloads that asset from `releases/latest` and refuses to install it when the hash does not match `SHA256SUMS`. `SHUTUP_AND_RUN_BIN` skips the download. A second job, `install`, waits for the assets, runs the README one-liner on a fresh runner, checks that the installed binary matches `SHA256SUMS`, and runs `smoke.sh`.
+
+To cut the first release: merge to `main`, then `git tag v0.1.0 && git push origin v0.1.0`. Tag from `main`, because the one-liner fetches `install.sh` from `main`. `Cargo.toml` says `0.1.0`.
 
 The workflows do not set `id-token` or a cloud deploy role. They use `GITHUB_TOKEN`.
 
@@ -123,37 +138,62 @@ Each heading in [DECISIONS.md](DECISIONS.md) is the context, the choice, and the
 
 - [Push, no queue](DECISIONS.md#push-no-queue). `429` and `503` are the failover signals.
 - [Slots come from Docker labels](DECISIONS.md#slots-come-from-docker-labels). One process mutex. Two processes can overshoot.
-- [Idempotency is `job_key`, on one machine](DECISIONS.md#idempotency-is-job_key-on-one-machine). A failed start keeps the key.
+- [Idempotency is `job_key`, on one machine](DECISIONS.md#idempotency-is-job_key-on-one-machine). A failed pull or start keeps the key.
+- [202 before the pull](DECISIONS.md#202-before-the-pull) and [No cancel call](DECISIONS.md#no-cancel-call).
+- [A machine someone else lends](DECISIONS.md#a-machine-someone-else-lends).
 - [Every route requires the bearer token](DECISIONS.md#every-route-requires-the-bearer-token) and [Three failures, then 48 hours](DECISIONS.md#three-failures-then-48-hours).
 - [Public IP and TLS in the binary](DECISIONS.md#public-ip-and-tls-in-the-binary). Plain HTTP is opt-in.
 - [No volumes, published ports, or privileged](DECISIONS.md#no-volumes-published-ports-or-privileged).
 - [Pull, optional](DECISIONS.md#pull-optional). Unset means the old behavior.
 - [Security is a convention](DECISIONS.md#security-is-a-convention). Do not add a sandbox in a drive-by review.
-- [Windows and macOS later](DECISIONS.md#windows-and-macos-later). Documentation only.
+- [Windows and macOS: the same product](DECISIONS.md#windows-and-macos-the-same-product). Decided, not built.
 
 ## Known risks
 
 These are accepted, not a bug list. A review should confirm they are still true in the code.
 
 - The Docker socket is root on the host. The token is that power, limited by the allowlist and by the host config the code actually sets (`src/bollard_rt.rs`).
-- Allowlist matching is a string prefix of the repository, not a signature or a digest pin, unless the operator pins a tag (`src/allowlist.rs`).
+- Allowlist matching is a string match on the repository, not a signature. An entry pinned to a tag or digest is exact (`src/allowlist.rs`).
 - Job containers get Docker's default capabilities, user, and bridge network. The code does not drop capabilities or set `privileged: false` explicitly; it leaves those fields at the API default and does not take them from the request.
 - `memory` is optional. An omitted limit does not cap the container.
 - `callback_url` is any http(s) URL the host can reach. No private-address block (`src/callback.rs`).
 - `poll_url` is an outbound POST to an operator-chosen URL. Unset token means no Authorization header. A redirect is not followed.
-- A task can be lost if the server deletes it when it offers it and the launcher then refuses (slot taken, not allowlisted). `job_key` is stored on a failed start, same as POST. The README tells the server to offer the same key until the callback.
+- A task can be lost if the server deletes it when it offers it and the launcher then refuses (slot taken, not allowlisted). An accepted task keeps its `job_key` even if the image fails to pull. The README tells the server to offer the same key until the callback.
+- A job answered with `202` and still pulling its image exists only in memory. A graceful stop waits 30 seconds for it. A crash, or a longer pull, ends it: the row is closed at the next start and the callback says so.
+- `202` does not mean the image exists. A wrong tag is a `start_failed` job, not an error on the POST.
 - `trust_x_forwarded_for` trusts the first header value. The default is off (`src/api.rs`).
 - Bans key off the peer IP. A shared NAT can lock out everyone behind it. The ban is an empty `403` even with the right token.
 - SQLite uses `Mutex::lock().expect`. A poisoned lock panics the calling task (`src/store.rs`).
 - `scripts/install.sh` listens on `0.0.0.0` and generates a self-signed certificate. The downloaded binary is checked against `SHA256SUMS`. A binary passed in `SHUTUP_AND_RUN_BIN` is not.
 - Log lines kept in SQLite can contain secrets the container printed.
 - Two shutup-and-run processes on one daemon can exceed `max_slots`.
-- Stopping the service does not kill containers. A timeout is SIGKILL only.
+- Stopping the service does not kill containers. A timeout is SIGKILL only. While the service is stopped nothing enforces a timeout.
+- A client that keeps reconnecting can still hold connections on the TLS listener. It sends no token, so it is not banned. The defense is a firewall rule ([RECIPES.md](RECIPES.md)).
+- Four medium and six low findings in [REVIEW-2026-11-11.md](REVIEW-2026-11-11.md) are open. The allowlist ones are fixed.
+- There is no cancel call, by decision. Ending a job early needs a shell on the machine.
 
 ## Open TODOs
 
 - The Windows and macOS client in [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md). No code. The open questions there are undecided. The integrity check (sha256 or signature) is required before that client runs a downloaded script.
-- GHCR: if the package was created private, the owner still has to switch it to public for anonymous pulls. That is a registry setting, not a code change.
+- GHCR: if a package was created private, the owner still has to switch it to public for anonymous pulls. That applies to `shutup-and-run` and to `shutup-and-run-smoke`. It is a registry setting, not a code change.
+
+## Answered by the owner on 2026-11-11
+
+1. Allowlist match: fixed.
+2. Slow answers while pulling: `202` now comes before the pull. See DECISIONS.
+3. Cancel: no.
+4. Installer without an allowlist: it installs and warns.
+5. Smoke image: `hello-world`, or the Python image in `examples/smoke-image`.
+6. Windows and macOS: the same binary, with a script mode on Windows only. See DECISIONS and the roadmap.
+7. Lent machines: CONVENTIONS now covers them.
+
+## Open questions for the owner
+
+1. Script mode on Windows. The roadmap requires a sha256 or a signature before a downloaded script runs. Where does the hash come from: the task JSON, a file beside the script, or a signature with a key you hold? Nothing should be built before this is answered.
+2. macOS. Your answer mentioned running a script on Windows or macOS and then said script mode is Windows only. It is recorded as Windows only, with containers on macOS. Say so if macOS should run scripts too.
+3. The script-mode allowlist. Containers are limited to allowlisted images. What limits scripts: a list of URL prefixes in the config?
+4. The smoke image is pushed to GHCR by `image.yml` on `main`. The first push may create a private package. Make `shutup-and-run-smoke` public, or machines without a login will only run it from a local build.
+5. The four medium findings still open in the review (connection cap, log buffer, event reconnect, CI token). Fix them next?
 
 Do not add a queue, a web UI, a second database, cross-machine coordination, or automatic restarts of failed containers. [CONTRIBUTING.md](../CONTRIBUTING.md) says so.
 

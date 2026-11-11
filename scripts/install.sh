@@ -7,6 +7,9 @@
 # Offline, with a binary you already have:
 #   sudo SHUTUP_AND_RUN_BIN=./shutup-and-run bash scripts/install.sh
 #
+# Allowlist on first install (comma-separated; later, edit config.toml):
+#   curl -fsSL .../install.sh | sudo SHUTUP_AND_RUN_ALLOWLIST=ghcr.io/you/worker bash
+#
 # Show the token once:  sudo SHUTUP_AND_RUN_SHOW_TOKEN=1 bash scripts/install.sh
 # Skip ufw:             sudo SHUTUP_AND_RUN_NO_UFW=1 bash scripts/install.sh
 # Remove it:            sudo bash scripts/install.sh --uninstall
@@ -108,7 +111,7 @@ if [[ ! -f "$ETC/env" ]] || ! grep -q '^SHUTUP_AND_RUN_TOKEN=.\+' "$ETC/env"; th
   chmod 600 "$ETC/env"
 fi
 
-ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}' || true)
 if [[ -z "${ip}" ]]; then
   ip=127.0.0.1
 fi
@@ -136,13 +139,27 @@ fi
 fingerprint=$(openssl x509 -in "$ETC/cert.pem" -noout -fingerprint -sha256 | sed 's/^[^=]*=//')
 
 if [[ ! -f "$ETC/config.toml" ]]; then
+  # The service does not see this variable. It only fills the first config.toml.
+  if [[ -z "${SHUTUP_AND_RUN_ALLOWLIST:-}" ]]; then
+    placeholder=1
+  fi
+  allow=
+  IFS=',' read -ra images <<<"${SHUTUP_AND_RUN_ALLOWLIST:-ghcr.io/owner/selenium-worker}"
+  for image in "${images[@]}"; do
+    image="${image//[[:space:]]/}"
+    [[ -z "$image" ]] && continue
+    if [[ ! "$image" =~ ^[a-z0-9._:/@-]+$ ]]; then
+      echo "SHUTUP_AND_RUN_ALLOWLIST: invalid image name: ${image}" >&2
+      exit 1
+    fi
+    allow+="  \"${image}\","$'\n'
+  done
   umask 077
   cat >"$ETC/config.toml" <<EOF
 listen = "0.0.0.0:${PORT}"
 max_slots = ${slots}
 allowlist = [
-  "ghcr.io/owner/selenium-worker",
-]
+${allow}]
 tls_cert = "${ETC}/cert.pem"
 tls_key = "${ETC}/key.pem"
 history_path = "${LIB}/jobs.sqlite"
@@ -166,6 +183,7 @@ Environment=HOME=/root
 EnvironmentFile=-${ETC}/env
 Restart=on-failure
 RestartSec=2
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -186,7 +204,7 @@ health=0
 for _ in $(seq 1 50); do
   if curl -fsS --cacert "$ETC/cert.pem" \
     -H "Authorization: Bearer ${token}" \
-    "https://127.0.0.1:${PORT}/health" >/dev/null; then
+    "https://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
     health=1
     break
   fi
@@ -200,11 +218,18 @@ echo "  token file:    ${ETC}/env"
 echo "  certificate:   ${ETC}/cert.pem"
 echo "  fingerprint:   ${fingerprint}"
 echo "  config:        ${ETC}/config.toml"
+echo "  allowlist:     $(tr -d '\n"' <"$ETC/config.toml" | sed -n 's/.*allowlist = \[ *\([^]]*[^], ]\)[, ]*\].*/\1/p' | tr -s ' ')"
 if [[ "$health" == 1 ]]; then
   echo "  health:        ok"
 else
   echo "  health:        not answering (journalctl -u ${NAME} -n 40)"
   exit 1
+fi
+if [[ "${placeholder:-}" == 1 ]]; then
+  echo
+  echo "WARNING: SHUTUP_AND_RUN_ALLOWLIST was not set. The allowlist is the placeholder"
+  echo "  ghcr.io/owner/selenium-worker, which is not yours. No job of yours will start."
+  echo "  Edit ${ETC}/config.toml, then: sudo systemctl restart ${NAME}"
 fi
 if [[ "${SHUTUP_AND_RUN_SHOW_TOKEN:-}" == 1 ]]; then
   echo "  token:         ${token}"

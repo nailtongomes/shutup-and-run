@@ -1,6 +1,7 @@
 //! Image allowlist. An entry without a tag allows any tag or digest of that
-//! repository. An entry with a tag allows only that tag (optionally with a
-//! digest of the same tag). `repo` does not allow `repo-evil`.
+//! repository. An entry with a tag or a digest allows only that exact string.
+//! `repo` does not allow `repo-evil`, and it does not allow `repo:5000/other`,
+//! which Docker would read as a registry named `repo`.
 
 pub fn validate_image_name(image: &str) -> Result<(), String> {
     if image.is_empty() || image.len() > 512 {
@@ -27,9 +28,20 @@ pub fn image_allowed(image: &str, allowlist: &[String]) -> bool {
         .iter()
         .any(|entry| match image.strip_prefix(entry.as_str()) {
             Some("") => true,
-            Some(rest) => rest.starts_with(':') || rest.starts_with('@'),
+            Some(rest) => {
+                !pinned(entry)
+                    && (rest.starts_with(':') || rest.starts_with('@'))
+                    && !rest.contains('/')
+            }
             None => false,
         })
+}
+
+/// True when the entry names a tag or a digest. Docker ignores the tag once a
+/// digest is given, so a pinned entry must not accept any suffix.
+fn pinned(entry: &str) -> bool {
+    let tail = entry.rsplit_once('/').map_or(entry, |(_, tail)| tail);
+    tail.contains(':') || tail.contains('@')
 }
 
 #[cfg(test)]
@@ -52,8 +64,16 @@ mod tests {
         assert!(image_allowed("alpine@sha256:abcd", &allow));
         assert!(image_allowed("ghcr.io/owner/selenium-worker:1.2.3", &allow));
         assert!(image_allowed("ghcr.io/owner/pinned:1.4.2", &allow));
-        assert!(image_allowed(
+        // A pinned entry is exact. Docker ignores the tag when a digest follows it.
+        assert!(!image_allowed(
             "ghcr.io/owner/pinned:1.4.2@sha256:fff",
+            &allow
+        ));
+        // Docker would read this as an image on a registry named `alpine`.
+        assert!(!image_allowed("alpine:5000/evil", &allow));
+        assert!(!image_allowed("alpine:5000/evil:latest", &allow));
+        assert!(image_allowed(
+            "ghcr.io/owner/selenium-worker@sha256:abcd",
             &allow
         ));
         assert!(!image_allowed("alpine-evil:latest", &allow));

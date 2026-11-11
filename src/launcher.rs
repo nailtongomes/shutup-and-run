@@ -4,7 +4,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::config::Settings;
 use crate::runtime::{Inspected, Runtime, RuntimeError, StartSpec};
 use crate::store::{JobRecord, NewJob, Store, StoreError};
-use crate::{REASON_EXITED, REASON_LAUNCHER, REASON_START_FAILED, REASON_TIMEOUT};
+use crate::{REASON_EXITED, REASON_START_FAILED, REASON_TIMEOUT};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,8 +50,6 @@ pub enum LaunchError {
     Draining,
     #[error("{0}")]
     Unavailable(String),
-    #[error("failed to start container")]
-    StartFailed { id: String },
 }
 
 pub struct Launcher {
@@ -67,6 +65,10 @@ pub struct Launcher {
     /// Ids the reaper has decided to SIGKILL. The die event and the reaper
     /// share this so the stored reason is timeout_kill rather than exited.
     timeouts: Mutex<HashSet<String>>,
+    /// Jobs answered with 202 whose image is still being pulled. They hold a
+    /// slot. This set is memory only: after a restart such a row has no
+    /// container and reconcile closes it.
+    starting: Mutex<HashSet<String>>,
 }
 
 impl Launcher {
@@ -87,6 +89,7 @@ impl Launcher {
             store,
             slots: Mutex::new(()),
             timeouts: Mutex::new(HashSet::new()),
+            starting: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -140,7 +143,7 @@ impl Launcher {
     }
 
     pub async fn slots(&self) -> Result<Slots, LaunchError> {
-        let used = self.runtime.running_count().await.map_err(unavailable)?;
+        let used = self.used_slots().await?;
         let total = self.settings.max_slots;
         let draining = self.draining()?;
         Ok(Slots {
@@ -155,7 +158,14 @@ impl Launcher {
         self.store.counts().map_err(store_err)
     }
 
-    pub async fn launch(&self, req: LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
+    /// Answers as soon as the slot is taken and the row is written. The pull
+    /// and the start happen afterwards, so a caller is not kept waiting on a
+    /// registry and a full machine says so at once. A pull or start that
+    /// fails ends the job with reason `start_failed`.
+    pub async fn launch(
+        self: &Arc<Self>,
+        req: LaunchRequest,
+    ) -> Result<LaunchOutcome, LaunchError> {
         validate_image_name(&req.image).map_err(LaunchError::BadRequest)?;
         if !image_allowed(&req.image, &self.settings.allowlist) {
             return Err(LaunchError::Forbidden);
@@ -167,31 +177,18 @@ impl Launcher {
         let callback_url = validate_callback(req.callback_url)?;
         let nano_cpus = req.cpu.map(nano_cpus).transpose()?;
 
-        if self.draining()? {
-            return Err(LaunchError::Draining);
-        }
-        if let Some(key) = &job_key {
-            if let Some(existing) = self.store.get_by_key(key).map_err(store_err)? {
-                return Ok(LaunchOutcome::Existing(existing));
-            }
-        }
-
         let spec = StartSpec {
             image: req.image.clone(),
             env,
             command,
-            deadline_unix: self.clock.now_unix().saturating_add(timeout),
+            // Set when the container starts. Pull time does not count.
+            deadline_unix: 0,
             nano_cpus,
             memory_bytes: req.memory_bytes,
             shm_bytes: req.shm_bytes,
         };
 
-        self.runtime.pull(&spec.image).await.map_err(|err| {
-            tracing::warn!(image = %spec.image, error = %err, "pull failed");
-            LaunchError::Unavailable("failed to pull image".into())
-        })?;
-
-        let _guard = self.slots.lock().await;
+        let guard = self.slots.lock().await;
         if self.draining()? {
             return Err(LaunchError::Draining);
         }
@@ -200,48 +197,14 @@ impl Launcher {
                 return Ok(LaunchOutcome::Existing(existing));
             }
         }
-        let used = self.runtime.running_count().await.map_err(unavailable)?;
+        let used = self.used_slots().await?;
         if used >= self.settings.max_slots {
             return Err(LaunchError::NoSlots {
                 total: self.settings.max_slots,
                 used,
             });
         }
-
-        let id = match self.runtime.start(&spec).await {
-            Ok(id) => id,
-            Err(err) => {
-                tracing::warn!(image = %spec.image, error = %err, "start failed");
-                let failed_id = random_id();
-                let record = NewJob {
-                    id: failed_id.clone(),
-                    image: spec.image.clone(),
-                    job_key: job_key.clone(),
-                    started_at: self.clock.now_unix() as i64,
-                    callback_url: callback_url.clone(),
-                };
-                match self
-                    .store
-                    .insert_terminal(&record, REASON_START_FAILED, None)
-                {
-                    Ok(()) => {
-                        if let Ok(Some(saved)) = self.store.get(&failed_id) {
-                            self.fire_callback(&saved);
-                        }
-                    }
-                    Err(StoreError::Conflict) => {
-                        if let Some(key) = &job_key {
-                            if let Ok(Some(existing)) = self.store.get_by_key(key) {
-                                return Ok(LaunchOutcome::Existing(existing));
-                            }
-                        }
-                    }
-                    Err(err) => tracing::warn!(error = %err, "could not record start failure"),
-                }
-                return Err(LaunchError::StartFailed { id: failed_id });
-            }
-        };
-
+        let id = random_id();
         let record = NewJob {
             id: id.clone(),
             image: spec.image.clone(),
@@ -252,8 +215,7 @@ impl Launcher {
         match self.store.insert_running(&record) {
             Ok(()) => {}
             Err(StoreError::Conflict) => {
-                // Another process won the job_key. Drop the container we just started.
-                self.discard_loser(&id, &spec.image).await;
+                // Another process won the job_key.
                 if let Some(key) = &job_key {
                     if let Some(existing) = self.store.get_by_key(key).map_err(store_err)? {
                         return Ok(LaunchOutcome::Existing(existing));
@@ -268,8 +230,63 @@ impl Launcher {
             .get(&id)
             .map_err(store_err)?
             .ok_or_else(|| LaunchError::Unavailable("job disappeared after insert".into()))?;
+        self.starting.lock().await.insert(id.clone());
+        drop(guard);
+
         tracing::info!(%id, image = %spec.image, timeout_secs = timeout, "job accepted");
+        let launcher = self.clone();
+        tokio::spawn(async move { launcher.pull_and_start(id, spec, timeout).await });
         Ok(LaunchOutcome::Created(saved))
+    }
+
+    async fn pull_and_start(&self, id: String, mut spec: StartSpec, timeout: u64) {
+        // A pull that hangs would hold the slot forever, so it gets the job's own time limit.
+        let limit = std::time::Duration::from_secs(timeout);
+        let failure = match tokio::time::timeout(limit, self.runtime.pull(&spec.image)).await {
+            Err(_) => Some("image pull timed out"),
+            Ok(Err(err)) => {
+                tracing::warn!(%id, image = %spec.image, error = %err, "pull failed");
+                Some("failed to pull image")
+            }
+            Ok(Ok(())) => {
+                spec.deadline_unix = self.clock.now_unix().saturating_add(timeout);
+                match self.runtime.start(&id, &spec).await {
+                    Ok(()) => None,
+                    Err(err) => {
+                        tracing::warn!(%id, image = %spec.image, error = %err, "start failed");
+                        Some("failed to start container")
+                    }
+                }
+            }
+        };
+        if let Some(message) = failure {
+            // Close the row before the slot is released, so a status request
+            // cannot find the id neither starting nor recorded as failed.
+            let ended = self.clock.now_unix() as i64;
+            match self
+                .store
+                .finish(&id, ended, None, REASON_START_FAILED, message)
+            {
+                Ok(Some(job)) => self.fire_callback(&job),
+                Ok(None) => {}
+                Err(err) => tracing::warn!(%id, error = %err, "could not record start failure"),
+            }
+        }
+        self.starting.lock().await.remove(&id);
+    }
+
+    /// Running containers plus jobs accepted and not started yet.
+    async fn used_slots(&self) -> Result<usize, LaunchError> {
+        let running = self.runtime.running_count().await.map_err(unavailable)?;
+        Ok(running + self.starting.lock().await.len())
+    }
+
+    /// Wait until no job is between accepted and started. Shutdown calls this
+    /// so a restart does not drop a job that was already answered with 202.
+    pub async fn settled(&self) {
+        while !self.starting.lock().await.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     pub async fn job(&self, id: &str, with_logs: bool) -> Result<Option<JobRecord>, LaunchError> {
@@ -279,7 +296,7 @@ impl Launcher {
         let Some(mut record) = self.store.get(id).map_err(store_err)? else {
             return Ok(None);
         };
-        if !record.is_finished() {
+        if !record.is_finished() && !self.starting.lock().await.contains(id) {
             match self.runtime.inspect(id).await.map_err(unavailable)? {
                 Inspected::Running => {}
                 Inspected::Exited { exit_code } => {
@@ -298,6 +315,8 @@ impl Launcher {
         }
         if !with_logs {
             record.logs = None;
+        } else if self.starting.lock().await.contains(id) {
+            record.logs = Some(String::new());
         } else if !record.is_finished() {
             record.logs = self
                 .runtime
@@ -440,25 +459,6 @@ impl Launcher {
                 Ok(Inspected::NotFound) => self.complete(&id, None).await,
                 Err(err) => tracing::warn!(%id, error = %err, "reconcile inspect failed"),
             }
-        }
-    }
-
-    async fn discard_loser(&self, id: &str, image: &str) {
-        let _ = self.runtime.kill(id).await;
-        let _ = self.runtime.remove(id).await;
-        let record = NewJob {
-            id: id.to_string(),
-            image: image.to_string(),
-            job_key: None,
-            started_at: self.clock.now_unix() as i64,
-            callback_url: None,
-        };
-        if self
-            .store
-            .insert_terminal(&record, REASON_LAUNCHER, Some(137))
-            .is_err()
-        {
-            tracing::warn!(%id, "could not record launcher_kill");
         }
     }
 
@@ -674,14 +674,22 @@ pub fn valid_container_id(id: &str) -> bool {
     (1..=64).contains(&id.len()) && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// 32 hex characters. Unique on this machine: the time, a counter, the process
+/// id, and the standard library's per-process random hash seed, hashed together.
 fn random_id() -> String {
+    use sha2::{Digest, Sha256};
+    use std::hash::{BuildHasher, Hasher};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{nanos:032x}{n:08x}")[..32].to_string()
+    let seed = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let digest = Sha256::digest(format!("{nanos}-{n}-{}-{seed}", std::process::id()));
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn clip_logs(text: &str, lines: usize) -> String {
@@ -776,6 +784,7 @@ mod tests {
         else {
             panic!("expected a new job");
         };
+        launcher.settled().await;
         let id = created.id;
         clock.set(1_700_000_009);
         assert!(launcher.reap_once().await.unwrap().is_empty());
@@ -810,6 +819,7 @@ mod tests {
         else {
             panic!("created");
         };
+        launcher.settled().await;
         let path = launcher.settings().history_path.clone();
         let runtime: Arc<dyn Runtime> = mock.clone();
         let mut restarted_settings = settings(1);
@@ -826,16 +836,40 @@ mod tests {
         mock.fail_start(true).await;
         let mut req = job("alpine", None);
         req.job_key = Some("once".into());
-        let err = launcher.launch(req.clone()).await.unwrap_err();
-        let LaunchError::StartFailed { id } = err else {
-            panic!("expected start failure");
+        // The answer is still 202. The failure shows on the job afterwards.
+        let LaunchOutcome::Created(created) = launcher.launch(req.clone()).await.unwrap() else {
+            panic!("expected a new job");
         };
+        let id = created.id;
+        launcher.settled().await;
+        assert_eq!(launcher.slots().await.unwrap().used, 0);
         let LaunchOutcome::Existing(existing) = launcher.launch(req).await.unwrap() else {
             panic!("retry should see the failed row");
         };
+        assert_eq!(existing.logs.as_deref(), Some("failed to start container"));
         assert_eq!(existing.id, id);
         assert_eq!(existing.reason.as_deref(), Some(REASON_START_FAILED));
         assert_eq!(mock.start_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_job_holds_its_slot_while_the_image_is_pulled() {
+        let (launcher, mock, _) = harness(1);
+        let LaunchOutcome::Created(created) = launcher.launch(job("alpine", None)).await.unwrap()
+        else {
+            panic!("created");
+        };
+        // Nothing has started yet, and the slot is already taken.
+        assert_eq!(mock.start_count().await, 0);
+        assert_eq!(launcher.slots().await.unwrap().used, 1);
+        let err = launcher.launch(job("alpine", None)).await.unwrap_err();
+        assert!(matches!(err, LaunchError::NoSlots { used: 1, total: 1 }));
+        let view = launcher.job(&created.id, true).await.unwrap().unwrap();
+        assert_eq!(view.status(), "running");
+        launcher.settled().await;
+        assert_eq!(mock.start_count().await, 1);
+        assert_eq!(launcher.slots().await.unwrap().used, 1);
+        assert_eq!(mock.running_ids().await, vec![created.id]);
     }
 
     #[tokio::test]
@@ -847,6 +881,7 @@ mod tests {
         let LaunchOutcome::Created(created) = launcher.launch(first).await.unwrap() else {
             panic!("created");
         };
+        launcher.settled().await;
         let LaunchOutcome::Existing(existing) = launcher.launch(second).await.unwrap() else {
             panic!("existing");
         };
@@ -864,6 +899,7 @@ mod tests {
         assert!(launcher.slots().await.unwrap().draining);
         launcher.set_draining(false).unwrap();
         assert!(launcher.launch(job("alpine", None)).await.is_ok());
+        launcher.settled().await;
     }
 
     #[tokio::test]
@@ -874,6 +910,7 @@ mod tests {
         else {
             panic!("created");
         };
+        launcher.settled().await;
         clock.set(1_700_000_000 + 10);
         launcher.reap_once().await.unwrap();
         clock.set(1_700_000_000 + 10 + 31 * 86_400);

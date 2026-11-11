@@ -6,9 +6,18 @@ Read this with [SECURITY.md](../SECURITY.md). The record of why it stays this wa
 
 ## You do this
 
-**One machine, one owner.** The host runs this process and its jobs, not other people's workloads. The token is a root password. There is one token and no second tenant.
+**One machine, one caller.** The token is a root password for the machine. There is one token and no second tenant. Ideally the host runs this process and its jobs and nothing else.
 
-**Images you own.** Every allowlist entry is a repository you control, under a registry namespace you control. Do not allowlist a public library image or someone else's repository. An entry is one repository (any tag, or one tag if you pin it). It is not a wildcard. `ghcr.io/you/worker` does not allow `ghcr.io/you/worker-evil` or `ghcr.io/you/other`. Add each repository yourself.
+**A machine someone lends you.** A client may offer a machine so your jobs can use its idle capacity. That is allowed, and it is a risk both sides take on purpose:
+
+- The lender accepts that the token holder can run any allowlisted image on their machine, with Docker's default privileges and outbound network access. They are trusting the caller's images.
+- The lender stays in control. They install the service, write the allowlist, set `max_slots`, can read `docker ps` and the service log, and can stop the service and kill every job without asking anyone.
+- The caller sends `cpu` and `memory` with every job, uses a separate token for each lent machine, and does not print secrets, because the last log lines are stored on the lender's disk.
+- Other workloads on that machine are not protected from a job by anything except those limits. If that is not acceptable, lend a separate machine or a VM.
+
+The commands for both sides are in [RECIPES.md](RECIPES.md).
+
+**Images you own.** Every allowlist entry is a repository you control, under a registry namespace you control. Do not allowlist a public library image or someone else's repository. An entry is one repository (any tag, or exactly one tag or digest if you pin it). It is not a wildcard. `ghcr.io/you/worker` does not allow `ghcr.io/you/worker-evil` or `ghcr.io/you/other`. Add each repository yourself.
 
 **Secrets only in the task environment.** Pass secrets in the `env` object of the POST body or of the polled task. Do not bake them into the image. This process has no secret store. SQLite stores callback URLs and the last log lines, and those lines can contain whatever the container printed. The file is mode 600. Treat the disk that way. Tokens are not written to the log.
 
@@ -38,10 +47,11 @@ A request cannot override these. Unknown JSON fields are rejected. The container
 - No restart policy. A container that exits stays stopped.
 - When `memory` is set, `MemorySwap` is set to the same value, so there is no extra swap.
 - The deadline is a label. The reaper sends SIGKILL. There is no SIGTERM grace.
-- The image name must pass `validate_image_name` (lowercase, no spaces, no `..`) and match an allowlist entry.
+- The image name must pass `validate_image_name` (lowercase, no spaces, no `..`) and match an allowlist entry. An entry that names a tag or a digest matches only that exact string. Nothing after the entry may contain a `/`.
 - `callback_url`, and `poll_url` when you set it, must be `http` or `https` with a host. Redirects are not followed. `poll_url` must not carry a username or password.
 - Every HTTP route on this process requires the bearer token. Failed attempts are counted per peer address and then banned. The ban survives a restart.
 - TLS is on unless `http = true`. Plaintext on `0.0.0.0` logs a warning.
+- The TLS listener is HTTP/1.1 only. A connection that sends no request within 10 seconds is closed.
 - The poll token is never read from the TOML file. The poll response is capped at 64 KiB, the same limit as a job POST.
 - Job environment and the bearer tokens are not written to the log. A startup line for pull mode records the poll host, not the URL.
 
@@ -51,4 +61,4 @@ No image signature check, no vulnerability scan, no user namespace, no read-only
 
 ## If you cannot follow one of these
 
-Do not run the binary on that machine. There is no flag that makes a shared host safe.
+Do not run the binary on that machine. There is no flag that makes a shared host safe. A lent machine is safe only to the extent both people have read this file and agreed.

@@ -124,14 +124,33 @@ struct FileConfig {
 
 impl Settings {
     pub fn load() -> Result<Self, ConfigError> {
-        let mut env = HashMap::new();
-        for key in ENV_KEYS {
-            if let Ok(value) = std::env::var(key) {
-                env.insert((*key).to_string(), value);
-            }
-        }
+        let env = process_env();
         let toml_text = read_config_file(&env)?;
         Self::from_toml_and_env(&toml_text, &env)
+    }
+
+    /// Only the SQLite path, for `shutup-and-run bans`. That command runs from
+    /// an SSH shell, where the token in the systemd EnvironmentFile is not set,
+    /// so it must not need the rest of the settings.
+    pub fn history_path() -> Result<PathBuf, ConfigError> {
+        let env = process_env();
+        let toml_text = read_config_file(&env)?;
+        Self::history_path_from(&toml_text, &env)
+    }
+
+    pub fn history_path_from(
+        toml_text: &str,
+        env: &HashMap<String, String>,
+    ) -> Result<PathBuf, ConfigError> {
+        let file: FileConfig = if toml_text.trim().is_empty() {
+            FileConfig::default()
+        } else {
+            toml::from_str(toml_text).map_err(|err| ConfigError(format!("config.toml: {err}")))?
+        };
+        Ok(PathBuf::from(
+            take_string(env, "SHUTUP_AND_RUN_HISTORY_PATH", file.history_path)
+                .unwrap_or_else(|| DEFAULT_HISTORY.to_string()),
+        ))
     }
 
     pub fn from_toml_and_env(
@@ -346,6 +365,16 @@ impl Settings {
     }
 }
 
+fn process_env() -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    for key in ENV_KEYS {
+        if let Ok(value) = std::env::var(key) {
+            env.insert((*key).to_string(), value);
+        }
+    }
+    env
+}
+
 fn validate_poll_url(url: &str) -> Result<(), ConfigError> {
     if url.len() > 2048 || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(ConfigError("poll_url is invalid".into()));
@@ -438,6 +467,34 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn history_path_does_not_need_the_token() {
+        // What the installer writes: the token is only in the systemd env file.
+        let toml_text = r#"
+            listen = "0.0.0.0:8787"
+            max_slots = 2
+            allowlist = ["alpine"]
+            history_path = "/var/lib/elsewhere/jobs.sqlite"
+        "#;
+        assert!(Settings::from_toml_and_env(toml_text, &HashMap::new()).is_err());
+        assert_eq!(
+            Settings::history_path_from(toml_text, &HashMap::new()).unwrap(),
+            PathBuf::from("/var/lib/elsewhere/jobs.sqlite")
+        );
+        assert_eq!(
+            Settings::history_path_from("", &HashMap::new()).unwrap(),
+            PathBuf::from(DEFAULT_HISTORY)
+        );
+        assert_eq!(
+            Settings::history_path_from(
+                toml_text,
+                &env(&[("SHUTUP_AND_RUN_HISTORY_PATH", "/tmp/x.sqlite")])
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/x.sqlite")
+        );
     }
 
     #[test]
