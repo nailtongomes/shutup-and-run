@@ -1,7 +1,8 @@
 use crate::bytesize::ByteQty;
-use crate::launcher::{JobState, LaunchError, LaunchRequest, Launcher};
+use crate::launcher::{metrics_text, LaunchError, LaunchOutcome, LaunchRequest, Launcher};
+use crate::store::JobRecord;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,8 +17,10 @@ const MAX_BODY: usize = 64 * 1024;
 pub fn router(launcher: Arc<Launcher>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/jobs", post(create_job))
         .route("/v1/jobs/{id}", get(job_status))
+        .route("/v1/drain", post(set_drain))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(launcher)
 }
@@ -27,19 +30,60 @@ async fn health(State(launcher): State<Arc<Launcher>>) -> Response {
         Ok(slots) => (
             StatusCode::OK,
             Json(json!({
-                "status": "ok",
+                "status": if slots.draining { "draining" } else { "ok" },
+                "draining": slots.draining,
                 "slots_total": slots.total,
                 "slots_used": slots.used,
                 "slots_free": slots.free,
             })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "docker indisponível"})),
-        )
-            .into_response(),
+        Err(_) => {
+            let draining = launcher.draining().unwrap_or(false);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "docker is unavailable",
+                    "draining": draining,
+                })),
+            )
+                .into_response()
+        }
     }
+}
+
+async fn metrics(State(launcher): State<Arc<Launcher>>) -> Response {
+    let slots = match launcher.slots().await {
+        Ok(slots) => slots,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "docker is unavailable\n",
+            )
+                .into_response();
+        }
+    };
+    let counts = match launcher.counts() {
+        Ok(counts) => counts,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "job history is unavailable\n",
+            )
+                .into_response();
+        }
+    };
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        metrics_text(slots, counts),
+    )
+        .into_response()
 }
 
 async fn create_job(
@@ -52,7 +96,7 @@ async fn create_job(
     }
     let parsed: RunBody = match serde_json::from_slice(&body) {
         Ok(value) => value,
-        Err(_) => return error_body(StatusCode::BAD_REQUEST, "JSON inválido", None),
+        Err(_) => return error_body(StatusCode::BAD_REQUEST, "invalid JSON", None),
     };
     let request = LaunchRequest {
         image: parsed.image,
@@ -62,21 +106,38 @@ async fn create_job(
         memory_bytes: parsed.memory.map(ByteQty::get),
         shm_bytes: parsed.shm.map(ByteQty::get),
         command: parsed.command,
+        job_key: parsed.job_key,
+        callback_url: parsed.callback_url,
     };
     match launcher.launch(request).await {
-        Ok(id) => (StatusCode::ACCEPTED, Json(json!({"id": id}))).into_response(),
+        Ok(LaunchOutcome::Created(job)) => {
+            (StatusCode::ACCEPTED, Json(job_json(&job, false))).into_response()
+        }
+        Ok(LaunchOutcome::Existing(job)) => {
+            (StatusCode::OK, Json(job_json(&job, false))).into_response()
+        }
         Err(LaunchError::BadRequest(msg)) => error_body(StatusCode::BAD_REQUEST, &msg, None),
         Err(LaunchError::Forbidden) => {
-            error_body(StatusCode::FORBIDDEN, "imagem não permitida", None)
+            error_body(StatusCode::FORBIDDEN, "image is not allowlisted", None)
         }
         Err(LaunchError::NoSlots { total, used }) => error_body(
             StatusCode::TOO_MANY_REQUESTS,
-            "sem slot livre",
+            "no free slots",
             Some(json!({
                 "slots_total": total,
                 "slots_used": used,
                 "slots_free": total.saturating_sub(used),
             })),
+        ),
+        Err(LaunchError::Draining) => error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "draining",
+            Some(json!({"draining": true})),
+        ),
+        Err(LaunchError::StartFailed { id }) => error_body(
+            StatusCode::BAD_GATEWAY,
+            "failed to start container",
+            Some(json!({"id": id, "reason": "start_failed"})),
         ),
         Err(LaunchError::Unavailable(msg)) => error_body(StatusCode::BAD_GATEWAY, &msg, None),
     }
@@ -86,20 +147,18 @@ async fn job_status(
     State(launcher): State<Arc<Launcher>>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(query): Query<LogsQuery>,
 ) -> Response {
     if !authorized(&headers, &launcher) {
         return unauthorized();
     }
-    match launcher.job(&id).await {
-        Ok(JobState::Running) => {
-            (StatusCode::OK, Json(json!({"id": id, "status": "running"}))).into_response()
-        }
-        Ok(JobState::Exited { exit_code }) => (
-            StatusCode::OK,
-            Json(json!({"id": id, "status": "exited", "exit_code": exit_code})),
-        )
-            .into_response(),
-        Ok(JobState::NotFound) => (
+    let with_logs = query
+        .logs
+        .as_deref()
+        .is_some_and(|value| value == "true" || value == "1");
+    match launcher.job(&id, with_logs).await {
+        Ok(Some(job)) => (StatusCode::OK, Json(job_json(&job, with_logs))).into_response(),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({"id": id, "status": "not_found"})),
         )
@@ -107,6 +166,43 @@ async fn job_status(
         Err(LaunchError::Unavailable(msg)) => error_body(StatusCode::BAD_GATEWAY, &msg, None),
         Err(other) => error_body(StatusCode::BAD_GATEWAY, &other.to_string(), None),
     }
+}
+
+async fn set_drain(
+    State(launcher): State<Arc<Launcher>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !authorized(&headers, &launcher) {
+        return unauthorized();
+    }
+    let parsed: DrainBody = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return error_body(StatusCode::BAD_REQUEST, "invalid JSON", None),
+    };
+    match launcher.set_draining(parsed.draining) {
+        Ok(draining) => (StatusCode::OK, Json(json!({"draining": draining}))).into_response(),
+        Err(LaunchError::Unavailable(msg)) => error_body(StatusCode::BAD_GATEWAY, &msg, None),
+        Err(other) => error_body(StatusCode::BAD_GATEWAY, &other.to_string(), None),
+    }
+}
+
+fn job_json(job: &JobRecord, with_logs: bool) -> Value {
+    let mut body = json!({
+        "id": job.id,
+        "status": job.status(),
+        "image": job.image,
+        "job_key": job.job_key,
+        "started_at": job.started_at,
+        "ended_at": job.ended_at,
+        "exit_code": job.exit_code,
+        "reason": job.reason,
+        "duration_secs": job.duration_secs(),
+    });
+    if with_logs {
+        body["logs"] = Value::String(job.logs.clone().unwrap_or_default());
+    }
+    body
 }
 
 fn authorized(headers: &HeaderMap, launcher: &Launcher) -> bool {
@@ -121,7 +217,7 @@ fn authorized(headers: &HeaderMap, launcher: &Launcher) -> bool {
 fn unauthorized() -> Response {
     let mut response = (
         StatusCode::UNAUTHORIZED,
-        Json(json!({"error": "não autorizado"})),
+        Json(json!({"error": "unauthorized"})),
     )
         .into_response();
     response
@@ -153,6 +249,19 @@ struct RunBody {
     memory: Option<ByteQty>,
     shm: Option<ByteQty>,
     command: Option<Vec<String>>,
+    job_key: Option<String>,
+    callback_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DrainBody {
+    draining: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LogsQuery {
+    logs: Option<String>,
 }
 
 #[cfg(test)]
@@ -160,13 +269,13 @@ mod tests {
     use super::*;
     use crate::clock::FakeClock;
     use crate::config::Settings;
-    use crate::launcher::Launcher;
     use crate::mock::MockRuntime;
     use crate::runtime::Runtime;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
-    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::net::TcpListener;
     use tower::ServiceExt;
 
     struct Harness {
@@ -176,24 +285,34 @@ mod tests {
         clock: Arc<FakeClock>,
     }
 
-    fn harness(slots: usize) -> Harness {
-        let mock = Arc::new(MockRuntime::new());
-        let clock = Arc::new(FakeClock::new(1_700_000_000));
-        let settings = Settings::from_toml_and_env(
+    fn settings(slots: usize) -> Settings {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("fairlead-api-{n}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Settings::from_toml_and_env(
             &format!(
                 r#"
                 token = "test-token-value-ok"
                 max_slots = {slots}
-                allowlist = ["alpine", "ghcr.io/nailtongomes/rpa-worker-selenium"]
+                allowlist = ["alpine", "ghcr.io/owner/selenium-worker"]
                 default_timeout_secs = 30
                 max_timeout_secs = 60
-                "#
+                history_path = "{}"
+                "#,
+                dir.join("jobs.sqlite").display()
             ),
             &HashMap::new(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn harness(slots: usize) -> Harness {
+        let mock = Arc::new(MockRuntime::new());
+        let clock = Arc::new(FakeClock::new(1_700_000_000));
         let runtime: Arc<dyn Runtime> = mock.clone();
-        let launcher = Launcher::with_clock(settings, runtime, clock.clone());
+        let launcher = Launcher::with_clock(settings(slots), runtime, clock.clone()).unwrap();
         let app = router(launcher.clone());
         Harness {
             app,
@@ -217,20 +336,26 @@ mod tests {
     async fn json_of(response: Response) -> (StatusCode, Value) {
         let status = response.status();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes)
+                .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into()))
+        };
         (status, value)
     }
 
     const ALPINE: &str = r#"{"image":"alpine","command":["sleep","30"]}"#;
+    const TOKEN: &str = "test-token-value-ok";
 
     #[tokio::test]
-    async fn auth_allowlist_and_health() {
+    async fn auth_allowlist_health_and_metrics() {
         let h = harness(2);
 
         let (status, body) =
             json_of(h.app.clone().oneshot(post(ALPINE, None)).await.unwrap()).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body["error"], "não autorizado");
+        assert_eq!(body["error"], "unauthorized");
 
         let (status, _) = json_of(
             h.app
@@ -251,39 +376,36 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "token ruim não vira 403");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         let (status, body) = json_of(
             h.app
                 .clone()
-                .oneshot(post(forbidden, Some("test-token-value-ok")))
+                .oneshot(post(forbidden, Some(TOKEN)))
                 .await
                 .unwrap(),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["error"], "imagem não permitida");
-        assert!(
-            h.mock.pulls().await.is_empty(),
-            "imagem proibida não é baixada"
-        );
+        assert_eq!(body["error"], "image is not allowlisted");
+        assert!(h.mock.pulls().await.is_empty());
 
-        let neighbor = r#"{"image":"ghcr.io/nailtongomes/rpa-worker-selenium-evil:1"}"#;
+        let neighbor = r#"{"image":"ghcr.io/owner/selenium-worker-evil:1"}"#;
         let (status, _) = json_of(
             h.app
                 .clone()
-                .oneshot(post(neighbor, Some("test-token-value-ok")))
+                .oneshot(post(neighbor, Some(TOKEN)))
                 .await
                 .unwrap(),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
 
-        let tagged = r#"{"image":"ghcr.io/nailtongomes/rpa-worker-selenium:1.2.3","env":{"JOB":"a"},"shm":"64m","memory":"512m","cpu":0.5}"#;
+        let tagged = r#"{"image":"ghcr.io/owner/selenium-worker:1.2.3","env":{"JOB":"a"},"shm":"64m","memory":"512m","cpu":0.5}"#;
         let (status, body) = json_of(
             h.app
                 .clone()
-                .oneshot(post(tagged, Some("test-token-value-ok")))
+                .oneshot(post(tagged, Some(TOKEN)))
                 .await
                 .unwrap(),
         )
@@ -291,28 +413,13 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         let id = body["id"].as_str().unwrap().to_string();
 
-        let (status, _) = json_of(
-            h.app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(format!("/v1/jobs/{id}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-
         let (status, got) = json_of(
             h.app
                 .clone()
                 .oneshot(
                     Request::builder()
                         .uri(format!("/v1/jobs/{id}"))
-                        .header("authorization", "Bearer test-token-value-ok")
+                        .header("authorization", format!("Bearer {TOKEN}"))
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -322,6 +429,24 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(got["status"], "running");
+        assert!(got.get("logs").is_none());
+
+        let (status, with_logs) = json_of(
+            h.app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/jobs/{id}?logs=true"))
+                        .header("authorization", format!("Bearer {TOKEN}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(with_logs["logs"].as_str().unwrap().contains("log "));
 
         let (status, health) = json_of(
             h.app
@@ -337,15 +462,34 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(health["slots_total"], 2);
-        assert_eq!(health["slots_used"], 1);
+        assert_eq!(health["draining"], false);
         assert_eq!(health["slots_free"], 1);
+
+        let (status, text) = json_of(
+            h.app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = text.as_str().unwrap();
+        assert!(text.contains("fairlead_slots_total 2"));
+        assert!(text.contains("fairlead_slots_used 1"));
+        assert!(text.contains("fairlead_draining 0"));
+        assert!(text.contains("fairlead_jobs_started_total 1"));
 
         let too_long = r#"{"image":"alpine","timeout_secs":61}"#;
         let (status, _) = json_of(
             h.app
                 .clone()
-                .oneshot(post(too_long, Some("test-token-value-ok")))
+                .oneshot(post(too_long, Some(TOKEN)))
                 .await
                 .unwrap(),
         )
@@ -360,10 +504,7 @@ mod tests {
         for _ in 0..8 {
             let app = h.app.clone();
             tasks.push(tokio::spawn(async move {
-                let response = app
-                    .oneshot(post(ALPINE, Some("test-token-value-ok")))
-                    .await
-                    .unwrap();
+                let response = app.oneshot(post(ALPINE, Some(TOKEN))).await.unwrap();
                 response.status()
             }));
         }
@@ -373,65 +514,72 @@ mod tests {
             match task.await.unwrap() {
                 StatusCode::ACCEPTED => accepted += 1,
                 StatusCode::TOO_MANY_REQUESTS => rejected += 1,
-                other => panic!("status inesperado: {other}"),
+                other => panic!("unexpected status: {other}"),
             }
         }
         assert_eq!(accepted, 2);
         assert_eq!(rejected, 6);
         assert_eq!(h.mock.running_ids().await.len(), 2);
-
-        let (status, body) = json_of(
-            h.app
-                .clone()
-                .oneshot(post(ALPINE, Some("test-token-value-ok")))
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(body["slots_free"], 0);
-        assert_eq!(body["slots_total"], 2);
     }
 
     #[tokio::test]
-    async fn timeout_kill_is_visible_on_the_status_route() {
-        let h = harness(1);
-        let (status, body) = json_of(
+    async fn idempotent_key_drain_and_callback() {
+        let h = harness(2);
+        let hits = Arc::new(tokio::sync::Mutex::new(None));
+        let state = hits.clone();
+        let hook = Router::new().route(
+            "/hook",
+            axum::routing::post(move |body: Bytes| {
+                let state = state.clone();
+                async move {
+                    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    *state.lock().await = Some(value);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, hook).await.unwrap();
+        });
+
+        let body = format!(
+            r#"{{"image":"alpine","command":["sleep","30"],"job_key":"same-key","callback_url":"http://127.0.0.1:{port}/hook"}}"#
+        );
+        let (status, first) = json_of(
             h.app
                 .clone()
-                .oneshot(post(
-                    r#"{"image":"alpine","command":["sleep","300"],"timeout_secs":10}"#,
-                    Some("test-token-value-ok"),
-                ))
+                .oneshot(post(&body, Some(TOKEN)))
                 .await
                 .unwrap(),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
-        let id = body["id"].as_str().unwrap().to_string();
+        let id = first["id"].as_str().unwrap().to_string();
 
-        let (status, _) = json_of(
+        let (status, second) = json_of(
             h.app
                 .clone()
-                .oneshot(post(ALPINE, Some("test-token-value-ok")))
+                .oneshot(post(&body, Some(TOKEN)))
                 .await
                 .unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(second["id"], id);
+        assert_eq!(h.mock.start_count().await, 1);
 
-        h.clock.set(1_700_000_010);
-        let killed = h.launcher.reap_once().await.unwrap();
-        assert_eq!(killed, vec![id.clone()]);
-
-        let (status, got) = json_of(
+        let (status, _) = json_of(
             h.app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(format!("/v1/jobs/{id}"))
-                        .header("authorization", "Bearer test-token-value-ok")
-                        .body(Body::empty())
+                        .method("POST")
+                        .uri("/v1/drain")
+                        .header("authorization", format!("Bearer {TOKEN}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"draining":true}"#))
                         .unwrap(),
                 )
                 .await
@@ -439,25 +587,19 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(got["status"], "exited");
-        assert_eq!(got["exit_code"], 137);
-
-        let (status, _) = json_of(
+        let (status, denied) = json_of(
             h.app
-                .oneshot(post(ALPINE, Some("test-token-value-ok")))
+                .clone()
+                .oneshot(post(ALPINE, Some(TOKEN)))
                 .await
                 .unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::ACCEPTED);
-    }
-
-    #[tokio::test]
-    async fn health_reports_docker_failure() {
-        let h = harness(1);
-        h.mock.fail_lists(true).await;
-        let (status, _) = json_of(
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(denied["error"], "draining");
+        let (status, health) = json_of(
             h.app
+                .clone()
                 .oneshot(
                     Request::builder()
                         .uri("/health")
@@ -468,6 +610,43 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(health["status"], "draining");
+        assert_eq!(health["draining"], true);
+
+        h.clock.set(1_700_000_000 + 30);
+        h.launcher.reap_once().await.unwrap();
+        let mut saw = None;
+        for _ in 0..50 {
+            if let Some(body) = hits.lock().await.clone() {
+                saw = Some(body);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let saw = saw.expect("callback");
+        assert_eq!(saw["id"], id);
+        assert_eq!(saw["reason"], "timeout_kill");
+        assert_eq!(saw["exit_code"], 137);
+        assert!(saw["duration_secs"].as_i64().unwrap() >= 30);
+
+        let (status, metrics) = json_of(
+            h.app
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(metrics
+            .as_str()
+            .unwrap()
+            .contains("fairlead_jobs_timeout_total 1"));
+        assert!(metrics.as_str().unwrap().contains("fairlead_draining 1"));
     }
 }

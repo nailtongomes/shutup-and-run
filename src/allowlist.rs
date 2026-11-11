@@ -4,20 +4,20 @@
 
 pub fn validate_image_name(image: &str) -> Result<(), String> {
     if image.is_empty() || image.len() > 512 {
-        return Err("nome de imagem inválido".into());
+        return Err("invalid image name".into());
     }
     if image
         .chars()
         .any(|c| c.is_whitespace() || c.is_control() || c.is_ascii_uppercase())
     {
-        return Err("nome de imagem inválido".into());
+        return Err("invalid image name".into());
     }
     if image.contains("..")
         || image.contains("//")
         || image.starts_with('-')
         || image.ends_with(':')
     {
-        return Err("nome de imagem inválido".into());
+        return Err("invalid image name".into());
     }
     Ok(())
 }
@@ -39,8 +39,8 @@ mod tests {
     fn allow() -> Vec<String> {
         vec![
             "alpine".into(),
-            "ghcr.io/nailtongomes/rpa-worker-selenium".into(),
-            "ghcr.io/nailtongomes/pinned:1.4.2".into(),
+            "ghcr.io/owner/selenium-worker".into(),
+            "ghcr.io/owner/pinned:1.4.2".into(),
         ]
     }
 
@@ -50,26 +50,20 @@ mod tests {
         assert!(image_allowed("alpine", &allow));
         assert!(image_allowed("alpine:3.20", &allow));
         assert!(image_allowed("alpine@sha256:abcd", &allow));
+        assert!(image_allowed("ghcr.io/owner/selenium-worker:1.2.3", &allow));
+        assert!(image_allowed("ghcr.io/owner/pinned:1.4.2", &allow));
         assert!(image_allowed(
-            "ghcr.io/nailtongomes/rpa-worker-selenium:1.2.3",
-            &allow
-        ));
-        assert!(image_allowed("ghcr.io/nailtongomes/pinned:1.4.2", &allow));
-        assert!(image_allowed(
-            "ghcr.io/nailtongomes/pinned:1.4.2@sha256:fff",
+            "ghcr.io/owner/pinned:1.4.2@sha256:fff",
             &allow
         ));
         assert!(!image_allowed("alpine-evil:latest", &allow));
         assert!(!image_allowed(
-            "ghcr.io/nailtongomes/rpa-worker-selenium-evil:1",
+            "ghcr.io/owner/selenium-worker-evil:1",
             &allow
         ));
-        assert!(!image_allowed(
-            "ghcr.io/other/rpa-worker-selenium:1",
-            &allow
-        ));
-        assert!(!image_allowed("ghcr.io/nailtongomes/pinned:1.4.20", &allow));
-        assert!(!image_allowed("ghcr.io/nailtongomes/pinned:1.4.3", &allow));
+        assert!(!image_allowed("ghcr.io/other/selenium-worker:1", &allow));
+        assert!(!image_allowed("ghcr.io/owner/pinned:1.4.20", &allow));
+        assert!(!image_allowed("ghcr.io/owner/pinned:1.4.3", &allow));
         assert!(!image_allowed("redis:7", &allow));
     }
 

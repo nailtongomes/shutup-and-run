@@ -1,514 +1,336 @@
-# n3-launcher
+# fairlead
 
-Serviço pequeno, um binário estático por máquina, que empresta a capacidade ociosa de um Ubuntu com Docker. O Kestra ou o n8n fazem `POST` numa máquina. Se ela tem slot livre, o launcher sobe o container e responde na hora. Se não tem, responde 429 e o orquestrador tenta o próximo IP da lista dele. Não há fila, não há banco, não há escalonador entre máquinas e o launcher não busca o resultado do job: o container já grava no MinIO, no Mongo ou no Redis.
+fairlead is a single static binary. One machine with Docker receives an HTTP POST, and if it has a free slot it starts an allowlisted container and returns immediately. If it does not, it refuses, and the caller tries the next machine on its own list. There is no queue, no scheduler, and no UI. The container writes its own result wherever it already does.
 
-Cada máquina roda o seu próprio launcher. Reiniciar o processo não zera a contagem: o slot é um container em execução com o label `n3.launcher=1`.
+A slot is a running container labeled `fairlead=1`. Restarting the process does not forget them. Finished jobs stay in one SQLite file so `GET /v1/jobs/{id}` still works after a restart.
 
-## Segurança
+## Security
 
-Este processo fala com o socket do Docker. Quem tem o token manda a máquina rodar uma imagem da allowlist, com o ambiente que quiser. Trate o token como senha de root.
+This process speaks to the Docker socket. Anyone with the token can run any allowlisted image with any environment. Treat the token as a root password.
 
-**Escute só numa interface privada ou no IP Tailscale da máquina.** Não use `0.0.0.0`. O valor padrão, se você não configurar `listen`, é `127.0.0.1:8787`.
+**Bind `listen` to a private interface or a Tailscale address.** Do not use `0.0.0.0`. If you omit `listen`, the default is `127.0.0.1:8787`. See [SECURITY.md](SECURITY.md).
 
-O token não está no código. A comparação é em tempo constante (hash SHA-256 e `subtle`). Não mande segredo de registry no pedido: o pull usa o `docker login` que já existe na máquina.
+The token is not in the source. Comparison is a SHA-256 digest checked in constant time. Registry credentials come from the machine's existing `docker login`, never from the request.
 
-O unit sobe como root porque o socket do Docker já é equivalente a root. O arquivo do token fica em `/etc/n3-launcher/env` com modo `600`.
+## Install
 
-## Instalar
+The release workflow builds `fairlead-x86_64-unknown-linux-musl` and, on a GitHub-compatible forge, attaches it to the release for tag `v*`. Check `SHA256SUMS` from the same release. The compile does not require GitHub; publishing the file to a Release does. See the note in `.github/workflows/release.yml`.
 
-Binário estático de Linux x86_64 (musl), publicado no release quando a tag `v*` é enviada. O asset se chama `n3-launcher-x86_64-unknown-linux-musl`. Confira o `SHA256SUMS` do mesmo release se quiser.
-
-Na máquina, como root, com o Docker já instalado e no ar:
+On the machine, as root, with Docker already running:
 
 ```bash
-sudo install -m 0755 n3-launcher-x86_64-unknown-linux-musl /usr/local/bin/n3-launcher
-sudo mkdir -p /etc/n3-launcher
-sudo tee /etc/n3-launcher/config.toml >/dev/null <<'EOF'
-listen = "100.64.0.11:8787"
+sudo install -m 0755 fairlead-x86_64-unknown-linux-musl /usr/local/bin/fairlead
+sudo mkdir -p /etc/fairlead /var/lib/fairlead
+sudo tee /etc/fairlead/config.toml >/dev/null <<'EOF'
+listen = "192.0.2.11:8787"
 max_slots = 2
 allowlist = [
-  "ghcr.io/nailtongomes/rpa-worker-selenium",
+  "ghcr.io/owner/selenium-worker",
 ]
 default_timeout_secs = 3600
 max_timeout_secs = 21600
+history_path = "/var/lib/fairlead/jobs.sqlite"
 EOF
-echo "N3_TOKEN=$(openssl rand -hex 32)" | sudo tee /etc/n3-launcher/env >/dev/null
-sudo chmod 600 /etc/n3-launcher/env /etc/n3-launcher/config.toml
-sudo tee /etc/systemd/system/n3-launcher.service >/dev/null <<'EOF'
-[Unit]
-Description=n3-launcher — slots de containers RPA sob demanda
-After=docker.service
-Requires=docker.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/n3-launcher
-Environment=N3_CONFIG=/etc/n3-launcher/config.toml
-Environment=HOME=/root
-EnvironmentFile=-/etc/n3-launcher/env
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
+echo "FAIRLEAD_TOKEN=$(openssl rand -hex 32)" | sudo tee /etc/fairlead/env >/dev/null
+sudo chmod 600 /etc/fairlead/env /etc/fairlead/config.toml
+sudo cp deploy/fairlead.service /etc/systemd/system/fairlead.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now n3-launcher
-sudo systemctl status n3-launcher
-curl -sS http://100.64.0.11:8787/health
+sudo systemctl enable --now fairlead
+curl -sS http://192.0.2.11:8787/health
 ```
 
-Troque `100.64.0.11` pelo IP Tailscale (ou outro IP privado) **desta** máquina. O `curl` do health tem que ser feito nesse mesmo IP, não em `0.0.0.0`.
+`192.0.2.11` is a documentation address. Replace it with this machine's private address. Image names are lowercase. An allowlist entry without a tag allows any tag of that repository; `ghcr.io/owner/selenium-worker` does not allow `ghcr.io/owner/selenium-worker-evil`.
 
-O `openssl rand` imprime o token uma vez no terminal. Copie para o secret `N3_LAUNCHER_TOKEN` do Kestra e para o ambiente do n8n. Quem perde o token gera outro e reinicia o serviço: `sudo systemctl restart n3-launcher`.
+`openssl rand` prints the token once. Put the same value in the orchestrator's secret. To rotate it, edit the env file and `sudo systemctl restart fairlead`.
 
-Se você tem o repositório em vez do release, o unit também está em `deploy/n3-launcher.service` e um config de exemplo em `deploy/config.toml.example`.
-
-### Imagem privada no GHCR
-
-O pedido não carrega usuário nem senha. Na máquina, como root (o unit usa `HOME=/root`):
+### Private registries
 
 ```bash
-sudo docker login ghcr.io -u SEU_USUARIO
+sudo docker login ghcr.io -u USER
 ```
 
-Isso grava `/root/.docker/config.json`. Um PAT do GitHub com `read:packages` basta. Não use um credential helper de desktop (`pass`, `secretservice`, `osxkeychain`) num servidor sem sessão: se o `config.json` apontar para um helper, o launcher chama `docker-credential-<helper> get` com o nome do registry na entrada padrão, e o helper precisa funcionar sem terminal. O caminho do arquivo pode ser outro com `docker_config` no toml ou `N3_DOCKER_CONFIG`. O arquivo é relido a cada pull, então um `docker login` novo vale sem reiniciar o launcher.
+That writes `/root/.docker/config.json` because the unit sets `HOME=/root`. A desktop credential helper will not work on a headless server. The file is read on every pull, so a new login applies without a restart. This login is not `FAIRLEAD_TOKEN`.
 
-Esse login é o da registry. Não é o `N3_TOKEN` do launcher.
+## Configuration
 
-## Configuração
+TOML from `FAIRLEAD_CONFIG`, or `/etc/fairlead/config.toml` when that variable is unset. Environment variables override the file. An unknown TOML field refuses to start.
 
-Arquivo toml em `N3_CONFIG` ou, se essa variável não existir, `/etc/n3-launcher/config.toml`. Variável de ambiente ganha do arquivo. Campo desconhecido no toml faz o processo recusar subir.
-
-| toml | ambiente | o que é |
+| toml | environment | meaning |
 | --- | --- | --- |
-| `listen` | `N3_LISTEN` | `ip:porta`. Padrão `127.0.0.1:8787`. |
-| `token` | `N3_TOKEN` | Obrigatório, mínimo 16 caracteres, sem espaço. Prefira o env. |
-| `max_slots` | `N3_MAX_SLOTS` | Obrigatório, de 1 a 256. |
-| `allowlist` | `N3_ALLOWLIST` | Lista de imagens. No env, separe por vírgula. |
-| `default_timeout_secs` | `N3_DEFAULT_TIMEOUT_SECS` | Se o pedido não mandar timeout. Padrão 3600. |
-| `max_timeout_secs` | `N3_MAX_TIMEOUT_SECS` | Teto do pedido. Padrão 21600. Máximo 7 dias. |
-| `reaper_interval_secs` | `N3_REAPER_INTERVAL_SECS` | De quanto em quanto um container vencido é morto. Padrão 2, entre 1 e 300. |
-| `docker_config` | `N3_DOCKER_CONFIG` | `config.json` do Docker. Padrão `$DOCKER_CONFIG/config.json` ou `$HOME/.docker/config.json`. |
+| `listen` | `FAIRLEAD_LISTEN` | `ip:port`. Default `127.0.0.1:8787`. |
+| `token` | `FAIRLEAD_TOKEN` | Required, at least 16 characters, no spaces. |
+| `max_slots` | `FAIRLEAD_MAX_SLOTS` | Required, 1 to 256. |
+| `allowlist` | `FAIRLEAD_ALLOWLIST` | Images. Comma-separated in the environment. |
+| `default_timeout_secs` | `FAIRLEAD_DEFAULT_TIMEOUT_SECS` | Used when the request omits a timeout. Default 3600. |
+| `max_timeout_secs` | `FAIRLEAD_MAX_TIMEOUT_SECS` | Ceiling. Default 21600. At most 7 days. |
+| `reaper_interval_secs` | `FAIRLEAD_REAPER_INTERVAL_SECS` | How often expired containers are killed. Default 2. |
+| `history_path` | `FAIRLEAD_HISTORY_PATH` | SQLite file. Default `/var/lib/fairlead/jobs.sqlite`. |
+| `history_days` | `FAIRLEAD_HISTORY_DAYS` | Delete finished rows older than this. Default 30. `0` deletes them on the next purge. |
+| `purge_interval_secs` | `FAIRLEAD_PURGE_INTERVAL_SECS` | How often that delete runs. Default 3600. |
+| `log_lines` | `FAIRLEAD_LOG_LINES` | Log lines kept per job. Default 200. |
+| `prune_interval_secs` | `FAIRLEAD_PRUNE_INTERVAL_SECS` | `0` (default) disables pruning. |
+| `docker_config` | `FAIRLEAD_DOCKER_CONFIG` | Path to Docker's `config.json`. |
 
-Allowlist, do jeito estrito:
-
-- `ghcr.io/nailtongomes/rpa-worker-selenium` aceita qualquer tag ou digest desse repositório.
-- `ghcr.io/nailtongomes/rpa-worker-selenium:1.4.2` aceita só essa tag (e o digest dessa mesma tag).
-- Não aceita o vizinho `...-selenium-evil`. Nome com maiúscula é recusado.
-
-Log: `journalctl -u n3-launcher -f`. O nível sai de `RUST_LOG` (padrão `info`). O token e as variáveis do job não são escritos no log.
+Logs: `journalctl -u fairlead -f`. Level comes from `RUST_LOG` (default `info`). The token and job environment are not logged.
 
 ## API
 
-Token no header `Authorization: Bearer ...`. Health não pede token: só devolve a contagem de slots.
+`Authorization: Bearer <token>` except for `/health` and `/metrics`.
 
-| método | caminho | sucesso | outros |
-| --- | --- | --- | --- |
-| `GET` | `/health` | 200 | 503 se o Docker não listar |
-| `POST` | `/v1/jobs` | 202 com `id` | 401 token, 403 imagem, 429 cheio, 400 pedido, 502 pull ou start |
-| `GET` | `/v1/jobs/{id}` | 200 `running` ou `exited` | 404 `not_found`, 401 |
+### `GET /health`
 
-O `id` é o id do container. O container sobe detached, com `--rm`: quando sai, o Docker apaga. Por isso, depois que ele some, o 200 `exited` só existe enquanto o processo do launcher ainda lembra o código de saída. Reiniciou o launcher, o id vira `not_found`.
+No token.
 
 ```bash
-export N3_TOKEN='cole-o-token'
-export N3_URL='http://100.64.0.11:8787'
+curl -sS http://192.0.2.11:8787/health
+```
 
-curl -sS "$N3_URL/health"
+```json
+{"status":"ok","draining":false,"slots_total":2,"slots_used":1,"slots_free":1}
+```
 
-curl -sS -D - -o - -X POST "$N3_URL/v1/jobs" \
-  -H "Authorization: Bearer $N3_TOKEN" \
+While draining, `status` is `"draining"` and `draining` is `true`. `503` if Docker cannot be listed: `{"error":"docker is unavailable","draining":false}`.
+
+### `GET /metrics`
+
+No token. Prometheus text, so Uptime Kuma or Prometheus can scrape it on the private interface.
+
+```text
+# HELP fairlead_slots_total Configured slot capacity.
+# TYPE fairlead_slots_total gauge
+fairlead_slots_total 2
+# HELP fairlead_slots_used Running containers labeled fairlead=1.
+# TYPE fairlead_slots_used gauge
+fairlead_slots_used 1
+# HELP fairlead_slots_free Slots not currently taken. Not offered while draining.
+# TYPE fairlead_slots_free gauge
+fairlead_slots_free 1
+# HELP fairlead_draining 1 while new jobs are refused.
+# TYPE fairlead_draining gauge
+fairlead_draining 0
+# HELP fairlead_jobs_started_total Jobs recorded in SQLite, including those still running.
+# TYPE fairlead_jobs_started_total counter
+fairlead_jobs_started_total 4
+# HELP fairlead_jobs_finished_total Jobs that have ended.
+# TYPE fairlead_jobs_finished_total counter
+fairlead_jobs_finished_total 3
+# HELP fairlead_jobs_timeout_total Jobs ended with reason timeout_kill.
+# TYPE fairlead_jobs_timeout_total counter
+fairlead_jobs_timeout_total 1
+```
+
+### `POST /v1/jobs`
+
+```bash
+curl -sS -D - -o - -X POST http://192.0.2.11:8787/v1/jobs \
+  -H "Authorization: Bearer $FAIRLEAD_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-    "image": "ghcr.io/nailtongomes/rpa-worker-selenium:latest",
-    "env": { "JOB_NAME": "consulta-tj" },
+    "image": "ghcr.io/owner/selenium-worker:latest",
+    "job_key": "order-1001",
+    "env": {"JOB_NAME": "example"},
     "timeout_secs": 3600,
     "cpu": 1,
     "memory": "2g",
-    "shm": "2g"
+    "shm": "2g",
+    "callback_url": "https://n8n.example/webhook/fairlead"
   }'
 ```
 
-202:
+`202` when a container is started. `200` when `job_key` already exists: the same job is returned and nothing new is started, including while it is still running and after it has finished. A retry of the same URL is safe. The key is local to this machine's SQLite file; another machine does not know it.
 
 ```json
-{"id":"0123abcd..."}
+{"id":"0123abcd","status":"running","image":"ghcr.io/owner/selenium-worker:latest","job_key":"order-1001","started_at":1700000000,"ended_at":null,"exit_code":null,"reason":null,"duration_secs":null}
 ```
 
-429:
+| field | |
+| --- | --- |
+| `image` | Required. Must be on the allowlist. |
+| `job_key` | Optional. 1–200 characters: letters, digits, `.`, `_`, `:`, `-`. |
+| `env` | Optional object of strings. |
+| `timeout_secs` | Optional. Otherwise the default. Above the maximum is `400`. |
+| `cpu` | Optional CPU count, such as `0.5` or `1`. |
+| `memory`, `shm` | Optional bytes, or a Docker-style string: `512m`, `1g`, `64mb`. |
+| `command` | Optional Docker `Cmd`. Omit it to use the image's own entrypoint. |
+| `callback_url` | Optional `http` or `https` URL. Called when the job ends. |
 
-```json
-{"error":"sem slot livre","slots_total":2,"slots_used":2,"slots_free":0}
-```
+`memory` sets Docker `Memory` and `MemorySwap` to the same value, so the container gets no extra swap.
 
-401 é `{"error":"não autorizado"}`. 403 é `{"error":"imagem não permitida"}`.
+Other responses:
 
-Status:
+| code | body |
+| --- | --- |
+| `429` | `{"error":"no free slots","slots_total":2,"slots_used":2,"slots_free":0}` |
+| `503` | `{"error":"draining","draining":true}` while draining. Running jobs are left alone. |
+| `401` | `{"error":"unauthorized"}` |
+| `403` | `{"error":"image is not allowlisted"}` |
+| `400` | `{"error":"..."}` for a bad body, timeout, key, or callback URL. |
+| `502` | `{"error":"failed to start container","id":"...","reason":"start_failed"}` or `{"error":"failed to pull image"}`. A `job_key` on a failed start is kept, so a retry returns `200` with that failure instead of starting again. Use a new key for a new attempt. |
+
+### `GET /v1/jobs/{id}`
 
 ```bash
-curl -sS -H "Authorization: Bearer $N3_TOKEN" "$N3_URL/v1/jobs/0123abcd..."
+curl -sS -H "Authorization: Bearer $FAIRLEAD_TOKEN" \
+  "http://192.0.2.11:8787/v1/jobs/0123abcd?logs=true"
 ```
+
+The row is in SQLite, so this survives a process restart. `?logs=true` adds `logs` (the last `log_lines` lines). While the container is still running those lines are read from Docker; after it exits they are the copy stored before the container is removed.
 
 ```json
-{"id":"0123abcd...","status":"running"}
+{"id":"0123abcd","status":"exited","image":"ghcr.io/owner/selenium-worker:latest","job_key":"order-1001","started_at":1700000000,"ended_at":1700000012,"exit_code":0,"reason":"exited","duration_secs":12,"logs":"..."}
 ```
 
-```json
-{"id":"0123abcd...","status":"exited","exit_code":0}
+`reason` is `exited`, `timeout_kill`, `launcher_kill`, or `start_failed`. `404` is `{"id":"...","status":"not_found"}` for an unknown id or a row that purge has deleted.
+
+When the job ends, fairlead POSTs the same fields (without logs) to `callback_url`. It tries three times, does not follow redirects, and does not hold a slot. Point it at the Kestra or n8n webhook.
+
+### `POST /v1/drain`
+
+```bash
+curl -sS -X POST http://192.0.2.11:8787/v1/drain \
+  -H "Authorization: Bearer $FAIRLEAD_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"draining":true}'
 ```
 
-Corpo do `POST`, tudo opcional menos `image`:
-
-| campo | formato |
-| --- | --- |
-| `image` | referência já listada na allowlist |
-| `env` | objeto de strings. Sem `env`, vale o da imagem. |
-| `timeout_secs` | segundos até o launcher mandar SIGKILL. Sem o campo, vale o default. Acima do máximo, 400. |
-| `cpu` | número de CPUs, por exemplo `0.5` ou `1` |
-| `memory` | bytes inteiros ou string no estilo Docker: `512m`, `1g`, `64mb` |
-| `shm` | igual a `memory`. Chrome/Selenium costuma precisar de `1g` ou `2g`. |
-| `command` | lista de strings, o `Cmd` do Docker. Omita para a imagem de RPA usar o entrypoint dela. O teste de aceitação manda `["sleep","4"]` numa `alpine`. |
-
-Não publique porta, não monte volume e não peça privileged: a API não tem esses campos. A API não é idempotente. Não ligue retry de POST no Kestra nem no n8n para o mesmo IP: se a resposta se perder depois do container ter subido, o retry abre outro.
-
-`memory` iguala `Memory` e `MemorySwap`, então o container não ganha swap além do limite.
+`200` `{"draining":true}`. `{"draining":false}` leaves drain mode. The flag is stored in SQLite, so a restart stays drained. New jobs get `503`. Running jobs finish.
 
 ## Kestra
 
-Crie o secret `N3_LAUNCHER_TOKEN` com o mesmo valor de `N3_TOKEN`. O `timeout: PT20S` de cada task é quanto o Kestra espera a **resposta** do launcher (ele responde assim que o container sobe). A duração do RPA é `timeout_secs` dentro do JSON.
+Create the secret `FAIRLEAD_TOKEN`. The task `timeout` is how long Kestra waits for fairlead to answer, not how long the container may run. That duration is `timeout_secs` in the JSON.
 
-O `runIf` segue para a próxima máquina quando a anterior não devolveu 202: 429, 502, ou a máquina nem respondeu (`allowFailure` deixa o flow continuar e o output não existe). Não aumente o retry de POST do plugin HTTP; o padrão do Kestra já não retenta POST.
+`job_key` is `execution.id`, and POST transport errors are retried on the same URL, so a lost response does not start a second container on that machine. The next machine is used only for `429` and `503`. A machine that never answers fails the flow instead of failing over, because a request that actually landed would be duplicated on the other host (keys are not shared).
 
-Duplique o bloco `maquina_N` para cada IP novo e inclua essa máquina na condição do `Fail`. O arquivo também está em `examples/kestra-disparar-rpa.yml`.
+The same file is `examples/kestra-dispatch.yml`.
 
 ```yaml
-id: disparar_rpa
-namespace: n3.rpa
-
-description: >
-  Envia um job para a primeira máquina n3-launcher com slot livre.
-  429 ou máquina fora do ar segue para o próximo IP.
-  O flow falha só se nenhuma devolver 202.
+id: dispatch_job
+namespace: example.jobs
 
 inputs:
   - id: job_name
     type: STRING
-    defaults: consulta-tj
+    defaults: example-job
 
 tasks:
-  - id: maquina_1
+  - id: host_1
     type: io.kestra.plugin.core.http.Request
-    uri: http://100.64.0.11:8787/v1/jobs
+    uri: http://192.0.2.11:8787/v1/jobs
     method: POST
     contentType: application/json
     timeout: PT20S
     allowFailure: true
     options:
       allowFailed: true
+      retryableTransportFailureMethods:
+        - POST
+      retry:
+        type: constant
+        interval: PT2S
+        maxAttempts: 3
     headers:
-      Authorization: "Bearer {{ secret('N3_LAUNCHER_TOKEN') }}"
+      Authorization: "Bearer {{ secret('FAIRLEAD_TOKEN') }}"
     body: |
       {{ {
-        "image": "ghcr.io/nailtongomes/rpa-worker-selenium:latest",
+        "image": "ghcr.io/owner/selenium-worker:latest",
+        "job_key": execution.id,
         "env": { "JOB_NAME": inputs.job_name },
         "timeout_secs": 3600,
-        "shm": "2g"
+        "shm": "2g",
+        "callback_url": "https://kestra.example/api/v1/executions/webhook/example/jobs/dispatch_job/finish"
       } }}
 
-  - id: maquina_2
+  - id: host_2
     type: io.kestra.plugin.core.http.Request
-    runIf: "{{ outputs.maquina_1 is not defined or outputs.maquina_1.code != 202 }}"
-    uri: http://100.64.0.12:8787/v1/jobs
+    runIf: "{{ outputs.host_1 is defined and (outputs.host_1.code == 429 or outputs.host_1.code == 503) }}"
+    uri: http://192.0.2.12:8787/v1/jobs
     method: POST
     contentType: application/json
     timeout: PT20S
     allowFailure: true
     options:
       allowFailed: true
+      retryableTransportFailureMethods:
+        - POST
+      retry:
+        type: constant
+        interval: PT2S
+        maxAttempts: 3
     headers:
-      Authorization: "Bearer {{ secret('N3_LAUNCHER_TOKEN') }}"
+      Authorization: "Bearer {{ secret('FAIRLEAD_TOKEN') }}"
     body: |
       {{ {
-        "image": "ghcr.io/nailtongomes/rpa-worker-selenium:latest",
+        "image": "ghcr.io/owner/selenium-worker:latest",
+        "job_key": execution.id,
         "env": { "JOB_NAME": inputs.job_name },
         "timeout_secs": 3600,
-        "shm": "2g"
+        "shm": "2g",
+        "callback_url": "https://kestra.example/api/v1/executions/webhook/example/jobs/dispatch_job/finish"
       } }}
 
-  - id: maquina_3
-    type: io.kestra.plugin.core.http.Request
-    runIf: "{{ (outputs.maquina_1 is not defined or outputs.maquina_1.code != 202) and (outputs.maquina_2 is not defined or outputs.maquina_2.code != 202) }}"
-    uri: http://100.64.0.13:8787/v1/jobs
-    method: POST
-    contentType: application/json
-    timeout: PT20S
-    allowFailure: true
-    options:
-      allowFailed: true
-    headers:
-      Authorization: "Bearer {{ secret('N3_LAUNCHER_TOKEN') }}"
-    body: |
-      {{ {
-        "image": "ghcr.io/nailtongomes/rpa-worker-selenium:latest",
-        "env": { "JOB_NAME": inputs.job_name },
-        "timeout_secs": 3600,
-        "shm": "2g"
-      } }}
-
-  - id: nenhuma_aceitou
+  - id: none_accepted
     type: io.kestra.plugin.core.execution.Fail
-    runIf: "{{ (outputs.maquina_1 is not defined or outputs.maquina_1.code != 202) and (outputs.maquina_2 is not defined or outputs.maquina_2.code != 202) and (outputs.maquina_3 is not defined or outputs.maquina_3.code != 202) }}"
-    errorMessage: "Nenhuma máquina aceitou o job (slots cheios ou launchers inacessíveis)."
+    runIf: "{{ (outputs.host_1 is not defined or (outputs.host_1.code != 200 and outputs.host_1.code != 202)) and (outputs.host_2 is not defined or (outputs.host_2.code != 200 and outputs.host_2.code != 202)) }}"
+    errorMessage: "No machine accepted the job (full, draining, or unreachable)."
 ```
 
 ## n8n
 
-A mesma ideia, com um nó HTTP Request por IP, em ordem. Não use o retry do próprio nó: isso martelaria a mesma máquina cheia. O 429 (e qualquer status que não seja 202) sai pela saída falsa do IF e cai no próximo HTTP Request. Erro de conexão não derruba o workflow porque o nó está com "continuar" (`onError: continueRegularOutput`) e a resposta completa vem com `neverError`, então um 429 ainda traz `statusCode`.
+Import `examples/n8n-dispatch.json`. Each HTTP Request node retries the same URL (`retryOnFail`, 3 tries). `200` and `202` stop the chain. `429` and `503` go to the next host. Anything else stops with an error, so a connection failure is not treated as "try the other machine" after the retries are spent.
 
-Defina `N3_LAUNCHER_TOKEN` no processo do n8n e libere a leitura de ambiente (`N8N_BLOCK_ENV_ACCESS_IN_NODE=false`), ou troque a expressão do header por uma credencial Header Auth.
+Set `FAIRLEAD_TOKEN` on the n8n process and allow environment access (`N8N_BLOCK_ENV_ACCESS_IN_NODE=false`), or replace the header expression with a Header Auth credential. `job_key` is `$execution.id`. Put your webhook URL in `callback_url`.
 
-Para um terceiro IP, duplique o par HTTP Request + IF, ligue a saída falsa do IF anterior no novo HTTP Request, a saída verdadeira no nó Aceito, e a saída falsa do último IF no Stop and Error.
+## Acceptance test
 
-Importe `examples/n8n-disparar-rpa.json` (Workflows → Import from File). O JSON:
-
-```json
-{
-  "name": "n3 — disparar RPA",
-  "nodes": [
-    {
-      "parameters": {},
-      "id": "a1b2c3d4-0001-4000-8000-000000000001",
-      "name": "Quando clicar",
-      "type": "n8n-nodes-base.manualTrigger",
-      "typeVersion": 1,
-      "position": [0, 300]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "http://100.64.0.11:8787/v1/jobs",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "Authorization",
-              "value": "={{ 'Bearer ' + $env.N3_LAUNCHER_TOKEN }}"
-            },
-            {
-              "name": "Content-Type",
-              "value": "application/json"
-            }
-          ]
-        },
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ image: 'ghcr.io/nailtongomes/rpa-worker-selenium:latest', env: { JOB_NAME: 'exemplo' }, timeout_secs: 3600, shm: '2g' }) }}",
-        "options": {
-          "timeout": 20000,
-          "response": {
-            "response": {
-              "fullResponse": true,
-              "neverError": true
-            }
-          }
-        }
-      },
-      "id": "a1b2c3d4-0001-4000-8000-000000000002",
-      "name": "Launcher 1",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [280, 300],
-      "onError": "continueRegularOutput"
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "loose",
-            "version": 2
-          },
-          "conditions": [
-            {
-              "id": "cond-202-1",
-              "leftValue": "={{ $json.statusCode }}",
-              "rightValue": 202,
-              "operator": { "type": "number", "operation": "equals" }
-            }
-          ],
-          "combinator": "and"
-        }
-      },
-      "id": "a1b2c3d4-0001-4000-8000-000000000003",
-      "name": "Aceito no 1?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "position": [560, 300]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "http://100.64.0.12:8787/v1/jobs",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "Authorization",
-              "value": "={{ 'Bearer ' + $env.N3_LAUNCHER_TOKEN }}"
-            },
-            {
-              "name": "Content-Type",
-              "value": "application/json"
-            }
-          ]
-        },
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ image: 'ghcr.io/nailtongomes/rpa-worker-selenium:latest', env: { JOB_NAME: 'exemplo' }, timeout_secs: 3600, shm: '2g' }) }}",
-        "options": {
-          "timeout": 20000,
-          "response": {
-            "response": {
-              "fullResponse": true,
-              "neverError": true
-            }
-          }
-        }
-      },
-      "id": "a1b2c3d4-0001-4000-8000-000000000004",
-      "name": "Launcher 2",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [840, 460],
-      "onError": "continueRegularOutput"
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "loose",
-            "version": 2
-          },
-          "conditions": [
-            {
-              "id": "cond-202-2",
-              "leftValue": "={{ $json.statusCode }}",
-              "rightValue": 202,
-              "operator": { "type": "number", "operation": "equals" }
-            }
-          ],
-          "combinator": "and"
-        }
-      },
-      "id": "a1b2c3d4-0001-4000-8000-000000000005",
-      "name": "Aceito no 2?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "position": [1120, 460]
-    },
-    {
-      "parameters": {},
-      "id": "a1b2c3d4-0001-4000-8000-000000000006",
-      "name": "Aceito",
-      "type": "n8n-nodes-base.noOp",
-      "typeVersion": 1,
-      "position": [1400, 200]
-    },
-    {
-      "parameters": {
-        "errorMessage": "Nenhuma máquina aceitou o job (slots cheios ou launchers inacessíveis)."
-      },
-      "id": "a1b2c3d4-0001-4000-8000-000000000007",
-      "name": "Nenhuma aceitou",
-      "type": "n8n-nodes-base.stopAndError",
-      "typeVersion": 1,
-      "position": [1400, 620]
-    }
-  ],
-  "connections": {
-    "Quando clicar": { "main": [[{ "node": "Launcher 1", "type": "main", "index": 0 }]] },
-    "Launcher 1": { "main": [[{ "node": "Aceito no 1?", "type": "main", "index": 0 }]] },
-    "Aceito no 1?": {
-      "main": [
-        [{ "node": "Aceito", "type": "main", "index": 0 }],
-        [{ "node": "Launcher 2", "type": "main", "index": 0 }]
-      ]
-    },
-    "Launcher 2": { "main": [[{ "node": "Aceito no 2?", "type": "main", "index": 0 }]] },
-    "Aceito no 2?": {
-      "main": [
-        [{ "node": "Aceito", "type": "main", "index": 0 }],
-        [{ "node": "Nenhuma aceitou", "type": "main", "index": 0 }]
-      ]
-    }
-  },
-  "active": false,
-  "settings": { "executionOrder": "v1" },
-  "pinData": {},
-  "meta": { "templateCredsSetupCompleted": true },
-  "tags": []
-}
-```
-
-A saída de cima do IF (verdadeiro, 202) vai para Aceito e para. A de baixo (falso: 429, 401, 403, ou conexão sem `statusCode`) vai para a próxima máquina.
-
-## Teste de aceitação
-
-Numa Ubuntu com Docker, de preferência sem outro n3-launcher e sem container já etiquetado `n3.launcher=1`:
+On Ubuntu with Docker, preferably with no other fairlead and no container already labeled `fairlead=1`:
 
 ```bash
 sudo bash scripts/accept.sh
+sudo bash scripts/accept.sh /path/to/fairlead-x86_64-unknown-linux-musl
 ```
 
-Se o binário do release já estiver em disco:
-
-```bash
-sudo bash scripts/accept.sh /caminho/n3-launcher-x86_64-unknown-linux-musl
-```
-
-Sem argumento e sem `target/release/n3-launcher`, o script compila com `cargo build --release` se o Rust estiver instalado. Com systemd de verdade (sudo numa Ubuntu), ele instala o binário em `/usr/local/bin/n3-launcher`, sobe o unit `n3-launcher-accept.service` e, no fim, para e remove esse unit. Os containers `alpine sleep` do teste são apagados. O binário em `/usr/local/bin/n3-launcher` fica.
-
-O script escreve quatro linhas. As quatro precisam aparecer:
+With systemd it installs `/usr/local/bin/fairlead`, starts `fairlead-accept.service`, and removes that unit at the end. The binary stays. It does not touch a production `fairlead.service`. You want:
 
 ```text
 PASS: accepted until full
 PASS: 429 when full
 PASS: slot freed after a job ends
+PASS: metrics exposed
+PASS: idempotent job_key
+PASS: logs returned
+PASS: status survives restart
+PASS: callback delivered
 PASS: timeout kill
+PASS: drain rejects new jobs
+PASS: history purged
 RESULT: all passed
 ```
 
-Ele usa dois slots, a imagem `alpine` e `sleep`. Não aponta para o GHCR e não mexe no unit de produção `n3-launcher.service`.
+## Limits
 
-## Limitações
+- One process per Docker daemon. Two processes can exceed `max_slots`.
+- Stopping the service does not kill containers.
+- A timeout is SIGKILL, with no SIGTERM.
+- `job_key` does not cross machines.
+- Pruning is off unless `prune_interval_secs` is set. It removes stopped containers with the fairlead label, and images recorded in this SQLite file that no container is using. It does not delete images fairlead never launched.
+- Container JSON logs can still fill the disk. Turn on rotation in the Docker daemon.
+- There is no queue, no cross-machine coordination, and no restart of a container that exits on its own.
 
-- Um processo por daemon. Dois launchers no mesmo Docker podem passar de `max_slots`, porque o cadeado é do processo. A contagem em si é a lista do Docker.
-- Parar o serviço não mata os containers. Eles seguem até sair ou até o timeout, e um launcher novo volta a enxergá-los.
-- Timeout é SIGKILL, sem SIGTERM. Um Selenium travado não descarrega o que estava no meio.
-- Código de saída fica na memória do processo (os últimos 256). Container com `--rm` some do Docker.
-- Todo job faz pull. Se a registry falha e a imagem já está local, essa cópia local é usada.
-- O log json-file do Docker pode encher o disco. Ligue a rotação no daemon.
-- Não há fila, retentativa, restart de container falho, UI, banco nem coordenação entre máquinas.
-
-## Desenvolvimento
+## Development
 
 ```bash
 cargo test
 cargo build --release
 ```
 
-O workflow `.github/workflows/ci.yml` roda os testes e confirma que o binário musl é estático. `.github/workflows/release.yml`, numa tag `v*`, anexa `n3-launcher-x86_64-unknown-linux-musl` ao GitHub Release.
-
-Para gerar o binário na mão:
+Static binary:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
-sudo apt-get install -y musl-tools
-cargo build --release --target x86_64-unknown-linux-musl
+sudo apt-get install -y musl-tools build-essential
+CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-O socket usado é `DOCKER_HOST`, se for `unix://...`, ou `/var/run/docker.sock`. Host TCP não é aceito.
+SQLite is bundled, so the musl build needs a C compiler. The socket is `DOCKER_HOST` when it is `unix://...`, otherwise `/var/run/docker.sock`.
+
+License: MIT. See [CONTRIBUTING.md](CONTRIBUTING.md).

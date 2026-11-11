@@ -131,7 +131,7 @@ fn candidate_keys(host: &str) -> Vec<String> {
 
 fn helper_source(helper: &str, server: &str) -> Result<AuthSource, String> {
     if !valid_helper_name(helper) {
-        return Err("nome de credential helper inválido".into());
+        return Err("invalid credential helper name".into());
     }
     Ok(AuthSource::Helper {
         helper: helper.to_string(),
@@ -158,9 +158,9 @@ fn decode_entry(entry: &AuthEntry) -> Result<Option<RegistryAuth>, String> {
     if let Some(auth) = entry.auth.as_deref().filter(|s| !s.is_empty()) {
         let bytes = STANDARD
             .decode(auth.trim())
-            .map_err(|_| "auth do config.json não é base64".to_string())?;
+            .map_err(|_| "docker config auth is not base64".to_string())?;
         let text =
-            String::from_utf8(bytes).map_err(|_| "auth do config.json não é utf-8".to_string())?;
+            String::from_utf8(bytes).map_err(|_| "docker config auth is not utf-8".to_string())?;
         let (user, pass) = text.split_once(':').unwrap_or((text.as_str(), ""));
         return Ok(Some(RegistryAuth {
             username: Some(user.to_string()),
@@ -181,7 +181,7 @@ fn decode_entry(entry: &AuthEntry) -> Result<Option<RegistryAuth>, String> {
 /// Parse the JSON document printed by `docker-credential-* get`.
 pub fn auth_from_helper_output(stdout: &str) -> Result<RegistryAuth, String> {
     let value: Value = serde_json::from_str(stdout)
-        .map_err(|_| "credential helper não devolveu JSON".to_string())?;
+        .map_err(|_| "credential helper did not return JSON".to_string())?;
     let username = value
         .get("Username")
         .and_then(|v| v.as_str())
@@ -213,12 +213,9 @@ mod tests {
         assert_eq!(registry_host("alpine"), "docker.io");
         assert_eq!(registry_host("alpine:3.20"), "docker.io");
         assert_eq!(registry_host("library/alpine"), "docker.io");
+        assert_eq!(registry_host("ghcr.io/owner/selenium-worker:1"), "ghcr.io");
         assert_eq!(
-            registry_host("ghcr.io/nailtongomes/rpa-worker-selenium:1"),
-            "ghcr.io"
-        );
-        assert_eq!(
-            registry_host("ghcr.io/nailtongomes/rpa-worker-selenium@sha256:abc"),
+            registry_host("ghcr.io/owner/selenium-worker@sha256:abc"),
             "ghcr.io"
         );
         assert_eq!(registry_host("localhost:5000/foo:bar"), "localhost:5000");

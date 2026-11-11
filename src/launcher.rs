@@ -1,12 +1,15 @@
 use crate::allowlist::{image_allowed, validate_image_name};
+use crate::callback::{spawn_callback, validate_callback_url};
 use crate::clock::{Clock, SystemClock};
 use crate::config::Settings;
 use crate::runtime::{Inspected, Runtime, RuntimeError, StartSpec};
-use std::collections::{HashMap, VecDeque};
+use crate::store::{JobRecord, NewJob, Store, StoreError};
+use crate::{REASON_EXITED, REASON_LAUNCHER, REASON_START_FAILED, REASON_TIMEOUT};
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-
-const EXIT_CACHE: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
@@ -17,6 +20,8 @@ pub struct LaunchRequest {
     pub memory_bytes: Option<i64>,
     pub shm_bytes: Option<i64>,
     pub command: Option<Vec<String>>,
+    pub job_key: Option<String>,
+    pub callback_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,49 +29,48 @@ pub struct Slots {
     pub total: usize,
     pub used: usize,
     pub free: usize,
+    pub draining: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JobState {
-    Running,
-    Exited { exit_code: i64 },
-    NotFound,
+pub enum LaunchOutcome {
+    Created(JobRecord),
+    Existing(JobRecord),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum LaunchError {
     #[error("{0}")]
     BadRequest(String),
-    #[error("imagem não permitida")]
+    #[error("image is not allowlisted")]
     Forbidden,
-    #[error("sem slot livre")]
+    #[error("no free slots")]
     NoSlots { total: usize, used: usize },
+    #[error("draining")]
+    Draining,
     #[error("{0}")]
     Unavailable(String),
-}
-
-struct ExitLog {
-    map: HashMap<String, i64>,
-    order: VecDeque<String>,
+    #[error("failed to start container")]
+    StartFailed { id: String },
 }
 
 pub struct Launcher {
     settings: Settings,
     runtime: Arc<dyn Runtime>,
     clock: Arc<dyn Clock>,
-    /// shortcut: one process mutex around list+create. The count is still the
-    /// Docker list, so a restart does not forget running jobs. Two launcher
-    /// processes on the same daemon can exceed max_slots. Upgrade to a shared
-    /// lock (flock or a locked volume) if you ever run more than one process.
+    store: Arc<Store>,
+    /// shortcut: one process mutex around list+create. The count itself is the
+    /// Docker list, so a restart does not forget running jobs. Two fairlead
+    /// processes on the same daemon can still exceed max_slots. Upgrade to a
+    /// shared lock if you ever run more than one process.
     slots: Mutex<()>,
-    /// shortcut: exit codes live in memory and vanish on restart. After that,
-    /// an auto-removed container is `not_found`. Upgrade to a small log file
-    /// if operators need the code across restarts.
-    exits: Mutex<ExitLog>,
+    /// Ids the reaper has decided to SIGKILL. The die event and the reaper
+    /// share this so the stored reason is timeout_kill rather than exited.
+    timeouts: Mutex<HashSet<String>>,
 }
 
 impl Launcher {
-    pub fn new(settings: Settings, runtime: Arc<dyn Runtime>) -> Arc<Self> {
+    pub fn new(settings: Settings, runtime: Arc<dyn Runtime>) -> Result<Arc<Self>, StoreError> {
         Self::with_clock(settings, runtime, Arc::new(SystemClock))
     }
 
@@ -74,17 +78,16 @@ impl Launcher {
         settings: Settings,
         runtime: Arc<dyn Runtime>,
         clock: Arc<dyn Clock>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> Result<Arc<Self>, StoreError> {
+        let store = Arc::new(Store::open(&settings.history_path)?);
+        Ok(Arc::new(Self {
             settings,
             runtime,
             clock,
+            store,
             slots: Mutex::new(()),
-            exits: Mutex::new(ExitLog {
-                map: HashMap::new(),
-                order: VecDeque::new(),
-            }),
-        })
+            timeouts: Mutex::new(HashSet::new()),
+        }))
     }
 
     pub fn settings(&self) -> &Settings {
@@ -95,17 +98,33 @@ impl Launcher {
         self.settings.token.matches(provided)
     }
 
+    pub fn draining(&self) -> Result<bool, LaunchError> {
+        self.store.draining().map_err(store_err)
+    }
+
+    pub fn set_draining(&self, draining: bool) -> Result<bool, LaunchError> {
+        self.store.set_draining(draining).map_err(store_err)?;
+        tracing::info!(draining, "drain mode");
+        Ok(draining)
+    }
+
     pub async fn slots(&self) -> Result<Slots, LaunchError> {
         let used = self.runtime.running_count().await.map_err(unavailable)?;
         let total = self.settings.max_slots;
+        let draining = self.draining()?;
         Ok(Slots {
             total,
             used,
             free: total.saturating_sub(used),
+            draining,
         })
     }
 
-    pub async fn launch(&self, req: LaunchRequest) -> Result<String, LaunchError> {
+    pub fn counts(&self) -> Result<crate::store::JobCounts, LaunchError> {
+        self.store.counts().map_err(store_err)
+    }
+
+    pub async fn launch(&self, req: LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
         validate_image_name(&req.image).map_err(LaunchError::BadRequest)?;
         if !image_allowed(&req.image, &self.settings.allowlist) {
             return Err(LaunchError::Forbidden);
@@ -113,7 +132,19 @@ impl Launcher {
         let timeout = resolve_timeout(req.timeout_secs, &self.settings)?;
         let env = validate_env(req.env)?;
         let command = validate_command(req.command)?;
+        let job_key = validate_job_key(req.job_key)?;
+        let callback_url = validate_callback(req.callback_url)?;
         let nano_cpus = req.cpu.map(nano_cpus).transpose()?;
+
+        if self.draining()? {
+            return Err(LaunchError::Draining);
+        }
+        if let Some(key) = &job_key {
+            if let Some(existing) = self.store.get_by_key(key).map_err(store_err)? {
+                return Ok(LaunchOutcome::Existing(existing));
+            }
+        }
+
         let spec = StartSpec {
             image: req.image.clone(),
             env,
@@ -124,12 +155,20 @@ impl Launcher {
             shm_bytes: req.shm_bytes,
         };
 
-        self.runtime.pull(&spec.image).await.map_err(|e| {
-            tracing::warn!(image = %spec.image, error = %e, "pull falhou");
-            LaunchError::Unavailable("falha ao baixar a imagem".into())
+        self.runtime.pull(&spec.image).await.map_err(|err| {
+            tracing::warn!(image = %spec.image, error = %err, "pull failed");
+            LaunchError::Unavailable("failed to pull image".into())
         })?;
 
         let _guard = self.slots.lock().await;
+        if self.draining()? {
+            return Err(LaunchError::Draining);
+        }
+        if let Some(key) = &job_key {
+            if let Some(existing) = self.store.get_by_key(key).map_err(store_err)? {
+                return Ok(LaunchOutcome::Existing(existing));
+            }
+        }
         let used = self.runtime.running_count().await.map_err(unavailable)?;
         if used >= self.settings.max_slots {
             return Err(LaunchError::NoSlots {
@@ -137,106 +176,377 @@ impl Launcher {
                 used,
             });
         }
-        let id = self.runtime.start(&spec).await.map_err(|e| {
-            tracing::warn!(image = %spec.image, error = %e, "start falhou");
-            LaunchError::Unavailable("falha ao iniciar o container".into())
-        })?;
-        tracing::info!(%id, image = %spec.image, timeout_secs = timeout, "job aceito");
-        Ok(id)
+
+        let id = match self.runtime.start(&spec).await {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::warn!(image = %spec.image, error = %err, "start failed");
+                let failed_id = random_id();
+                let record = NewJob {
+                    id: failed_id.clone(),
+                    image: spec.image.clone(),
+                    job_key: job_key.clone(),
+                    started_at: self.clock.now_unix() as i64,
+                    callback_url: callback_url.clone(),
+                };
+                match self
+                    .store
+                    .insert_terminal(&record, REASON_START_FAILED, None)
+                {
+                    Ok(()) => {
+                        if let Ok(Some(saved)) = self.store.get(&failed_id) {
+                            self.fire_callback(&saved);
+                        }
+                    }
+                    Err(StoreError::Conflict) => {
+                        if let Some(key) = &job_key {
+                            if let Ok(Some(existing)) = self.store.get_by_key(key) {
+                                return Ok(LaunchOutcome::Existing(existing));
+                            }
+                        }
+                    }
+                    Err(err) => tracing::warn!(error = %err, "could not record start failure"),
+                }
+                return Err(LaunchError::StartFailed { id: failed_id });
+            }
+        };
+
+        let record = NewJob {
+            id: id.clone(),
+            image: spec.image.clone(),
+            job_key: job_key.clone(),
+            started_at: self.clock.now_unix() as i64,
+            callback_url,
+        };
+        match self.store.insert_running(&record) {
+            Ok(()) => {}
+            Err(StoreError::Conflict) => {
+                // Another process won the job_key. Drop the container we just started.
+                self.discard_loser(&id, &spec.image).await;
+                if let Some(key) = &job_key {
+                    if let Some(existing) = self.store.get_by_key(key).map_err(store_err)? {
+                        return Ok(LaunchOutcome::Existing(existing));
+                    }
+                }
+                return Err(LaunchError::Unavailable("job_key conflict".into()));
+            }
+            Err(err) => return Err(store_err(err)),
+        }
+        let saved = self
+            .store
+            .get(&id)
+            .map_err(store_err)?
+            .ok_or_else(|| LaunchError::Unavailable("job disappeared after insert".into()))?;
+        tracing::info!(%id, image = %spec.image, timeout_secs = timeout, "job accepted");
+        Ok(LaunchOutcome::Created(saved))
     }
 
-    pub async fn job(&self, id: &str) -> Result<JobState, LaunchError> {
+    pub async fn job(&self, id: &str, with_logs: bool) -> Result<Option<JobRecord>, LaunchError> {
         if !valid_container_id(id) {
-            return Ok(JobState::NotFound);
+            return Ok(None);
         }
-        match self.runtime.inspect(id).await.map_err(unavailable)? {
-            Inspected::Running => Ok(JobState::Running),
-            Inspected::Exited { exit_code } => {
-                self.record_exit(id, exit_code).await;
-                Ok(JobState::Exited { exit_code })
-            }
-            Inspected::NotFound => {
-                if let Some(exit_code) = self.exit_of(id).await {
-                    Ok(JobState::Exited { exit_code })
-                } else {
-                    Ok(JobState::NotFound)
+        let Some(mut record) = self.store.get(id).map_err(store_err)? else {
+            return Ok(None);
+        };
+        if !record.is_finished() {
+            match self.runtime.inspect(id).await.map_err(unavailable)? {
+                Inspected::Running => {}
+                Inspected::Exited { exit_code } => {
+                    self.complete(id, Some(exit_code)).await;
+                    if let Some(updated) = self.store.get(id).map_err(store_err)? {
+                        record = updated;
+                    }
+                }
+                Inspected::NotFound => {
+                    self.complete(id, None).await;
+                    if let Some(updated) = self.store.get(id).map_err(store_err)? {
+                        record = updated;
+                    }
                 }
             }
         }
+        if !with_logs {
+            record.logs = None;
+        } else if !record.is_finished() {
+            record.logs = self
+                .runtime
+                .tail_logs(id, self.settings.log_lines)
+                .await
+                .ok();
+        } else if record.logs.is_none() {
+            record.logs = Some(String::new());
+        }
+        Ok(Some(record))
     }
 
-    pub async fn record_exit(&self, id: &str, code: i64) {
-        if !valid_container_id(id) {
+    /// Called from the Docker die event and from the reaper.
+    pub async fn on_exit(&self, id: &str, exit_code: i64) {
+        self.complete(id, Some(exit_code)).await;
+    }
+
+    async fn complete(&self, id: &str, exit_code: Option<i64>) {
+        let Some(current) = self.store.get(id).ok().flatten() else {
+            return;
+        };
+        if current.is_finished() {
+            let _ = self.runtime.remove(id).await;
             return;
         }
-        let mut log = self.exits.lock().await;
-        if !log.map.contains_key(id) {
-            log.order.push_back(id.to_string());
-            while log.order.len() > EXIT_CACHE {
-                if let Some(old) = log.order.pop_front() {
-                    log.map.remove(&old);
-                }
+        let timed_out = self.timeouts.lock().await.contains(id);
+        let reason = if timed_out {
+            REASON_TIMEOUT
+        } else {
+            REASON_EXITED
+        };
+        let logs = self
+            .runtime
+            .tail_logs(id, self.settings.log_lines)
+            .await
+            .unwrap_or_default();
+        let logs = clip_logs(&logs, self.settings.log_lines);
+        let code = exit_code.or(if timed_out { Some(137) } else { None });
+        let ended = self.clock.now_unix() as i64;
+        match self.store.finish(id, ended, code, reason, &logs) {
+            Ok(Some(job)) => {
+                self.timeouts.lock().await.remove(id);
+                let _ = self.runtime.remove(id).await;
+                self.fire_callback(&job);
             }
+            Ok(None) => {
+                let _ = self.runtime.remove(id).await;
+            }
+            Err(err) => tracing::warn!(%id, error = %err, "could not finish job"),
         }
-        // A later `die` event overwrites the 137 we guess at kill time.
-        log.map.insert(id.to_string(), code);
     }
 
-    async fn exit_of(&self, id: &str) -> Option<i64> {
-        self.exits.lock().await.map.get(id).copied()
-    }
-
-    /// Kill containers whose deadline has passed. SIGKILL's conventional code is 137;
-    /// a later Docker `die` event may overwrite it with the real code.
     pub async fn reap_once(&self) -> Result<Vec<String>, LaunchError> {
         let now = self.clock.now_unix();
         let ids = self.runtime.list_expired(now).await.map_err(unavailable)?;
         let mut killed = Vec::new();
         for id in ids {
-            match self.runtime.kill(&id).await {
-                Ok(()) => {
-                    self.record_exit(&id, 137).await;
-                    tracing::info!(%id, "timeout: container morto");
-                    killed.push(id);
-                }
-                Err(e) => {
-                    tracing::warn!(%id, error = %e, "falha ao matar container vencido");
-                }
+            self.timeouts.lock().await.insert(id.clone());
+            if let Err(err) = self.runtime.kill(&id).await {
+                tracing::warn!(%id, error = %err, "failed to kill expired container");
+                continue;
             }
+            self.complete(&id, Some(137)).await;
+            tracing::info!(%id, "timeout: container killed");
+            killed.push(id);
         }
         Ok(killed)
     }
+
+    pub fn purge_once(&self) -> Result<usize, LaunchError> {
+        let days = self.settings.history_days;
+        let now = self.clock.now_unix() as i64;
+        // history_days = 0 purges every finished row on the next pass.
+        let cutoff = now.saturating_sub((days as i64).saturating_mul(86_400));
+        let removed = if days == 0 {
+            self.store
+                .purge_finished_before(now.saturating_add(1))
+                .map_err(store_err)?
+        } else {
+            self.store
+                .purge_finished_before(cutoff)
+                .map_err(store_err)?
+        };
+        if removed > 0 {
+            tracing::info!(removed, "purged old jobs");
+        }
+        Ok(removed)
+    }
+
+    pub async fn prune_once(&self) -> Result<(usize, usize), LaunchError> {
+        let stopped = self.runtime.list_stopped().await.map_err(unavailable)?;
+        let mut containers = 0usize;
+        for id in stopped {
+            if self
+                .store
+                .get(&id)
+                .map_err(store_err)?
+                .is_some_and(|job| !job.is_finished())
+            {
+                self.complete(&id, None).await;
+            }
+            match self.runtime.remove(&id).await {
+                Ok(()) => containers += 1,
+                Err(err) => tracing::warn!(%id, error = %err, "prune could not remove container"),
+            }
+        }
+        let mut images = 0usize;
+        for image in self.store.images().map_err(store_err)? {
+            match self.runtime.image_in_use(&image).await {
+                Ok(true) => {}
+                Ok(false) => match self.runtime.remove_image(&image).await {
+                    Ok(()) => images += 1,
+                    Err(err) => {
+                        tracing::warn!(%image, error = %err, "prune could not remove image")
+                    }
+                },
+                Err(err) => tracing::warn!(%image, error = %err, "prune image check failed"),
+            }
+        }
+        if containers + images > 0 {
+            tracing::info!(containers, images, "pruned");
+        }
+        Ok((containers, images))
+    }
+
+    /// After a restart, close rows whose containers are already gone and send
+    /// any callback that was missed while the process was down.
+    pub async fn reconcile(&self) {
+        let ids = match self.store.running_ids() {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(error = %err, "reconcile");
+                return;
+            }
+        };
+        for id in ids {
+            match self.runtime.inspect(&id).await {
+                Ok(Inspected::Running) => {}
+                Ok(Inspected::Exited { exit_code }) => self.complete(&id, Some(exit_code)).await,
+                Ok(Inspected::NotFound) => self.complete(&id, None).await,
+                Err(err) => tracing::warn!(%id, error = %err, "reconcile inspect failed"),
+            }
+        }
+    }
+
+    async fn discard_loser(&self, id: &str, image: &str) {
+        let _ = self.runtime.kill(id).await;
+        let _ = self.runtime.remove(id).await;
+        let record = NewJob {
+            id: id.to_string(),
+            image: image.to_string(),
+            job_key: None,
+            started_at: self.clock.now_unix() as i64,
+            callback_url: None,
+        };
+        if self
+            .store
+            .insert_terminal(&record, REASON_LAUNCHER, Some(137))
+            .is_err()
+        {
+            tracing::warn!(%id, "could not record launcher_kill");
+        }
+    }
+
+    fn fire_callback(&self, job: &JobRecord) {
+        let Some(url) = job.callback_url.clone() else {
+            return;
+        };
+        let body = callback_body(job);
+        spawn_callback(url, body);
+    }
 }
 
-pub fn spawn_reaper(launcher: Arc<Launcher>) {
-    let interval = launcher.settings.reaper_interval;
+pub fn spawn_maintenance(launcher: Arc<Launcher>) {
+    let reaper = launcher.settings.reaper_interval;
+    let purge = launcher.settings.purge_interval;
+    let prune = launcher.settings.prune_interval;
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut since_reap = std::time::Duration::ZERO;
+        let mut since_purge = std::time::Duration::ZERO;
+        let mut since_prune = std::time::Duration::ZERO;
         loop {
-            ticker.tick().await;
-            if let Err(e) = launcher.reap_once().await {
-                tracing::warn!(error = %e, "reaper");
+            ticks.tick().await;
+            let step = std::time::Duration::from_secs(1);
+            since_reap += step;
+            since_purge += step;
+            since_prune += step;
+            if since_reap >= reaper {
+                since_reap = std::time::Duration::ZERO;
+                if let Err(err) = launcher.reap_once().await {
+                    tracing::warn!(error = %err, "reaper");
+                }
+            }
+            if since_purge >= purge {
+                since_purge = std::time::Duration::ZERO;
+                if let Err(err) = launcher.purge_once() {
+                    tracing::warn!(error = %err, "purge");
+                }
+            }
+            if !prune.is_zero() && since_prune >= prune {
+                since_prune = std::time::Duration::ZERO;
+                if let Err(err) = launcher.prune_once().await {
+                    tracing::warn!(error = %err, "prune");
+                }
             }
         }
     });
 }
 
+pub fn callback_body(job: &JobRecord) -> Value {
+    json!({
+        "id": job.id,
+        "job_key": job.job_key,
+        "image": job.image,
+        "status": job.status(),
+        "exit_code": job.exit_code,
+        "reason": job.reason,
+        "started_at": job.started_at,
+        "ended_at": job.ended_at,
+        "duration_secs": job.duration_secs(),
+    })
+}
+
+pub fn metrics_text(slots: Slots, counts: crate::store::JobCounts) -> String {
+    format!(
+        "\
+# HELP fairlead_slots_total Configured slot capacity.
+# TYPE fairlead_slots_total gauge
+fairlead_slots_total {total}
+# HELP fairlead_slots_used Running containers labeled fairlead=1.
+# TYPE fairlead_slots_used gauge
+fairlead_slots_used {used}
+# HELP fairlead_slots_free Slots not currently taken. Not offered while draining.
+# TYPE fairlead_slots_free gauge
+fairlead_slots_free {free}
+# HELP fairlead_draining 1 while new jobs are refused.
+# TYPE fairlead_draining gauge
+fairlead_draining {draining}
+# HELP fairlead_jobs_started_total Jobs recorded in SQLite, including those still running.
+# TYPE fairlead_jobs_started_total counter
+fairlead_jobs_started_total {started}
+# HELP fairlead_jobs_finished_total Jobs that have ended.
+# TYPE fairlead_jobs_finished_total counter
+fairlead_jobs_finished_total {finished}
+# HELP fairlead_jobs_timeout_total Jobs ended with reason timeout_kill.
+# TYPE fairlead_jobs_timeout_total counter
+fairlead_jobs_timeout_total {timeouts}
+",
+        total = slots.total,
+        used = slots.used,
+        free = slots.free,
+        draining = if slots.draining { 1 } else { 0 },
+        started = counts.started,
+        finished = counts.finished,
+        timeouts = counts.timeouts,
+    )
+}
+
 fn unavailable(err: RuntimeError) -> LaunchError {
     tracing::warn!(error = %err, "docker");
-    LaunchError::Unavailable("docker indisponível".into())
+    LaunchError::Unavailable("docker is unavailable".into())
+}
+
+fn store_err(err: StoreError) -> LaunchError {
+    tracing::warn!(error = %err, "sqlite");
+    LaunchError::Unavailable("job history is unavailable".into())
 }
 
 fn resolve_timeout(requested: Option<u64>, settings: &Settings) -> Result<u64, LaunchError> {
     let timeout = requested.unwrap_or(settings.default_timeout_secs);
     if timeout == 0 {
         return Err(LaunchError::BadRequest(
-            "timeout_secs deve ser maior que zero".into(),
+            "timeout_secs must be greater than zero".into(),
         ));
     }
     if timeout > settings.max_timeout_secs {
         return Err(LaunchError::BadRequest(format!(
-            "timeout_secs {timeout} acima do máximo {}",
+            "timeout_secs {timeout} is above the maximum {}",
             settings.max_timeout_secs
         )));
     }
@@ -246,7 +556,7 @@ fn resolve_timeout(requested: Option<u64>, settings: &Settings) -> Result<u64, L
 fn validate_env(env: HashMap<String, String>) -> Result<Vec<String>, LaunchError> {
     if env.len() > 128 {
         return Err(LaunchError::BadRequest(
-            "env aceita no máximo 128 variáveis".into(),
+            "env accepts at most 128 variables".into(),
         ));
     }
     let mut out = Vec::with_capacity(env.len());
@@ -260,13 +570,11 @@ fn validate_env(env: HashMap<String, String>) -> Result<Vec<String>, LaunchError
             && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         if !ok {
             return Err(LaunchError::BadRequest(format!(
-                "variável de ambiente inválida: {key}"
+                "invalid environment variable: {key}"
             )));
         }
         if value.len() > 16 * 1024 || value.contains('\0') {
-            return Err(LaunchError::BadRequest(format!(
-                "valor inválido para {key}"
-            )));
+            return Err(LaunchError::BadRequest(format!("invalid value for {key}")));
         }
         out.push(format!("{key}={value}"));
     }
@@ -282,28 +590,51 @@ fn validate_command(command: Option<Vec<String>>) -> Result<Option<Vec<String>>,
     }
     if command.len() > 32 {
         return Err(LaunchError::BadRequest(
-            "command aceita no máximo 32 argumentos".into(),
+            "command accepts at most 32 arguments".into(),
         ));
     }
     for arg in &command {
         if arg.is_empty() || arg.len() > 4096 || arg.contains('\0') {
-            return Err(LaunchError::BadRequest(
-                "argumento de command inválido".into(),
-            ));
+            return Err(LaunchError::BadRequest("invalid command argument".into()));
         }
     }
     Ok(Some(command))
 }
 
+fn validate_job_key(job_key: Option<String>) -> Result<Option<String>, LaunchError> {
+    let Some(key) = job_key else {
+        return Ok(None);
+    };
+    if key.is_empty()
+        || key.len() > 200
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+    {
+        return Err(LaunchError::BadRequest(
+            "job_key must be 1-200 characters of letters, digits, '.', '_', ':' or '-'".into(),
+        ));
+    }
+    Ok(Some(key))
+}
+
+fn validate_callback(callback_url: Option<String>) -> Result<Option<String>, LaunchError> {
+    let Some(url) = callback_url else {
+        return Ok(None);
+    };
+    validate_callback_url(&url).map_err(LaunchError::BadRequest)?;
+    Ok(Some(url))
+}
+
 fn nano_cpus(cpu: f64) -> Result<i64, LaunchError> {
     if !cpu.is_finite() || cpu <= 0.0 || cpu > 128.0 {
         return Err(LaunchError::BadRequest(
-            "cpu deve ser um número entre 0 e 128".into(),
+            "cpu must be a number between 0 and 128".into(),
         ));
     }
     let nano = (cpu * 1_000_000_000.0).round();
     if nano < 1.0 || nano > i64::MAX as f64 {
-        return Err(LaunchError::BadRequest("cpu inválido".into()));
+        return Err(LaunchError::BadRequest("cpu is invalid".into()));
     }
     Ok(nano as i64)
 }
@@ -312,23 +643,61 @@ pub fn valid_container_id(id: &str) -> bool {
     (1..=64).contains(&id.len()) && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+fn random_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:032x}{n:08x}")[..32].to_string()
+}
+
+fn clip_logs(text: &str, lines: usize) -> String {
+    let mut kept: Vec<&str> = text.lines().collect();
+    if kept.len() > lines {
+        kept = kept.split_off(kept.len() - lines);
+    }
+    let mut joined = kept.join("\n");
+    if text.ends_with('\n') && !joined.is_empty() {
+        joined.push('\n');
+    }
+    if joined.len() > 256 * 1024 {
+        let mut start = joined.len() - 256 * 1024;
+        while start < joined.len() && !joined.is_char_boundary(start) {
+            start += 1;
+        }
+        joined = joined[start..].to_string();
+    }
+    joined
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clock::FakeClock;
     use crate::config::Settings;
     use crate::mock::MockRuntime;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn settings(slots: usize) -> Settings {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("fairlead-launch-{n}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         Settings::from_toml_and_env(
             &format!(
                 r#"
                 token = "test-token-value-ok"
                 max_slots = {slots}
-                allowlist = ["alpine", "ghcr.io/nailtongomes/rpa-worker-selenium"]
+                allowlist = ["alpine", "ghcr.io/owner/selenium-worker"]
                 default_timeout_secs = 30
                 max_timeout_secs = 120
-                "#
+                history_path = "{}"
+                history_days = 30
+                "#,
+                dir.join("jobs.sqlite").display()
             ),
             &HashMap::new(),
         )
@@ -339,7 +708,7 @@ mod tests {
         let mock = Arc::new(MockRuntime::new());
         let clock = Arc::new(FakeClock::new(1_700_000_000));
         let runtime: Arc<dyn Runtime> = mock.clone();
-        let launcher = Launcher::with_clock(settings(slots), runtime, clock.clone());
+        let launcher = Launcher::with_clock(settings(slots), runtime, clock.clone()).unwrap();
         (launcher, mock, clock)
     }
 
@@ -352,6 +721,8 @@ mod tests {
             memory_bytes: None,
             shm_bytes: None,
             command: Some(vec!["sleep".into(), "30".into()]),
+            job_key: None,
+            callback_url: None,
         }
     }
 
@@ -366,34 +737,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_kills_only_expired_and_remembers_the_code() {
+    async fn timeout_kills_and_history_survives_a_new_process() {
         let (launcher, mock, clock) = harness(1);
-        let id = launcher.launch(job("alpine", Some(10))).await.unwrap();
+        let LaunchOutcome::Created(created) =
+            launcher.launch(job("alpine", Some(10))).await.unwrap()
+        else {
+            panic!("expected a new job");
+        };
+        let id = created.id;
         clock.set(1_700_000_009);
         assert!(launcher.reap_once().await.unwrap().is_empty());
-        assert_eq!(launcher.job(&id).await.unwrap(), JobState::Running);
+        let running = launcher.job(&id, false).await.unwrap().unwrap();
+        assert_eq!(running.status(), "running");
 
         clock.set(1_700_000_010);
         assert_eq!(launcher.reap_once().await.unwrap(), vec![id.clone()]);
         assert_eq!(mock.killed().await, vec![id.clone()]);
-        assert!(mock.running_ids().await.is_empty());
-        assert_eq!(
-            launcher.job(&id).await.unwrap(),
-            JobState::Exited { exit_code: 137 }
-        );
+        let finished = launcher.job(&id, true).await.unwrap().unwrap();
+        assert_eq!(finished.reason.as_deref(), Some(REASON_TIMEOUT));
+        assert_eq!(finished.exit_code, Some(137));
+        assert!(finished.logs.unwrap().contains("log "));
 
-        let again = launcher.launch(job("alpine", Some(10))).await.unwrap();
-        assert_ne!(again, id);
+        let path = launcher.settings().history_path.clone();
+        let clock2 = Arc::new(FakeClock::new(1_700_000_011));
+        let empty = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = empty.clone();
+        let mut settings = settings(1);
+        settings.history_path = path;
+        settings.token = launcher.settings().token.clone();
+        let restarted = Launcher::with_clock(settings, runtime, clock2).unwrap();
+        let again = restarted.job(&id, true).await.unwrap().unwrap();
+        assert_eq!(again.reason.as_deref(), Some(REASON_TIMEOUT));
+        assert_eq!(again.exit_code, Some(137));
     }
 
     #[tokio::test]
-    async fn natural_exit_is_remembered_after_removal() {
-        let (launcher, _, _) = harness(1);
-        launcher.record_exit("abc123", 0).await;
-        assert_eq!(
-            launcher.job("abc123").await.unwrap(),
-            JobState::Exited { exit_code: 0 }
-        );
-        assert_eq!(launcher.job("nope").await.unwrap(), JobState::NotFound);
+    async fn a_running_job_is_visible_from_a_new_process() {
+        let (launcher, mock, clock) = harness(1);
+        let LaunchOutcome::Created(created) = launcher.launch(job("alpine", None)).await.unwrap()
+        else {
+            panic!("created");
+        };
+        let path = launcher.settings().history_path.clone();
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let mut restarted_settings = settings(1);
+        restarted_settings.history_path = path;
+        let restarted = Launcher::with_clock(restarted_settings, runtime, clock).unwrap();
+        let view = restarted.job(&created.id, false).await.unwrap().unwrap();
+        assert_eq!(view.status(), "running");
+        assert_eq!(view.id, created.id);
+    }
+
+    #[tokio::test]
+    async fn start_failure_is_recorded_and_the_key_is_not_retried() {
+        let (launcher, mock, _) = harness(1);
+        mock.fail_start(true).await;
+        let mut req = job("alpine", None);
+        req.job_key = Some("once".into());
+        let err = launcher.launch(req.clone()).await.unwrap_err();
+        let LaunchError::StartFailed { id } = err else {
+            panic!("expected start failure");
+        };
+        let LaunchOutcome::Existing(existing) = launcher.launch(req).await.unwrap() else {
+            panic!("retry should see the failed row");
+        };
+        assert_eq!(existing.id, id);
+        assert_eq!(existing.reason.as_deref(), Some(REASON_START_FAILED));
+        assert_eq!(mock.start_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn same_job_key_does_not_start_twice() {
+        let (launcher, mock, _) = harness(2);
+        let mut first = job("alpine", None);
+        first.job_key = Some("run-1".into());
+        let second = first.clone();
+        let LaunchOutcome::Created(created) = launcher.launch(first).await.unwrap() else {
+            panic!("created");
+        };
+        let LaunchOutcome::Existing(existing) = launcher.launch(second).await.unwrap() else {
+            panic!("existing");
+        };
+        assert_eq!(created.id, existing.id);
+        assert_eq!(mock.start_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn drain_rejects_before_a_container_starts() {
+        let (launcher, mock, _) = harness(1);
+        launcher.set_draining(true).unwrap();
+        let err = launcher.launch(job("alpine", None)).await.unwrap_err();
+        assert!(matches!(err, LaunchError::Draining));
+        assert_eq!(mock.start_count().await, 0);
+        assert!(launcher.slots().await.unwrap().draining);
+        launcher.set_draining(false).unwrap();
+        assert!(launcher.launch(job("alpine", None)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn purge_uses_the_configured_window() {
+        let (launcher, _, clock) = harness(1);
+        let LaunchOutcome::Created(created) =
+            launcher.launch(job("alpine", Some(10))).await.unwrap()
+        else {
+            panic!("created");
+        };
+        clock.set(1_700_000_000 + 10);
+        launcher.reap_once().await.unwrap();
+        clock.set(1_700_000_000 + 10 + 31 * 86_400);
+        assert_eq!(launcher.purge_once().unwrap(), 1);
+        assert!(launcher.job(&created.id, false).await.unwrap().is_none());
     }
 }

@@ -36,6 +36,12 @@ pub trait Runtime: Send + Sync {
     async fn inspect(&self, id: &str) -> Result<Inspected, RuntimeError>;
     async fn list_expired(&self, now_unix: u64) -> Result<Vec<String>, RuntimeError>;
     async fn kill(&self, id: &str) -> Result<(), RuntimeError>;
+    async fn tail_logs(&self, id: &str, lines: usize) -> Result<String, RuntimeError>;
+    async fn remove(&self, id: &str) -> Result<(), RuntimeError>;
+    /// Stopped containers that still carry our label.
+    async fn list_stopped(&self) -> Result<Vec<String>, RuntimeError>;
+    async fn image_in_use(&self, image: &str) -> Result<bool, RuntimeError>;
+    async fn remove_image(&self, image: &str) -> Result<(), RuntimeError>;
     /// Remove our containers left in `created` after a crash between create and start.
     async fn cleanup_created(&self) -> Result<usize, RuntimeError>;
 }

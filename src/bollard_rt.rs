@@ -103,7 +103,7 @@ impl Runtime for BollardRuntime {
             match self.pull_once(&reference, creds).await {
                 Ok(()) => return Ok(()),
                 Err(err) => {
-                    tracing::warn!(error = %err, %image, "pull autenticado falhou; tentando anônimo");
+                    tracing::warn!(error = %err, %image, "authenticated pull failed; trying anonymous");
                     authed_err = Some(err);
                 }
             }
@@ -115,7 +115,7 @@ impl Runtime for BollardRuntime {
                 let local = self.image_present(image).await
                     || (reference != image && self.image_present(&reference).await);
                 if local {
-                    tracing::warn!(error = %err, %image, "pull falhou; usando imagem local");
+                    tracing::warn!(error = %err, %image, "pull failed; using the local image");
                     Ok(())
                 } else {
                     Err(err)
@@ -143,12 +143,13 @@ impl Runtime for BollardRuntime {
             cmd: spec.command.clone(),
             labels: Some(labels),
             host_config: Some(HostConfig {
-                auto_remove: Some(true),
+                // AutoRemove would delete the container before we can read logs.
+                // We remove it ourselves after the log tail is stored.
+                auto_remove: Some(false),
                 nano_cpus: spec.nano_cpus,
                 memory: spec.memory_bytes,
                 // shortcut: MemorySwap == Memory disables extra swap. Upgrade if a
-                // job must page. AutoRemove is ignored when a restart policy is set;
-                // we do not set one, and we do not restart failed containers.
+                // job must page. No restart policy: a failed container stays stopped.
                 memory_swap: spec.memory_bytes,
                 shm_size: spec.shm_bytes,
                 ..Default::default()
@@ -164,7 +165,7 @@ impl Runtime for BollardRuntime {
             .await
             .map_err(docker_err)?;
         if !created.warnings.is_empty() {
-            tracing::warn!(id = %created.id, warnings = ?created.warnings, "avisos ao criar");
+            tracing::warn!(id = %created.id, warnings = ?created.warnings, "create warnings");
         }
         if let Err(err) = self
             .docker
@@ -177,7 +178,7 @@ impl Runtime for BollardRuntime {
                 .remove_container(&created.id, Some(remove))
                 .await
             {
-                tracing::warn!(id = %created.id, error = %rm, "não removi o container que não subiu");
+                tracing::warn!(id = %created.id, error = %rm, "could not remove the container that failed to start");
             }
             return Err(docker_err(err));
         }
@@ -247,13 +248,81 @@ impl Runtime for BollardRuntime {
         }
         Ok(removed)
     }
+
+    async fn tail_logs(&self, id: &str, lines: usize) -> Result<String, RuntimeError> {
+        let tail = lines.max(1).to_string();
+        let options = bollard::query_parameters::LogsOptionsBuilder::new()
+            .stdout(true)
+            .stderr(true)
+            .tail(&tail)
+            .build();
+        let mut stream = self.docker.logs(id, Some(options));
+        let mut buf = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => buf.push_str(&chunk.to_string()),
+                Err(err) if is_status(&err, 404) => break,
+                Err(err) => return Err(docker_err(err)),
+            }
+        }
+        Ok(buf)
+    }
+
+    async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
+        let options = RemoveContainerOptionsBuilder::new().force(true).build();
+        match self.docker.remove_container(id, Some(options)).await {
+            Ok(()) => Ok(()),
+            Err(err) if is_status(&err, 404) => Ok(()),
+            Err(err) => Err(docker_err(err)),
+        }
+    }
+
+    async fn list_stopped(&self) -> Result<Vec<String>, RuntimeError> {
+        let mut ids = Vec::new();
+        for status in ["exited", "dead"] {
+            for container in self.list_labeled(status).await? {
+                if !is_ours(&container.labels) {
+                    continue;
+                }
+                if let Some(id) = container.id {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    async fn image_in_use(&self, image: &str) -> Result<bool, RuntimeError> {
+        let filters = HashMap::from([("ancestor".to_string(), vec![image.to_string()])]);
+        let options = ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&filters)
+            .build();
+        let list = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .map_err(docker_err)?;
+        Ok(!list.is_empty())
+    }
+
+    async fn remove_image(&self, image: &str) -> Result<(), RuntimeError> {
+        let options = bollard::query_parameters::RemoveImageOptionsBuilder::new()
+            .force(false)
+            .build();
+        self.docker
+            .remove_image(image, Some(options), None)
+            .await
+            .map(|_| ())
+            .map_err(docker_err)
+    }
 }
 
 pub fn spawn_exit_watcher(docker: Docker, launcher: Arc<Launcher>) {
     tokio::spawn(async move {
         loop {
             if let Err(err) = watch_once(&docker, &launcher).await {
-                tracing::warn!(error = %err, "stream de eventos do docker caiu");
+                tracing::warn!(error = %err, "docker event stream ended");
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -274,7 +343,7 @@ async fn watch_once(docker: &Docker, launcher: &Launcher) -> Result<(), RuntimeE
     while let Some(item) = stream.next().await {
         let event = item.map_err(docker_err)?;
         if let Some((id, code)) = exit_from_event(&event) {
-            launcher.record_exit(&id, code).await;
+            launcher.on_exit(&id, code).await;
         }
     }
     Ok(())
@@ -326,7 +395,7 @@ fn load_credentials(path: &std::path::Path, image: &str) -> Option<DockerCredent
     let source = match auth_from_docker_config(&text, image) {
         Ok(source) => source,
         Err(err) => {
-            tracing::warn!(error = %err, "config.json do docker ignorado");
+            tracing::warn!(error = %err, "ignoring docker config.json");
             return None;
         }
     };
@@ -336,7 +405,7 @@ fn load_credentials(path: &std::path::Path, image: &str) -> Option<DockerCredent
         AuthSource::Helper { helper, server } => match run_helper(&helper, &server) {
             Ok(auth) => auth,
             Err(err) => {
-                tracing::warn!(error = %err, "credential helper falhou; pull anônimo");
+                tracing::warn!(error = %err, "credential helper failed; anonymous pull");
                 return None;
             }
         },
@@ -356,7 +425,7 @@ fn to_docker_credentials(auth: RegistryAuth, image: &str) -> DockerCredentials {
 
 fn run_helper(helper: &str, server: &str) -> Result<RegistryAuth, String> {
     if !valid_helper_name(helper) {
-        return Err("credential helper inválido".into());
+        return Err("invalid credential helper name".into());
     }
     // shortcut: no timeout around the helper. Upgrade with a 5s cap if one hangs.
     // The server name goes on stdin, never on the command line.
@@ -366,7 +435,7 @@ fn run_helper(helper: &str, server: &str) -> Result<RegistryAuth, String> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|err| format!("não executei {bin}: {err}"))?;
+        .map_err(|err| format!("could not run {bin}: {err}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         let _ = stdin.write_all(server.as_bytes());
@@ -375,7 +444,7 @@ fn run_helper(helper: &str, server: &str) -> Result<RegistryAuth, String> {
         .wait_with_output()
         .map_err(|err| format!("credential helper: {err}"))?;
     if !output.status.success() {
-        return Err(format!("credential helper saiu com {}", output.status));
+        return Err(format!("credential helper exited with {}", output.status));
     }
     auth_from_helper_output(&String::from_utf8_lossy(&output.stdout))
 }

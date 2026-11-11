@@ -1,10 +1,12 @@
 [package]
-name = "n3-launcher"
-version = "0.1.0"
+name = "fairlead"
+version = "0.2.0"
 edition = "2021"
-description = "Lança containers de RPA sob demanda, com slots limitados por máquina."
-publish = false
+description = "Start allowlisted containers on one machine, up to a fixed number of slots."
+license = "MIT"
+readme = "README.md"
 rust-version = "1.85"
+publish = false
 
 [dependencies]
 async-trait = "0.1"
@@ -12,6 +14,8 @@ axum = "0.8"
 base64 = "0.22"
 bollard = { version = "0.21", default-features = false, features = ["pipe"] }
 futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

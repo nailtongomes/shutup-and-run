@@ -1,25 +1,37 @@
-# IP privado ou Tailscale desta máquina. Não use 0.0.0.0.
-listen = "100.64.0.11:8787"
+# Private interface or Tailscale address. Do not use 0.0.0.0.
+listen = "192.0.2.11:8787"
 
-# Quantos containers nossos podem rodar ao mesmo tempo.
+# How many of our containers may run at once.
 max_slots = 2
 
-# Sem tag: qualquer tag ou digest daquele repositório.
-# Com tag: só aquela tag (e o digest dela).
+# An entry without a tag allows any tag or digest of that repository.
+# An entry with a tag allows only that tag.
 allowlist = [
-  "ghcr.io/nailtongomes/rpa-worker-selenium",
+  "ghcr.io/owner/selenium-worker",
 ]
 
-# Usados quando o pedido não traz timeout_secs, e como teto do pedido.
 default_timeout_secs = 3600
 max_timeout_secs = 21600
 
-# De quanto em quanto tempo um container vencido é morto. Padrão: 2.
+# How often a container past its deadline is killed. Default 2.
 # reaper_interval_secs = 2
 
-# Caminho do config.json do `docker login`. Padrão: $HOME/.docker/config.json
-# (com HOME=/root no unit, isso é /root/.docker/config.json).
+# SQLite job history. Default /var/lib/fairlead/jobs.sqlite
+# history_path = "/var/lib/fairlead/jobs.sqlite"
+# Finished rows older than this many days are deleted. 0 purges on the next pass.
+# history_days = 30
+# purge_interval_secs = 3600
+
+# Log lines kept per job and returned with ?logs=true. Default 200.
+# log_lines = 200
+
+# 0 disables pruning. Otherwise, seconds between sweeps of our stopped
+# containers and of images this process recorded that nothing is using.
+# prune_interval_secs = 0
+
+# Path to the docker CLI config.json. Default: $DOCKER_CONFIG/config.json
+# or $HOME/.docker/config.json (HOME=/root in the unit file).
 # docker_config = "/root/.docker/config.json"
 
-# O token NÃO fica aqui. Ponha em /etc/n3-launcher/env:
-#   N3_TOKEN=...
+# Prefer the token in /etc/fairlead/env (mode 600):
+#   FAIRLEAD_TOKEN=...
