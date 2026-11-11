@@ -1,0 +1,45 @@
+{
+  "name": "shutup-and-run — offer a task",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "shutup-and-run-poll",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "name": "Poll",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 300],
+      "webhookId": "shutup-and-run-poll"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.headers.authorization === ('Bearer ' + $env.SHUTUP_AND_RUN_POLL_TOKEN) ? { task: { image: 'ghcr.io/owner/selenium-worker:latest', job_key: 'example-1', env: { JOB_NAME: 'example' }, timeout_secs: 3600, callback_url: 'https://n8n.example/webhook/shutup-and-run' } } : {}) }}",
+        "options": {}
+      },
+      "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [280, 300]
+    }
+  ],
+  "connections": {
+    "Poll": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {}
+}

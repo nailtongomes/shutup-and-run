@@ -1,0 +1,36 @@
+# Server side of pull mode. The launcher POSTs to the webhook URL Kestra prints
+# for this trigger. Put that URL in SHUTUP_AND_RUN_POLL_URL (the key is in the path).
+# Kestra does not read Authorization. The path key is the secret.
+#
+# The HTTP body is the flow outputs. The output id must be `task`.
+# Nothing to do: set task to null, so the body is {"task": null}.
+# A task: task is the same object as POST /v1/jobs, so the body is {"task": {...}}.
+# Replace the static object with a queue lookup. Offer the same job_key until
+# the callback arrives. A static object is only the shape.
+
+id: offer_task
+namespace: example.jobs
+
+tasks:
+  - id: decide
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      task:
+        image: ghcr.io/owner/selenium-worker:latest
+        job_key: example-1
+        env:
+          JOB_NAME: example
+        timeout_secs: 3600
+        callback_url: https://kestra.example/api/v1/executions/webhook/example/jobs/finish/FINISH_KEY
+
+outputs:
+  - id: task
+    type: JSON
+    value: "{{ outputs.decide.values.task }}"
+
+triggers:
+  - id: poll
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "{{ secret('POLL_WEBHOOK_KEY') }}"
+    wait: true
+    returnOutputs: true

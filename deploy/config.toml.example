@@ -1,0 +1,43 @@
+# Private interface or Tailscale address. Do not use 0.0.0.0.
+listen = "192.0.2.11:8787"
+
+# How many of our containers may run at once.
+max_slots = 2
+
+# An entry without a tag allows any tag or digest of that repository.
+# An entry with a tag allows only that tag.
+allowlist = [
+  "ghcr.io/owner/selenium-worker",
+]
+
+default_timeout_secs = 3600
+max_timeout_secs = 21600
+
+# How often a container past its deadline is killed. Default 2.
+# reaper_interval_secs = 2
+
+# SQLite job history. Default /var/lib/shutup-and-run/jobs.sqlite
+# history_path = "/var/lib/shutup-and-run/jobs.sqlite"
+# Finished rows older than this many days are deleted. 0 purges on the next pass.
+# history_days = 30
+# purge_interval_secs = 3600
+
+# Log lines kept per job and returned with ?logs=true. Default 200.
+# log_lines = 200
+
+# 0 disables pruning. Otherwise, seconds between sweeps of our stopped
+# containers and of images this process recorded that nothing is using.
+# prune_interval_secs = 0
+
+# Path to the docker CLI config.json. Default: $DOCKER_CONFIG/config.json
+# or $HOME/.docker/config.json (HOME=/root in the unit file).
+# docker_config = "/root/.docker/config.json"
+
+# Prefer the token in /etc/shutup-and-run/env (mode 600):
+#   SHUTUP_AND_RUN_TOKEN=...
+
+# Optional pull. Unset means this process only accepts POST /v1/jobs.
+# poll_url = "https://orchestrator.example/poll"
+# poll_interval_secs = 15
+# The poll bearer token is not a key in this file. Add it to the env file:
+#   SHUTUP_AND_RUN_POLL_TOKEN=...

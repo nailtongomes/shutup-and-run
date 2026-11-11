@@ -1,0 +1,243 @@
+{
+  "name": "shutup-and-run — dispatch job",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "11111111-1111-4111-8111-111111111111",
+      "name": "Manual",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://192.0.2.11:8787/v1/jobs",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.SHUTUP_AND_RUN_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ image: 'ghcr.io/owner/selenium-worker:latest', job_key: $execution.id, env: { JOB_NAME: 'example' }, timeout_secs: 3600, shm: '2g', callback_url: 'https://n8n.example/webhook/shutup-and-run' }) }}",
+        "options": {
+          "allowUnauthorizedCerts": true,
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "22222222-2222-4222-8222-222222222222",
+      "name": "Host 1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [260, 300],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "accepted-1",
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 202,
+              "operator": { "type": "number", "operation": "equals" }
+            },
+            {
+              "id": "replay-1",
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 200,
+              "operator": { "type": "number", "operation": "equals" }
+            }
+          ],
+          "combinator": "or"
+        }
+      },
+      "id": "33333333-3333-4333-8333-333333333333",
+      "name": "Accepted on 1?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [540, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "full-1",
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 429,
+              "operator": { "type": "number", "operation": "equals" }
+            },
+            {
+              "id": "drain-1",
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 503,
+              "operator": { "type": "number", "operation": "equals" }
+            }
+          ],
+          "combinator": "or"
+        }
+      },
+      "id": "44444444-4444-4444-8444-444444444444",
+      "name": "Full or draining?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [820, 460]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://192.0.2.12:8787/v1/jobs",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.SHUTUP_AND_RUN_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ image: 'ghcr.io/owner/selenium-worker:latest', job_key: $execution.id, env: { JOB_NAME: 'example' }, timeout_secs: 3600, shm: '2g', callback_url: 'https://n8n.example/webhook/shutup-and-run' }) }}",
+        "options": {
+          "allowUnauthorizedCerts": true,
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "55555555-5555-4555-8555-555555555555",
+      "name": "Host 2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 360],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "accepted-2",
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 202,
+              "operator": { "type": "number", "operation": "equals" }
+            },
+            {
+              "id": "replay-2",
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 200,
+              "operator": { "type": "number", "operation": "equals" }
+            }
+          ],
+          "combinator": "or"
+        }
+      },
+      "id": "66666666-6666-4666-8666-666666666666",
+      "name": "Accepted on 2?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1360, 360]
+    },
+    {
+      "parameters": {},
+      "id": "77777777-7777-4777-8777-777777777777",
+      "name": "Accepted",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1620, 200]
+    },
+    {
+      "parameters": {
+        "errorMessage": "No machine accepted the job (full, draining, or unreachable)."
+      },
+      "id": "88888888-8888-4888-8888-888888888888",
+      "name": "None accepted",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [1620, 560]
+    }
+  ],
+  "connections": {
+    "Manual": {
+      "main": [[{ "node": "Host 1", "type": "main", "index": 0 }]]
+    },
+    "Host 1": {
+      "main": [[{ "node": "Accepted on 1?", "type": "main", "index": 0 }]]
+    },
+    "Accepted on 1?": {
+      "main": [
+        [{ "node": "Accepted", "type": "main", "index": 0 }],
+        [{ "node": "Full or draining?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Full or draining?": {
+      "main": [
+        [{ "node": "Host 2", "type": "main", "index": 0 }],
+        [{ "node": "None accepted", "type": "main", "index": 0 }]
+      ]
+    },
+    "Host 2": {
+      "main": [[{ "node": "Accepted on 2?", "type": "main", "index": 0 }]]
+    },
+    "Accepted on 2?": {
+      "main": [
+        [{ "node": "Accepted", "type": "main", "index": 0 }],
+        [{ "node": "None accepted", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "meta": { "templateCredsSetupCompleted": true },
+  "tags": []
+}
