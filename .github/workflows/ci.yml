@@ -25,9 +25,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: release binary
         run: cargo build --release --locked
-      - name: acceptance
+      - name: acceptance, then smoke.sh against the same instance
         timeout-minutes: 30
-        run: sudo bash scripts/accept.sh "${GITHUB_WORKSPACE}/target/release/shutup-and-run"
+        run: sudo SHUTUP_AND_RUN_SMOKE=1 bash scripts/accept.sh "${GITHUB_WORKSPACE}/target/release/shutup-and-run"
 
   musl:
     runs-on: ubuntu-latest

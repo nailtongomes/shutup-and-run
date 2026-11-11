@@ -3,6 +3,7 @@
 #
 #   sudo bash scripts/accept.sh
 #   sudo bash scripts/accept.sh /path/to/shutup-and-run
+#   sudo SHUTUP_AND_RUN_SMOKE=1 bash scripts/accept.sh   # then scripts/smoke.sh on the same instance
 #
 # Do not run this on a machine that is already serving jobs. Test containers
 # use the label shutup-and-run=1 and count against every shutup-and-run on this Docker.
@@ -14,7 +15,6 @@ CALLBACK_PORT=18788
 BASE="http://127.0.0.1:${PORT}"
 FAILURES=0
 MODE=none
-PID=
 CB_PID=
 IDS=()
 WORK=
@@ -32,7 +32,7 @@ dump_logs() {
 }
 
 # Reachable from the EXIT trap. Shellcheck does not count that as a call.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   if [[ -n "${CB_PID}" ]]; then
     kill "$CB_PID" >/dev/null 2>&1 || true
@@ -42,9 +42,8 @@ cleanup() {
     systemctl stop shutup-and-run-accept.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/shutup-and-run-accept.service
     systemctl daemon-reload >/dev/null 2>&1 || true
-  elif [[ -n "${PID}" ]]; then
-    kill "$PID" >/dev/null 2>&1 || true
-    wait "$PID" >/dev/null 2>&1 || true
+  elif [[ -n "$WORK" && -s "$WORK/pid" ]]; then
+    kill "$(cat "$WORK/pid")" >/dev/null 2>&1 || true
   fi
   if ((${#IDS[@]} > 0)); then
     docker rm -f "${IDS[@]}" >/dev/null 2>&1 || true
@@ -163,6 +162,7 @@ Restart=no
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
+  printf '#!/usr/bin/env bash\nsystemctl restart shutup-and-run-accept.service\n' >"$WORK/restart.sh"
   if ! systemctl start shutup-and-run-accept.service; then
     echo "FAIL: systemctl did not start shutup-and-run-accept.service"
     MODE=systemd
@@ -178,21 +178,40 @@ else
   else
     BIN_RUN=$BIN
   fi
-  SHUTUP_AND_RUN_CONFIG="$WORK/config.toml" HOME="${HOME:-/tmp}" "$BIN_RUN" >"$WORK/shutup-and-run.log" 2>&1 &
-  PID=$!
+  # Start and restart are the same script, so smoke.sh can restart it too.
+  cat >"$WORK/restart.sh" <<EOF
+#!/usr/bin/env bash
+pid=\$(cat "${WORK}/pid" 2>/dev/null)
+if [[ -n "\$pid" ]]; then
+  kill "\$pid" >/dev/null 2>&1
+  for _ in \$(seq 1 50); do
+    kill -0 "\$pid" 2>/dev/null || break
+    grep -q '^State:[[:space:]]*Z' "/proc/\$pid/status" 2>/dev/null && break
+    sleep 0.1
+  done
+fi
+SHUTUP_AND_RUN_CONFIG="${WORK}/config.toml" HOME="${HOME:-/tmp}" nohup "${BIN_RUN}" >>"${WORK}/shutup-and-run.log" 2>&1 &
+echo \$! >"${WORK}/pid"
+EOF
+  rm -f "$WORK/pid" "$WORK/shutup-and-run.log"
+  bash "$WORK/restart.sh"
   MODE=background
-  echo "mode: background pid ${PID} (no systemd here; on Ubuntu with sudo the script installs the unit)"
+  echo "mode: background pid $(cat "$WORK/pid") (no systemd here; on Ubuntu with sudo the script installs the unit)"
 fi
 
+wait_ready() {
+  ready=0
+  for _ in $(seq 1 50); do
+    if curl -sf -m 2 -H "Authorization: Bearer ${TOKEN}" "$BASE/health" >/dev/null; then
+      ready=1
+      break
+    fi
+    sleep 0.2
+  done
+}
+
 SHUTUP_AND_RUN_CONFIG="$WORK/config.toml" "$BIN" bans lift 127.0.0.1 >/dev/null 2>&1 || true
-ready=0
-for _ in $(seq 1 50); do
-  if curl -sf -m 2 -H "Authorization: Bearer ${TOKEN}" "$BASE/health" >/dev/null; then
-    ready=1
-    break
-  fi
-  sleep 0.2
-done
+wait_ready
 if [[ "$ready" -ne 1 ]]; then
   echo "FAIL: the service did not answer $BASE/health"
   dump_logs
@@ -299,22 +318,8 @@ else
   fail "logs returned (http ${log_code})"
 fi
 
-if [[ "$MODE" == systemd ]]; then
-  systemctl restart shutup-and-run-accept.service
-else
-  kill "$PID" >/dev/null 2>&1 || true
-  wait "$PID" >/dev/null 2>&1 || true
-  SHUTUP_AND_RUN_CONFIG="$WORK/config.toml" HOME="${HOME:-/tmp}" "$BIN_RUN" >"$WORK/shutup-and-run.log" 2>&1 &
-  PID=$!
-fi
-ready=0
-for _ in $(seq 1 50); do
-  if curl -sf -m 2 -H "Authorization: Bearer ${TOKEN}" "$BASE/health" >/dev/null; then
-    ready=1
-    break
-  fi
-  sleep 0.2
-done
+bash "$WORK/restart.sh"
+wait_ready
 restart_code=$(get_job "$LONG")
 if [[ "$ready" == 1 && "$restart_code" == 200 ]] && grep -q '"status"[[:space:]]*:[[:space:]]*"running"' "$WORK/status.json"; then
   pass "status survives restart"
@@ -434,6 +439,29 @@ if [[ "$restored" == 200 ]]; then
   pass "ban lifted"
 else
   fail "ban lifted (health ${restored})"
+fi
+
+# Optional second pass: the smoke test, against this same instance, with every
+# scenario switched on. A skipped scenario counts as a failure here.
+if [[ "${SHUTUP_AND_RUN_SMOKE:-}" == 1 ]]; then
+  echo
+  if ((${#IDS[@]} > 0)); then
+    docker rm -f "${IDS[@]}" >/dev/null 2>&1 || true
+  fi
+  sed -i 's/^history_days = 0$/history_days = 30/' "$WORK/config.toml"
+  cat >>"$WORK/config.toml" <<EOF
+poll_url = "http://127.0.0.1:18790/poll"
+poll_interval_secs = 2
+EOF
+  bash "$WORK/restart.sh"
+  wait_ready
+  SMOKE_URL="$BASE" SMOKE_TOKEN="$TOKEN" SMOKE_IMAGE=alpine SMOKE_POLL=1 SMOKE_STUB_PORT=18790 \
+    SMOKE_RESTART_CMD="bash $WORK/restart.sh" \
+    SMOKE_BAN_LIFT_CMD="env SHUTUP_AND_RUN_CONFIG=$WORK/config.toml $BIN bans lift" \
+    bash "$ROOT/scripts/smoke.sh" 2>&1 | tee "$WORK/smoke.out"
+  if [[ "${PIPESTATUS[0]}" -ne 0 ]] || grep -q '^SKIP:' "$WORK/smoke.out"; then
+    fail "smoke.sh"
+  fi
 fi
 
 echo
