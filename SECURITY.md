@@ -1,6 +1,6 @@
 # Security
 
-shutup-and-run talks to the Docker socket. A valid token can start any allowlisted image with any environment variables. Treat the token as a root password. There is one owner.
+shutup-and-run talks to the Docker socket. A valid token can start any allowlisted image with any environment variables. Treat the token as a root password. There is one token and one caller. When the machine belongs to someone else, [docs/CONVENTIONS.md](docs/CONVENTIONS.md) says what each side accepts.
 
 What the operator must do, and which defaults a request cannot turn off, is [docs/CONVENTIONS.md](docs/CONVENTIONS.md). This file is how the process behaves. That file is what you accept by running it. The process does not add checks for rules a person can follow.
 

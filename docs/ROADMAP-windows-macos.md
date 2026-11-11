@@ -1,6 +1,14 @@
 # Windows and macOS client
 
-This describes a future program that runs on a person's computer. Nothing in this repository implements it. The Linux service stays a Linux service. Do not treat the open questions as decisions.
+This describes how shutup-and-run will run on a person's computer. Nothing in this repository implements it yet.
+
+## Decided on 2026-11-11
+
+- It is the same product and the same Rust binary, not a separate client. It accepts pushed jobs or polls for them, like the Linux service.
+- On macOS a job is a container.
+- On Windows a job may be a script instead of a container. The binary downloads the script from a URL and runs it with no WSL and no Docker around it. The owner of the machine accepts that loss of isolation in order to run the automation. Script mode is for Windows only.
+
+That answers questions 1 (a binary), 3 (both), and 13 (this repository) in the list at the end, and part of 2 (the script path does not require WSL). The rest of this file is the earlier description. Where it disagrees with the three points above, the points above win. The other open questions are still open, and the integrity requirement below still stands.
 
 ## What it would do
 

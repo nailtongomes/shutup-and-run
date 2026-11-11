@@ -204,6 +204,8 @@ Container logs are Docker's. Limit them in `/etc/docker/daemon.json` with `"log-
 
 ## Check a machine after any change
 
+`SMOKE_IMAGE` must be on the machine's allowlist. Use your worker if it has `sh` and `sleep`. Otherwise allowlist `ghcr.io/nailtongomes/shutup-and-run-smoke` (a small Python image, the default when `SMOKE_IMAGE` is unset) or `hello-world` (fewer checks, because it has no shell).
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/smoke.sh | sudo SMOKE_LOCAL=1 SMOKE_IMAGE=ghcr.io/you/worker bash
 ```

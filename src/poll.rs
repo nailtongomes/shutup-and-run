@@ -88,8 +88,8 @@ pub(crate) async fn poll_once(
         return Ok(PollOutcome::Idle);
     };
     // The slot check only decides whether to ask. launch() checks again.
-    // A refused task is not stored, except a start that fails after the image
-    // is accepted, which matches POST /v1/jobs.
+    // A refused task is not stored. An accepted one is, even when the image
+    // then fails to pull, which matches POST /v1/jobs.
     let slots = launcher
         .slots()
         .await

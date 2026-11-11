@@ -22,7 +22,7 @@ When `poll_url` is set, the same process also asks that URL for one task on an i
 
 `serve` (the default command) loads config, connects to a local Docker unix socket, opens SQLite, and serves HTTPS (or plain HTTP when `http = true`). The HTTPS listener is HTTP/1.1 only and closes a connection that sends no request within 10 seconds. Every route goes through middleware that bans the peer after repeated bad tokens and then checks `Authorization: Bearer`.
 
-`POST /v1/jobs` parses a body with `deny_unknown_fields` and calls `Launcher::launch`. Launch checks the image name, the allowlist, timeout, env, command, `job_key`, and `callback_url`. It pulls the image, then holds one process mutex while it rechecks drain, the key, and the running count, and creates the container. The host config sets cpu, memory, memory swap equal to memory, and shm. It does not set mounts, ports, or privileged.
+`POST /v1/jobs` parses a body with `deny_unknown_fields` and calls `Launcher::launch`. Launch checks the image name, the allowlist, timeout, env, command, `job_key`, and `callback_url`. Then it holds one process mutex while it checks drain, the key, and the slot count, writes the row, and answers `202`. A spawned task pulls the image and creates the container, named `shutup-and-run-<job id>`. A pull or start that fails closes the row with `start_failed`. The ids of jobs between `202` and a running container are in `Launcher::starting`; they count as used slots. The host config sets cpu, memory, memory swap equal to memory, and shm. It does not set mounts, ports, or privileged.
 
 A background task reaps containers past the deadline label with SIGKILL, purges old rows, and optionally prunes. Docker events and a reconcile pass on startup close rows when a container exits. An optional `callback_url` is POSTed three times with no redirects and does not hold a slot.
 
@@ -39,9 +39,9 @@ Pull mode is `spawn_poller` in `src/poll.rs`. It is not started when `poll_url` 
 | `src/config.rs` | TOML plus env. Unknown TOML fields refuse startup. `PollToken` redacts Debug. |
 | `src/api.rs` | Routes, auth middleware, client IP, shared job JSON parse (`launch_request_from_slice`). |
 | `src/auth.rs` | SHA-256 of the token, compared with `subtle`. Bearer parsing. |
-| `src/launcher.rs` | Slot mutex, `launch`, reaper, purge, prune, reconcile, metrics text. |
+| `src/launcher.rs` | Slot mutex, `launch` (answers, then pulls and starts in a task), reaper, purge, prune, reconcile, metrics text. |
 | `src/poll.rs` | Optional outbound poll. Same launch path. |
-| `src/allowlist.rs` | Image name check and repository match (`repo` allows `repo:tag` and `repo@digest`, not `repo-evil`). |
+| `src/allowlist.rs` | Image name check and repository match (`repo` allows `repo:tag` and `repo@digest`, not `repo-evil` and not `repo:5000/x`; a pinned entry is exact). |
 | `src/runtime.rs` | `Runtime` trait and `StartSpec`. |
 | `src/bollard_rt.rs` | Docker create/start/kill/logs/prune. Host config is built here. |
 | `src/registry.rs` | Pull credentials from the machine's Docker config. The request cannot supply them. |
@@ -54,11 +54,12 @@ Pull mode is `spawn_poller` in `src/poll.rs`. It is not started when `poll_url` 
 | `scripts/install.sh` | Ubuntu install: Docker, token, self-signed cert, systemd, optional ufw. |
 | `scripts/accept.sh` | End-to-end test against a real Docker daemon. Starts its own instance. `SHUTUP_AND_RUN_SMOKE=1` then runs `smoke.sh` on it. |
 | `scripts/smoke.sh` | Twelve scenarios against an instance that is already running, through the API only. |
+| `examples/smoke-image/` | The Python image `smoke.sh` runs by default. `image.yml` publishes it. |
 | `docs/RECIPES.md` | Copy-and-paste answers: firewall, pinning, NAT, a client's machine, stop everything. |
 | `docs/REVIEW-2026-11-11.md` | The last run of the review prompt below, with issue text for what was deferred. |
 | `deploy/` | Example config and the systemd unit. |
 | `.github/workflows/ci.yml` | fmt, clippy, test, shellcheck, accept.sh with smoke.sh, musl static check, scratch image, install.sh from a local release with smoke.sh. |
-| `.github/workflows/image.yml` | GHCR image on `main` (`:edge`) and on `v*` tags. |
+| `.github/workflows/image.yml` | GHCR image on `main` (`:edge`) and on `v*` tags, and the smoke image. |
 | `.github/workflows/release.yml` | `v*` tag attaches the musl binary and `SHA256SUMS`, then runs the one-line install and smoke.sh on a fresh runner. |
 
 ## Config
@@ -137,25 +138,29 @@ Each heading in [DECISIONS.md](DECISIONS.md) is the context, the choice, and the
 
 - [Push, no queue](DECISIONS.md#push-no-queue). `429` and `503` are the failover signals.
 - [Slots come from Docker labels](DECISIONS.md#slots-come-from-docker-labels). One process mutex. Two processes can overshoot.
-- [Idempotency is `job_key`, on one machine](DECISIONS.md#idempotency-is-job_key-on-one-machine). A failed start keeps the key.
+- [Idempotency is `job_key`, on one machine](DECISIONS.md#idempotency-is-job_key-on-one-machine). A failed pull or start keeps the key.
+- [202 before the pull](DECISIONS.md#202-before-the-pull) and [No cancel call](DECISIONS.md#no-cancel-call).
+- [A machine someone else lends](DECISIONS.md#a-machine-someone-else-lends).
 - [Every route requires the bearer token](DECISIONS.md#every-route-requires-the-bearer-token) and [Three failures, then 48 hours](DECISIONS.md#three-failures-then-48-hours).
 - [Public IP and TLS in the binary](DECISIONS.md#public-ip-and-tls-in-the-binary). Plain HTTP is opt-in.
 - [No volumes, published ports, or privileged](DECISIONS.md#no-volumes-published-ports-or-privileged).
 - [Pull, optional](DECISIONS.md#pull-optional). Unset means the old behavior.
 - [Security is a convention](DECISIONS.md#security-is-a-convention). Do not add a sandbox in a drive-by review.
-- [Windows and macOS later](DECISIONS.md#windows-and-macos-later). Documentation only.
+- [Windows and macOS: the same product](DECISIONS.md#windows-and-macos-the-same-product). Decided, not built.
 
 ## Known risks
 
 These are accepted, not a bug list. A review should confirm they are still true in the code.
 
 - The Docker socket is root on the host. The token is that power, limited by the allowlist and by the host config the code actually sets (`src/bollard_rt.rs`).
-- Allowlist matching is a string prefix of the repository, not a signature or a digest pin, unless the operator pins a tag (`src/allowlist.rs`).
+- Allowlist matching is a string match on the repository, not a signature. An entry pinned to a tag or digest is exact (`src/allowlist.rs`).
 - Job containers get Docker's default capabilities, user, and bridge network. The code does not drop capabilities or set `privileged: false` explicitly; it leaves those fields at the API default and does not take them from the request.
 - `memory` is optional. An omitted limit does not cap the container.
 - `callback_url` is any http(s) URL the host can reach. No private-address block (`src/callback.rs`).
 - `poll_url` is an outbound POST to an operator-chosen URL. Unset token means no Authorization header. A redirect is not followed.
-- A task can be lost if the server deletes it when it offers it and the launcher then refuses (slot taken, not allowlisted). `job_key` is stored on a failed start, same as POST. The README tells the server to offer the same key until the callback.
+- A task can be lost if the server deletes it when it offers it and the launcher then refuses (slot taken, not allowlisted). An accepted task keeps its `job_key` even if the image fails to pull. The README tells the server to offer the same key until the callback.
+- A job answered with `202` and still pulling its image exists only in memory. A graceful stop waits 30 seconds for it. A crash, or a longer pull, ends it: the row is closed at the next start and the callback says so.
+- `202` does not mean the image exists. A wrong tag is a `start_failed` job, not an error on the POST.
 - `trust_x_forwarded_for` trusts the first header value. The default is off (`src/api.rs`).
 - Bans key off the peer IP. A shared NAT can lock out everyone behind it. The ban is an empty `403` even with the right token.
 - SQLite uses `Mutex::lock().expect`. A poisoned lock panics the calling task (`src/store.rs`).
@@ -164,25 +169,31 @@ These are accepted, not a bug list. A review should confirm they are still true 
 - Two shutup-and-run processes on one daemon can exceed `max_slots`.
 - Stopping the service does not kill containers. A timeout is SIGKILL only. While the service is stopped nothing enforces a timeout.
 - A client that keeps reconnecting can still hold connections on the TLS listener. It sends no token, so it is not banned. The defense is a firewall rule ([RECIPES.md](RECIPES.md)).
-- The findings in [REVIEW-2026-11-11.md](REVIEW-2026-11-11.md) marked medium and low are open. Two of them are in the allowlist match.
-- There is no cancel call. Ending a job early needs a shell on the machine.
+- Four medium and six low findings in [REVIEW-2026-11-11.md](REVIEW-2026-11-11.md) are open. The allowlist ones are fixed.
+- There is no cancel call, by decision. Ending a job early needs a shell on the machine.
 
 ## Open TODOs
 
 - The Windows and macOS client in [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md). No code. The open questions there are undecided. The integrity check (sha256 or signature) is required before that client runs a downloaded script.
-- GHCR: if the package was created private, the owner still has to switch it to public for anonymous pulls. That is a registry setting, not a code change.
+- GHCR: if a package was created private, the owner still has to switch it to public for anonymous pulls. That applies to `shutup-and-run` and to `shutup-and-run-smoke`. It is a registry setting, not a code change.
+
+## Answered by the owner on 2026-11-11
+
+1. Allowlist match: fixed.
+2. Slow answers while pulling: `202` now comes before the pull. See DECISIONS.
+3. Cancel: no.
+4. Installer without an allowlist: it installs and warns.
+5. Smoke image: `hello-world`, or the Python image in `examples/smoke-image`.
+6. Windows and macOS: the same binary, with a script mode on Windows only. See DECISIONS and the roadmap.
+7. Lent machines: CONVENTIONS now covers them.
 
 ## Open questions for the owner
 
-Nothing here was built. Each one needs a yes or a no.
-
-1. Allowlist match (review M2, M3). A one-word entry such as `alpine` also allows `alpine:5000/x`, and a tag-pinned entry allows any digest. Both fixes are a few lines in `src/allowlist.rs`. They were left because the instruction was to fix only Critical and High. Fix them next?
-2. `429` after the pull (review L1). A full machine pulls the image before it answers `429`. An early slot check would make failover faster. Do it?
-3. Cancel. The API cannot end a job, so `smoke.sh` waits for its jobs and an operator needs SSH to kill one. Is `DELETE /v1/jobs/{id}` wanted, or does that stay out?
-4. Installer default allowlist. Without `SHUTUP_AND_RUN_ALLOWLIST` the installer writes the placeholder `ghcr.io/owner/selenium-worker`, a namespace the operator does not own. Should the installer refuse to run without the variable instead?
-5. Smoke image. `smoke.sh` needs an allowlisted image with a shell. [CONVENTIONS.md](CONVENTIONS.md) says not to allowlist public library images, and CI uses `busybox`. Is a small image of your own (for example `ghcr.io/nailtongomes/smoke`) worth publishing, or is "use one of your workers" enough?
-6. Windows and macOS. "The same worker" could mean this binary, built for macOS against Docker Desktop's socket and run inside WSL2 on Windows. That keeps one code base. [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md) describes something else, a client that runs downloaded Python scripts without Docker. Which one is the goal? Neither was tried here.
-7. Client machines. [CONVENTIONS.md](CONVENTIONS.md) says one machine, one owner, and "there is no flag that makes a shared host safe". [RECIPES.md](RECIPES.md) now has a section for a client who lends a machine and accepts that risk knowingly. If you agree with that reading, CONVENTIONS should say so. It was not edited.
+1. Script mode on Windows. The roadmap requires a sha256 or a signature before a downloaded script runs. Where does the hash come from: the task JSON, a file beside the script, or a signature with a key you hold? Nothing should be built before this is answered.
+2. macOS. Your answer mentioned running a script on Windows or macOS and then said script mode is Windows only. It is recorded as Windows only, with containers on macOS. Say so if macOS should run scripts too.
+3. The script-mode allowlist. Containers are limited to allowlisted images. What limits scripts: a list of URL prefixes in the config?
+4. The smoke image is pushed to GHCR by `image.yml` on `main`. The first push may create a private package. Make `shutup-and-run-smoke` public, or machines without a login will only run it from a local build.
+5. The four medium findings still open in the review (connection cap, log buffer, event reconnect, CI token). Fix them next?
 
 Do not add a queue, a web UI, a second database, cross-machine coordination, or automatic restarts of failed containers. [CONTRIBUTING.md](../CONTRIBUTING.md) says so.
 

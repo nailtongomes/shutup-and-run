@@ -10,13 +10,29 @@ Orchestrators already know the list of machines. shutup-and-run accepts a job or
 
 A slot is a running container labeled `shutup-and-run=1`. The count is a Docker list, not a counter in memory, so a restart does not forget work that is still running. The check and the create share one process mutex. Two processes on the same daemon can still go over `max_slots`.
 
+A job that was accepted and is still pulling its image also holds a slot. That part is a set in memory, because no container exists yet. See the next record.
+
+## 202 before the pull
+
+`POST /v1/jobs` used to pull the image and start the container before it answered. A slow registry made Kestra and n8n wait, and a full machine pulled before it said `429`.
+
+Now the request takes the slot, writes the row, and answers `202` at once. The pull and the start happen afterwards. The job runs either way. If the pull or the start fails, the job ends with reason `start_failed`, its stored log line says which, and the callback is sent. That is no longer a `502`. The pull has the job's own `timeout_secs` as its limit, and the container's timeout starts when the container does.
+
+To answer before a container exists, the launcher picks the job id itself and names the container `shutup-and-run-<id>`.
+
+The cost: `202` no longer proves the image exists, so a caller that needs to know must read the callback or the job. And a job accepted but not yet started lives only in this process. On shutdown the process waits up to 30 seconds for such jobs to become containers. One that is still pulling after that is recorded as ended when the process comes back.
+
+## No cancel call
+
+There is no `DELETE /v1/jobs/{id}`. The owner decided against it. A job ends by itself, by its timeout, or because someone with a shell on the machine kills the container named `shutup-and-run-<id>`. One fewer thing a stolen token can do, and one fewer state to reason about.
+
 ## SQLite for history, logs, and bans
 
 One file. Job rows keep id, image, `job_key`, start, end, exit code, and reason, so `GET /v1/jobs/{id}` works after a restart. The last log lines are stored before the container is removed. Bans live in the same file. Finished rows older than `history_days` (default 30) are deleted on a timer. There is no other database.
 
 ## Idempotency is `job_key`, on one machine
 
-The same key returns the existing row and does not start another container, including while it is running. A retry of the same URL is safe. The key is not shared with other machines. A start that fails still holds the key; a new attempt needs a new key.
+The same key returns the existing row and does not start another container, including while it is running. A retry of the same URL is safe. The key is not shared with other machines. A job whose pull or start fails still holds the key; a new attempt needs a new key.
 
 ## Callback when the job ends
 
@@ -50,6 +66,12 @@ The cost is no HTTP/2, which no caller here needs, and a client that waits more 
 
 There is no user database and no per-tenant token. One token is the whole ACL.
 
+## A machine someone else lends
+
+The owner runs jobs on idle machines, including machines a client offers. That does not change the model: the token holder is still the single caller, and the token is still root on that machine. What changes is that the person who owns the hardware is not the person who holds the token.
+
+So the risk is shared knowingly, and it is written down. The client installs the service, chooses the allowlist and `max_slots`, can watch every job, and can stop everything with two commands. [CONVENTIONS.md](CONVENTIONS.md) says what each side accepts, and [RECIPES.md](RECIPES.md) has the commands. No code enforces any of it.
+
 ## Timeouts are SIGKILL
 
 A container past its deadline is killed with SIGKILL. There is no SIGTERM grace and no restart of a container that exits on its own.
@@ -82,7 +104,7 @@ When `poll_url` is unset, nothing calls out. When it is set, the process asks th
 
 `SHUTUP_AND_RUN_POLL_TOKEN` is environment only. A `poll_token` field in the TOML is an unknown field and startup fails. The URL is not logged, only its host. Credentials in the URL userinfo are rejected.
 
-The cost is an outbound request to whatever URL the operator configured, and a task that can be dropped if the slot disappears between the check and the start. That refusal does not store `job_key` (a failed start still does, same as POST). The server should offer the same key again until the callback arrives. There is still no queue.
+The cost is an outbound request to whatever URL the operator configured, and a task that can be dropped if the slot disappears between the check and the launch. A refused task does not store `job_key`. An accepted one does, even if its image then fails to pull. The server should offer the same key again until the callback arrives. There is still no queue.
 
 ## Security is a convention
 
@@ -92,13 +114,19 @@ Operator obligations live in [CONVENTIONS.md](CONVENTIONS.md): a dedicated machi
 
 The cost is that a deployer who skips the document is running whatever image the token holder names, as the image's user, with Docker's default capabilities, on the default bridge. This repository will not stop them.
 
-## Windows and macOS later
+## Windows and macOS: the same product
 
-Some work has to run on a person's computer, including a Windows machine that may not have Docker. Building that now would change what this binary is.
+Decided 2026-11-11. Nothing is built yet.
 
-[ROADMAP-windows-macos.md](ROADMAP-windows-macos.md) describes a future client: a small program, or on Windows possibly only a script, that polls or waits and then starts a container or, on Windows, runs a Python script fetched from a URL. The simplest behavior to mirror is an existing `.bat` bootstrap (config at the top, a per-task lock with an orphan TTL, Python via `py -3` then `python`, downloads with cache and backoff, `.tmp` then replace, offline fallback, exit codes 0, 1, and 2). That bootstrap does not check integrity. The roadmap requires a sha256 or a signature before a downloaded script runs. Open questions are listed there and are not decided here. There is no client code in this change.
+Windows and macOS get the same Rust binary and the same contract: accept a pushed job or poll for one, enforce slots and a timeout, keep history, call back. It is not a separate client.
 
-The cost is a document that can drift, and a known gap (no integrity check) that stays open until someone builds the client.
+On macOS a job is a container, as on Linux.
+
+On Windows a job may instead be a script. The binary downloads it from a URL and runs it directly, with no WSL and no Docker around it. That is less isolation than a container, and it is a risk the machine's owner accepts in order to run the automation. This script mode is for Windows only.
+
+[ROADMAP-windows-macos.md](ROADMAP-windows-macos.md) has the details and the questions that are still open. The one that must be answered before any script runs is integrity: how the binary knows the script it downloaded is the one that was published.
+
+The cost is a second kind of job with weaker isolation, inside a binary whose whole security story so far was "it only starts allowlisted containers".
 
 ## Smoke test against a running instance
 
@@ -106,7 +134,7 @@ The cost is a document that can drift, and a known gap (no integrity check) that
 
 CI runs it twice: after `accept.sh` on the same instance, and against a service that `install.sh` installed from a local copy of the release assets. The release workflow runs it a third time after the real one-line install.
 
-The cost is that the instance must allowlist an image with a shell for the test. [CONVENTIONS.md](CONVENTIONS.md) says to allowlist only images you own, so point `SMOKE_IMAGE` at one of yours. `busybox` is the default because CI uses it. There is no cancel call in the API, so cleanup is waiting for the test's jobs to end.
+The cost is that the instance must allowlist an image for the test. The owner chose two: a small Python image built from `examples/smoke-image` and published as `ghcr.io/nailtongomes/shutup-and-run-smoke`, which is the default, and Docker's `hello-world`, which has no shell and so runs a reduced set. A worker image of your own works too if it has `sh` and `sleep`. There is no cancel call in the API, so cleanup is waiting for the test's jobs to end.
 
 ## The name
 
