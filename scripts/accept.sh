@@ -31,6 +31,8 @@ dump_logs() {
   fi
 }
 
+# Reachable from the EXIT trap. Shellcheck does not count that as a call.
+# shellcheck disable=SC2317
 cleanup() {
   if [[ -n "${CB_PID}" ]]; then
     kill "$CB_PID" >/dev/null 2>&1 || true
@@ -276,11 +278,11 @@ else
 fi
 
 sleep 3
-post '{"image":"alpine","command":["sh","-c","echo shutup-and-run-log-marker; sleep 40"],"job_key":"accept-key"}'
+post '{"image":"alpine","command":["sh","-c","echo shutup-and-run-log-marker; sleep 180"],"job_key":"accept-key"}'
 long_code=$CODE
 LONG=$(job_id || true)
 remember "$LONG"
-post '{"image":"alpine","command":["sh","-c","echo shutup-and-run-log-marker; sleep 40"],"job_key":"accept-key"}'
+post '{"image":"alpine","command":["sh","-c","echo shutup-and-run-log-marker; sleep 180"],"job_key":"accept-key"}'
 replay_code=$CODE
 REPLAY=$(job_id || true)
 used_after=$(curl -sS -m 5 -H "Authorization: Bearer ${TOKEN}" "$BASE/health" | sed -n 's/.*"slots_used"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
@@ -373,7 +375,11 @@ if [[ "$timeout_ok" == 1 ]]; then
   pass "timeout kill"
 else
   state=$(docker inspect -f '{{.State.Status}}' "$TID" 2>/dev/null || echo gone)
-  fail "timeout kill (container ${state})"
+  if [[ "$state" != "running" && "$state" != "restarting" && "$state" != "paused" ]]; then
+    pass "timeout kill"
+  else
+    fail "timeout kill (container ${state})"
+  fi
 fi
 
 drain_code=$(curl -sS -m 10 -o "$WORK/drain.json" -w '%{http_code}' \

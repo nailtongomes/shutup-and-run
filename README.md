@@ -12,11 +12,10 @@ The installer listens on `0.0.0.0` and serves HTTPS from a self-signed certifica
 
 ## Install
 
-One command on a new Ubuntu machine. Replace `OWNER` with the repository, and point `SHUTUP_AND_RUN_URL` at the musl asset from the release. The release workflow builds that asset; attaching it assumes a GitHub-compatible Releases API. See `.github/workflows/release.yml`.
+One command on a new Ubuntu machine. A tag `v*` builds the musl binary and attaches it to the GitHub release, which is what this downloads.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/shutup-and-run/main/scripts/install.sh \
-  | sudo SHUTUP_AND_RUN_URL=https://github.com/OWNER/shutup-and-run/releases/latest/download/shutup-and-run-x86_64-unknown-linux-musl bash
+curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.sh | sudo bash
 ```
 
 Offline, with a binary you already copied onto the machine:
@@ -28,6 +27,21 @@ sudo SHUTUP_AND_RUN_BIN=./shutup-and-run bash scripts/install.sh
 The script installs Docker if it is missing, picks `max_slots` from CPU and RAM (about one CPU and 2 GiB per slot, leaving one CPU free), writes a token to `/etc/shutup-and-run/env` without printing it, generates a self-signed cert if you do not have one, installs the systemd unit, and opens the port in ufw when ufw is already active. Running it again upgrades the binary and restarts the service. It does not rotate an existing token or certificate. `SHUTUP_AND_RUN_SHOW_TOKEN=1` prints the token. `sudo bash scripts/install.sh --uninstall` removes the unit and the binary; add `--purge` to delete `/etc/shutup-and-run` and `/var/lib/shutup-and-run`.
 
 Image names are lowercase. An allowlist entry without a tag allows any tag of that repository; `ghcr.io/owner/selenium-worker` does not allow `ghcr.io/owner/selenium-worker-evil`. Edit the allowlist after install. To rotate the token, edit the env file and `sudo systemctl restart shutup-and-run`.
+
+### Container image
+
+The systemd install above is the path to use. A container image is also published to `ghcr.io/nailtongomes/shutup-and-run` (`:edge` from `main`, and the tag name from `v*`). It is a scratch image around the static binary. It can only start jobs if you hand it the host Docker socket, and that socket is root on the host:
+
+```bash
+docker run -d --name shutup-and-run --restart unless-stopped \
+  -p 8787:8787 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /etc/shutup-and-run:/etc/shutup-and-run:ro \
+  -v /var/lib/shutup-and-run:/var/lib/shutup-and-run \
+  ghcr.io/nailtongomes/shutup-and-run:edge
+```
+
+Put the same config, token, and certificate the installer would write under those two directories. Mount `/root/.docker` as well if jobs pull private images. The image is linux/amd64.
 
 ### Private registries
 

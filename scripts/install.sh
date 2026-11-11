@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Install shutup-and-run on Ubuntu.
 #
-# Online, after you publish a release (replace OWNER):
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/shutup-and-run/main/scripts/install.sh \
-#     | sudo SHUTUP_AND_RUN_URL=https://github.com/OWNER/shutup-and-run/releases/latest/download/shutup-and-run-x86_64-unknown-linux-musl bash
+# Online:
+#   curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.sh | sudo bash
 #
 # Offline, with a binary you already have:
 #   sudo SHUTUP_AND_RUN_BIN=./shutup-and-run bash scripts/install.sh
@@ -54,15 +53,12 @@ install_bin() {
     install -m 0755 "$SHUTUP_AND_RUN_BIN" "$PREFIX/$NAME"
     return
   fi
-  if [[ -n "${SHUTUP_AND_RUN_URL:-}" ]]; then
-    tmp=$(mktemp)
-    curl -fsSL "$SHUTUP_AND_RUN_URL" -o "$tmp"
-    install -m 0755 "$tmp" "$PREFIX/$NAME"
-    rm -f "$tmp"
-    return
-  fi
-  echo "set SHUTUP_AND_RUN_BIN to a local binary, or SHUTUP_AND_RUN_URL to the musl release asset" >&2
-  exit 1
+  local url="${SHUTUP_AND_RUN_URL:-https://github.com/nailtongomes/shutup-and-run/releases/latest/download/shutup-and-run-x86_64-unknown-linux-musl}"
+  local tmp
+  tmp=$(mktemp)
+  curl -fsSL "$url" -o "$tmp"
+  install -m 0755 "$tmp" "$PREFIX/$NAME"
+  rm -f "$tmp"
 }
 install_bin
 

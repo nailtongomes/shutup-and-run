@@ -1,8 +1,5 @@
-# Builds a static musl binary. Attaching it to a Release assumes a
-# GitHub-compatible Releases API and a token in GITHUB_TOKEN (GitHub,
-# and Forgejo or Gitea when they emulate that API). The compile itself
-# does not. actions/upload-artifact keeps the binary on the workflow
-# run when no release is published.
+# On tag v*, attach the musl binary and SHA256SUMS to the GitHub release.
+# install.sh downloads that asset from releases/latest.
 name: release
 
 on:
