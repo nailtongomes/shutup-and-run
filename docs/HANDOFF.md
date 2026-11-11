@@ -113,7 +113,7 @@ Run the service: `shutup-and-run` or `shutup-and-run serve`. Config errors print
 
 `image.yml` runs on `main` and on `v*` tags. It builds the musl binary, wraps it in `Dockerfile` (`FROM scratch`), and pushes `ghcr.io/nailtongomes/shutup-and-run:edge` or `:vX.Y.Z`. Permissions: `contents: read`, `packages: write`. linux/amd64 only. The first push can create a private package; someone has to make it public if anonymous pulls should work.
 
-`release.yml` runs on `v*` tags. Permissions: `contents: write`. It attaches `shutup-and-run-x86_64-unknown-linux-musl` and `SHA256SUMS` to the GitHub release. `scripts/install.sh` downloads that asset from `releases/latest` and does not check the checksum.
+`release.yml` runs on `v*` tags. Permissions: `contents: write`. It attaches `shutup-and-run-x86_64-unknown-linux-musl` and `SHA256SUMS` to the GitHub release. `scripts/install.sh` downloads that asset from `releases/latest` and refuses to install it when the hash does not match `SHA256SUMS`. `SHUTUP_AND_RUN_BIN` skips the download.
 
 The workflows do not set `id-token` or a cloud deploy role. They use `GITHUB_TOKEN`.
 
@@ -145,7 +145,7 @@ These are accepted, not a bug list. A review should confirm they are still true 
 - `trust_x_forwarded_for` trusts the first header value. The default is off (`src/api.rs`).
 - Bans key off the peer IP. A shared NAT can lock out everyone behind it. The ban is an empty `403` even with the right token.
 - SQLite uses `Mutex::lock().expect`. A poisoned lock panics the calling task (`src/store.rs`).
-- `scripts/install.sh` listens on `0.0.0.0`, generates a self-signed certificate, and does not verify `SHA256SUMS` on the downloaded binary.
+- `scripts/install.sh` listens on `0.0.0.0` and generates a self-signed certificate. The downloaded binary is checked against `SHA256SUMS`. A binary passed in `SHUTUP_AND_RUN_BIN` is not.
 - Log lines kept in SQLite can contain secrets the container printed.
 - Two shutup-and-run processes on one daemon can exceed `max_slots`.
 - Stopping the service does not kill containers. A timeout is SIGKILL only.
@@ -154,7 +154,6 @@ These are accepted, not a bug list. A review should confirm they are still true 
 
 - The Windows and macOS client in [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md). No code. The open questions there are undecided. The integrity check (sha256 or signature) is required before that client runs a downloaded script.
 - GHCR: if the package was created private, the owner still has to switch it to public for anonymous pulls. That is a registry setting, not a code change.
-- `install.sh` still does not compare the download to `SHA256SUMS`. The convention is to pass `SHUTUP_AND_RUN_BIN` when the operator wants that check. Do not treat that as a request to redesign the installer unless you were asked.
 
 Do not add a queue, a web UI, a second database, cross-machine coordination, or automatic restarts of failed containers. [CONTRIBUTING.md](../CONTRIBUTING.md) says so.
 

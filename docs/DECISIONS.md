@@ -64,7 +64,7 @@ The repo is public at github.com/nailtongomes/shutup-and-run. GitHub Actions run
 
 ## GitHub release
 
-A `v*` tag builds `shutup-and-run-x86_64-unknown-linux-musl`, writes `SHA256SUMS`, and attaches both to the GitHub release. `install.sh` downloads that exact asset from `releases/latest`. No release tag, no one-line install.
+A `v*` tag builds `shutup-and-run-x86_64-unknown-linux-musl`, writes `SHA256SUMS`, and attaches both to the GitHub release. `install.sh` downloads that exact asset from `releases/latest` and checks it against `SHA256SUMS` before installing. `SHUTUP_AND_RUN_BIN` skips the download. No release tag, no one-line install.
 
 ## Pull, optional
 

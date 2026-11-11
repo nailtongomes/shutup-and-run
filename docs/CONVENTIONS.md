@@ -18,7 +18,7 @@ Read this with [SECURITY.md](../SECURITY.md). The record of why it stays this wa
 
 **Certificates.** Pin the fingerprint the installer prints, or replace the self-signed certificate. Skipping TLS verification is a choice you make in the caller. It is not a default of this process.
 
-**The release binary.** `scripts/install.sh` downloads the GitHub release asset and does not compare it to `SHA256SUMS`. The release workflow publishes that file. If you want the check, download both yourself and install with `SHUTUP_AND_RUN_BIN`.
+**The release binary.** `scripts/install.sh` downloads the GitHub release asset and `SHA256SUMS` from that same release, and stops if the hash does not match. `SHUTUP_AND_RUN_BIN` installs a binary you already have and skips that check.
 
 **Callbacks.** `callback_url` is called from this host, three times, with no redirects. Point it only at an endpoint you trust. Anyone who holds the token can set any http or https URL the host can reach, including link-local addresses.
 

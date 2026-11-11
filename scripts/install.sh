@@ -53,12 +53,23 @@ install_bin() {
     install -m 0755 "$SHUTUP_AND_RUN_BIN" "$PREFIX/$NAME"
     return
   fi
-  local url="${SHUTUP_AND_RUN_URL:-https://github.com/nailtongomes/shutup-and-run/releases/latest/download/shutup-and-run-x86_64-unknown-linux-musl}"
-  local tmp
-  tmp=$(mktemp)
+  local url asset dir tmp expected actual
+  url="${SHUTUP_AND_RUN_URL:-https://github.com/nailtongomes/shutup-and-run/releases/latest/download/shutup-and-run-x86_64-unknown-linux-musl}"
+  asset=$(basename "$url")
+  dir=$(mktemp -d)
+  tmp="$dir/$asset"
   curl -fsSL "$url" -o "$tmp"
+  curl -fsSL "${url%/*}/SHA256SUMS" -o "$dir/SHA256SUMS"
+  # GNU sha256sum writes "<hash>  <filename>". Match the asset name, not every line.
+  expected=$(awk -v asset="$asset" '$2 == asset { print $1; exit }' "$dir/SHA256SUMS")
+  actual=$(sha256sum "$tmp" | awk '{ print $1 }')
+  if [[ -z "$expected" || "$expected" != "$actual" ]]; then
+    echo "checksum mismatch for ${asset}" >&2
+    rm -rf "$dir"
+    exit 1
+  fi
   install -m 0755 "$tmp" "$PREFIX/$NAME"
-  rm -f "$tmp"
+  rm -rf "$dir"
 }
 install_bin
 

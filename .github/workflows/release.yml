@@ -1,5 +1,5 @@
 # On tag v*, attach the musl binary and SHA256SUMS to the GitHub release.
-# install.sh downloads that asset from releases/latest.
+# install.sh downloads that asset from releases/latest and checks SHA256SUMS.
 name: release
 
 on:
