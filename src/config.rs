@@ -27,6 +27,9 @@ const ENV_KEYS: &[&str] = &[
     "SHUTUP_AND_RUN_AUTH_FAILURES",
     "SHUTUP_AND_RUN_BAN_HOURS",
     "SHUTUP_AND_RUN_TRUST_X_FORWARDED_FOR",
+    "SHUTUP_AND_RUN_POLL_URL",
+    "SHUTUP_AND_RUN_POLL_INTERVAL_SECS",
+    "SHUTUP_AND_RUN_POLL_TOKEN",
 ];
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
@@ -37,6 +40,7 @@ const DEFAULT_HISTORY: &str = "/var/lib/shutup-and-run/jobs.sqlite";
 const DEFAULT_HISTORY_DAYS: u64 = 30;
 const DEFAULT_PURGE: u64 = 3600;
 const DEFAULT_LOG_LINES: u64 = 200;
+const DEFAULT_POLL_INTERVAL: u64 = 15;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -65,9 +69,34 @@ pub struct Settings {
     pub ban_secs: u64,
     pub trust_forwarded: bool,
     pub token: TokenChecker,
+    /// Unset means push only. The process does not call out.
+    pub poll_url: Option<String>,
+    pub poll_interval: Duration,
+    /// Bearer token for `poll_url`. Environment only, so it cannot be committed in TOML.
+    pub poll_token: Option<PollToken>,
 }
 
-#[derive(Debug, Deserialize)]
+/// Outbound poll secret. Debug output is redacted.
+#[derive(Clone)]
+pub struct PollToken(String);
+
+impl std::fmt::Debug for PollToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PollToken(***)")
+    }
+}
+
+impl PollToken {
+    fn new(token: &str) -> Self {
+        Self(token.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     listen: Option<String>,
@@ -89,6 +118,8 @@ struct FileConfig {
     auth_failures: Option<u64>,
     ban_hours: Option<u64>,
     trust_x_forwarded_for: Option<bool>,
+    poll_url: Option<String>,
+    poll_interval_secs: Option<u64>,
 }
 
 impl Settings {
@@ -108,27 +139,7 @@ impl Settings {
         env: &HashMap<String, String>,
     ) -> Result<Self, ConfigError> {
         let file: FileConfig = if toml_text.trim().is_empty() {
-            FileConfig {
-                listen: None,
-                token: None,
-                max_slots: None,
-                allowlist: None,
-                default_timeout_secs: None,
-                max_timeout_secs: None,
-                reaper_interval_secs: None,
-                docker_config: None,
-                history_path: None,
-                history_days: None,
-                purge_interval_secs: None,
-                log_lines: None,
-                prune_interval_secs: None,
-                http: None,
-                tls_cert: None,
-                tls_key: None,
-                auth_failures: None,
-                ban_hours: None,
-                trust_x_forwarded_for: None,
-            }
+            FileConfig::default()
         } else {
             toml::from_str(toml_text).map_err(|err| ConfigError(format!("config.toml: {err}")))?
         };
@@ -266,6 +277,48 @@ impl Settings {
         )?
         .unwrap_or(false);
 
+        let poll_url = take_string(env, "SHUTUP_AND_RUN_POLL_URL", file.poll_url)
+            .filter(|url| !url.is_empty());
+        if let Some(url) = &poll_url {
+            validate_poll_url(url)?;
+        }
+        let poll_interval_secs = match take_u64(
+            env,
+            "SHUTUP_AND_RUN_POLL_INTERVAL_SECS",
+            file.poll_interval_secs,
+        )? {
+            Some(value) => {
+                if !(1..=3600).contains(&value) {
+                    return Err(ConfigError(
+                        "poll_interval_secs must be between 1 and 3600".into(),
+                    ));
+                }
+                value
+            }
+            None => DEFAULT_POLL_INTERVAL,
+        };
+        // The token is not a TOML field. deny_unknown_fields rejects `poll_token` in the file.
+        // When poll_url is unset the variable is ignored, so a stray value does not change startup.
+        let poll_token = if poll_url.is_some() {
+            match env
+                .get("SHUTUP_AND_RUN_POLL_TOKEN")
+                .map(String::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                Some(raw) => {
+                    if raw.chars().any(|c| c.is_whitespace()) || raw.len() < 16 {
+                        return Err(ConfigError(
+                            "SHUTUP_AND_RUN_POLL_TOKEN must be at least 16 characters and contain no whitespace".into(),
+                        ));
+                    }
+                    Some(PollToken::new(raw))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Settings {
             listen,
             max_slots,
@@ -286,8 +339,30 @@ impl Settings {
             ban_secs: ban_hours.saturating_mul(3600),
             trust_forwarded,
             token: TokenChecker::new(&token),
+            poll_url,
+            poll_interval: Duration::from_secs(poll_interval_secs),
+            poll_token,
         })
     }
+}
+
+fn validate_poll_url(url: &str) -> Result<(), ConfigError> {
+    if url.len() > 2048 || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ConfigError("poll_url is invalid".into()));
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|_| ConfigError("poll_url is invalid".into()))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(ConfigError("poll_url must be http or https".into()));
+    }
+    if parsed.host_str().is_none() {
+        return Err(ConfigError("poll_url is invalid".into()));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ConfigError(
+            "poll_url must not embed credentials. Set SHUTUP_AND_RUN_POLL_TOKEN.".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn read_config_file(env: &HashMap<String, String>) -> Result<String, ConfigError> {
@@ -420,5 +495,68 @@ mod tests {
             allowlist = ["alpine"]
         "#;
         assert!(Settings::from_toml_and_env(short, &HashMap::new()).is_err());
+    }
+
+    fn base_toml(extra: &str) -> String {
+        format!(
+            r#"
+            token = "token-from-the-file"
+            max_slots = 1
+            allowlist = ["alpine"]
+            {extra}
+            "#
+        )
+    }
+
+    #[test]
+    fn poll_is_off_unless_configured_and_token_is_env_only() {
+        let settings = Settings::from_toml_and_env(&base_toml(""), &HashMap::new()).unwrap();
+        assert!(settings.poll_url.is_none());
+        assert!(settings.poll_token.is_none());
+        assert_eq!(settings.poll_interval, Duration::from_secs(15));
+
+        let settings = Settings::from_toml_and_env(
+            &base_toml(""),
+            &env(&[("SHUTUP_AND_RUN_POLL_TOKEN", "short")]),
+        )
+        .unwrap();
+        assert!(settings.poll_url.is_none());
+        assert!(settings.poll_token.is_none());
+
+        let settings = Settings::from_toml_and_env(
+            &base_toml("poll_url = \"https://jobs.example/poll\"\npoll_interval_secs = 5"),
+            &env(&[
+                ("SHUTUP_AND_RUN_POLL_URL", "http://127.0.0.1:9/poll"),
+                ("SHUTUP_AND_RUN_POLL_TOKEN", "poll-token-value-ok"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            settings.poll_url.as_deref(),
+            Some("http://127.0.0.1:9/poll")
+        );
+        assert_eq!(settings.poll_interval, Duration::from_secs(5));
+        assert_eq!(
+            settings.poll_token.as_ref().map(PollToken::as_str),
+            Some("poll-token-value-ok")
+        );
+        assert_eq!(format!("{:?}", settings.poll_token), "Some(PollToken(***))");
+
+        let in_file = base_toml("poll_token = \"poll-token-value-ok\"");
+        assert!(Settings::from_toml_and_env(&in_file, &HashMap::new()).is_err());
+        assert!(Settings::from_toml_and_env(
+            &base_toml("poll_url = \"http://127.0.0.1:9/poll\""),
+            &env(&[("SHUTUP_AND_RUN_POLL_TOKEN", "short")]),
+        )
+        .is_err());
+        assert!(Settings::from_toml_and_env(
+            &base_toml("poll_url = \"http://user:pass@127.0.0.1:9/poll\""),
+            &HashMap::new(),
+        )
+        .is_err());
+        assert!(
+            Settings::from_toml_and_env(&base_toml("poll_interval_secs = 0"), &HashMap::new(),)
+                .is_err()
+        );
     }
 }

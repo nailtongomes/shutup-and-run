@@ -2,6 +2,7 @@ use shutup_and_run::bollard_rt::{spawn_exit_watcher, BollardRuntime};
 use shutup_and_run::cert::fingerprint_file;
 use shutup_and_run::config::Settings;
 use shutup_and_run::launcher::{spawn_maintenance, Launcher};
+use shutup_and_run::poll::spawn_poller;
 use shutup_and_run::runtime::Runtime;
 use shutup_and_run::store::Store;
 use std::net::{IpAddr, SocketAddr};
@@ -169,6 +170,7 @@ async fn serve() -> ExitCode {
     launcher.reconcile().await;
     spawn_exit_watcher(docker, launcher.clone());
     spawn_maintenance(launcher.clone());
+    spawn_poller(launcher.clone());
 
     let app =
         shutup_and_run::api::router(launcher).into_make_service_with_connect_info::<SocketAddr>();

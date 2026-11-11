@@ -151,20 +151,9 @@ async fn metrics(State(launcher): State<Arc<Launcher>>) -> Response {
 }
 
 async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Response {
-    let parsed: RunBody = match serde_json::from_slice(&body) {
-        Ok(value) => value,
+    let request = match launch_request_from_slice(&body) {
+        Ok(request) => request,
         Err(_) => return error_body(StatusCode::BAD_REQUEST, "invalid JSON", None),
-    };
-    let request = LaunchRequest {
-        image: parsed.image,
-        env: parsed.env,
-        timeout_secs: parsed.timeout_secs,
-        cpu: parsed.cpu,
-        memory_bytes: parsed.memory.map(ByteQty::get),
-        shm_bytes: parsed.shm.map(ByteQty::get),
-        command: parsed.command,
-        job_key: parsed.job_key,
-        callback_url: parsed.callback_url,
     };
     match launcher.launch(request).await {
         Ok(LaunchOutcome::Created(job)) => {
@@ -297,6 +286,25 @@ struct RunBody {
     command: Option<Vec<String>>,
     job_key: Option<String>,
     callback_url: Option<String>,
+}
+
+pub(crate) fn launch_request_from_slice(bytes: &[u8]) -> Result<LaunchRequest, serde_json::Error> {
+    launch_request_from_value(serde_json::from_slice(bytes)?)
+}
+
+pub(crate) fn launch_request_from_value(value: Value) -> Result<LaunchRequest, serde_json::Error> {
+    let parsed: RunBody = serde_json::from_value(value)?;
+    Ok(LaunchRequest {
+        image: parsed.image,
+        env: parsed.env,
+        timeout_secs: parsed.timeout_secs,
+        cpu: parsed.cpu,
+        memory_bytes: parsed.memory.map(ByteQty::get),
+        shm_bytes: parsed.shm.map(ByteQty::get),
+        command: parsed.command,
+        job_key: parsed.job_key,
+        callback_url: parsed.callback_url,
+    })
 }
 
 #[derive(Debug, Deserialize)]

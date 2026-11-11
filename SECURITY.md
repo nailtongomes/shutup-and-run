@@ -2,6 +2,8 @@
 
 shutup-and-run talks to the Docker socket. A valid token can start any allowlisted image with any environment variables. Treat the token as a root password. There is one owner.
 
+What the operator must do, and which defaults a request cannot turn off, is [docs/CONVENTIONS.md](docs/CONVENTIONS.md). This file is how the process behaves. That file is what you accept by running it. The process does not add checks for rules a person can follow.
+
 ## Every route needs the token
 
 `/health` and `/metrics` included. A wrong or missing token is `401`. Nothing is served anonymously.
@@ -38,6 +40,10 @@ The token is never hard-coded. Comparison is a SHA-256 digest checked with `subt
 ## Registry and containers
 
 Image pulls use the machine's `docker login`. The request cannot supply registry credentials, volumes, published ports, or privileged mode.
+
+## Pull
+
+`poll_url` makes this process call out. You choose that URL. The bearer token is `SHUTUP_AND_RUN_POLL_TOKEN` in the environment, not in the TOML file. When the variable is unset the request has no Authorization header. Redirects are not followed. The contract is in the README.
 
 ## Reporting
 

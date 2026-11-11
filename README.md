@@ -1,12 +1,12 @@
 # shutup-and-run
 
-shutup-and-run is a single static binary. One machine with Docker receives an HTTP POST, and if it has a free slot it starts an allowlisted container and returns immediately. If it does not, it refuses, and the caller tries the next machine on its own list. There is no queue, no scheduler, and no UI. The container writes its own result wherever it already does.
+shutup-and-run is a single static binary. One machine with Docker starts an allowlisted container when a slot is free. Work arrives as an HTTP POST or, when `poll_url` is set, the machine asks a URL for a task. A POST with no free slot is `429`, and the caller tries the next machine on its own list. A poll is skipped until a slot is free. There is no queue, no scheduler, and no UI. The container writes its own result wherever it already does.
 
 A slot is a running container labeled `shutup-and-run=1`. Restarting the process does not forget them. Finished jobs stay in one SQLite file so `GET /v1/jobs/{id}` still works after a restart.
 
 ## Security
 
-This process speaks to the Docker socket. Anyone with the token can run any allowlisted image with any environment. Treat the token as a root password. Every route, including `/health` and `/metrics`, requires it. See [SECURITY.md](SECURITY.md).
+This process speaks to the Docker socket. Anyone with the token can run any allowlisted image with any environment. Treat the token as a root password. Every route, including `/health` and `/metrics`, requires it. See [SECURITY.md](SECURITY.md). What you are accepting by deploying it is [docs/CONVENTIONS.md](docs/CONVENTIONS.md). The binary does not try to enforce those conventions.
 
 The installer listens on `0.0.0.0` and serves HTTPS from a self-signed certificate it generates. It prints the certificate's SHA-256 fingerprint. Plain HTTP is only `http = true`, meant for localhost. Three bad tokens from one IP ban that IP for 48 hours (`403` with an empty body). Lift it over SSH with `shutup-and-run bans lift <ip>`.
 
@@ -76,6 +76,9 @@ TOML from `SHUTUP_AND_RUN_CONFIG`, or `/etc/shutup-and-run/config.toml` when tha
 | `auth_failures` | `SHUTUP_AND_RUN_AUTH_FAILURES` | Failed auths from one IP before a ban. Default 3. |
 | `ban_hours` | `SHUTUP_AND_RUN_BAN_HOURS` | How long a ban lasts. Default 48. |
 | `trust_x_forwarded_for` | `SHUTUP_AND_RUN_TRUST_X_FORWARDED_FOR` | Use the first `X-Forwarded-For` address. Default false. |
+| `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Optional. When set, ask this URL for one task. Unset means push only. |
+| `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Seconds between polls. Default 15. Range 1 to 3600. Used only when `poll_url` is set. |
+| (none) | `SHUTUP_AND_RUN_POLL_TOKEN` | Bearer token for the poll request. Environment only. A `poll_token` key in the file is refused. |
 
 Logs: `journalctl -u shutup-and-run -f`. Level comes from `RUST_LOG` (default `info`). The token and job environment are not logged.
 
@@ -291,6 +294,38 @@ Import `examples/n8n-dispatch.json`. Each HTTP Request node retries the same URL
 
 Set `SHUTUP_AND_RUN_TOKEN` on the n8n process and allow environment access (`N8N_BLOCK_ENV_ACCESS_IN_NODE=false`), or replace the header expression with a Header Auth credential. `job_key` is `$execution.id`. Put your webhook URL in `callback_url`. The exported nodes set `allowUnauthorizedCerts` for the installer's self-signed certificate; turn that off if you replace the cert with one n8n already trusts, and compare the fingerprint the installer printed.
 
+## Pull
+
+Leave `poll_url` unset and the process only wakes up on `POST /v1/jobs`. Set it when this machine cannot be reached from outside. The HTTP server stays up either way.
+
+On each interval, if a slot is free and the process is not draining, it sends:
+
+```http
+POST {poll_url}
+Accept: application/json
+Content-Type: application/json
+Authorization: Bearer {SHUTUP_AND_RUN_POLL_TOKEN}
+
+{}
+```
+
+The Authorization header is omitted when `SHUTUP_AND_RUN_POLL_TOKEN` is unset. Redirects are not followed. The timeout is 10 seconds. A body over 64 KiB is an error. Startup logs the host only, not the URL, so a webhook key in the path is not written to the log line. Do not put a secret in the URL userinfo; that form is rejected. Put `SHUTUP_AND_RUN_POLL_URL` and `SHUTUP_AND_RUN_POLL_TOKEN` in `/etc/shutup-and-run/env` (the unit already loads that file) when the URL itself is a secret. `poll_token` is not a TOML key.
+
+Nothing to do, logged at debug, next wait is the normal interval:
+
+- `204`
+- `200` with an empty body, `null`, `{}`, or `{"task": null}`
+
+A task is `200` and either the same JSON object as `POST /v1/jobs`, or `{"task": { ...that object, and no sibling fields... }}`. Unknown fields are rejected. The object goes through the same checks as POST: allowlist, `job_key`, limits, `callback_url`, then start. A refusal is a warning. The process stays up. `job_key` idempotency matches POST, including a failed start keeping the key.
+
+Offering a task is not an acknowledgement. The launcher may still refuse if the slot is taken between the check and the start, or if the image is not allowlisted. A refusal other than a failed start does not store the key. Keep offering the same `job_key` until the callback arrives if the job must land. Once it has started, further offers of that key do not start a second container.
+
+Any other outcome (connection failure, timeout, a redirect, any status other than 200 or 204) is a warning. The wait doubles, up to 300 seconds, or stays at `poll_interval_secs` when that is already longer. The next empty response or accepted task resets the wait. The process does not exit.
+
+`examples/kestra-poll.yml` is a Kestra webhook with `wait` and `returnOutputs`. Kestra's body is the flow outputs, so the output id is `task` and the body is `{"task": null}` or `{"task": {image, ...}}`. The webhook key is in the URL path. Kestra does not read the bearer header.
+
+`examples/n8n-poll.json` is an n8n Webhook plus Respond to Webhook. A matching bearer token returns one static task so you can see the shape. Replace that object with your queue, and return `{}` when the queue is empty. Set `SHUTUP_AND_RUN_POLL_TOKEN` on the n8n process (`N8N_BLOCK_ENV_ACCESS_IN_NODE=false`).
+
 ## Acceptance test
 
 On Ubuntu with Docker, preferably with no other shutup-and-run and no container already labeled `shutup-and-run=1`:
@@ -346,4 +381,4 @@ CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --target x86_64-unkn
 
 SQLite is bundled, so the musl build needs a C compiler. The socket is `DOCKER_HOST` when it is `unix://...`, otherwise `/var/run/docker.sock`.
 
-License: MIT. See [CONTRIBUTING.md](CONTRIBUTING.md).
+License: MIT. See [CONTRIBUTING.md](CONTRIBUTING.md). Decisions: [docs/DECISIONS.md](docs/DECISIONS.md). Operator conventions: [docs/CONVENTIONS.md](docs/CONVENTIONS.md). A future Windows and macOS client: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md). Notes for a reviewer: [docs/HANDOFF.md](docs/HANDOFF.md).

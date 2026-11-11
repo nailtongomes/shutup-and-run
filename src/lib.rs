@@ -11,6 +11,7 @@ pub mod cert;
 pub mod clock;
 pub mod config;
 pub mod launcher;
+pub mod poll;
 pub mod registry;
 pub mod runtime;
 pub mod store;

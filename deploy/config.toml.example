@@ -35,3 +35,9 @@ max_timeout_secs = 21600
 
 # Prefer the token in /etc/shutup-and-run/env (mode 600):
 #   SHUTUP_AND_RUN_TOKEN=...
+
+# Optional pull. Unset means this process only accepts POST /v1/jobs.
+# poll_url = "https://orchestrator.example/poll"
+# poll_interval_secs = 15
+# The poll bearer token is not a key in this file. Add it to the env file:
+#   SHUTUP_AND_RUN_POLL_TOKEN=...
