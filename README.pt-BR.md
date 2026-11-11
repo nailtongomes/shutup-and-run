@@ -433,4 +433,6 @@ Licença MIT. Para ler mais (em inglês):
 - [SECURITY.md](SECURITY.md): como o processo se defende.
 - [docs/DECISIONS.md](docs/DECISIONS.md): por que foi construído assim.
 - [docs/HANDOFF.md](docs/HANDOFF.md): notas para quem for manter ou revisar.
+- [docs/SIZING.md](docs/SIZING.md): RAM e CPU do processo do launcher.
 - [CONTRIBUTING.md](CONTRIBUTING.md).
+- [AGENTS.md](AGENTS.md): notas para um agente de código.

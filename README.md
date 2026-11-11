@@ -431,4 +431,6 @@ MIT license. More reading:
 - [SECURITY.md](SECURITY.md): how the process defends itself.
 - [docs/DECISIONS.md](docs/DECISIONS.md): why it is built this way.
 - [docs/HANDOFF.md](docs/HANDOFF.md): notes for the next maintainer or reviewer.
+- [docs/SIZING.md](docs/SIZING.md): RAM and CPU for the launcher process.
 - [CONTRIBUTING.md](CONTRIBUTING.md).
+- [AGENTS.md](AGENTS.md): notes for an AI coding agent.
