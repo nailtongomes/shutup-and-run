@@ -22,6 +22,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("bans") => bans_cli(&args[1..]),
+        Some("wsl") => shutup_and_run::wsl::cli(&args[1..]).await,
         None | Some("serve") => serve().await,
         _ => {
             usage();
@@ -40,7 +41,11 @@ shutup-and-run bans
     list IPs banned for authentication failures
 
 shutup-and-run bans lift <ip>
-    remove a ban and its failure count"
+    remove a ban and its failure count
+
+shutup-and-run wsl <doctor|install|serve|start|stop|logs|uninstall>
+    Windows 11: run the service inside a WSL2 distribution of its own.
+    `shutup-and-run wsl --help` lists the options."
     );
 }
 

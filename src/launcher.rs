@@ -32,6 +32,14 @@ pub struct Slots {
     pub draining: bool,
 }
 
+/// Where a task came from. Only a `Poll` task may skip the allowlist, and
+/// only when `poll_any_image` is set. A push never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobSource {
+    Push,
+    Poll,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchOutcome {
     Created(JobRecord),
@@ -166,8 +174,17 @@ impl Launcher {
         self: &Arc<Self>,
         req: LaunchRequest,
     ) -> Result<LaunchOutcome, LaunchError> {
+        self.launch_from(req, JobSource::Push).await
+    }
+
+    pub async fn launch_from(
+        self: &Arc<Self>,
+        req: LaunchRequest,
+        source: JobSource,
+    ) -> Result<LaunchOutcome, LaunchError> {
         validate_image_name(&req.image).map_err(LaunchError::BadRequest)?;
-        if !image_allowed(&req.image, &self.settings.allowlist) {
+        let skip_allowlist = source == JobSource::Poll && self.settings.poll_any_image;
+        if !skip_allowlist && !image_allowed(&req.image, &self.settings.allowlist) {
             return Err(LaunchError::Forbidden);
         }
         let timeout = resolve_timeout(req.timeout_secs, &self.settings)?;
@@ -676,7 +693,7 @@ pub fn valid_container_id(id: &str) -> bool {
 
 /// 32 hex characters. Unique on this machine: the time, a counter, the process
 /// id, and the standard library's per-process random hash seed, hashed together.
-fn random_id() -> String {
+pub(crate) fn random_id() -> String {
     use sha2::{Digest, Sha256};
     use std::hash::{BuildHasher, Hasher};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -764,6 +781,48 @@ mod tests {
             job_key: None,
             callback_url: None,
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_poll_task_skips_the_allowlist_and_only_when_configured() {
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let mut settings = settings(2);
+        settings.poll_url = Some("http://127.0.0.1:9/poll".into());
+
+        // Default: the allowlist applies to both sources.
+        let launcher = Launcher::new(settings.clone(), runtime.clone()).unwrap();
+        for source in [JobSource::Push, JobSource::Poll] {
+            let err = launcher
+                .launch_from(job("redis:7", None), source)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, LaunchError::Forbidden), "{source:?}: {err}");
+        }
+
+        // poll_any_image: the poll task runs, the pushed job is still refused,
+        // and the image name is still checked.
+        settings.poll_any_image = true;
+        let launcher = Launcher::new(settings, runtime).unwrap();
+        let err = launcher
+            .launch_from(job("redis:7", None), JobSource::Push)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LaunchError::Forbidden));
+        let err = launcher
+            .launch_from(job("Bad Image", None), JobSource::Poll)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LaunchError::BadRequest(_)));
+        assert!(matches!(
+            launcher
+                .launch_from(job("redis:7", None), JobSource::Poll)
+                .await
+                .unwrap(),
+            LaunchOutcome::Created(_)
+        ));
+        launcher.settled().await;
+        assert_eq!(mock.start_count().await, 1);
     }
 
     #[tokio::test]

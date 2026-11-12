@@ -1,6 +1,14 @@
 # Windows and macOS client
 
-This describes how shutup-and-run will run on a person's computer. Nothing in this repository implements it yet.
+This describes how shutup-and-run runs on a person's computer.
+
+## Built on 2026-11-12: Windows, as containers inside WSL2
+
+Windows 11 is done and documented in [WINDOWS.md](WINDOWS.md). It is the same Rust binary: `shutup-and-run.exe wsl install` imports a WSL2 distribution, puts Docker Engine and the Linux service inside it, and the service polls in the same contract as a Linux machine. There is no script mode. The decisions are in [DECISIONS.md](DECISIONS.md#windows-is-the-linux-service-inside-wsl2).
+
+That answers, for Windows: 1 (a binary), 2 (WSL is required; there is no script path), 3 (poll only), 4 (the bearer poll token, plus `worker_name` in the body), 10 (the same `job_key` rule as Linux, inside the distribution), 12 (not signed; `SHA256SUMS` is the integrity check), 13 (this repository), 17 (the poll URL is the only base; a `manifest_url` is one hop from it, with the token only on the same origin), 18 (a task is a container, so Python is whatever the image has).
+
+Script mode, the rest of this file, is deferred. It is not deleted because the integrity requirement below is the reason it is not built, and the next person should see that. The remaining open questions are the script ones (5 to 9, 11, 16) and macOS (14, 15).
 
 ## Decided on 2026-11-11
 

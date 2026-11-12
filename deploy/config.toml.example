@@ -41,3 +41,13 @@ max_timeout_secs = 21600
 # poll_interval_secs = 15
 # The poll bearer token is not a key in this file. Add it to the env file:
 #   SHUTUP_AND_RUN_POLL_TOKEN=...
+#
+# What the poll body calls this machine. Default: the hostname, and the OS
+# the binary was built for.
+# worker_name = "machine-a"
+# worker_os = "linux"
+#
+# A polled task may name any image, allowlisted or not. Pushed jobs are still
+# held to the allowlist. Only for a machine whose single source of work is the
+# orchestrator behind poll_url. The Windows worker is installed with this on.
+# poll_any_image = false

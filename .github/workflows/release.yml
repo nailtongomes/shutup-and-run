@@ -1,8 +1,10 @@
-# On tag v*, attach the musl binary and SHA256SUMS to the GitHub release.
-# install.sh downloads that asset from releases/latest and checks SHA256SUMS.
-# A second job then runs the README one-liner on a fresh runner and smokes
-# the service it installed. Tag from main: the one-liner fetches install.sh
-# from main.
+# On tag v*, attach the musl binary, the Windows .exe and one SHA256SUMS
+# that lists both to the GitHub release. install.sh downloads the musl asset
+# from releases/latest and checks SHA256SUMS. install.ps1 does the same for
+# the .exe, and the .exe then fetches the musl asset of its own version for
+# the WSL distribution. A later job runs the README one-liner on a fresh
+# runner and smokes the service it installed. Tag from main: the one-liners
+# fetch install.sh and install.ps1 from main.
 name: release
 
 on:
@@ -27,26 +29,54 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --target x86_64-unknown-linux-musl
-      - name: pack
-        run: |
-          mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/shutup-and-run dist/shutup-and-run-x86_64-unknown-linux-musl
-          # Hash from inside dist so the line names the asset, not dist/<asset>.
-          (cd dist && sha256sum shutup-and-run-x86_64-unknown-linux-musl > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
           name: shutup-and-run-x86_64-unknown-linux-musl
-          path: |
-            dist/shutup-and-run-x86_64-unknown-linux-musl
-            dist/SHA256SUMS
+          path: target/x86_64-unknown-linux-musl/release/shutup-and-run
+
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - run: .\target\release\shutup-and-run.exe --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shutup-and-run-x86_64-pc-windows-msvc.exe
+          path: target/release/shutup-and-run.exe
+
+  publish:
+    needs: [musl, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: shutup-and-run-x86_64-unknown-linux-musl
+          path: musl
+      - uses: actions/download-artifact@v4
+        with:
+          name: shutup-and-run-x86_64-pc-windows-msvc.exe
+          path: windows
+      - name: pack
+        run: |
+          mkdir -p dist
+          cp musl/shutup-and-run dist/shutup-and-run-x86_64-unknown-linux-musl
+          cp windows/shutup-and-run.exe dist/shutup-and-run-x86_64-pc-windows-msvc.exe
+          # Hash from inside dist so each line names the asset, not dist/<asset>.
+          (cd dist && sha256sum shutup-and-run-x86_64-unknown-linux-musl shutup-and-run-x86_64-pc-windows-msvc.exe > SHA256SUMS)
+          cat dist/SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/shutup-and-run-x86_64-unknown-linux-musl
+            dist/shutup-and-run-x86_64-pc-windows-msvc.exe
             dist/SHA256SUMS
 
   install:
-    needs: musl
+    needs: publish
     runs-on: ubuntu-latest
     permissions:
       contents: read

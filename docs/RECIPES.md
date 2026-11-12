@@ -138,7 +138,7 @@ curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/sc
 sudo ufw allow from 198.51.100.7 to any port 8787 proto tcp
 ```
 
-A client machine behind NAT uses the poll recipe above instead of the firewall rule.
+A client machine behind NAT uses the poll recipe above instead of the firewall rule. A client's Windows 11 machine is the same poll recipe with the Windows worker: [WINDOWS.md](WINDOWS.md).
 
 ## Private images
 

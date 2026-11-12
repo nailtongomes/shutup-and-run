@@ -11,6 +11,17 @@ cargo test --locked
 shellcheck scripts/*.sh
 ```
 
+`scripts/install.ps1` has no linter in CI. Keep it short and keep its checksum logic the same shape as `install.sh`.
+
+The Windows `.exe` (`src/wsl.rs`, the WSL2 supervisor) is built on `windows-latest` in CI with the MSVC toolchain. From Linux it cross-compiles for a check, with `rustup target add x86_64-pc-windows-gnu` and `apt-get install gcc-mingw-w64-x86-64`:
+
+```bash
+cargo clippy --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
+cargo build --release --locked --target x86_64-pc-windows-gnu
+```
+
+The parts of `src/wsl.rs` that shell out to `wsl.exe` and `schtasks.exe` can only run on Windows 11 with WSL2. Their pure parts (flag parsing, `wsl --list` decoding, the rendered config, checksum matching) are unit tested everywhere. `shutup-and-run wsl doctor` on a machine without WSL must stop at its first line and exit 1; CI checks that on a Windows runner.
+
 The release binary is static musl. SQLite is bundled, so the link needs a C compiler and `musl-gcc`:
 
 ```bash
@@ -43,9 +54,11 @@ The scratch image is the Dockerfile with the musl binary copied to `./shutup-and
 
 ## Keep it this shape
 
-- One machine, one bearer token. An allowlist entry is one repository. `repo` allows `repo:tag` and `repo@digest`. It does not allow `repo-evil`, a wildcard, or someone else's image. Do not loosen that match.
-- A request sets image, env, command, timeout, cpu, memory, and shm. It does not set mounts, ports, privileged, capabilities, or a network mode. Do not add those fields.
+- One machine, one bearer token. An allowlist entry is one repository. `repo` allows `repo:tag` and `repo@digest`. It does not allow `repo-evil`, a wildcard, or someone else's image. Do not loosen that match. The one way around the list is `poll_any_image`, which applies to a polled task only, never to a push, and needs `poll_url`. Do not widen it.
+- A request sets image, env, command, timeout, cpu, memory, and shm. It does not set mounts, ports, privileged, capabilities, or a network mode. Do not add those fields. A manifest is that same request, fetched once from `manifest_url`; it cannot point at another manifest.
+- The poll body is `worker`, `os`, `free_slots`. Do not put the machine's config, tokens, or job history in it.
 - Unknown JSON fields and unknown TOML fields stay rejected. `poll_token` is not a TOML key. `SHUTUP_AND_RUN_POLL_TOKEN` is environment only.
+- On Windows a job is a container inside the `shutup-and-run` WSL2 distribution. The `.exe` is a supervisor; it does not talk to Docker and does not run scripts. No Docker Desktop path, no script mode.
 - No queue, no scheduler, no web UI, no second database, no cross-machine coordination, and no automatic restart of a container that exits.
 - No secrets, tokens, or credentials in the repo, in examples, or in logs. Do not print `SHUTUP_AND_RUN_TOKEN`.
 - Prefer a smaller patch. A shortcut in code is marked `// shortcut: <limit>, <when to upgrade>`.

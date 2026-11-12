@@ -23,7 +23,7 @@ Não há fila, escalonador nem interface. O launcher não sabe o que a sua image
  webhook        <----------------------------------------- callback quando termina
 ```
 
-Uma máquina atrás de NAT pode pedir trabalho em vez de ser chamada. Veja [Pull](#pull).
+Uma máquina atrás de NAT pode pedir trabalho em vez de ser chamada. Veja [Pull](#pull). Uma máquina Windows 11 roda a mesma coisa em modo pull dentro do WSL2: [docs/WINDOWS.md](docs/WINDOWS.md).
 
 ## Início rápido
 
@@ -283,13 +283,18 @@ POST {poll_url}
 Authorization: Bearer {SHUTUP_AND_RUN_POLL_TOKEN}
 Content-Type: application/json
 
-{}
+{"worker": "desk-07", "os": "linux", "free_slots": 1}
 ```
 
-- Nada a fazer: `204`, ou `200` com corpo vazio, `null`, `{}` ou `{"task": null}`.
+O corpo diz quem está pedindo, para que uma URL atenda todas as máquinas: `worker` é o `worker_name` (padrão: o hostname), `os` é o `worker_os` (padrão: o sistema para o qual o binário foi compilado; o worker Windows diz `windows`) e `free_slots` é quantas tarefas a máquina aceitaria agora.
+
+- Nada a fazer: `204`, ou `200` com corpo vazio, `null`, `{}`, `{"task": null}` ou `{"manifest_url": null}`.
 - Uma tarefa: `200` com o mesmo JSON do `POST /v1/jobs`, ou `{"task": { ... }}`.
+- Um manifesto: `200` com `{"manifest_url": "https://..."}`. A máquina busca essa URL uma vez com `GET`, e o corpo precisa ser uma tarefa em um dos dois formatos acima. Um manifesto não pode apontar para outro manifesto. O token de poll só vai junto no `GET` quando o manifesto está no mesmo esquema, host e porta da `poll_url`; um manifesto em storage de objetos ou CDN é buscado sem ele. Mesmo limite de 64 KiB, sem redirecionamento.
 
 A tarefa passa pelas mesmas verificações de um POST. Oferecer uma tarefa não é uma confirmação: a máquina pode recusar (o slot acabou de ser ocupado, a imagem não está na allowlist). Continue oferecendo a mesma `job_key` até o callback chegar. Depois de aceita, essa chave nunca inicia um segundo container.
+
+`poll_any_image = true` deixa uma tarefa vinda do poll usar qualquer imagem, na allowlist ou não. O nome da imagem continua validado, e um job empurrado por POST continua preso à allowlist, que então pode ficar vazia. Exige `poll_url`. É para uma máquina cuja única fonte de trabalho é o seu orquestrador, como o worker Windows; em um servidor que também recebe POST, deixe desligado.
 
 Erros (falha de conexão, redirecionamento, qualquer outro status, corpo acima de 64 KiB) vão para o log e a espera dobra, até 5 minutos. O processo não encerra. O token de poll é lido só do ambiente. Exemplos: `examples/kestra-poll.yml`, `examples/n8n-poll.json`. Os comandos de configuração estão em [docs/RECIPES.md](docs/RECIPES.md).
 
@@ -302,7 +307,7 @@ Erros (falha de conexão, redirecionamento, qualquer outro status, corpo acima d
 | `listen` | `SHUTUP_AND_RUN_LISTEN` | `ip:porta`. Padrão `127.0.0.1:8787`. O instalador grava `0.0.0.0:8787`. |
 | `token` | `SHUTUP_AND_RUN_TOKEN` | Obrigatório. Pelo menos 16 caracteres. O instalador guarda em `/etc/shutup-and-run/env`. |
 | `max_slots` | `SHUTUP_AND_RUN_MAX_SLOTS` | Obrigatório. De 1 a 256. O instalador sugere um por CPU e por 2 GiB. |
-| `allowlist` | `SHUTUP_AND_RUN_ALLOWLIST` | Obrigatório. Imagens que podem rodar. Separadas por vírgula no ambiente. |
+| `allowlist` | `SHUTUP_AND_RUN_ALLOWLIST` | Obrigatório, a menos que `poll_any_image` esteja ligado. Imagens que podem rodar. Separadas por vírgula no ambiente. |
 | `default_timeout_secs` | `SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS` | Padrão 3600. |
 | `max_timeout_secs` | `SHUTUP_AND_RUN_MAX_TIMEOUT_SECS` | Padrão 21600. No máximo 7 dias. |
 | `history_path` | `SHUTUP_AND_RUN_HISTORY_PATH` | Arquivo SQLite. Padrão `/var/lib/shutup-and-run/jobs.sqlite`. |
@@ -316,6 +321,9 @@ Erros (falha de conexão, redirecionamento, qualquer outro status, corpo acima d
 | `trust_x_forwarded_for` | `SHUTUP_AND_RUN_TRUST_X_FORWARDED_FOR` | Só atrás de um proxy seu. Padrão false. |
 | `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Opcional. Veja [Pull](#pull). |
 | `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Padrão 15. |
+| `poll_any_image` | `SHUTUP_AND_RUN_POLL_ANY_IMAGE` | Uma tarefa do poll pode usar qualquer imagem. Padrão false. Exige `poll_url`. Permite `allowlist` vazia. |
+| `worker_name` | `SHUTUP_AND_RUN_WORKER_NAME` | Enviado no corpo do poll. Padrão: o hostname. |
+| `worker_os` | `SHUTUP_AND_RUN_WORKER_OS` | Enviado no corpo do poll. Padrão: o sistema da compilação. |
 | (nenhum) | `SHUTUP_AND_RUN_POLL_TOKEN` | Só no ambiente. |
 | `reaper_interval_secs` | `SHUTUP_AND_RUN_REAPER_INTERVAL_SECS` | Intervalo para matar containers que passaram do prazo. Padrão 2. |
 | `purge_interval_secs` | `SHUTUP_AND_RUN_PURGE_INTERVAL_SECS` | Intervalo para apagar histórico antigo. Padrão 3600. |
@@ -345,6 +353,18 @@ curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/sc
 O download é conferido com o `SHA256SUMS` da mesma release, e uma diferença interrompe a instalação. Rodar de novo atualiza o binário e mantém o token, o certificado e a configuração. `--uninstall` remove o serviço e o binário. `--uninstall --purge` também remove `/etc/shutup-and-run` e `/var/lib/shutup-and-run`.
 
 Também é publicada uma imagem em `ghcr.io/nailtongomes/shutup-and-run`, para quem roda tudo em Docker. Ela precisa do socket do Docker do host montado, o que equivale a root no host. A instalação por systemd é o caminho suportado.
+
+### Windows 11
+
+A release também traz `shutup-and-run-x86_64-pc-windows-msvc.exe`. Ele é um supervisor: importa uma distribuição WSL2 só dele, instala o Docker Engine e o binário Linux lá dentro e mantém o serviço rodando ali em modo pull. Sem Docker Desktop, sem porta aberta. Com o WSL2 habilitado (`wsl --install --no-distribution` como administrador, depois reiniciar):
+
+```powershell
+$env:SHUTUP_AND_RUN_POLL_TOKEN = "<token emitido pelo seu orquestrador>"
+$env:SHUTUP_AND_RUN_POLL_URL = "https://orchestrator.example/poll"
+irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
+```
+
+`shutup-and-run wsl doctor` confere o WSL, a distribuição, o Docker, roda um container e confere o serviço. `wsl logs`, `wsl stop`, `wsl start`, `wsl uninstall`. Tudo, inclusive o que uma máquina Windows emprestada abre mão, está em [docs/WINDOWS.md](docs/WINDOWS.md).
 
 ## Testes
 
@@ -402,7 +422,7 @@ O `scripts/accept.sh` é o teste de quem desenvolve. Ele sobe a própria instân
 - O timeout é SIGKILL. Não há período de tolerância.
 - A `job_key` vale por máquina. Outra máquina não a conhece.
 - Sem cancelamento, sem fila, sem nova tentativa de um job que falhou.
-- Só Linux por enquanto. Windows e macOS estão planejados: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md).
+- No Windows o serviço Linux roda dentro do WSL2, só em modo pull, enquanto o usuário que instalou estiver logado. Parar o serviço mata os containers dentro da VM. [docs/WINDOWS.md](docs/WINDOWS.md). macOS está planejado: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md).
 
 ## Desenvolvimento
 

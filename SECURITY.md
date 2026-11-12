@@ -49,6 +49,14 @@ Image pulls use the machine's `docker login`. The request cannot supply registry
 
 `poll_url` makes this process call out. You choose that URL. The bearer token is `SHUTUP_AND_RUN_POLL_TOKEN` in the environment, not in the TOML file. When the variable is unset the request has no Authorization header. Redirects are not followed. The contract is in the README.
 
+The poll body carries `worker_name`, `worker_os` and the free slot count, nothing else. A `manifest_url` in the answer is fetched once, with the same size cap and no redirects, and the poll token is sent with it only when the manifest is on the same scheme, host and port as `poll_url`.
+
+`poll_any_image = true` lets a polled task name any image. It never applies to a pushed job, it still validates the image name, and it needs `poll_url`. The Windows worker is installed with it on, because the orchestrator is that machine's only source of work.
+
+## Windows
+
+The `.exe` is a supervisor for a WSL2 distribution it creates. The service, Docker Engine and the containers live inside that distribution. It mounts no Windows drive and cannot launch Windows programs. Both tokens are written only to `/etc/shutup-and-run/env` inside it, mode 600, and the API listens on `127.0.0.1` inside the distribution only. Downloads (the rootfs, the Linux binary, the `.exe` itself through `install.ps1`) are checked against the publisher's `SHA256SUMS` before use. The `.exe` is not code signed. `wsl stop` terminates the distribution, which kills every container in it.
+
 ## Reporting
 
 Open a private security report with the repository host if you can. Otherwise open an issue without exploit detail and ask for a private channel.

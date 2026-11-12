@@ -15,6 +15,7 @@ pub mod poll;
 pub mod registry;
 pub mod runtime;
 pub mod store;
+pub mod wsl;
 
 #[cfg(test)]
 pub mod mock;

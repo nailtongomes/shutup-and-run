@@ -17,6 +17,26 @@ jobs:
       - run: cargo test --locked
       - run: shellcheck scripts/*.sh
 
+  # The Windows .exe is the WSL supervisor. The GitHub-hosted runner has no
+  # usable WSL2, so the doctor must stop at its first check and exit 1.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - run: cargo test --locked
+      - name: the .exe runs and the doctor fails cleanly without WSL
+        shell: pwsh
+        run: |
+          .\target\release\shutup-and-run.exe --help
+          .\target\release\shutup-and-run.exe wsl --help
+          .\target\release\shutup-and-run.exe wsl doctor
+          if ($LASTEXITCODE -ne 1) { throw "wsl doctor exited $LASTEXITCODE, expected 1" }
+          # A typo must not install anything.
+          .\target\release\shutup-and-run.exe wsl install --pol-url https://x/poll
+          if ($LASTEXITCODE -ne 1) { throw "wsl install with a bad flag exited $LASTEXITCODE, expected 1" }
+
   accept:
     runs-on: ubuntu-latest
     steps:
