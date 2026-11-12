@@ -69,7 +69,7 @@ SUMMARY
   RAM per job      peak 912 MiB  avg 760 MiB  (x4 at once = about 3.6 GiB)
   CPU per job      avg 14.3 cpu-seconds
   files received   19  in ...
-  worker           DESK-07  windows  v0.2.3  8 cpus  7.7 GiB  max_slots 4
+  worker           DESK-07  windows  v0.2.4  8 cpus  7.7 GiB  max_slots 4
 ```
 
 (Those numbers are an illustration of the format, not a measurement.)

@@ -308,7 +308,7 @@ POST {poll_url}
 Authorization: Bearer {SHUTUP_AND_RUN_POLL_TOKEN}
 Content-Type: application/json
 
-{"worker": "desk-07", "os": "linux", "arch": "x86_64", "version": "0.2.3", "max_slots": 2, "free_slots": 1, "cpus": 8, "memory_bytes": 16624934912}
+{"worker": "desk-07", "os": "linux", "arch": "x86_64", "version": "0.2.4", "max_slots": 2, "free_slots": 1, "cpus": 8, "memory_bytes": 16624934912}
 ```
 
 The body says who is asking, so one URL can serve every machine: `worker` is `worker_name` (default: the hostname), `os` is `worker_os` (default: the OS the binary was built for; the Windows worker says `windows`), and `free_slots` is how many tasks the machine could take right now. `arch`, `version`, `max_slots`, `cpus` and `memory_bytes` say what the machine is and could lend, so the server can decide whether its queue may serve it. The machine's address is not in the body: read it from the connection. A `401` or `403` means "not approved": the machine starts nothing and asks again, backing off to five minutes.
