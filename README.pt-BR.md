@@ -308,7 +308,7 @@ POST {poll_url}
 Authorization: Bearer {SHUTUP_AND_RUN_POLL_TOKEN}
 Content-Type: application/json
 
-{"worker": "desk-07", "os": "linux", "arch": "x86_64", "version": "0.2.0", "max_slots": 2, "free_slots": 1, "cpus": 8, "memory_bytes": 16624934912}
+{"worker": "desk-07", "os": "linux", "arch": "x86_64", "version": "0.2.4", "max_slots": 2, "free_slots": 1, "cpus": 8, "memory_bytes": 16624934912}
 ```
 
 O corpo diz quem está pedindo, para que uma URL atenda todas as máquinas: `worker` é o `worker_name` (padrão: o hostname), `os` é o `worker_os` (padrão: o sistema para o qual o binário foi compilado; o worker Windows diz `windows`) e `free_slots` é quantas tarefas a máquina aceitaria agora. `arch`, `version`, `max_slots`, `cpus` e `memory_bytes` dizem o que a máquina é e o que pode emprestar, para o servidor decidir se a fila pode atendê-la. O endereço da máquina não vai no corpo: leia da conexão. Um `401` ou `403` significa "não liberada": a máquina não inicia nada e pergunta de novo, espaçando até cinco minutos.

@@ -2,7 +2,7 @@
   "worker": "DESK-07",
   "os": "windows",
   "arch": "x86_64",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "max_slots": 1,
   "free_slots": 1,
   "cpus": 4,

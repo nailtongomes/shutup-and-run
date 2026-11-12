@@ -1,6 +1,6 @@
 # Integration contract
 
-What an orchestrator (n8n, Kestra, your own API) needs in order to give work to a shutup-and-run machine and learn how it ended, without reading the Rust source. It describes what the runner does today, release 0.2.3. Where the behavior is awkward it is written down as it is, under [Limits](#9-limits-of-the-current-contract), and not as it might be wished.
+What an orchestrator (n8n, Kestra, your own API) needs in order to give work to a shutup-and-run machine and learn how it ended, without reading the Rust source. It describes what the runner does today, release 0.2.4. Where the behavior is awkward it is written down as it is, under [Limits](#9-limits-of-the-current-contract), and not as it might be wished.
 
 Machine-readable, JSON Schema Draft 2020-12:
 
@@ -256,7 +256,7 @@ Authorization: Bearer <poll-token>
 Accept: application/json
 Content-Type: application/json
 
-{"worker":"DESK-07","os":"windows","arch":"x86_64","version":"0.2.3","max_slots":1,"free_slots":1,"cpus":4,"memory_bytes":4110753792}
+{"worker":"DESK-07","os":"windows","arch":"x86_64","version":"0.2.4","max_slots":1,"free_slots":1,"cpus":4,"memory_bytes":4110753792}
 ```
 
 | Field | Type | |
@@ -264,7 +264,7 @@ Content-Type: application/json
 | `worker` | string, 1 to 64 printable ASCII, no space, `"` or `\` | The machine's `worker_name`. Default: its hostname; on Windows, the computer name. |
 | `os` | string, same limits | `worker_os`. `linux` by default. The Windows install writes `windows`. |
 | `arch` | string | `x86_64`, `aarch64`. |
-| `version` | string | The runner's version, such as `0.2.3`. |
+| `version` | string | The runner's version, such as `0.2.4`. |
 | `max_slots` | integer, 1 to 256 | Containers the machine runs at once. |
 | `free_slots` | integer, 1 to `max_slots` | Free when the poll was sent. Never `0`: a full machine does not poll. |
 | `cpus` | integer or `null` | What the process sees. On Windows that is the WSL2 VM. |
