@@ -172,6 +172,16 @@ With Windows workers spread across clients, one URL serves many machines and the
 
 The cost is a contract change for anyone who validated the body as empty, and two more config keys.
 
+## The poll body says what the machine is, and the server enrolls it
+
+Decided 2026-11-12, for v0.2.0. The owner's Linux machines are his own. The Windows machines are clients' PCs that he sets up over remote access and leaves running, so they are not trusted, and the queue must know a machine before it serves it.
+
+The body grew from three keys to eight: `worker`, `os`, `arch`, `version`, `max_slots`, `free_slots`, `cpus`, `memory_bytes`. That is identity and capacity. Still no config, token or history. There is no IP in it: inside WSL2 the worker sees a private address, and an untrusted machine could claim any address, so the server reads the public one from the connection.
+
+Enrollment is the token. `wsl install` with a URL and no `SHUTUP_AND_RUN_POLL_TOKEN` keeps the token already in the distribution or makes a random one. The poll URL sees an unknown token, records a pending machine, and refuses until the owner approves. A `401` or `403` is logged as "not approved" and backs off like any poll error. There is no separate register call and no new state on the worker.
+
+The cost: anyone who knows the poll URL can create pending records, so the server must rate-limit them and must never answer an unapproved token with a task. A token made on the client's PC is readable by that client; it identifies the machine, it does not prove who is using it. And the poll contract changed again for a server that validated the body strictly.
+
 ## A poll answer may be a manifest URL
 
 Decided 2026-11-12. A poll answer is a task inline, or `{"manifest_url": "..."}`. The machine fetches that URL once with a `GET` and the body must be a task in the same shape as `POST /v1/jobs`. A manifest cannot point at another manifest, so there is one hop, never a chain. Same 64 KiB cap, no redirects, same validation.

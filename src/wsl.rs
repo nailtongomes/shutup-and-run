@@ -70,8 +70,10 @@ shutup-and-run wsl doctor [--smoke-image IMAGE]
 shutup-and-run wsl install [--poll-url URL] [options]
     create the distribution, install Docker and the Linux binary in it, write a
     pull-only config, register the logon task, and run the doctor.
-    With --poll-url, SHUTUP_AND_RUN_POLL_TOKEN must be set in the environment.
-    Without it the worker is installed idle: only the doctor's smoke test runs.
+    Without --poll-url the worker is installed idle: only the doctor's smoke
+    test runs. SHUTUP_AND_RUN_POLL_TOKEN is the token the poll URL knows this
+    machine by. Unset, the machine keeps the one it has or makes its own, and
+    the poll URL decides whether to serve it.
       --max-slots N              containers at once (default 1)
       --poll-interval-secs N     default 15
       --worker-name NAME         default: the computer name
@@ -291,8 +293,10 @@ pub(crate) fn decode_console(bytes: &[u8]) -> String {
     let looks_utf16 = bytes.len() >= 2 && bytes.iter().take(64).any(|b| *b == 0);
     if looks_utf16 {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         String::from_utf16_lossy(&units)
             .trim_start_matches('\u{feff}')
@@ -1013,17 +1017,11 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
         .or_else(|| std::env::var("SHUTUP_AND_RUN_POLL_URL").ok())
         .filter(|u| !u.trim().is_empty());
     // No URL: install everything, poll nothing. The doctor is the only work.
-    let poll_token = match &poll_url {
-        None => None,
-        Some(_) => Some(
-            std::env::var("SHUTUP_AND_RUN_POLL_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-                .ok_or_else(|| {
-                    err("set SHUTUP_AND_RUN_POLL_TOKEN in this environment first. It is written only inside the distribution.")
-                })?,
-        ),
-    };
+    // A URL and no token: step 6 keeps the token this machine already has, or
+    // makes one, and the poll URL enrolls the machine the first time it asks.
+    let given_token = std::env::var("SHUTUP_AND_RUN_POLL_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     let max_slots = parse_count(&flags, "--max-slots", 1, 1..=256)?;
     let poll_interval_secs = parse_count(&flags, "--poll-interval-secs", 15, 1..=3600)?;
     let worker_name = flags
@@ -1052,7 +1050,7 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     let api_token = crate::launcher::random_id();
     let probe = render_config(&inner);
     let mut probe_env = HashMap::from([("SHUTUP_AND_RUN_TOKEN".to_string(), api_token.clone())]);
-    if let Some(token) = &poll_token {
+    if let Some(token) = &given_token {
         probe_env.insert("SHUTUP_AND_RUN_POLL_TOKEN".to_string(), token.clone());
     }
     crate::config::Settings::from_toml_and_env(&probe, &probe_env)
@@ -1141,6 +1139,26 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     println!("    {INNER_BIN}");
 
     println!("[6/8] config, env and the serve script");
+    let mut enrolling = false;
+    let poll_token = match (&poll_url, given_token) {
+        (None, _) => None,
+        (Some(_), Some(token)) => Some(token),
+        (Some(_), None) => match existing_poll_token() {
+            Some(token) => {
+                println!("    kept this machine's poll token");
+                Some(token)
+            }
+            None => {
+                enrolling = true;
+                println!("    made a poll token for this machine");
+                Some(format!(
+                    "{}{}",
+                    crate::launcher::random_id(),
+                    crate::launcher::random_id()
+                ))
+            }
+        },
+    };
     put_file(INNER_CONFIG, "644", render_config(&inner).into_bytes())?;
     put_file(
         INNER_ENV,
@@ -1195,16 +1213,40 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     }
     println!();
     match &poll_url {
-        Some(url) => println!(
-            "done. The worker polls {} as {worker_name} with {max_slots} slot(s).",
-            host_of(url)
-        ),
+        Some(url) => {
+            println!(
+                "done. The worker polls {} as {worker_name} with {max_slots} slot(s).",
+                host_of(url)
+            );
+            if enrolling {
+                println!(
+                    "This machine has a new token. It gets no work until the poll URL approves it."
+                );
+            }
+        }
         None => println!(
             "done. No poll URL: the worker is installed and idle. Run install again with --poll-url to give it work."
         ),
     }
     println!("logs: shutup-and-run wsl logs");
     Ok(ExitCode::SUCCESS)
+}
+
+/// The poll token a previous install left in the distribution, so a
+/// re-install is still the machine the poll URL already knows. Never printed.
+fn existing_poll_token() -> Option<String> {
+    let script =
+        format!("[ -r {INNER_ENV} ] && . {INNER_ENV}; printf %s \"$SHUTUP_AND_RUN_POLL_TOKEN\"");
+    let out = sh_in_distro(&script, None, SHORT).ok()?;
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    is_token(&token).then_some(token)
+}
+
+/// What a token we wrote looks like. Anything else in that file is not reused.
+pub(crate) fn is_token(s: &str) -> bool {
+    (16..=256).contains(&s.len())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
 }
 
 fn host_of(url: &str) -> String {
@@ -1739,6 +1781,10 @@ mod tests {
             &r#""C:\ProgramData\shutup-and-run\shutup-and-run.exe" wsl serve --background"#
                 .to_string()
         ));
+
+        assert!(is_token(&"a".repeat(64)));
+        assert!(!is_token("short"));
+        assert!(!is_token("has space in it, and is long enough"));
 
         let settings = task_settings_script();
         assert!(settings.contains("-TaskName 'shutup-and-run'"));

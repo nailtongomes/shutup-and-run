@@ -2,7 +2,8 @@
 # for this trigger. Put that URL in SHUTUP_AND_RUN_POLL_URL (the key is in the path).
 # Kestra does not read Authorization. The path key is the secret.
 #
-# The launcher's POST body is {"worker": "<name>", "os": "linux"|"windows", "free_slots": n},
+# The launcher's POST body is {"worker": "<name>", "os": "linux"|"windows", "free_slots": n,
+# "max_slots": n, "arch": ..., "version": ..., "cpus": n, "memory_bytes": n},
 # available as {{ trigger.body }} if the lookup wants to pick a task per machine.
 #
 # The HTTP body is the flow outputs. The output id must be `task`.

@@ -8,7 +8,7 @@ shutup-and-run is one static Rust binary. It sits on one machine that has Docker
 
 A slot is a running container labeled `shutup-and-run=1`. The count is a Docker list, so a restart does not forget work that is still running. Finished jobs, the last log lines, the drain flag, and auth bans live in one SQLite file.
 
-When `poll_url` is set, the same process also asks that URL for one task on an interval, and only if a slot is free and the process is not draining. The poll body names the machine (`worker_name`, `worker_os`, `free_slots`). The answer is a task, the same JSON as `POST /v1/jobs`, or a `manifest_url` that is fetched once and must be a task. Either goes through the same `launch` path, with `JobSource::Poll`, which is the only source `poll_any_image` can exempt from the allowlist. When `poll_url` is unset, nothing calls out.
+When `poll_url` is set, the same process also asks that URL for one task on an interval, and only if a slot is free and the process is not draining. The poll body names the machine and what it could lend (`worker`, `os`, `arch`, `version`, `max_slots`, `free_slots`, `cpus`, `memory_bytes`). A `401` or `403` is "not approved": nothing starts and the poll backs off. The answer is a task, the same JSON as `POST /v1/jobs`, or a `manifest_url` that is fetched once and must be a task. Either goes through the same `launch` path, with `JobSource::Poll`, which is the only source `poll_any_image` can exempt from the allowlist. When `poll_url` is unset, nothing calls out.
 
 ## What this is not
 

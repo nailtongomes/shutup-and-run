@@ -1,7 +1,7 @@
 # Install the shutup-and-run worker on Windows 11 (WSL2).
 #
 # In PowerShell, as the user who will stay logged on:
-#   $env:SHUTUP_AND_RUN_POLL_TOKEN = "<token from your orchestrator>"
+#   $env:SHUTUP_AND_RUN_POLL_TOKEN = "<token>"   # optional: without it the machine makes its own and waits for approval
 #   irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
 #   shutup-and-run wsl install --poll-url https://orchestrator.example/poll
 #
@@ -73,7 +73,7 @@ if ($env:SHUTUP_AND_RUN_POLL_URL) {
     if ($LASTEXITCODE -ne 0) { throw "shutup-and-run wsl install exited $LASTEXITCODE" }
 } else {
     Write-Host ""
-    Write-Host "next, with SHUTUP_AND_RUN_POLL_TOKEN set in this terminal:"
+    Write-Host "next (set SHUTUP_AND_RUN_POLL_TOKEN first if your orchestrator issued one):"
     Write-Host "  shutup-and-run wsl install --poll-url https://orchestrator.example/poll"
     Write-Host "or, to only check this machine (no polling, smoke test only):"
     Write-Host "  shutup-and-run wsl install"
