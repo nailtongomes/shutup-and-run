@@ -15,7 +15,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-      - run: shellcheck scripts/*.sh
+      - run: shellcheck scripts/*.sh tests/poll-mock/*.sh
       - name: windows fallback launcher shape
         run: python3 scripts/windows/check-sar-launcher.py
 
@@ -136,6 +136,28 @@ jobs:
       - name: acceptance, then smoke.sh against the same instance
         timeout-minutes: 30
         run: sudo SHUTUP_AND_RUN_SMOKE=1 bash scripts/accept.sh "${GITHUB_WORKSPACE}/target/release/shutup-and-run"
+      # Pull mode end to end: the mock poll URL offers tasks, this worker
+      # runs them and calls back, and one task that hangs is killed.
+      - name: poll cycle against the mock
+        timeout-minutes: 10
+        run: sudo bash tests/poll-mock/cycle.sh "${GITHUB_WORKSPACE}/target/release/shutup-and-run"
+      # The heavy test job: build the Selenium probe image and run it through
+      # the same cycle. Its screenshot is kept as an artifact.
+      - name: selenium probe image
+        timeout-minutes: 15
+        run: docker build -t ghcr.io/nailtongomes/shutup-and-run-selenium-probe:ci examples/selenium-probe
+      - name: poll cycle with the selenium probe
+        timeout-minutes: 10
+        run: |
+          sudo CYCLE_KEEP="${RUNNER_TEMP}/probe-screenshot.png" bash tests/poll-mock/cycle.sh \
+            "${GITHUB_WORKSPACE}/target/release/shutup-and-run" probe ghcr.io/nailtongomes/shutup-and-run-selenium-probe:ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-screenshot
+          path: ${{ runner.temp }}/probe-screenshot.png
+          if-no-files-found: ignore
+          retention-days: 7
 
   musl:
     runs-on: ubuntu-latest

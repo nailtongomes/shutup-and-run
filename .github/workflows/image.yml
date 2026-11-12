@@ -51,3 +51,9 @@ jobs:
           context: examples/smoke-image
           push: true
           tags: ghcr.io/nailtongomes/shutup-and-run-smoke:latest
+      # The heavy job tests/poll-mock offers. See examples/selenium-probe.
+      - uses: docker/build-push-action@v6
+        with:
+          context: examples/selenium-probe
+          push: true
+          tags: ghcr.io/nailtongomes/shutup-and-run-selenium-probe:latest

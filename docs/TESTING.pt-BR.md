@@ -47,11 +47,11 @@ sudo sed -n 's/.*"state":"\([^"]*\)".*/\1/p' /var/lib/shutup-and-run/status.json
 Na VPS (ou em qualquer máquina que o PC Windows alcance). É um mock: HTTP sem TLS, só para teste.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/examples/mock-poll.py
-MOCK_PUBLIC_URL=http://IP_DA_SUA_VPS:8080 python3 mock-poll.py
+curl -fsSLO https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/tests/poll-mock/poll_mock.py
+python3 poll_mock.py --require-approval --tasks 3 --keep-serving
 ```
 
-- [ ] `mock poll URL on 0.0.0.0:8080`. Abra a porta 8080 no firewall durante o teste. Deixe esse terminal visível.
+- [ ] Ele imprime `poll URL: http://<this machine's address>:8080/poll`. Abra a porta 8080 no firewall durante o teste. Deixe esse terminal visível.
 
 ## 3. Windows 11: instalar ocioso
 
@@ -111,7 +111,7 @@ Aprove a máquina, na VPS, na pasta onde o mock roda, com a linha que o mock imp
 echo <hash> >> approved.txt
 ```
 
-- [ ] Em até cinco minutos (o worker espaça as consultas enquanto é recusado) o mock imprime `TASK 1/3` e depois `CALLBACK ... "status":"exited","exit_code":0,"reason":"exited"`, três vezes, a cada 15 segundos. Depois nada: o mock responde `204`.
+- [ ] Em até cinco minutos (o worker espaça as consultas enquanto é recusado) o mock imprime `TASK mock-...-1` e depois `ok   1/3 ... reason=exited exit=0`, três vezes, a cada 15 segundos, e então um `SUMMARY` com `ok 3`. Depois disso responde `204`.
 - [ ] `shutup-and-run wsl logs` mostra `poll started a job` três vezes.
 
 Instale de novo com o mesmo comando:
@@ -133,18 +133,18 @@ Dê dois cliques nele.
 Para ver a outra resposta, dê ao worker uma tarefa longa. Na VPS, pare o mock (Ctrl+C) e inicie com uma tarefa que dorme cinco minutos:
 
 ```bash
-MOCK_IMAGE=ghcr.io/nailtongomes/shutup-and-run-smoke MOCK_COMMAND="sleep 300" MOCK_TIMEOUT=600 MOCK_TASKS=1 MOCK_PUBLIC_URL=http://IP_DA_SUA_VPS:8080 python3 mock-poll.py
+python3 poll_mock.py --require-approval --image ghcr.io/nailtongomes/shutup-and-run-smoke --command "sleep 300" --timeout 600 --tasks 1 --keep-serving
 ```
 
-Quando o mock imprimir `TASK 1/1`, espere meio minuto pelo download da imagem e dê dois cliques no atalho.
+Quando o mock imprimir `TASK mock-...-1`, espere meio minuto pelo download da imagem e dê dois cliques no atalho.
 
 - [ ] `Jobs now: 1` e `NAO DESLIGUE AGORA. / DO NOT TURN OFF NOW.` Tecle `P`.
 - [ ] `[PARADO / STOPPED]  PODE DESLIGAR O PC.` em uns 15 segundos.
-- [ ] Dois cliques de novo: ele inicia o serviço e diz `RUNNING`. O mock então imprime um `CALLBACK` do job interrompido, com `"status":"exited"` e `exit_code` diferente de zero.
+- [ ] Dois cliques de novo: ele inicia o serviço e diz `RUNNING`. O mock então imprime `FAIL 1/1` para o job interrompido, com `exit` diferente de zero.
 
 Inicie de novo uma tarefa longa, saia do Windows (logoff) enquanto ela roda e entre de novo.
 
-- [ ] `shutup-and-run wsl logs` tem `the session is ending; stopping the jobs`, e o mock recebeu um `CALLBACK` desse job.
+- [ ] `shutup-and-run wsl logs` tem `the session is ending; stopping the jobs`, e o mock imprimiu uma linha `FAIL` para esse job.
 
 Reinicie o PC e faça logon.
 

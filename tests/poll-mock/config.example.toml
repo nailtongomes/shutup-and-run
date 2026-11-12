@@ -1,0 +1,18 @@
+# A test config for a Linux worker that pulls from the mock. Not for
+# production: the allowlist names a public test image, which a real machine
+# should not do (docs/CONVENTIONS.md). A Windows worker needs no such file:
+# `wsl install --poll-url` writes poll_any_image = true.
+#
+#   SHUTUP_AND_RUN_CONFIG=tests/poll-mock/config.example.toml \
+#   SHUTUP_AND_RUN_TOKEN=$(openssl rand -hex 32) \
+#   SHUTUP_AND_RUN_POLL_TOKEN=$(openssl rand -hex 32) sudo -E shutup-and-run serve
+listen = "127.0.0.1:8787"
+http = true
+max_slots = 2
+allowlist = ["ghcr.io/nailtongomes/shutup-and-run-selenium-probe", "hello-world"]
+default_timeout_secs = 180
+max_timeout_secs = 600
+history_path = "/tmp/shutup-and-run-test/jobs.sqlite"
+# The mock's address as this machine AND its containers see it. Not 127.0.0.1.
+poll_url = "http://192.0.2.10:8080/poll"
+poll_interval_secs = 2

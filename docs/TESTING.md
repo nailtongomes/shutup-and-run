@@ -47,11 +47,11 @@ sudo sed -n 's/.*"state":"\([^"]*\)".*/\1/p' /var/lib/shutup-and-run/status.json
 On the VPS (or any machine the Windows PC can reach). It is a mock: plain HTTP, test only.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/examples/mock-poll.py
-MOCK_PUBLIC_URL=http://YOUR_VPS_IP:8080 python3 mock-poll.py
+curl -fsSLO https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/tests/poll-mock/poll_mock.py
+python3 poll_mock.py --require-approval --tasks 3 --keep-serving
 ```
 
-- [ ] `mock poll URL on 0.0.0.0:8080`. Open port 8080 in the firewall for the test. Leave this terminal visible.
+- [ ] It prints `poll URL: http://<this machine's address>:8080/poll`. Open port 8080 in the firewall for the test. Leave this terminal visible.
 
 ## 3. Windows 11: install idle
 
@@ -111,7 +111,7 @@ Approve it, on the VPS, in the folder where the mock runs, with the line the moc
 echo <hash> >> approved.txt
 ```
 
-- [ ] Within five minutes (the worker backs off while refused) the mock prints `TASK 1/3`, then `CALLBACK ... "status":"exited","exit_code":0,"reason":"exited"`, three times, 15 seconds apart. Then nothing: the mock answers `204`.
+- [ ] Within five minutes (the worker backs off while refused) the mock prints `TASK mock-...-1`, then `ok   1/3 ... reason=exited exit=0`, three times, 15 seconds apart, then a `SUMMARY` with `ok 3`. After that it answers `204`.
 - [ ] `shutup-and-run wsl logs` shows `poll started a job` three times.
 
 Install again with the same command:
@@ -133,18 +133,18 @@ Double-click it.
 To see the other answer, give the worker a long job. On the VPS, stop the mock (Ctrl+C) and start it with a task that sleeps five minutes:
 
 ```bash
-MOCK_IMAGE=ghcr.io/nailtongomes/shutup-and-run-smoke MOCK_COMMAND="sleep 300" MOCK_TIMEOUT=600 MOCK_TASKS=1 MOCK_PUBLIC_URL=http://YOUR_VPS_IP:8080 python3 mock-poll.py
+python3 poll_mock.py --require-approval --image ghcr.io/nailtongomes/shutup-and-run-smoke --command "sleep 300" --timeout 600 --tasks 1 --keep-serving
 ```
 
-When the mock prints `TASK 1/1`, wait half a minute for the image to download, then double-click the shortcut.
+When the mock prints `TASK mock-...-1`, wait half a minute for the image to download, then double-click the shortcut.
 
 - [ ] `Jobs now: 1` and `NAO DESLIGUE AGORA. / DO NOT TURN OFF NOW.` Press `P`.
 - [ ] `[PARADO / STOPPED]  PODE DESLIGAR O PC.` within about 15 seconds.
-- [ ] Double-click again: it starts the service and says `RUNNING`. The mock then prints a `CALLBACK` for the interrupted job with `"status":"exited"` and a non-zero `exit_code`.
+- [ ] Double-click again: it starts the service and says `RUNNING`. The mock then prints `FAIL 1/1` for the interrupted job, with a non-zero `exit`.
 
 Start a long job again, then sign out of Windows while it runs, and sign in again.
 
-- [ ] `shutup-and-run wsl logs` has `the session is ending; stopping the jobs`, and the mock got a `CALLBACK` for that job.
+- [ ] `shutup-and-run wsl logs` has `the session is ending; stopping the jobs`, and the mock printed a `FAIL` line for that job.
 
 Reboot the PC and log on.
 
