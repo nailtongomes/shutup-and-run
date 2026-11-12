@@ -47,10 +47,11 @@ TOML
 
 MOCK_PID=""
 WORKER_PID=""
-# shellcheck disable=SC2329  # invoked by the trap below
+# Invoked by the trap below, which some shellcheck versions do not see.
+# shellcheck disable=SC2317,SC2329
 cleanup() {
-  [[ -n "$WORKER_PID" ]] && kill "$WORKER_PID" 2>/dev/null || true
-  [[ -n "$MOCK_PID" ]] && kill "$MOCK_PID" 2>/dev/null || true
+  if [[ -n "$WORKER_PID" ]]; then kill "$WORKER_PID" 2>/dev/null || true; fi
+  if [[ -n "$MOCK_PID" ]]; then kill "$MOCK_PID" 2>/dev/null || true; fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
