@@ -139,6 +139,12 @@ The terminal you type that in is listed; nothing titled `wsl.exe` or `shutup-and
 
 **Status page.** `http://127.0.0.1:8787/` in a browser on the PC shows whether the worker is running, how many jobs are running, whether the PC can be turned off, the last job, and the version. One button pauses or resumes taking new work. It opens only on that PC and shows no token. Ask for a screenshot of it when someone needs support.
 
+**Status file.** The same facts are in `C:\ProgramData\shutup-and-run\status.json`, written by the supervisor, so a script can read it without HTTP and without an administrator. `state` is `idle`, `active`, `draining`, `failed`, or `stopped`. If `updated_at` is more than 60 seconds ago, the worker is dead. After `wsl stop` the state is `stopped`.
+
+```powershell
+(Get-Content C:\ProgramData\shutup-and-run\status.json -Raw | ConvertFrom-Json).state
+```
+
 `scripts/shutup-and-run.bat` is a desktop shortcut for the machine's user. Double-clicked, it starts the worker if it is stopped and answers two questions in two lines: is it running, and can the PC be turned off. With a job running it says not to, and `P` stops the worker with the 10 second grace first. It reads nothing but the process list and `docker ps` inside the distribution.
 
 ```powershell

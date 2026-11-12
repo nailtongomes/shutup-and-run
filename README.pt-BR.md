@@ -207,7 +207,17 @@ Como o processo se comporta está em [SECURITY.md](SECURITY.md). O que você ace
 
 ## API
 
-Todas as rotas exigem `Authorization: Bearer <token>`.
+Todas as rotas exigem `Authorization: Bearer <token>`. A exceção é a página de status local, quando `status_page` está ligado.
+
+Um script na máquina lê `status.json` e não chama HTTP. No Linux o arquivo fica ao lado do histórico, por padrão `/var/lib/shutup-and-run/status.json`, e o diretório é só do root. No Windows o supervisor grava `C:\ProgramData\shutup-and-run\status.json`, que o usuário logado lê sem ser administrador. São os mesmos fatos da página de status. `state` é `active` (uma tarefa ocupa um slot), `idle`, `draining`, `failed` ou `stopped`. Os outros campos são `slots_total`, `slots_used`, `job_ids`, `last_job_at`, `last_error`, `version`, `pid` e `updated_at` (UTC, `YYYY-MM-DDThh:mm:ssZ`). O arquivo é trocado pelo menos a cada 30 segundos e em até um segundo depois de uma mudança, gravando um arquivo temporário e renomeando por cima do antigo. Se `updated_at` tem mais de 60 segundos, o worker está morto. `stopped` com `updated_at` recente é uma parada limpa. No Windows, quando a distribuição ou o serviço morreu, `state` é `failed` e `last_error` diz o motivo.
+
+```sh
+sudo sed -n 's/.*"state":"\([^"]*\)".*/\1/p' /var/lib/shutup-and-run/status.json
+```
+
+```powershell
+(Get-Content C:\ProgramData\shutup-and-run\status.json -Raw | ConvertFrom-Json).state
+```
 
 ### `POST /v1/jobs`
 

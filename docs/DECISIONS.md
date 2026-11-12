@@ -220,6 +220,16 @@ It is the one thing on the port without the bearer token, so it is fenced: the s
 
 The cost: "every route requires the token" now has an exception, and "no web UI" has one page. Anyone who can open a browser on that machine can pause the worker, which the person lending the PC could already do. Do not turn it on behind a reverse proxy on the same host that forwards `Host: localhost`.
 
+## A status file beside the page
+
+Decided 2026-11-12. Scripts on the machine need the same answer as the status page without opening HTTP. The page and `status.json` are built from one snapshot: slots, whether new work is refused, the running job ids, and the last job.
+
+On Linux the service writes it next to the history file (`/var/lib/shutup-and-run/status.json` by default) at least every 30 seconds and within a second of a change, as a temp file renamed over the previous one. A graceful stop writes `stopped` last. The directory stays root-only, like the history file.
+
+On Windows the distribution does not mount the Windows disk, so the service cannot write `C:\ProgramData`. The supervisor copies each status line from the service into `C:\ProgramData\shutup-and-run\status.json`. When the service or the distribution is gone, the supervisor writes `failed` and the reason itself. `wsl stop` and the end of the Windows session write `stopped` after that, so the file does not stay on `failed`.
+
+The cost: a reader that looks only at `state` will trust a dead process until it also checks `updated_at`. Older than 60 seconds means dead. The Windows file lags the service by whatever it takes the log line to arrive, and the supervisor log gains one JSON line per rewrite.
+
 ## The poll body names the worker
 
 Decided 2026-11-12. The poll used to send `{}`; the server told machines apart only by their bearer token.

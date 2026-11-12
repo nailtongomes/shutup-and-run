@@ -34,6 +34,14 @@ sudo SHUTUP_AND_RUN_CONFIG=/etc/shutup-and-run/config.toml SHUTUP_AND_RUN_TOKEN=
 
 - [ ] `another shutup-and-run is already running (...jobs.lock is locked)` e `exit 1`. O serviço não é afetado: `systemctl is-active shutup-and-run` responde `active`.
 
+O arquivo de status, na VPS:
+
+```sh
+sudo sed -n 's/.*"state":"\([^"]*\)".*/\1/p' /var/lib/shutup-and-run/status.json
+```
+
+- [ ] Imprime `idle` (ou `active` se um job do smoke ainda estiver rodando). O `updated_at` desse arquivo está dentro do último minuto.
+
 ## 2. Uma URL de poll para testar
 
 Na VPS (ou em qualquer máquina que o PC Windows alcance). É um mock: HTTP sem TLS, só para teste.
@@ -74,6 +82,7 @@ Get-Process wsl, shutup-and-run, conhost, WindowsTerminal, OpenConsole -ErrorAct
 
 - [ ] Só aparece o terminal em que você está digitando. Nenhuma janela com título `wsl.exe` apareceu durante a instalação, e nenhuma aparece depois de sair e entrar de novo ou depois de `shutup-and-run wsl start`.
 - [ ] `http://127.0.0.1:8787/` no navegador mostra `RODANDO / RUNNING`, `0 / 1` e a versão. O botão pausa (`PAUSADO / PAUSED`) e retoma.
+- [ ] `(Get-Content C:\ProgramData\shutup-and-run\status.json -Raw | ConvertFrom-Json).state` imprime `idle`. Depois de `shutup-and-run wsl stop` imprime `stopped`.
 - [ ] `shutup-and-run wsl doctor` logo depois da instalação diz `ok   service`, e não "not running".
 
 Configurações da tarefa e instância única:

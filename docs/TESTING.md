@@ -34,6 +34,14 @@ sudo SHUTUP_AND_RUN_CONFIG=/etc/shutup-and-run/config.toml SHUTUP_AND_RUN_TOKEN=
 
 - [ ] `another shutup-and-run is already running (...jobs.lock is locked)` and `exit 1`. The service is untouched: `systemctl is-active shutup-and-run` says `active`.
 
+The status file, on the VPS:
+
+```sh
+sudo sed -n 's/.*"state":"\([^"]*\)".*/\1/p' /var/lib/shutup-and-run/status.json
+```
+
+- [ ] Prints `idle` (or `active` while a smoke job is still running). `updated_at` in that file is within the last minute.
+
 ## 2. A poll URL to test with
 
 On the VPS (or any machine the Windows PC can reach). It is a mock: plain HTTP, test only.
@@ -74,6 +82,7 @@ Get-Process wsl, shutup-and-run, conhost, WindowsTerminal, OpenConsole -ErrorAct
 
 - [ ] Only the terminal you are typing in is listed. No window titled `wsl.exe` appeared during the install, and none appears after signing out and in again or after `shutup-and-run wsl start`.
 - [ ] `http://127.0.0.1:8787/` in a browser shows `RODANDO / RUNNING`, `0 / 1`, and the version. The button pauses (`PAUSADO / PAUSED`) and resumes.
+- [ ] `(Get-Content C:\ProgramData\shutup-and-run\status.json -Raw | ConvertFrom-Json).state` prints `idle`. After `shutup-and-run wsl stop` it prints `stopped`.
 - [ ] `shutup-and-run wsl doctor` right after the install says `ok   service`, not "not running".
 
 Task settings and one instance:

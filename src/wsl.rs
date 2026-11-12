@@ -1474,9 +1474,23 @@ fn serve_cli(args: &[String]) -> WslResult<ExitCode> {
     let mut wait = RESTART_MIN;
     loop {
         let started = Instant::now();
-        match run_service(&log) {
-            Ok(code) => log.line(&format!("service exited with {code:?}")),
-            Err(e) => log.line(&format!("service could not start: {e}")),
+        let reason = match run_service(&log) {
+            Ok(code) => {
+                log.line(&format!("service exited with {code:?}"));
+                format!("service exited with {code:?}")
+            }
+            Err(e) => {
+                log.line(&format!("service could not start: {e}"));
+                format!("service could not start: {e}")
+            }
+        };
+        // The service is gone, so its last status line is no longer true.
+        // A later line from the next start replaces this.
+        if let Err(e) = crate::status::write_atomic(
+            &data_dir().join("status.json"),
+            &crate::status::failed_bytes(&reason),
+        ) {
+            log.line(&format!("status file: {e}"));
         }
         // A service that stayed up for a while gets a quick restart. One that
         // dies at once backs off, so a broken config does not spin.
@@ -1521,7 +1535,13 @@ fn pump<R: Read>(reader: Option<R>, log: &Logger) {
         line.clear();
         match std::io::BufRead::read_line(&mut reader, &mut line) {
             Ok(0) | Err(_) => break,
-            Ok(_) => log.raw(line.trim_end_matches(['\r', '\n'])),
+            Ok(_) => {
+                let text = line.trim_end_matches(['\r', '\n']);
+                if let Some(json) = crate::status::status_json_from_log(text) {
+                    publish_host_status(json);
+                }
+                log.raw(text);
+            }
         }
     }
 }
@@ -1620,6 +1640,7 @@ fn stop_jobs_when_the_session_ends(log: &Logger) {
             log.line("the session is ending; stopping the jobs");
         }
         let _ = sh_in_distro(&graceful_stop_script(3), None, Duration::from_secs(8));
+        mark_stopped();
         1
     }
     let _ = SESSION_LOG.set(log.clone());
@@ -1666,8 +1687,29 @@ fn stop_cli() -> WslResult<ExitCode> {
     if !out.ok() {
         return Err(step_failed("wsl --terminate", "wsl --terminate", &out));
     }
+    mark_stopped();
     println!("stopped {TASK_NAME} and terminated {DISTRO}; its containers were stopped");
     Ok(ExitCode::SUCCESS)
+}
+
+/// `status.json` on the Windows side. The bytes are the service's own
+/// document, copied from its log line, so the host file and the page match.
+fn publish_host_status(json: &str) {
+    let path = data_dir().join("status.json");
+    let mut bytes = json.as_bytes().to_vec();
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    if let Err(e) = crate::status::write_atomic(&path, &bytes) {
+        if let Some(log) = SESSION_LOG.get() {
+            log.line(&format!("status file: {e}"));
+        }
+    }
+}
+
+fn mark_stopped() {
+    let path = data_dir().join("status.json");
+    let _ = crate::status::write_atomic(&path, &crate::status::stopped_bytes());
 }
 
 fn logs_cli(args: &[String]) -> WslResult<ExitCode> {
