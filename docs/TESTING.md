@@ -1,4 +1,4 @@
-# Testing v0.2.0 by hand
+# Testing a release by hand
 
 Português: [TESTING.pt-BR.md](TESTING.pt-BR.md).
 
@@ -8,9 +8,9 @@ One Linux VPS (yours, trusted) and one Windows 11 PC (treated as a client's). Ab
 
 The one-line installs download from the latest GitHub release.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` is `v0.2.0` and has three files: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` is `v0.2.1` or later and has three files: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
-If it is not there, tag `main`: `git tag v0.2.0 && git push origin v0.2.0`, and wait for the `release` workflow.
+If it is not there, tag `main`: `git tag v0.2.1 && git push origin v0.2.1`, and wait for the `release` workflow.
 
 ## 1. Linux VPS: push
 

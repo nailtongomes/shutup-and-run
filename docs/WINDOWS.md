@@ -11,7 +11,7 @@ Tested target: Windows 11 Pro 25H2 with WSL2. Windows 10 is not a target.
  -------                                   ----------------------------------
  shutup-and-run.exe wsl serve   --------->  /usr/local/bin/shutup-and-run serve   (the Linux musl binary)
    scheduled task at logon                    polls your URL, listens on 127.0.0.1:8787 only
-   restarts the service if it exits           Docker Engine (docker.io), started with the distribution
+   restarts the service if it exits           Docker Engine (docker.io), started by systemd in it  
    writes %ProgramData%\shutup-and-run\       /etc/shutup-and-run/config.toml, env (600)
      supervisor.log                           containers, images, jobs.sqlite
 ```
@@ -181,4 +181,6 @@ Prefer the `.exe` whenever WSL2 works.
 - The `.exe` is not code signed. SmartScreen shows "Windows protected your PC" the first time; "More info", "Run anyway". The hash check in `install.ps1` is the integrity check.
 - `wsl --install --no-distribution` and the reboot need an administrator once. Nothing else does.
 - There is no script mode in the binary. A job of the service is a container. The `.bat` in [When the .exe cannot run](#when-the-exe-cannot-run) is a fallback for a PC that cannot run the `.exe`, and it is not that mode. [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md) keeps the open questions.
+- Docker inside the distribution is started by systemd, which needs WSL 0.67.6 or newer. `wsl --update` brings an older one up to date.
+- Docker Desktop may be installed on the same PC. This worker has its own distribution, `shutup-and-run`, and always names it; it does not use or change `docker-desktop`, the default distribution, or Docker Desktop's engine. The one shared file is `%UserProfile%\.wslconfig`, which caps every WSL2 VM and is only written when it does not exist.
 - A Windows machine without virtualization (some VMs, some corporate images) cannot run WSL2 and cannot run the `.exe`. That section is the other option.
