@@ -137,7 +137,7 @@ Run the service: `shutup-and-run` or `shutup-and-run serve`. Config errors print
 
 `release.yml` runs on `v*` tags. Permissions: `contents: write`. It attaches `shutup-and-run-x86_64-unknown-linux-musl` and `SHA256SUMS` to the GitHub release. `scripts/install.sh` downloads that asset from `releases/latest` and refuses to install it when the hash does not match `SHA256SUMS`. `SHUTUP_AND_RUN_BIN` skips the download. A second job, `install`, waits for the assets, runs the README one-liner on a fresh runner, checks that the installed binary matches `SHA256SUMS`, and runs `smoke.sh`.
 
-To cut the first release: merge to `main`, then `git tag v0.1.0 && git push origin v0.1.0`. Tag from `main`, because the one-liner fetches `install.sh` from `main`. `Cargo.toml` says `0.1.0`.
+To cut the first release: merge to `main`, then `git tag v0.1.0 && git push origin v0.1.0`. Tag from `main`, because the one-liner fetches `install.sh` from `main`. `Cargo.toml` must say the version of the tag (now `0.2.0`), because the Windows `.exe` downloads the Linux binary of its own version.
 
 The workflows do not set `id-token` or a cloud deploy role. They use `GITHUB_TOKEN`.
 
@@ -171,7 +171,7 @@ These are accepted, not a bug list. A review should confirm they are still true 
 - `poll_url` is an outbound POST to an operator-chosen URL. Unset token means no Authorization header. A redirect is not followed.
 - `manifest_url` is a second outbound GET to a URL the poll server chose. The token goes only to the poll origin. No private-address block, as with callbacks.
 - With `poll_any_image` the poll server decides the image. The allowlist is not consulted for that task. The flag cannot exist without `poll_url` and never applies to a push (`src/launcher.rs`, `JobSource`).
-- On Windows the containers live in a WSL2 VM that the installing user owns. `wsl stop` kills them. The service is up only while that user is logged on. The `.exe` is not signed.
+- On Windows the containers live in a WSL2 VM that the installing user owns. `wsl stop` stops them with a 10 second grace; a sign-out or shutdown kills them. The service is up only while that user is logged on. The `.exe` is not signed.
 - A task can be lost if the server deletes it when it offers it and the launcher then refuses (slot taken, not allowlisted). An accepted task keeps its `job_key` even if the image fails to pull. The README tells the server to offer the same key until the callback.
 - A job answered with `202` and still pulling its image exists only in memory. A graceful stop waits 30 seconds for it. A crash, or a longer pull, ends it: the row is closed at the next start and the callback says so.
 - `202` does not mean the image exists. A wrong tag is a `start_failed` job, not an error on the POST.

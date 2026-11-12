@@ -41,6 +41,11 @@ const LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 const RESTART_MIN: Duration = Duration::from_secs(5);
 const RESTART_MAX: Duration = Duration::from_secs(60);
 
+/// Run inside the distribution by `wsl stop`, before the VM is terminated.
+const GRACEFUL_STOP: &str = "pkill -TERM -x shutup-and-run; \
+     ids=$(docker ps -q --filter label=shutup-and-run=1 2>/dev/null); \
+     [ -z \"$ids\" ] || docker stop -t 10 $ids >/dev/null";
+
 const SHORT: Duration = Duration::from_secs(30);
 const DISTRO_START: Duration = Duration::from_secs(120);
 const APT: Duration = Duration::from_secs(20 * 60);
@@ -62,10 +67,11 @@ shutup-and-run wsl doctor [--smoke-image IMAGE]
     check WSL2, the shutup-and-run distribution, Docker inside it, and run
     one container as a smoke test. Exit 1 when something is missing.
 
-shutup-and-run wsl install --poll-url URL [options]
+shutup-and-run wsl install [--poll-url URL] [options]
     create the distribution, install Docker and the Linux binary in it, write a
     pull-only config, register the logon task, and run the doctor.
-    SHUTUP_AND_RUN_POLL_TOKEN must be set in the environment.
+    With --poll-url, SHUTUP_AND_RUN_POLL_TOKEN must be set in the environment.
+    Without it the worker is installed idle: only the doctor's smoke test runs.
       --max-slots N              containers at once (default 1)
       --poll-interval-secs N     default 15
       --worker-name NAME         default: the computer name
@@ -81,8 +87,8 @@ shutup-and-run wsl serve [--background]
     --background detaches from the console and writes only to the log.
 
 shutup-and-run wsl start | stop
-    start or end the scheduled task. stop also terminates the distribution,
-    which kills the containers running inside it.
+    start or end the scheduled task. stop gives running containers SIGTERM
+    and 10 seconds, then terminates the distribution.
 
 shutup-and-run wsl logs [--lines N]
     print the end of the supervisor log (default 100 lines).
@@ -488,7 +494,9 @@ pub(crate) fn render_serve_script() -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InnerConfig {
-    pub poll_url: String,
+    /// None: nothing to poll. The service idles and only the doctor runs a container.
+    pub poll_url: Option<String>,
+    pub smoke_image: String,
     pub poll_interval_secs: u64,
     pub max_slots: u64,
     pub worker_name: String,
@@ -497,22 +505,31 @@ pub(crate) struct InnerConfig {
 /// The pull-only config. No allowlist: the poll URL decides the image, which
 /// is what `poll_any_image` means. The listener stays on localhost inside the
 /// distribution, for the doctor and for `GET /v1/jobs/{id}` from a shell.
+///
+/// Without a poll URL nothing is polled and `poll_any_image` cannot be set, so
+/// the allowlist holds the smoke image, because the service wants one entry.
 pub(crate) fn render_config(c: &InnerConfig) -> String {
+    let work = match &c.poll_url {
+        Some(url) => format!(
+            "allowlist = []\n\
+             poll_url = {}\n\
+             poll_interval_secs = {}\n\
+             poll_any_image = true\n",
+            toml_string(url),
+            c.poll_interval_secs,
+        ),
+        None => format!("allowlist = [{}]\n", toml_string(&c.smoke_image)),
+    };
     format!(
         "# Written by shutup-and-run.exe wsl install. Edit and restart the task.\n\
          listen = \"{INNER_LISTEN}\"\n\
          http = true\n\
          max_slots = {}\n\
-         allowlist = []\n\
-         poll_url = {}\n\
-         poll_interval_secs = {}\n\
-         poll_any_image = true\n\
+         {work}\
          worker_name = {}\n\
          worker_os = \"windows\"\n\
          history_path = \"/var/lib/shutup-and-run/jobs.sqlite\"\n",
         c.max_slots,
-        toml_string(&c.poll_url),
-        c.poll_interval_secs,
         toml_string(&c.worker_name),
     )
 }
@@ -536,8 +553,12 @@ fn toml_string(s: &str) -> String {
 }
 
 /// `/etc/shutup-and-run/env`, mode 600. Both tokens live only here.
-pub(crate) fn render_env(api_token: &str, poll_token: &str) -> String {
-    format!("SHUTUP_AND_RUN_TOKEN={api_token}\nSHUTUP_AND_RUN_POLL_TOKEN={poll_token}\n")
+pub(crate) fn render_env(api_token: &str, poll_token: Option<&str>) -> String {
+    let mut text = format!("SHUTUP_AND_RUN_TOKEN={api_token}\n");
+    if let Some(poll_token) = poll_token {
+        text.push_str(&format!("SHUTUP_AND_RUN_POLL_TOKEN={poll_token}\n"));
+    }
+    text
 }
 
 /// `%UserProfile%\.wslconfig` is per user and global to WSL2, so it is written
@@ -990,14 +1011,19 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
         .get("--poll-url")
         .map(str::to_string)
         .or_else(|| std::env::var("SHUTUP_AND_RUN_POLL_URL").ok())
-        .filter(|u| !u.trim().is_empty())
-        .ok_or_else(|| err("--poll-url is required (or SHUTUP_AND_RUN_POLL_URL)"))?;
-    let poll_token = std::env::var("SHUTUP_AND_RUN_POLL_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| {
-            err("set SHUTUP_AND_RUN_POLL_TOKEN in this environment first. It is written only inside the distribution.")
-        })?;
+        .filter(|u| !u.trim().is_empty());
+    // No URL: install everything, poll nothing. The doctor is the only work.
+    let poll_token = match &poll_url {
+        None => None,
+        Some(_) => Some(
+            std::env::var("SHUTUP_AND_RUN_POLL_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| {
+                    err("set SHUTUP_AND_RUN_POLL_TOKEN in this environment first. It is written only inside the distribution.")
+                })?,
+        ),
+    };
     let max_slots = parse_count(&flags, "--max-slots", 1, 1..=256)?;
     let poll_interval_secs = parse_count(&flags, "--poll-interval-secs", 15, 1..=3600)?;
     let worker_name = flags
@@ -1018,16 +1044,17 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     // The same checks the service applies, before anything is downloaded.
     let inner = InnerConfig {
         poll_url: poll_url.clone(),
+        smoke_image: smoke_image.to_string(),
         poll_interval_secs,
         max_slots,
         worker_name: worker_name.clone(),
     };
     let api_token = crate::launcher::random_id();
     let probe = render_config(&inner);
-    let probe_env = HashMap::from([
-        ("SHUTUP_AND_RUN_TOKEN".to_string(), api_token.clone()),
-        ("SHUTUP_AND_RUN_POLL_TOKEN".to_string(), poll_token.clone()),
-    ]);
+    let mut probe_env = HashMap::from([("SHUTUP_AND_RUN_TOKEN".to_string(), api_token.clone())]);
+    if let Some(token) = &poll_token {
+        probe_env.insert("SHUTUP_AND_RUN_POLL_TOKEN".to_string(), token.clone());
+    }
     crate::config::Settings::from_toml_and_env(&probe, &probe_env)
         .map_err(|e| err(format!("the config these options make is invalid: {e}")))?;
 
@@ -1118,7 +1145,7 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     put_file(
         INNER_ENV,
         "600",
-        render_env(&api_token, &poll_token).into_bytes(),
+        render_env(&api_token, poll_token.as_deref()).into_bytes(),
     )?;
     put_file(INNER_SERVE, "755", render_serve_script().into_bytes())?;
     println!("    {INNER_CONFIG}, {INNER_ENV} (600), {INNER_SERVE}");
@@ -1167,10 +1194,15 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
         ));
     }
     println!();
-    println!(
-        "done. The worker polls {} as {worker_name} with {max_slots} slot(s).",
-        host_of(&poll_url)
-    );
+    match &poll_url {
+        Some(url) => println!(
+            "done. The worker polls {} as {worker_name} with {max_slots} slot(s).",
+            host_of(url)
+        ),
+        None => println!(
+            "done. No poll URL: the worker is installed and idle. Run install again with --poll-url to give it work."
+        ),
+    }
     println!("logs: shutup-and-run wsl logs");
     Ok(ExitCode::SUCCESS)
 }
@@ -1221,12 +1253,39 @@ pub(crate) fn schtasks_create_args(exe: &Path) -> Vec<String> {
     ]
 }
 
+/// `schtasks /Create` leaves defaults meant for a short job: the task does
+/// not start on battery, stops when the machine goes on battery, and is
+/// ended after 72 hours. This worker runs for as long as the user is logged
+/// on, so those are turned off. A second run of the task is ignored.
+pub(crate) fn task_settings_script() -> String {
+    format!(
+        "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
+         -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew; \
+         Set-ScheduledTask -TaskName '{TASK_NAME}' -Settings $s | Out-Null"
+    )
+}
+
 fn register_task(exe: &Path) -> WslResult<()> {
     let args = schtasks_create_args(exe);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = run("schtasks.exe", &refs, None, SHORT)?;
     if !out.ok() {
         return Err(err(format!("schtasks /Create: {}", out.one_line())));
+    }
+    // Soft: the task works without this, with the defaults described above.
+    let script = task_settings_script();
+    match run(
+        "powershell.exe",
+        &["-NoProfile", "-NonInteractive", "-Command", &script],
+        None,
+        SHORT,
+    ) {
+        Ok(out) if out.ok() => {}
+        Ok(out) => println!(
+            "    could not change the task settings ({}). It will not start on battery and ends after 72 hours.",
+            out.one_line()
+        ),
+        Err(e) => println!("    could not change the task settings ({e})."),
     }
     let out = run("schtasks.exe", &["/Run", "/TN", TASK_NAME], None, SHORT)?;
     if !out.ok() {
@@ -1243,6 +1302,9 @@ fn serve_cli(args: &[String]) -> WslResult<ExitCode> {
     let background = flags.has("--background");
     let data = data_dir();
     std::fs::create_dir_all(&data).map_err(|e| err(format!("{}: {e}", data.display())))?;
+    // One supervisor per machine. A second one would only fight over the
+    // service inside the distribution, so it says so and leaves.
+    let _lock = crate::lock::acquire(&data.join("supervisor.lock")).map_err(err)?;
     let log = Logger::open(&log_path(), !background)?;
     // Only after the log is open: with no console, a print would have
     // nowhere to go, and this loop never returns to print anything.
@@ -1392,11 +1454,21 @@ fn stop_cli() -> WslResult<ExitCode> {
     if !ended.ok() {
         println!("schtasks /End: {}", ended.one_line());
     }
+    // Terminating the VM would kill the containers with no warning. Stop the
+    // service first so it takes no new task, then give each job SIGTERM and
+    // 10 seconds. The rows are closed when the service next starts.
+    if our_distro()?.is_some() {
+        match sh_in_distro(GRACEFUL_STOP, None, DISTRO_START) {
+            Ok(out) if out.ok() => {}
+            Ok(out) => println!("graceful stop: {}", out.one_line()),
+            Err(e) => println!("graceful stop: {e}"),
+        }
+    }
     let out = run("wsl.exe", &["--terminate", DISTRO], None, SHORT)?;
     if !out.ok() {
         return Err(err(format!("wsl --terminate: {}", out.one_line())));
     }
-    println!("stopped {TASK_NAME} and terminated {DISTRO}; containers inside it are gone");
+    println!("stopped {TASK_NAME} and terminated {DISTRO}; its containers were stopped");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1544,7 +1616,8 @@ mod tests {
     #[test]
     fn rendered_config_is_one_the_service_accepts() {
         let text = render_config(&InnerConfig {
-            poll_url: "https://orchestrator.example/poll?x=\"1\"".into(),
+            poll_url: Some("https://orchestrator.example/poll?x=\"1\"".into()),
+            smoke_image: "hello-world".into(),
             poll_interval_secs: 20,
             max_slots: 2,
             worker_name: "DESK-07".into(),
@@ -1578,8 +1651,26 @@ mod tests {
     }
 
     #[test]
+    fn without_a_poll_url_the_config_is_idle_and_still_accepted() {
+        let text = render_config(&InnerConfig {
+            poll_url: None,
+            smoke_image: "hello-world".into(),
+            poll_interval_secs: 15,
+            max_slots: 1,
+            worker_name: "DESK-07".into(),
+        });
+        let env = HashMap::from([("SHUTUP_AND_RUN_TOKEN".to_string(), "a".repeat(32))]);
+        let settings = crate::config::Settings::from_toml_and_env(&text, &env).unwrap();
+        assert!(settings.poll_url.is_none());
+        assert!(!settings.poll_any_image);
+        assert_eq!(settings.allowlist, vec!["hello-world".to_string()]);
+        assert!(settings.listen.ip().is_loopback());
+        assert_eq!(render_env("api", None), "SHUTUP_AND_RUN_TOKEN=api\n");
+    }
+
+    #[test]
     fn env_wsl_conf_and_serve_script_have_the_expected_shape() {
-        let env = render_env("api-token-value-ok", "poll-token-value-ok");
+        let env = render_env("api-token-value-ok", Some("poll-token-value-ok"));
         assert_eq!(
             env,
             "SHUTUP_AND_RUN_TOKEN=api-token-value-ok\nSHUTUP_AND_RUN_POLL_TOKEN=poll-token-value-ok\n"
@@ -1648,6 +1739,13 @@ mod tests {
             &r#""C:\ProgramData\shutup-and-run\shutup-and-run.exe" wsl serve --background"#
                 .to_string()
         ));
+
+        let settings = task_settings_script();
+        assert!(settings.contains("-TaskName 'shutup-and-run'"));
+        assert!(settings.contains("-AllowStartIfOnBatteries"));
+        assert!(settings.contains("[TimeSpan]::Zero"));
+        assert!(settings.contains("IgnoreNew"));
+        assert!(!settings.contains('"'));
 
         let checks = vec![
             check("wsl", true, "ok"),

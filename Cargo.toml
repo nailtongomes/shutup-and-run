@@ -1,11 +1,11 @@
 [package]
 name = "shutup-and-run"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Start allowlisted containers on one machine, up to a fixed number of slots."
 license = "MIT"
 readme = "README.md"
-rust-version = "1.85"
+rust-version = "1.89"
 publish = false
 
 [dependencies]

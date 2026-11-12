@@ -142,7 +142,27 @@ The listener stays on, but on `127.0.0.1:8787` inside the distribution with `htt
 
 The `.exe` downloads the musl binary of its own version from the GitHub release, so the two halves never disagree about the poll contract, and checks it against that release's `SHA256SUMS`. `install.ps1` does the same for the `.exe`. The release carries both binaries and one `SHA256SUMS`.
 
-The costs. The service runs only while the installing user is logged on; a service account or a stored password would need administrator rights and was not worth it for the first version. `wsl stop` terminates the VM and so kills the containers, unlike a Linux server where the service and the containers are independent. The rootfs is a 340 MiB download and `apt-get install docker.io` runs on the client's machine. The `.exe` is not code signed, so SmartScreen warns once. And CI can build the `.exe` but cannot run WSL2 on a GitHub runner, so the install path is tested by hand on a Windows 11 machine, not by a workflow.
+The costs. The service runs only while the installing user is logged on; a service account or a stored password would need administrator rights and was not worth it for the first version. `wsl stop` terminates the VM, so the containers end with it (after a 10 second grace since v0.2.0), unlike a Linux server where the service and the containers are independent. The rootfs is a 340 MiB download and `apt-get install docker.io` runs on the client's machine. The `.exe` is not code signed, so SmartScreen warns once. And CI can build the `.exe` but cannot run WSL2 on a GitHub runner, so the install path is tested by hand on a Windows 11 machine, not by a workflow.
+
+## One instance, by a file lock
+
+Decided 2026-11-12, for v0.2.0. A second `serve` used to run until its bind failed, after it had already reconciled and started polling, and with another port it kept running. On Windows a second supervisor restarted its failing service forever.
+
+The service now takes an exclusive lock on `jobs.lock` beside the history file before it touches Docker, and the Windows supervisor takes one on `%ProgramData%\shutup-and-run\supervisor.lock`. A second start says so and exits 1. The OS drops the lock when the process dies, so nothing goes stale. It is `File::try_lock` from the standard library, which raised `rust-version` to 1.89.
+
+The cost: the lock follows `history_path`. Two services with two configs and two history files on one Docker daemon are still possible, which is what `scripts/accept.sh` does on purpose.
+
+## Windows for v0.2.0: what was left out
+
+Decided 2026-11-12. This is an internal tool, and the Windows half cannot be tested in CI, so only what keeps a lent machine predictable went in.
+
+- `wsl install` without `--poll-url` installs an idle worker: no token, no poll, the smoke image as the one allowlist entry, and the doctor as the only container.
+- `wsl stop` stops the service and runs `docker stop -t 10` on our containers inside the distribution before it terminates the VM.
+- The logon task's battery and 72 hour defaults are turned off with `Set-ScheduledTask` after `schtasks /Create`. It is a soft step, because it has not run in CI.
+- No tray icon. It would be a window message loop in `unsafe` Win32 that no workflow can run. `wsl doctor` and `wsl logs` answer "is it working".
+- No grace at sign-out or shutdown. Windows gives a process about five seconds there, and catching it needs the same hidden window. The job is killed, its row is closed at the next start with its exit code, and the callback is sent; there is no separate `reason` for it. Tasks sent to a lent machine must be safe to run twice.
+
+The cost is that the person at the machine sees nothing on screen, and a job cut by a shutdown looks like a job that failed.
 
 ## The poll body names the worker
 

@@ -47,7 +47,7 @@ shutup-and-run.exe wsl install --poll-url https://orchestrator.example/poll --ma
 
 | Option | |
 | --- | --- |
-| `--poll-url URL` | Required, or `SHUTUP_AND_RUN_POLL_URL`. |
+| `--poll-url URL` | Or `SHUTUP_AND_RUN_POLL_URL`. Without it the worker is installed idle, see below. |
 | `--max-slots N` | Containers at once. Default 1. |
 | `--poll-interval-secs N` | Default 15. |
 | `--worker-name NAME` | What the poll body calls this machine. Default: the computer name. |
@@ -58,7 +58,11 @@ shutup-and-run.exe wsl install --poll-url https://orchestrator.example/poll --ma
 
 `SHUTUP_AND_RUN_POLL_TOKEN` is read from the environment and written only to `/etc/shutup-and-run/env` inside the distribution, mode 600. It is never on a command line. The API token for the localhost listener is generated and written beside it. `SHUTUP_AND_RUN_URL` and `SHUTUP_AND_RUN_ROOTFS_URL` point the downloads at a mirror; `SHA256SUMS` is fetched from the same directory either way.
 
-The task runs `shutup-and-run.exe wsl serve --background` when that user logs on. The service is up while the user is logged on. A machine that nobody logs on to after a reboot runs nothing; that is the trade for not needing administrator rights or a stored password.
+**Without a poll URL** the install does everything except give the machine work: no token is needed, nothing is polled, and the only container that runs is the doctor's smoke test. Use it to check a machine before your orchestrator exists. Run `wsl install --poll-url ...` again, with the token set, to turn polling on.
+
+The task runs `shutup-and-run.exe wsl serve --background` when that user logs on. It may run on battery and has no time limit; the install changes those two task defaults with PowerShell and says so if it could not.
+
+**One instance.** A second `wsl serve` while one is running prints `another shutup-and-run is already running` and exits 1. The service inside the distribution does the same. The service is up while the user is logged on. A machine that nobody logs on to after a reboot runs nothing; that is the trade for not needing administrator rights or a stored password.
 
 ## Check it
 
@@ -91,7 +95,7 @@ wsl -d shutup-and-run -u root -- sh -c '. /etc/shutup-and-run/env; curl -s -H "A
 | | |
 | --- | --- |
 | `shutup-and-run wsl logs` | The end of `%ProgramData%\shutup-and-run\supervisor.log`: the supervisor's lines and the service's own log. `--lines 500` for more. The file rotates once at 10 MiB. |
-| `shutup-and-run wsl stop` | Ends the task and terminates the distribution. **Containers inside it are killed.** On a Linux server, stopping the service leaves containers alone; here the VM goes away with the service. |
+| `shutup-and-run wsl stop` | Ends the task, stops the service, gives each running container SIGTERM and 10 seconds, then terminates the distribution. On a Linux server, stopping the service leaves containers alone; here the VM goes away with the service. |
 | `shutup-and-run wsl start` | Starts the task again. |
 | `shutup-and-run wsl uninstall` | Deletes the task and the distribution, with its images and job history. `--purge` also removes `%ProgramData%\shutup-and-run`. |
 | `wsl -d shutup-and-run -u root` | A root shell in the distribution. `docker ps`, `cat /etc/shutup-and-run/config.toml`. |
@@ -117,6 +121,10 @@ Each poll is a `POST` with the token and this body:
 The answer is a task (the same JSON as `POST /v1/jobs`), `{"task": {...}}`, nothing, or `{"manifest_url": "https://..."}`. A manifest is fetched once with a `GET` and must be a task. See [Pull](../README.md#pull).
 
 **There is no allowlist on a Windows worker.** `wsl install` writes `poll_any_image = true` and an empty allowlist: the image is whatever the manifest names. The orchestrator is the one source of work for these machines, and it is yours, so the list would only repeat what it already decides. A pushed job is still refused on this config, because the listener is on localhost and the empty allowlist matches nothing. The image name is still validated. The machine's owner is trusting your orchestrator, and that is written down in [CONVENTIONS.md](CONVENTIONS.md).
+
+## Shutdown, restart, sign-out
+
+Windows ends the WSL2 VM when the user signs out or the machine shuts down. **A running container is killed without a warning then**; only `wsl stop` gives it time. Nothing is left behind: a container is never restarted, and when the service next starts it closes the job's row, removes the container, and sends the callback. Such a job has `reason` `exited` with a non-zero `exit_code` (usually 137 or 255), or no `exit_code` if it was still pulling its image. The orchestrator offers the work again under a new `job_key`. Tasks should be safe to run twice.
 
 ## Limits
 

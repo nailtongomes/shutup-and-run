@@ -75,4 +75,6 @@ if ($env:SHUTUP_AND_RUN_POLL_URL) {
     Write-Host ""
     Write-Host "next, with SHUTUP_AND_RUN_POLL_TOKEN set in this terminal:"
     Write-Host "  shutup-and-run wsl install --poll-url https://orchestrator.example/poll"
+    Write-Host "or, to only check this machine (no polling, smoke test only):"
+    Write-Host "  shutup-and-run wsl install"
 }
