@@ -364,7 +364,7 @@ $env:SHUTUP_AND_RUN_POLL_URL = "https://orchestrator.example/poll"
 irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
 ```
 
-`shutup-and-run wsl doctor` confere o WSL, a distribuição, o Docker, roda um container e confere o serviço. Sem a URL e sem o token, `shutup-and-run wsl install` deixa a máquina instalada e ociosa, só com o smoke test. `wsl logs`, `wsl stop`, `wsl start`, `wsl uninstall`. Tudo, inclusive o que uma máquina Windows emprestada abre mão, está em [docs/WINDOWS.md](docs/WINDOWS.md).
+`shutup-and-run wsl doctor` confere o WSL, a distribuição, o Docker, roda um container e confere o serviço. Sem a URL e sem o token, `shutup-and-run wsl install` deixa a máquina instalada e ociosa, só com o smoke test. `wsl logs`, `wsl stop`, `wsl start`, `wsl uninstall`. Tudo, inclusive o que uma máquina Windows emprestada abre mão, está em [docs/WINDOWS.md](docs/WINDOWS.md). O teste manual passo a passo está em [docs/TESTING.pt-BR.md](docs/TESTING.pt-BR.md).
 
 ## Testes
 
