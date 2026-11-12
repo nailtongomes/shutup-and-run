@@ -166,6 +166,34 @@ impl Launcher {
         self.store.last_job().map_err(store_err)
     }
 
+    /// One read for the status page and for `status.json`. Docker down is
+    /// `failed`; the page and the file cannot disagree about that.
+    pub async fn live_status(&self) -> crate::status::Live {
+        let (slots, docker_error) = match self.slots().await {
+            Ok(slots) => (Some(slots), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
+        let mut job_ids = self.store.running_ids().unwrap_or_default();
+        job_ids.sort();
+        let last = self.last_job().ok().flatten();
+        let last_job_error = match (&docker_error, &last) {
+            (None, Some(job)) => crate::status::job_error(job),
+            _ => None,
+        };
+        crate::status::Live {
+            slots_used: slots.map(|s| s.used as u64),
+            slots_total: slots.map(|s| s.total as u64),
+            draining: slots.is_some_and(|s| s.draining),
+            job_ids,
+            last_job_at: last
+                .as_ref()
+                .map(|job| job.ended_at.unwrap_or(job.started_at)),
+            last_job_error,
+            docker_error,
+            last,
+        }
+    }
+
     pub fn counts(&self) -> Result<crate::store::JobCounts, LaunchError> {
         self.store.counts().map_err(store_err)
     }

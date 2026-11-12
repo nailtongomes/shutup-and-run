@@ -209,6 +209,16 @@ How the process behaves is in [SECURITY.md](SECURITY.md). What you accept by run
 
 Every route requires `Authorization: Bearer <token>`. The one exception is the local status page, when `status_page` is on.
 
+A script on the machine reads `status.json` and does not call HTTP. On Linux the file is next to the history file, `/var/lib/shutup-and-run/status.json` by default, and the directory is root-only. On Windows the supervisor writes `C:\ProgramData\shutup-and-run\status.json`, which the logged-on user can read without an administrator. It is the same facts as the status page. `state` is `active` (a job holds a slot), `idle`, `draining`, `failed`, or `stopped`. The other fields are `slots_total`, `slots_used`, `job_ids`, `last_job_at`, `last_error`, `version`, `pid`, and `updated_at` (UTC, `YYYY-MM-DDThh:mm:ssZ`). The file is replaced at least every 30 seconds and within a second of a change, by writing a temporary file and renaming it over the old one. If `updated_at` is more than 60 seconds ago, the worker is dead. `stopped` with a fresh `updated_at` is a graceful stop. On Windows, once the distribution or the service has died, `state` is `failed` and `last_error` says why.
+
+```sh
+sudo sed -n 's/.*"state":"\([^"]*\)".*/\1/p' /var/lib/shutup-and-run/status.json
+```
+
+```powershell
+(Get-Content C:\ProgramData\shutup-and-run\status.json -Raw | ConvertFrom-Json).state
+```
+
 ### `POST /v1/jobs`
 
 ```json

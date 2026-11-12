@@ -193,6 +193,7 @@ async fn serve() -> ExitCode {
     };
     launcher.reconcile().await;
     let pending = launcher.clone();
+    let status_file = shutup_and_run::status::spawn(launcher.clone());
     spawn_exit_watcher(docker, launcher.clone());
     spawn_maintenance(launcher.clone());
     spawn_poller(launcher.clone());
@@ -203,6 +204,12 @@ async fn serve() -> ExitCode {
         let listener = match TcpListener::bind(listen).await {
             Ok(listener) => listener,
             Err(err) => {
+                status_file
+                    .finish(
+                        &pending,
+                        shutup_and_run::status::End::Failed(err.to_string()),
+                    )
+                    .await;
                 eprintln!("shutup-and-run: could not listen on {listen}: {err}");
                 return ExitCode::from(1);
             }
@@ -212,10 +219,19 @@ async fn serve() -> ExitCode {
             .with_graceful_shutdown(shutdown_signal())
             .await
         {
+            status_file
+                .finish(
+                    &pending,
+                    shutup_and_run::status::End::Failed(err.to_string()),
+                )
+                .await;
             eprintln!("shutup-and-run: {err}");
             return ExitCode::from(1);
         }
         finish_starts(&pending).await;
+        status_file
+            .finish(&pending, shutup_and_run::status::End::Stopped)
+            .await;
         return ExitCode::SUCCESS;
     }
 
@@ -228,6 +244,12 @@ async fn serve() -> ExitCode {
     let config = match axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await {
         Ok(config) => config,
         Err(err) => {
+            status_file
+                .finish(
+                    &pending,
+                    shutup_and_run::status::End::Failed(err.to_string()),
+                )
+                .await;
             eprintln!("shutup-and-run: tls: {err}");
             return ExitCode::from(1);
         }
@@ -256,10 +278,19 @@ async fn serve() -> ExitCode {
         .http1()
         .header_read_timeout(HEADER_READ_TIMEOUT);
     if let Err(err) = server.handle(handle).serve(app).await {
+        status_file
+            .finish(
+                &pending,
+                shutup_and_run::status::End::Failed(err.to_string()),
+            )
+            .await;
         eprintln!("shutup-and-run: {err}");
         return ExitCode::from(1);
     }
     finish_starts(&pending).await;
+    status_file
+        .finish(&pending, shutup_and_run::status::End::Stopped)
+        .await;
     ExitCode::SUCCESS
 }
 
