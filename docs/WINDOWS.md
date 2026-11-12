@@ -127,6 +127,16 @@ The answer is a task (the same JSON as `POST /v1/jobs`), `{"task": {...}}`, noth
 
 **There is no allowlist on a Windows worker.** `wsl install` writes `poll_any_image = true` and an empty allowlist: the image is whatever the manifest names. The orchestrator is the one source of work for these machines, and it is yours, so the list would only repeat what it already decides. A pushed job is still refused on this config, because the listener is on localhost and the empty allowlist matches nothing. The image name is still validated. The machine's owner is trusting your orchestrator, and that is written down in [CONVENTIONS.md](CONVENTIONS.md).
 
+## For the person at the PC
+
+`scripts/shutup-and-run.bat` is a desktop shortcut for the machine's user. Double-clicked, it starts the worker if it is stopped and answers two questions in two lines: is it running, and can the PC be turned off. With a job running it says not to, and `P` stops the worker with the 10 second grace first. It reads nothing but the process list and `docker ps` inside the distribution.
+
+```powershell
+irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/shutup-and-run.bat -OutFile "$env:USERPROFILE\Desktop\shutup-and-run.bat"
+```
+
+A full hand test of a Windows PC and a Linux server is in [TESTING.md](TESTING.md).
+
 ## Shutdown, restart, sign-out
 
 Windows ends the WSL2 VM when the user signs out or the machine shuts down. **A running container is killed without a warning then**; only `wsl stop` gives it time. Nothing is left behind: a container is never restarted, and when the service next starts it closes the job's row, removes the container, and sends the callback. Such a job has `reason` `exited` with a non-zero `exit_code` (usually 137 or 255), or no `exit_code` if it was still pulling its image. The orchestrator offers the work again under a new `job_key`. Tasks should be safe to run twice.

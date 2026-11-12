@@ -11,7 +11,7 @@ cargo test --locked
 shellcheck scripts/*.sh
 ```
 
-`scripts/install.ps1` has no linter in CI. Keep it short and keep its checksum logic the same shape as `install.sh`.
+`scripts/install.ps1` and `scripts/shutup-and-run.bat` have no linter in CI. The `.bat` is ASCII with CRLF line ends (`.gitattributes`). Keep it short and keep its checksum logic the same shape as `install.sh`.
 
 The Windows `.exe` (`src/wsl.rs`, the WSL2 supervisor) is built on `windows-latest` in CI with the MSVC toolchain. From Linux it cross-compiles for a check, with `rustup target add x86_64-pc-windows-gnu` and `apt-get install gcc-mingw-w64-x86-64`:
 

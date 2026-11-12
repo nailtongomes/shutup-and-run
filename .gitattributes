@@ -1,0 +1,2 @@
+# cmd.exe wants CRLF, and the raw file is what a client downloads.
+*.bat -text
