@@ -2,9 +2,24 @@
 
 [English](README.md)
 
-Envie um job para uma máquina. Ela roda o seu container ou avisa que está cheia. O produto é só isso.
+Runner de jobs em container, auto-hospedado, para CPU e RAM sobrando num PC de casa ou do escritório. No Linux, o Kestra ou o n8n envia um container Docker para uma API HTTP. No Windows 11 o serviço roda dentro do WSL2 e puxa as tarefas. Os slots limitam quantas rodam ao mesmo tempo. Um timeout mata a tarefa que passa do prazo. Máquina cheia responde `429`.
 
-O shutup-and-run é um binário estático que fica em uma máquina com Docker. O seu orquestrador (Kestra, n8n, um script de shell) guarda a lista de máquinas e faz um POST do job para a primeira:
+Para quem empresta máquinas ociosas a workers de RPA ou Selenium, ou roda alguns workers de borda e está comparando Nomad, GitLab Runner e Tork.
+
+Não é fila, não é escalonador, não é CI e não é sandbox. Não tem interface web. O binário inicia uma imagem da allowlist e não sabe o que a imagem faz.
+
+## Projetos parecidos
+
+Ferramentas próximas. Esta é um processo só, numa máquina que você já tem. O orquestrador escolhe a máquina.
+
+- **Nomad** (HashiCorp) escalona jobs num cluster. Use quando um plano de controle deve decidir onde o trabalho roda.
+- **HTCondor** faz o matchmaking de jobs de alto volume num pool. Use para um pool de batch ou de pesquisa.
+- **GitLab Runner** roda jobs de CI do GitLab, com executor shell, Docker ou Kubernetes. Use quando o trabalho é um pipeline do GitLab.
+- **GitHub Actions self-hosted runner** roda workflows do GitHub Actions no seu hardware. Use quando o trabalho é um workflow do GitHub.
+- **Tork** é um motor de workflow: um coordenador enfileira tarefas em container e os workers executam, numa máquina ou em várias, por um broker. Use quando você quer essa fila, as retentativas e jobs feitos de várias tarefas.
+- **BOINC** é computação voluntária. Um servidor de projeto entrega trabalho a um cliente que as pessoas instalam para doar CPU. Use quando estranhos rodam uma carga publicada. Este projeto roda as suas imagens em máquinas que você configura.
+
+Envie um job para uma máquina. Ela roda o seu container ou avisa que está cheia. O seu orquestrador (Kestra, n8n, um script de shell) guarda a lista de máquinas e faz um POST do job para a primeira:
 
 | Resposta | Significado | O que o chamador faz |
 | --- | --- | --- |
@@ -12,7 +27,7 @@ O shutup-and-run é um binário estático que fica em uma máquina com Docker. O
 | `429` | Todos os slots estão ocupados. | Tenta a próxima máquina. |
 | `503` | A máquina está em drenagem para manutenção. | Tenta a próxima máquina. |
 
-Não há fila, escalonador nem interface. O launcher não sabe o que a sua imagem faz. Ele inicia uma imagem que está na allowlist, aplica o timeout e o limite de slots, guarda o histórico e chama você de volta quando o job termina.
+O launcher não sabe o que a sua imagem faz. Ele inicia uma imagem que está na allowlist, aplica o timeout e o limite de slots, guarda o histórico e chama você de volta quando o job termina.
 
 ```text
  Kestra / n8n                 máquina A                    máquina B
@@ -366,6 +381,8 @@ irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/i
 
 `shutup-and-run wsl doctor` confere o WSL, a distribuição, o Docker, roda um container e confere o serviço. Sem a URL e sem o token, `shutup-and-run wsl install` deixa a máquina instalada e ociosa, só com o smoke test. `wsl logs`, `wsl stop`, `wsl start`, `wsl uninstall`. Tudo, inclusive o que uma máquina Windows emprestada abre mão, está em [docs/WINDOWS.md](docs/WINDOWS.md). O teste manual passo a passo está em [docs/TESTING.pt-BR.md](docs/TESTING.pt-BR.md).
 
+Um PC que não consegue rodar WSL2 não consegue rodar o `.exe`. [`scripts/windows/sar-launcher.bat`](scripts/windows/sar-launcher.bat) é o recurso para esse caso: o `cmd` baixa um script Python de uma URL que você define, guarda em cache e executa. Não usa a allowlist, os slots nem a API HTTP, e não confere checksum. Use HTTPS e um host que você controla. Detalhes: [docs/WINDOWS.md](docs/WINDOWS.md#when-the-exe-cannot-run).
+
 ## Testes
 
 O `scripts/smoke.sh` confere uma instância em execução pela API. Precisa de `curl` e `python3` onde ele roda, e de uma imagem na allowlist da instância:
@@ -422,7 +439,7 @@ O `scripts/accept.sh` é o teste de quem desenvolve. Ele sobe a própria instân
 - O timeout é SIGKILL. Não há período de tolerância.
 - A `job_key` vale por máquina. Outra máquina não a conhece.
 - Sem cancelamento, sem fila, sem nova tentativa de um job que falhou.
-- No Windows o serviço Linux roda dentro do WSL2, só em modo pull, enquanto o usuário que instalou estiver logado. Parar o serviço mata os containers dentro da VM. [docs/WINDOWS.md](docs/WINDOWS.md). macOS está planejado: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md).
+- No Windows o serviço Linux roda dentro do WSL2, só em modo pull, enquanto o usuário que instalou estiver logado. Parar o serviço mata os containers dentro da VM. Um PC que não roda WSL2 não roda o `.exe`; o fallback em shell está em [docs/WINDOWS.md](docs/WINDOWS.md#when-the-exe-cannot-run). macOS está planejado: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md).
 
 ## Desenvolvimento
 

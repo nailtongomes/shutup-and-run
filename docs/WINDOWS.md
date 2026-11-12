@@ -150,11 +150,35 @@ Treat a Windows worker as a computer you do not control. Its user is administrat
 - What comes back (callback, results, exit code) is a claim by that machine. Check it where it matters.
 - Keep work that needs real secrets on your own Linux machines. The queue behind the poll URL makes that choice, using what the poll body says.
 
+## When the .exe cannot run
+
+A machine without virtualization cannot start WSL2, so `shutup-and-run.exe` cannot run. [`scripts/windows/sar-launcher.bat`](../scripts/windows/sar-launcher.bat) is the fallback: a `cmd` script you edit and start yourself. It is not the product. It does not poll, it does not take pushes, and what it runs is a Python process, not a container. The allowlist, slots, timeouts, and callbacks of the binary do not apply.
+
+It downloads `MAIN_SCRIPT` and the names in `HELPERS`, then runs the script with `py -3`, or with `python` if `py` is absent. Each URL is `BASE_URL`, a slash, the file name, then `URL_SUFFIX`. The sample config fetches `https://www.domain.example/files/smoke_test.py/0.0/0`. A file newer than its TTL stays as it is. A failed download is retried, then the previous local copy is used. If the main script is missing even locally, the launcher exits 1. A helper that fails is a warning. The script sees `RUN_MODE` and `BOT_TASK` in the environment. Its exit code is the launcher's exit code.
+
+| Variable | |
+| --- | --- |
+| `RUN_MODE`, `BOT_TASK` | Passed through to the Python process. `BOT_TASK` is also the lock file name. |
+| `BASE_DIR` | Directory for the scripts and the lock. Created if missing. |
+| `BASE_URL` | No trailing slash. HTTPS, on a host you control. |
+| `URL_SUFFIX` | Appended after the file name. Include the leading slash when the suffix is a path. |
+| `MAIN_SCRIPT` | `.py` or `.pyc`. |
+| `HELPERS`, `HELPER_EXT` | Space-separated helper names, same URL pattern. Extension `py` or `pyc`. |
+| `TTL_MAIN`, `TTL_HELPER` | Minutes to keep a cached file before downloading it again. |
+| `LOCK_TTL` | Minutes. A newer lock means the task is already running (exit 2). An older lock is stale and is taken. A killed window leaves the lock until then. The file does not store a process id. |
+| `RETRIES`, `TIMEOUT_SEC` | Download attempts, and the timeout of each attempt. The wait between tries is 2 seconds times the attempt number. |
+
+The lock is deleted when the launcher exits after taking it: Python missing, main script missing, or the script finished. It is not deleted when another run still holds it. The check is the file's last write time, so a stale lock is detectable without reading the file.
+
+**Security.** The file downloads those URLs and runs the bytes. There is no checksum and no allowlist. Anyone who can change the files at that URL, or redirect it, runs code on the PC. Use HTTPS and a host you control. Do not point it at a URL you do not administer.
+
+Prefer the `.exe` whenever WSL2 works.
+
 ## Limits
 
 - Resource limits (`cpu`, `memory`, `shm`) apply inside the WSL2 VM. The VM itself takes up to half the machine's RAM unless `.wslconfig` says otherwise. Use `--wsl-memory` and `--wsl-processors` on a machine someone lends.
 - The service runs only while the installing user is logged on. Lock the screen, do not sign out.
 - The `.exe` is not code signed. SmartScreen shows "Windows protected your PC" the first time; "More info", "Run anyway". The hash check in `install.ps1` is the integrity check.
 - `wsl --install --no-distribution` and the reboot need an administrator once. Nothing else does.
-- There is no script mode. A job is a container. [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md) keeps the idea.
-- A Windows machine without virtualization (some VMs, some corporate images) cannot run WSL2 and cannot run this.
+- There is no script mode in the binary. A job of the service is a container. The `.bat` in [When the .exe cannot run](#when-the-exe-cannot-run) is a fallback for a PC that cannot run the `.exe`, and it is not that mode. [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md) keeps the open questions.
+- A Windows machine without virtualization (some VMs, some corporate images) cannot run WSL2 and cannot run the `.exe`. That section is the other option.

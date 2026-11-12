@@ -164,6 +164,16 @@ Decided 2026-11-12. This is an internal tool, and the Windows half cannot be tes
 
 The cost is that the person at the machine sees nothing on screen, and a job cut by a shutdown looks like a job that failed.
 
+## Windows shell fallback when the .exe cannot run
+
+Decided 2026-11-12. Some client PCs have no virtualization, so WSL2 cannot start and `shutup-and-run.exe` cannot run. [`scripts/windows/sar-launcher.bat`](../scripts/windows/sar-launcher.bat) is that case: `cmd` downloads a Python script and helpers from a URL the operator sets, caches them, takes a lock file, and runs the script.
+
+It is not the script mode deferred above. The binary still does not download or run a script. This file does not speak the HTTP API, does not use the allowlist, and does not check a checksum. The integrity requirement in [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md) still stands before any of that behavior moves into the binary. Use HTTPS and a host you control.
+
+A lock younger than `LOCK_TTL` minutes counts as held (exit 2) and is not deleted. An older lock is stale and is replaced. The file does not record a PID, so a crashed run is abandoned only when the lock ages out. Every exit after the lock was taken deletes it. CI cannot run `cmd.exe`. [`scripts/windows/check-sar-launcher.py`](../scripts/windows/check-sar-launcher.py) checks that the file stayed ASCII, CRLF, and in that shape.
+
+The cost is remote code execution with no integrity check, on a machine whose user can already read anything the script writes, and a second Windows path that is easy to confuse with the product.
+
 ## The poll body names the worker
 
 Decided 2026-11-12. The poll used to send `{}`; the server told machines apart only by their bearer token.

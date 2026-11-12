@@ -188,7 +188,7 @@ These are accepted, not a bug list. A review should confirm they are still true 
 
 ## Open TODOs
 
-- macOS, and the deferred Windows script mode, in [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md). The integrity check (sha256 or signature) is required before any client runs a downloaded script.
+- macOS, and the deferred Windows script mode, in [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md). The integrity check (sha256 or signature) is required before any client runs a downloaded script. `scripts/windows/sar-launcher.bat` is the shell fallback for a PC that cannot run the `.exe`. It is not that mode: the binary does not run it, and it has no checksum.
 - The Windows install path (`wsl install`) is not exercised by CI, because a GitHub runner has no WSL2. It was built and clippy-checked for Windows; a run on a real Windows 11 25H2 machine is the acceptance test, and its doctor table belongs in the PR or the release notes.
 - The Windows service runs only while the installing user is logged on. A service account (`/RU SYSTEM` and a distribution registered for it) is the upgrade if a client wants it to survive a reboot without a logon.
 - GHCR: if a package was created private, the owner still has to switch it to public for anonymous pulls. That applies to `shutup-and-run` and to `shutup-and-run-smoke`. It is a registry setting, not a code change.
