@@ -162,6 +162,10 @@ impl Launcher {
         })
     }
 
+    pub fn last_job(&self) -> Result<Option<JobRecord>, LaunchError> {
+        self.store.last_job().map_err(store_err)
+    }
+
     pub fn counts(&self) -> Result<crate::store::JobCounts, LaunchError> {
         self.store.counts().map_err(store_err)
     }

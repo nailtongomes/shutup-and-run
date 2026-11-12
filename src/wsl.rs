@@ -73,12 +73,19 @@ const DOCKER_STEPS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Run inside the distribution by `wsl stop`, before the VM is terminated.
-const GRACEFUL_STOP: &str = "pkill -TERM -x shutup-and-run; \
-     ids=$(docker ps -q --filter label=shutup-and-run=1 2>/dev/null); \
-     [ -z \"$ids\" ] || docker stop -t 10 $ids >/dev/null";
+/// Run inside the distribution before the VM goes away: by `wsl stop` with
+/// 10 seconds, and at sign-out or shutdown with the 3 that Windows leaves.
+/// The service goes first so it takes no new task.
+pub(crate) fn graceful_stop_script(grace_secs: u32) -> String {
+    format!(
+        "pkill -TERM -x shutup-and-run; \
+         ids=$(docker ps -q --filter label=shutup-and-run=1 2>/dev/null); \
+         [ -z \"$ids\" ] || docker stop -t {grace_secs} $ids >/dev/null"
+    )
+}
 
 const FAIL_LINES: usize = 20;
+const SERVICE_WAIT_SECS: u32 = 20;
 const SHORT: Duration = Duration::from_secs(30);
 const DISTRO_START: Duration = Duration::from_secs(120);
 const APT: Duration = Duration::from_secs(20 * 60);
@@ -119,7 +126,8 @@ shutup-and-run wsl install [--poll-url URL] [options]
 
 shutup-and-run wsl serve [--background]
     run the service inside the distribution and restart it if it exits.
-    --background detaches from the console and writes only to the log.
+    --background writes only to the log. The logon task runs it under a
+    headless console host, so no window opens.
 
 shutup-and-run wsl start | stop
     start or end the scheduled task. stop gives running containers SIGTERM
@@ -390,6 +398,7 @@ fn run(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    no_window(&mut command);
     let mut child = command.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             err(format!(
@@ -598,6 +607,7 @@ pub(crate) fn render_config(c: &InnerConfig) -> String {
          {work}\
          worker_name = {}\n\
          worker_os = \"windows\"\n\
+         status_page = true\n\
          history_path = \"/var/lib/shutup-and-run/jobs.sqlite\"\n",
         c.max_slots,
         toml_string(&c.worker_name),
@@ -1024,11 +1034,13 @@ fn doctor(smoke_image: &str) -> WslResult<Vec<Check>> {
         },
     ));
 
+    // Right after an install the task has just started and the service is
+    // still waiting for dockerd, so the port gets some seconds to answer.
     // No double quotes in the script: the token is hex, so it needs none,
     // and one fewer quoting layer between here and sh is one fewer surprise.
     let health = sh_in_distro(
         &format!(
-            ". {INNER_ENV} && curl -fsS -m 5 --oauth2-bearer $SHUTUP_AND_RUN_TOKEN http://{INNER_LISTEN}/health"
+            ". {INNER_ENV} && i=0; until curl -fs -m 5 --oauth2-bearer $SHUTUP_AND_RUN_TOKEN http://{INNER_LISTEN}/health; do i=$((i + 1)); [ $i -ge {SERVICE_WAIT_SECS} ] && exit 1; sleep 1; done"
         ),
         None,
         DISTRO_START,
@@ -1356,13 +1368,22 @@ fn install_exe_copy(data: &Path) -> WslResult<PathBuf> {
 /// The settings undo defaults meant for a short job: do not start on battery,
 /// stop on battery, end after 72 hours. A second run of the task is ignored.
 ///
+/// The action is `conhost.exe --headless <exe> wsl serve --background`. The
+/// `.exe` is a console program, so started directly it gets a console
+/// window, and whoever closes that window kills the worker. Under a headless
+/// console host there is no window, and the process still has a console to
+/// receive the sign-out and shutdown events on.
+///
 /// No double quote in the script: it travels as one command-line argument.
+/// The quotes around the path are `[char]34`.
 pub(crate) fn task_register_script(exe: &Path) -> String {
     let exe = exe.display().to_string().replace('\'', "''");
     format!(
         "$ErrorActionPreference = 'Stop'; \
          $u = $env:USERDOMAIN + '\\' + $env:USERNAME; \
-         $a = New-ScheduledTaskAction -Execute '{exe}' -Argument 'wsl serve --background'; \
+         $q = [char]34; \
+         $a = New-ScheduledTaskAction -Execute ($env:WINDIR + '\\System32\\conhost.exe') \
+         -Argument ('--headless ' + $q + '{exe}' + $q + ' wsl serve --background'); \
          $t = New-ScheduledTaskTrigger -AtLogOn -User $u; \
          $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
          -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew; \
@@ -1445,11 +1466,7 @@ fn serve_cli(args: &[String]) -> WslResult<ExitCode> {
     // service inside the distribution, so it says so and leaves.
     let _lock = crate::lock::acquire(&data.join("supervisor.lock")).map_err(err)?;
     let log = Logger::open(&log_path(), !background)?;
-    // Only after the log is open: with no console, a print would have
-    // nowhere to go, and this loop never returns to print anything.
-    if background {
-        detach_console();
-    }
+    stop_jobs_when_the_session_ends(&log);
     log.line(&format!(
         "supervisor {} starting; distribution {DISTRO}",
         env!("CARGO_PKG_VERSION")
@@ -1476,13 +1493,14 @@ fn serve_cli(args: &[String]) -> WslResult<ExitCode> {
 /// One run of the service. Its output goes to the log as it is written.
 fn run_service(log: &Logger) -> WslResult<Option<i32>> {
     let args = wsl_exec_args(&[INNER_SERVE]);
-    let mut child = Command::new("wsl.exe")
+    let mut command = Command::new("wsl.exe");
+    command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| err(format!("wsl.exe: {e}")))?;
+        .stderr(Stdio::piped());
+    no_window(&mut command);
+    let mut child = command.spawn().map_err(|e| err(format!("wsl.exe: {e}")))?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let a = log.clone();
@@ -1561,20 +1579,61 @@ fn stamp() -> String {
     format!("{secs}")
 }
 
+/// Every child is `wsl.exe`, `schtasks.exe` or `powershell.exe`: console
+/// programs. Their output is piped, so they need no console, and without
+/// this flag Windows gives a console program that has none a new window.
+/// That window was the worker: closing it killed the service.
 #[cfg(windows)]
-fn detach_console() {
+fn no_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn no_window(_command: &mut Command) {}
+
+static SESSION_LOG: std::sync::OnceLock<Logger> = std::sync::OnceLock::new();
+
+/// Sign-out, shutdown and restart reach a console process as a control
+/// event, and Windows then gives it about five seconds. That is spent on the
+/// jobs: stop the service, SIGTERM to each container, three seconds, kill.
+/// The task runs under a headless console host, so the event arrives though
+/// there is no window.
+#[cfg(windows)]
+fn stop_jobs_when_the_session_ends(log: &Logger) {
     extern "system" {
-        fn FreeConsole() -> i32;
+        fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
     }
-    // SAFETY: FreeConsole takes no arguments and only detaches this process
-    // from its console. Output after this goes to the log file alone.
+    unsafe extern "system" fn handler(event: u32) -> i32 {
+        const CTRL_CLOSE: u32 = 2;
+        const CTRL_LOGOFF: u32 = 5;
+        const CTRL_SHUTDOWN: u32 = 6;
+        if !matches!(event, CTRL_CLOSE | CTRL_LOGOFF | CTRL_SHUTDOWN) {
+            // Ctrl+C in a terminal: the default, which ends the supervisor.
+            return 0;
+        }
+        if let Some(log) = SESSION_LOG.get() {
+            log.line("the session is ending; stopping the jobs");
+        }
+        let _ = sh_in_distro(&graceful_stop_script(3), None, Duration::from_secs(8));
+        1
+    }
+    let _ = SESSION_LOG.set(log.clone());
+    // SAFETY: the handler is a plain function that lives for the whole
+    // process, and it only reads a OnceLock and starts a child process.
     unsafe {
-        FreeConsole();
+        SetConsoleCtrlHandler(Some(handler), 1);
     }
 }
 
 #[cfg(not(windows))]
-fn detach_console() {}
+fn stop_jobs_when_the_session_ends(log: &Logger) {
+    let _ = SESSION_LOG.set(log.clone());
+}
 
 // ---------------------------------------------------------------------------
 // start, stop, logs, uninstall
@@ -1597,7 +1656,7 @@ fn stop_cli() -> WslResult<ExitCode> {
     // service first so it takes no new task, then give each job SIGTERM and
     // 10 seconds. The rows are closed when the service next starts.
     if our_distro()?.is_some() {
-        match sh_in_distro(GRACEFUL_STOP, None, DISTRO_START) {
+        match sh_in_distro(&graceful_stop_script(10), None, DISTRO_START) {
             Ok(out) if out.ok() => {}
             Ok(out) => println!("graceful stop: {}", out.one_line()),
             Err(e) => println!("graceful stop: {e}"),
@@ -1770,6 +1829,7 @@ mod tests {
         assert_eq!(settings.worker_name, "DESK-07");
         assert_eq!(settings.worker_os, "windows");
         assert!(settings.poll_token.is_some());
+        assert!(settings.status_page);
 
         // Without the poll token in the env the service refuses, and so does install.
         let no_poll_token = HashMap::from([("SHUTUP_AND_RUN_TOKEN".to_string(), "a".repeat(32))]);
@@ -1868,8 +1928,14 @@ mod tests {
         assert!(!is_token("has space in it, and is long enough"));
 
         let script = task_register_script(Path::new(r"C:\ProgramData\shutup-and-run\it's.exe"));
-        assert!(script.contains(r"-Execute 'C:\ProgramData\shutup-and-run\it''s.exe'"));
-        assert!(script.contains("-Argument 'wsl serve --background'"));
+        // No window: the console host is headless and the .exe is its argument.
+        assert!(script.contains(r"-Execute ($env:WINDIR + '\System32\conhost.exe')"));
+        assert!(script.contains(
+            r"-Argument ('--headless ' + $q + 'C:\ProgramData\shutup-and-run\it''s.exe' + $q + ' wsl serve --background')"
+        ));
+        assert!(script.contains("$q = [char]34"));
+        assert!(graceful_stop_script(3).contains("docker stop -t 3 $ids"));
+        assert!(graceful_stop_script(10).starts_with("pkill -TERM -x shutup-and-run;"));
         // Tied to the current user, which is what a non-administrator may register.
         assert!(script.contains(r"$u = $env:USERDOMAIN + '\' + $env:USERNAME"));
         assert!(script.contains("New-ScheduledTaskTrigger -AtLogOn -User $u"));

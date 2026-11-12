@@ -6,7 +6,7 @@ What the operator must do, and which defaults a request cannot turn off, is [doc
 
 ## Every route needs the token
 
-`/health` and `/metrics` included. A wrong or missing token is `401`. Nothing is served anonymously.
+`/health` and `/metrics` included. A wrong or missing token is `401`. Nothing is served anonymously. The one exception is off by default: with `status_page = true`, `/` serves a status page and a pause button to a loopback peer that names a loopback host, with a same-origin check on the button. It shows the state, the slots, the last job's image and result, and the version. The Windows worker turns it on for the person at the PC.
 
 ## Public address, native TLS
 

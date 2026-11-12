@@ -9,6 +9,8 @@ A hand test for the two things that depend on the Windows user's rights and that
 .\tests\windows-sandbox\run.ps1
 ```
 
+It also reads the `.exe` itself: that it is a console program (so `install`, `doctor` and `logs` print to the terminal), that it does not import the Visual C++ runtime (a clean Windows, like the Sandbox, does not have it), and that the task opens no window.
+
 It opens Windows Sandbox, waits, prints one `PASS` or `FAIL` line per item, and exits 1 if any failed. Results and logs are in `C:\sar-sandbox-results\` on the host: `summary.txt`, `results.txt`, and one `*.stdout.log` / `*.stderr.log` per command.
 
 To test a build that is not released yet, give it the `.exe`: the `shutup-and-run-windows-exe` artifact of a CI run, or `target\release\shutup-and-run.exe`.

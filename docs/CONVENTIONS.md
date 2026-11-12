@@ -55,7 +55,7 @@ A request cannot override these. Unknown JSON fields are rejected. The container
 - The deadline is a label. The reaper sends SIGKILL. There is no SIGTERM grace.
 - The image name must pass `validate_image_name` (lowercase, no spaces, no `..`) and match an allowlist entry. An entry that names a tag or a digest matches only that exact string. Nothing after the entry may contain a `/`.
 - `callback_url`, and `poll_url` when you set it, must be `http` or `https` with a host. Redirects are not followed. `poll_url` must not carry a username or password.
-- Every HTTP route on this process requires the bearer token. Failed attempts are counted per peer address and then banned. The ban survives a restart.
+- Every HTTP route on this process requires the bearer token, with one exception you turn on: `status_page = true` serves a read-only status page and a pause button at `/` to a browser on the machine itself, and to nothing else. Failed attempts are counted per peer address and then banned. The ban survives a restart.
 - TLS is on unless `http = true`. Plaintext on `0.0.0.0` logs a warning.
 - The TLS listener is HTTP/1.1 only. A connection that sends no request within 10 seconds is closed.
 - The poll token is never read from the TOML file. The poll response is capped at 64 KiB, the same limit as a job POST.

@@ -125,6 +125,18 @@ impl Store {
             .map_err(sql)
     }
 
+    /// The job that started last, for the local status page.
+    pub fn last_job(&self) -> Result<Option<JobRecord>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.query_row(
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs FROM jobs ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            [],
+            map_job,
+        )
+        .optional()
+        .map_err(sql)
+    }
+
     pub fn get_by_key(&self, key: &str) -> Result<Option<JobRecord>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         conn.query_row(

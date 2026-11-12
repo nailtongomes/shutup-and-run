@@ -8,9 +8,9 @@ One Linux VPS (yours, trusted) and one Windows 11 PC (treated as a client's). Ab
 
 The one-line installs download from the latest GitHub release.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` is `v0.2.2` or later and has three files: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` is `v0.2.3` or later and has three files: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
-If it is not there, tag `main`: `git tag v0.2.2 && git push origin v0.2.2`, and wait for the `release` workflow.
+If it is not there, tag `main`: `git tag v0.2.3 && git push origin v0.2.3`, and wait for the `release` workflow.
 
 ## 1. Linux VPS: push
 
@@ -65,6 +65,16 @@ shutup-and-run wsl install
 - [ ] The doctor table is all `ok`, including `container  hello-world ran: Hello from Docker!`.
 - [ ] Last line: `done. No poll URL: the worker is installed and idle.`
 - [ ] If step 7 prints `could not change the task settings`, note the message. The install still works.
+
+No window, and the status page:
+
+```powershell
+Get-Process wsl, shutup-and-run, conhost, WindowsTerminal, OpenConsole -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Format-Table Name, Id, MainWindowTitle
+```
+
+- [ ] Only the terminal you are typing in is listed. No window titled `wsl.exe` appeared during the install, and none appears after signing out and in again or after `shutup-and-run wsl start`.
+- [ ] `http://127.0.0.1:8787/` in a browser shows `RODANDO / RUNNING`, `0 / 1`, and the version. The button pauses (`PAUSADO / PAUSED`) and resumes.
+- [ ] `shutup-and-run wsl doctor` right after the install says `ok   service`, not "not running".
 
 Task settings and one instance:
 
@@ -122,6 +132,10 @@ When the mock prints `TASK 1/1`, wait half a minute for the image to download, t
 - [ ] `Jobs now: 1` and `NAO DESLIGUE AGORA. / DO NOT TURN OFF NOW.` Press `P`.
 - [ ] `[PARADO / STOPPED]  PODE DESLIGAR O PC.` within about 15 seconds.
 - [ ] Double-click again: it starts the service and says `RUNNING`. The mock then prints a `CALLBACK` for the interrupted job with `"status":"exited"` and a non-zero `exit_code`.
+
+Start a long job again, then sign out of Windows while it runs, and sign in again.
+
+- [ ] `shutup-and-run wsl logs` has `the session is ending; stopping the jobs`, and the mock got a `CALLBACK` for that job.
 
 Reboot the PC and log on.
 
