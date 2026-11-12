@@ -323,6 +323,8 @@ A tarefa passa pelas mesmas verificações de um POST. Oferecer uma tarefa não 
 
 Erros (falha de conexão, redirecionamento, qualquer outro status, corpo acima de 64 KiB) vão para o log e a espera dobra, até 5 minutos. O processo não encerra. O token de poll é lido só do ambiente. Exemplos: `examples/kestra-poll.yml`, `examples/n8n-poll.json`. Os comandos de configuração estão em [docs/RECIPES.md](docs/RECIPES.md).
 
+O contrato completo para um orquestrador (push, poll, manifesto e callback), com JSON Schemas e o que é e não é garantido, está em [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md), em inglês. Uma URL de poll com aprovação de máquinas, manifesto e receptor de callback feita no n8n, e um teste de fumaça para Linux e Windows, estão em [examples/n8n](examples/n8n/README.md).
+
 ## Configuração
 
 `/etc/shutup-and-run/config.toml`, ou o arquivo indicado em `SHUTUP_AND_RUN_CONFIG`. As variáveis de ambiente têm prioridade sobre o arquivo. Uma chave desconhecida impede a partida. Depois de alterar: `sudo systemctl restart shutup-and-run`. Os jobs em execução sobrevivem ao restart.

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/docs/schemas/worker-poll-response.schema.json",
+  "title": "WorkerPollResponse",
+  "description": "The JSON body of a 200 answer to a poll. A 204, and a 200 whose body is empty or only whitespace, also mean 'nothing to do' and have no JSON to validate. Exactly one of these forms. A body that matches none is logged on the worker and dropped; the worker asks again after its normal interval.",
+  "oneOf": [
+    {
+      "title": "Nothing to do",
+      "type": "null"
+    },
+    {
+      "title": "Nothing to do",
+      "type": "object",
+      "maxProperties": 0
+    },
+    {
+      "title": "A task, or nothing when null",
+      "type": "object",
+      "required": [
+        "task"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "task": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "job-request.schema.json"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "title": "A manifest to fetch, or nothing when null",
+      "type": "object",
+      "required": [
+        "manifest_url"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "manifest_url": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/manifestUrl"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "title": "A task, bare",
+      "$ref": "job-request.schema.json"
+    }
+  ],
+  "$defs": {
+    "manifestUrl": {
+      "description": "http or https, with a host and no username or password. Fetched once with GET.",
+      "type": "string",
+      "maxLength": 2048,
+      "pattern": "^https?://[^\\s/?#@]+([/?#]\\S*)?$"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "id": "0c1d2e3f405162738495a6b7c8d9e0f1",
+  "job_key": "case-0002-attempt-1",
+  "image": "ghcr.io/you/worker:1.4.2",
+  "status": "exited",
+  "exit_code": 137,
+  "reason": "timeout_kill",
+  "started_at": 1700000000,
+  "ended_at": 1700000900,
+  "duration_secs": 900
+}

@@ -114,9 +114,21 @@ echo <hash> >> approved.txt
 - [ ] Em até cinco minutos (o worker espaça as consultas enquanto é recusado) o mock imprime `TASK mock-...-1` e depois `ok   1/3 ... reason=exited exit=0`, três vezes, a cada 15 segundos, e então um `SUMMARY` com `ok 3`. Depois disso responde `204`.
 - [ ] `shutup-and-run wsl logs` mostra `poll started a job` três vezes.
 
-Instale de novo com o mesmo comando:
+Instale de novo, mudando uma opção:
+
+```powershell
+shutup-and-run wsl install --poll-url http://IP_DO_SEU_VPS:8080/poll --max-slots 2
+```
 
 - [ ] `kept this machine's poll token`, e o mock não imprime outro `PENDING`: é a mesma máquina.
+- [ ] A linha `service` do doctor é `ok` e o JSON dela tem `"slots_total":2`: o serviço que responde leu a configuração nova. A instalação termina com `done` e `with 2 slot(s)`.
+- [ ] `wsl -d shutup-and-run -u root -e /usr/local/bin/shutup-and-run bans` imprime `no bans`.
+
+Abra um segundo PowerShell, rode `shutup-and-run wsl stop` e depois `shutup-and-run wsl serve`, e deixe aberto. No primeiro, instale de novo com o mesmo comando.
+
+- [ ] Ou a instalação termina e o segundo terminal volta ao prompt, ou ela para antes do passo 3 com `a shutup-and-run wsl serve is still running`. Ela nunca imprime `done` com o serviço antigo ainda rodando. Anote qual dos dois aconteceu.
+
+O mesmo cadastro, fila e callback contra o n8n, sem o mock: [examples/n8n/README.md](../examples/n8n/README.md#7-smoke-test).
 
 ## 5. Windows 11: o atalho, parar, desligar
 

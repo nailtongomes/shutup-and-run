@@ -78,12 +78,14 @@ ok   docker                 engine 27.5.1
 ok   container              hello-world ran: Hello from Docker!
 ok   binary                 /usr/local/bin/shutup-and-run
 ok   config                 /etc/shutup-and-run/config.toml
-ok   service                answers on 127.0.0.1:8787: {"ok":true,...}
+ok   service                answers on 127.0.0.1:8787: {"status":"ok","draining":false,...}
 ok   task                   shutup-and-run is registered
 the Windows worker is ready
 ```
 
-The doctor stops at the first hard failure and exits 1. `service` and `task` are soft: they say the service is not running yet or the task was skipped, and do not fail the doctor. The `container` line is a real `docker run --rm` of the smoke image inside the distribution; pass `--smoke-image ghcr.io/you/worker` to run the image you will use. The container is labeled `shutup-and-run.doctor=1`, not `shutup-and-run=1`, so it never takes a slot.
+The doctor stops at the first hard failure and exits 1. `service` and `task` are soft: they say the service is not running yet or the task was skipped, and do not fail the doctor. `wsl install` is stricter: when it registered the task, the service must answer or the install fails.
+
+If the `service` line says the service `refuses the token`, it was started before the config was last written: `shutup-and-run wsl stop`, then `shutup-and-run wsl start`. The doctor asked once and stopped, because three wrong tokens ban an address for 48 hours. If it says this machine's own address `is banned`, run `wsl install` again with the same options, or lift it by hand: `wsl -d shutup-and-run -u root -e /usr/local/bin/shutup-and-run bans lift 127.0.0.1`. The `container` line is a real `docker run --rm` of the smoke image inside the distribution; pass `--smoke-image ghcr.io/you/worker` to run the image you will use. The container is labeled `shutup-and-run.doctor=1`, not `shutup-and-run=1`, so it never takes a slot.
 
 From a Linux shell inside the distribution, the API is the same as on a server:
 
@@ -109,7 +111,16 @@ shutup-and-run wsl stop
 shutup-and-run wsl start
 ```
 
-To upgrade, run `install.ps1` again. It replaces the `.exe`, and `wsl install` replaces the Linux binary, keeps the distribution, and rewrites the config from the options you pass.
+To upgrade, or to change an option, run `install.ps1` or `wsl install` again. It replaces the `.exe` and the Linux binary, keeps the distribution, its job history and the machine's poll token, and rewrites the config from the options you pass. Pass all of them again: an option left out goes back to its default.
+
+A re-install replaces the running worker, and checks that it did:
+
+- It ends the logon task and waits for the supervisor to be gone. One that is still there, a `wsl serve` left open in a terminal for instance, is ended with `taskkill`. If that does not work the install stops before it changes anything and says so.
+- It stops the service inside the distribution and waits until that process is gone before it writes the new config and env.
+- It makes a new API token for the localhost listener, and after starting the task it waits up to a minute for the service to answer that token. Only a service started on the new files can. If none does, the install ends with an error and not with `done`.
+- It lifts a ban on `127.0.0.1` that an install before this fix may have left.
+
+Jobs that are running when you re-install are ended: the distribution is restarted. Their callbacks are sent when the service comes back, with a non-zero or missing `exit_code`. Pause the worker from its status page and wait for it to be idle first, if that matters.
 
 ## What the poll URL gets
 
@@ -123,7 +134,7 @@ Each poll is a `POST` with the token and this body:
 
 **The server decides.** Check the token before answering with anything. An unknown token is a pending machine, not a caller: record it, answer `403` (or `204`), and never put a task, an image name or a secret in that answer. Store a hash of the token, not the token. To retire a machine, stop serving its token.
 
-The answer is a task (the same JSON as `POST /v1/jobs`), `{"task": {...}}`, nothing, or `{"manifest_url": "https://..."}`. A manifest is fetched once with a `GET` and must be a task. See [Pull](../README.md#pull).
+The answer is a task (the same JSON as `POST /v1/jobs`), `{"task": {...}}`, nothing, or `{"manifest_url": "https://..."}`. A manifest is fetched once with a `GET` and must be a task. The full contract, with schemas, is [INTEGRATION-CONTRACT.md](INTEGRATION-CONTRACT.md), and a poll URL built in n8n is [examples/n8n](../examples/n8n/README.md).
 
 **There is no allowlist on a Windows worker.** `wsl install` writes `poll_any_image = true` and an empty allowlist: the image is whatever the manifest names. The orchestrator is the one source of work for these machines, and it is yours, so the list would only repeat what it already decides. A pushed job is still refused on this config, because the listener is on localhost and the empty allowlist matches nothing. The image name is still validated. The machine's owner is trusting your orchestrator, and that is written down in [CONVENTIONS.md](CONVENTIONS.md).
 

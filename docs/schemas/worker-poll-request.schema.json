@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/docs/schemas/worker-poll-request.schema.json",
+  "title": "WorkerPollRequest",
+  "description": "The body of the POST a worker sends to poll_url. Who is asking and what it could lend. All eight keys are always present. It carries no address, token, config or job history. A poll is only sent when the worker has a free slot and is not draining, so free_slots is never 0. additionalProperties is false because that is what this version sends; the body grew in v0.2.0, so a production endpoint should read the keys it knows and ignore the rest.",
+  "type": "object",
+  "required": [
+    "worker",
+    "os",
+    "arch",
+    "version",
+    "max_slots",
+    "free_slots",
+    "cpus",
+    "memory_bytes"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "worker": {
+      "description": "worker_name from the machine's config. Default: its hostname. A claim by the machine, not proof of identity; the bearer token is what identifies it.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[!#-\\[\\]-~]+$"
+    },
+    "os": {
+      "description": "worker_os from the config. Default: the OS the binary was built for ('linux'). The Windows install writes 'windows'.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[!#-\\[\\]-~]+$"
+    },
+    "arch": {
+      "description": "CPU architecture of the binary, as Rust names it: x86_64, aarch64.",
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "description": "Version of the runner, such as 0.2.3.",
+      "type": "string",
+      "minLength": 1
+    },
+    "max_slots": {
+      "description": "Containers this machine runs at once.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 256
+    },
+    "free_slots": {
+      "description": "Slots free when the poll was sent. One task is taken per poll, whatever this says.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 256
+    },
+    "cpus": {
+      "description": "CPUs the process sees; on Windows, those of the WSL2 VM. null when unknown.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "memory_bytes": {
+      "description": "MemTotal the process sees; on Windows, that of the WSL2 VM. null when unknown.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    }
+  }
+}

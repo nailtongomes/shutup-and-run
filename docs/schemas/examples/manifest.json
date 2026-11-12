@@ -1,0 +1,6 @@
+{
+  "image": "ghcr.io/nailtongomes/shutup-and-run-smoke",
+  "job_key": "smoke-001",
+  "timeout_secs": 120,
+  "callback_url": "https://n8n.example.com/webhook/n3-callback/REPLACE_WITH_CALLBACK_SECRET"
+}

@@ -35,6 +35,10 @@ const INNER_CONFIG: &str = "/etc/shutup-and-run/config.toml";
 const INNER_ENV: &str = "/etc/shutup-and-run/env";
 const INNER_LISTEN: &str = "127.0.0.1:8787";
 
+/// The service's process name inside the distribution, as `pgrep -x` sees it.
+const SERVICE_PROCESS: &str = "shutup-and-run";
+const SUPERVISOR_LOCK: &str = "supervisor.lock";
+
 const DEFAULT_SMOKE_IMAGE: &str = "hello-world";
 const LOG_FILE: &str = "supervisor.log";
 const LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
@@ -84,8 +88,46 @@ pub(crate) fn graceful_stop_script(grace_secs: u32) -> String {
     )
 }
 
+/// Run inside the distribution before a re-install writes the new config and
+/// env: the service that read the old ones must be gone first, so the next
+/// start is the only process there is and it reads the new files. SIGTERM
+/// leaves the containers alone, and the service may take 30 seconds to settle
+/// a job that is still pulling, so SIGKILL waits for 35.
+pub(crate) fn stop_service_script(process: &str) -> String {
+    format!(
+        "pkill -TERM -x {process}; i=0; \
+         while pgrep -x {process} >/dev/null; do i=$((i + 1)); \
+         [ $i -eq 35 ] && pkill -KILL -x {process}; \
+         [ $i -ge 40 ] && exit 1; sleep 1; done"
+    )
+}
+
+/// The doctor's question to the service: does it answer, with the token in
+/// the env file? It prints the body and exits 0 on a 200. On a 401 or 403 it
+/// prints the code and exits 3 at once: the service is up and was started
+/// with another token, so asking again would only count failures until the
+/// machine's own address is banned. Anything else (nothing listening yet,
+/// Docker still starting) is asked again, once a second, `wait_secs` times.
+///
+/// No double quotes in the script: the token is hex, so it needs none, and
+/// one fewer quoting layer between here and sh is one fewer surprise.
+pub(crate) fn health_script(env_file: &str, listen: &str, wait_secs: u32) -> String {
+    format!(
+        ". {env_file} && i=0; while :; do \
+         out=$(curl -s -m 5 -w ' %{{http_code}}' --oauth2-bearer $SHUTUP_AND_RUN_TOKEN http://{listen}/health); \
+         code=${{out##* }}; \
+         case $code in 200) echo ${{out% *}}; exit 0;; 401|403) echo $code; exit 3;; esac; \
+         i=$((i + 1)); [ $i -ge {wait_secs} ] && exit 1; sleep 1; done"
+    )
+}
+
+const HEALTH_REFUSED: i32 = 3;
 const FAIL_LINES: usize = 20;
 const SERVICE_WAIT_SECS: u32 = 20;
+/// After an install the service must answer, so it gets longer than a doctor
+/// run by hand: dockerd may still be starting.
+const INSTALL_SERVICE_WAIT_SECS: u32 = 60;
+const LOCK_TRIES: u32 = 20;
 const SHORT: Duration = Duration::from_secs(30);
 const DISTRO_START: Duration = Duration::from_secs(120);
 const APT: Duration = Duration::from_secs(20 * 60);
@@ -901,7 +943,7 @@ pub(crate) fn report(checks: &[Check]) -> (String, bool) {
 fn doctor_cli(args: &[String]) -> WslResult<ExitCode> {
     let flags = parse_flags(args, &["--smoke-image"], &[])?;
     let image = flags.get("--smoke-image").unwrap_or(DEFAULT_SMOKE_IMAGE);
-    let checks = doctor(image)?;
+    let checks = doctor(image, SERVICE_WAIT_SECS)?;
     let (text, healthy) = report(&checks);
     print!("{text}");
     if healthy {
@@ -915,7 +957,7 @@ fn doctor_cli(args: &[String]) -> WslResult<ExitCode> {
 
 /// Each check needs the one before it. The first failure stops the list,
 /// so a machine without WSL gets one line, not a page of errors.
-fn doctor(smoke_image: &str) -> WslResult<Vec<Check>> {
+fn doctor(smoke_image: &str, service_wait_secs: u32) -> WslResult<Vec<Check>> {
     let mut checks = Vec::new();
 
     let status = match wsl_status() {
@@ -1036,24 +1078,12 @@ fn doctor(smoke_image: &str) -> WslResult<Vec<Check>> {
 
     // Right after an install the task has just started and the service is
     // still waiting for dockerd, so the port gets some seconds to answer.
-    // No double quotes in the script: the token is hex, so it needs none,
-    // and one fewer quoting layer between here and sh is one fewer surprise.
     let health = sh_in_distro(
-        &format!(
-            ". {INNER_ENV} && i=0; until curl -fs -m 5 --oauth2-bearer $SHUTUP_AND_RUN_TOKEN http://{INNER_LISTEN}/health; do i=$((i + 1)); [ $i -ge {SERVICE_WAIT_SECS} ] && exit 1; sleep 1; done"
-        ),
+        &health_script(INNER_ENV, INNER_LISTEN, service_wait_secs),
         None,
         DISTRO_START,
     )?;
-    checks.push(soft(
-        "service",
-        health.ok(),
-        if health.ok() {
-            format!("answers on {INNER_LISTEN}: {}", health.one_line())
-        } else {
-            "not running (start it with `shutup-and-run wsl start`)".to_string()
-        },
-    ));
+    checks.push(service_check(health.status, &health.text()));
 
     let task = run("schtasks.exe", &["/Query", "/TN", TASK_NAME], None, SHORT);
     checks.push(match task {
@@ -1067,6 +1097,44 @@ fn doctor(smoke_image: &str) -> WslResult<Vec<Check>> {
     });
 
     Ok(checks)
+}
+
+/// What the health script's exit says. Soft either way: the doctor reports,
+/// and `wsl install` is what insists on a service that answers.
+pub(crate) fn service_check(status: Option<i32>, output: &str) -> Check {
+    let line = output
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    match status {
+        Some(0) => soft(
+            "service",
+            true,
+            format!("answers on {INNER_LISTEN}: {line}"),
+        ),
+        Some(HEALTH_REFUSED) if line == "403" => soft(
+            "service",
+            false,
+            format!(
+                "answers on {INNER_LISTEN} but this machine's own address is banned there (403). \
+                 Run `shutup-and-run wsl install` again with the same options; it lifts that ban."
+            ),
+        ),
+        Some(HEALTH_REFUSED) => soft(
+            "service",
+            false,
+            format!(
+                "answers on {INNER_LISTEN} but refuses the token in {INNER_ENV} ({line}): it was \
+                 started with an older config. Run `shutup-and-run wsl stop`, then `shutup-and-run wsl start`."
+            ),
+        ),
+        _ => soft(
+            "service",
+            false,
+            "not running (start it with `shutup-and-run wsl start`)",
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,8 +1250,22 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     }
 
     // On a re-install the task's supervisor would restart the old service in
-    // the middle of apt. End it first; step 7 starts it again.
+    // the middle of apt, on the old config, and that service would still be
+    // the one running at the end. End the task, then hold the supervisor's
+    // own lock until step 7, so none can start in between.
     let _ = run("schtasks.exe", &["/End", "/TN", TASK_NAME], None, SHORT);
+    let no_supervisor = wait_for_lock(
+        &data.join(SUPERVISOR_LOCK),
+        LOCK_TRIES,
+        Duration::from_secs(1),
+        kill_other_supervisors,
+    )
+    .map_err(|e| {
+        err(format!(
+            "a `shutup-and-run wsl serve` is still running and could not be ended ({e}). \
+             Close it, or sign out and in again, and run this install again."
+        ))
+    })?;
 
     println!("[3/8] /etc/wsl.conf (no Windows drives, no interop, docker at boot)");
     put_file("/etc/wsl.conf", "644", render_wsl_conf().into_bytes())?;
@@ -1221,6 +1303,15 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     println!("    {INNER_BIN}");
 
     println!("[6/8] config, env and the serve script");
+    // Step 3 terminated the distribution, so a service from an earlier
+    // install should be gone. Make sure, before the files it read change: a
+    // survivor would keep the old config, and the new token would be sent to
+    // it and counted as a wrong one.
+    let stop = stop_service_script(SERVICE_PROCESS);
+    let out = sh_in_distro(&stop, None, DISTRO_START)?;
+    if !out.ok() {
+        return Err(step_failed("stopping the previous service", &stop, &out));
+    }
     let mut enrolling = false;
     let poll_token = match (&poll_url, given_token) {
         (None, _) => None,
@@ -1249,6 +1340,15 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     )?;
     put_file(INNER_SERVE, "755", render_serve_script().into_bytes())?;
     println!("    {INNER_CONFIG}, {INNER_ENV} (600), {INNER_SERVE}");
+    // An earlier install may have banned this machine's own address by
+    // sending a new token to an old service, and a ban outlives a restart.
+    // This is `bans lift` as root inside the distribution, where the listener
+    // is on localhost: it changes nothing for a caller from anywhere else.
+    if let Ok(out) = in_distro(&[INNER_BIN, "bans", "lift", "127.0.0.1"], None, SHORT) {
+        if out.ok() && out.text().contains("lifted") {
+            println!("    lifted a ban on 127.0.0.1 left by an earlier install");
+        }
+    }
 
     if wsl_memory.is_some() || wsl_processors.is_some() {
         let text = render_wslconfig(wsl_memory.as_deref(), wsl_processors);
@@ -1273,6 +1373,8 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
 
     println!("[7/8] scheduled task {TASK_NAME} (at logon)");
     let exe = install_exe_copy(&data)?;
+    // The new supervisor needs the lock this install has been holding.
+    drop(no_supervisor);
     if flags.has("--no-task") {
         println!(
             "    skipped (--no-task). Run: \"{}\" wsl serve",
@@ -1285,12 +1387,21 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     }
 
     println!("[8/8] doctor");
-    let checks = doctor(smoke_image)?;
+    let checks = doctor(smoke_image, INSTALL_SERVICE_WAIT_SECS)?;
     let (text, healthy) = report(&checks);
     print!("{text}");
     if !healthy {
         return Err(err(
             "the doctor found a problem. Fix it and run `shutup-and-run wsl doctor`.",
+        ));
+    }
+    // The API token is new with every install, so a service that answers it
+    // was started after step 6 and read this install's config. Anything else
+    // is not an install that worked.
+    if !flags.has("--no-task") && !service_answers(&checks) {
+        return Err(err(
+            "the service is not running with the config this install wrote. \
+             See `shutup-and-run wsl logs`, then run this install again.",
         ));
     }
     println!();
@@ -1312,6 +1423,51 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     }
     println!("logs: shutup-and-run wsl logs");
     Ok(ExitCode::SUCCESS)
+}
+
+pub(crate) fn service_answers(checks: &[Check]) -> bool {
+    checks.iter().any(|c| c.name == "service" && c.ok)
+}
+
+/// Take the supervisor's lock, waiting for whoever holds it to end. Halfway
+/// through, `on_stuck` runs once: ending the task did not end the holder.
+/// The caller keeps the file; dropping it lets a supervisor start again.
+pub(crate) fn wait_for_lock(
+    path: &Path,
+    tries: u32,
+    pause: Duration,
+    mut on_stuck: impl FnMut(),
+) -> Result<std::fs::File, String> {
+    let mut last = String::new();
+    for attempt in 0..tries.max(1) {
+        match crate::lock::acquire(path) {
+            Ok(file) => return Ok(file),
+            Err(e) => last = e,
+        }
+        if attempt == tries / 2 {
+            on_stuck();
+        }
+        std::thread::sleep(pause);
+    }
+    Err(last)
+}
+
+/// `taskkill` for every `shutup-and-run.exe` except this one: a supervisor
+/// started by hand in a terminal, or one the ended task left behind.
+pub(crate) fn taskkill_args(own_pid: u32) -> Vec<String> {
+    vec![
+        "/F".to_string(),
+        "/FI".to_string(),
+        "IMAGENAME eq shutup-and-run.exe".to_string(),
+        "/FI".to_string(),
+        format!("PID ne {own_pid}"),
+    ]
+}
+
+fn kill_other_supervisors() {
+    let args = taskkill_args(std::process::id());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let _ = run("taskkill.exe", &args, None, SHORT);
 }
 
 /// The poll token a previous install left in the distribution, so a
@@ -1464,7 +1620,7 @@ fn serve_cli(args: &[String]) -> WslResult<ExitCode> {
     std::fs::create_dir_all(&data).map_err(|e| err(format!("{}: {e}", data.display())))?;
     // One supervisor per machine. A second one would only fight over the
     // service inside the distribution, so it says so and leaves.
-    let _lock = crate::lock::acquire(&data.join("supervisor.lock")).map_err(err)?;
+    let _lock = crate::lock::acquire(&data.join(SUPERVISOR_LOCK)).map_err(err)?;
     let log = Logger::open(&log_path(), !background)?;
     stop_jobs_when_the_session_ends(&log);
     log.line(&format!(
@@ -1763,6 +1919,7 @@ fn uninstall_cli(args: &[String]) -> WslResult<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -2046,13 +2203,193 @@ mod tests {
         // and exits 1. On Windows with WSL this test still passes when the
         // distribution is absent, because the second check fails instead.
         if cfg!(not(windows)) {
-            let checks = doctor(DEFAULT_SMOKE_IMAGE).unwrap();
+            let checks = doctor(DEFAULT_SMOKE_IMAGE, 1).unwrap();
             assert_eq!(checks.len(), 1);
             assert!(!checks[0].ok);
             assert!(checks[0].detail.contains("wsl.exe"), "{}", checks[0].detail);
             let (_, healthy) = report(&checks);
             assert!(!healthy);
         }
+    }
+
+    #[test]
+    fn a_reinstall_waits_for_the_supervisor_lock_and_knows_what_the_service_said() {
+        let dir = std::env::temp_dir().join(format!("sar-wsl-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SUPERVISOR_LOCK);
+
+        // A supervisor that ends while the install waits: the lock is taken,
+        // and while the install holds it no supervisor can start.
+        let held = crate::lock::acquire(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(held);
+        });
+        let mut stuck = 0;
+        let ours = wait_for_lock(&path, 40, Duration::from_millis(25), || stuck += 1).unwrap();
+        release.join().unwrap();
+        assert!(crate::lock::acquire(&path).is_err());
+        drop(ours);
+
+        // One that never ends: `on_stuck` runs once, then the install stops
+        // with an error instead of writing a config nothing will read.
+        let held = crate::lock::acquire(&path).unwrap();
+        let mut stuck = 0;
+        let refused = wait_for_lock(&path, 6, Duration::from_millis(5), || stuck += 1);
+        assert!(refused.unwrap_err().contains("already running"));
+        assert_eq!(stuck, 1);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Never this process, which is also named shutup-and-run.exe.
+        assert_eq!(
+            taskkill_args(4242),
+            [
+                "/F",
+                "/FI",
+                "IMAGENAME eq shutup-and-run.exe",
+                "/FI",
+                "PID ne 4242"
+            ]
+        );
+
+        let up = service_check(Some(0), "{\"status\":\"ok\"}\n");
+        assert!(up.ok && up.detail.contains("{\"status\":\"ok\"}"));
+        let stale = service_check(Some(HEALTH_REFUSED), "401\n");
+        assert!(!stale.ok && stale.soft);
+        assert!(stale.detail.contains("older config"), "{}", stale.detail);
+        let banned = service_check(Some(HEALTH_REFUSED), "403\n");
+        assert!(banned.detail.contains("banned"), "{}", banned.detail);
+        let down = service_check(Some(1), "");
+        assert!(down.detail.starts_with("not running"));
+        assert!(service_check(None, "").detail.starts_with("not running"));
+
+        // The doctor stays healthy on a stale service; the install does not.
+        assert!(report(std::slice::from_ref(&stale)).1);
+        assert!(!service_answers(&[check("wsl", true, ""), stale]));
+        assert!(service_answers(&[check("wsl", true, ""), up]));
+    }
+
+    /// The first defect: the old service kept running, on the old config,
+    /// after the install wrote a new one. The stop script returns only when
+    /// no process of that name is left.
+    #[test]
+    fn the_stop_script_returns_only_when_the_old_service_is_gone() {
+        let script = stop_service_script(SERVICE_PROCESS);
+        assert!(script.starts_with("pkill -TERM -x shutup-and-run;"));
+        assert!(script.contains("while pgrep -x shutup-and-run >/dev/null"));
+        assert!(script.contains("exit 1"));
+        assert!(!script.contains('"'));
+
+        let have = |program: &str| run(program, &["-V"], None, SHORT).is_ok_and(|o| o.ok());
+        if !cfg!(target_os = "linux") || !have("pgrep") || !have("pkill") {
+            return;
+        }
+        // A stand-in for the old service: `sleep` under a name of its own,
+        // short enough for the 15 characters `pgrep -x` compares.
+        let name = format!("sar-old-{}", std::process::id() % 100_000);
+        let dir = std::env::temp_dir().join(format!("{name}-dir"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join(&name);
+        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .unwrap();
+        std::fs::copy(sleep, &fake).unwrap();
+        let mut old = Command::new(&fake).arg("300").spawn().unwrap();
+        let pid = old.id().to_string();
+        // Reaped as it dies, as init does in the distribution. Unreaped, it
+        // would stay in the process table and the script would wait for it.
+        let reaper = std::thread::spawn(move || old.wait());
+        let seen = run("pgrep", &["-x", &name], None, SHORT).unwrap();
+        assert!(seen.ok(), "the stand-in is not running");
+
+        let out = run("sh", &["-c", &stop_service_script(&name)], None, SHORT).unwrap();
+        assert!(out.ok(), "{}", out.tail(5));
+        let after = run("pgrep", &["-x", &name], None, SHORT).unwrap();
+        assert_eq!(after.status, Some(1), "the old process survived");
+        // Nothing to stop is not an error: a first install has no service.
+        let out = run("sh", &["-c", &stop_service_script(&name)], None, SHORT).unwrap();
+        assert!(out.ok());
+        let _ = reaper.join();
+        assert!(!Path::new("/proc").join(pid).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The second defect: a new token sent to a service started with the old
+    /// one. The doctor used to ask 20 times; three refusals ban the address,
+    /// here 127.0.0.1, for 48 hours. It now stops at the first refusal, and
+    /// the service's own rule for everyone else is untouched.
+    #[tokio::test]
+    async fn a_wrong_token_from_the_doctor_is_one_failure_and_never_a_ban() {
+        use crate::launcher::Launcher;
+        use crate::mock::MockRuntime;
+        use crate::runtime::Runtime;
+        use std::net::SocketAddr;
+
+        if !cfg!(unix) || run("curl", &["--version"], None, SHORT).is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("sar-wsl-health-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_token = "a".repeat(32);
+        let settings = crate::config::Settings::from_toml_and_env(
+            &format!(
+                "max_slots = 1\nallowlist = [\"alpine\"]\nhttp = true\nhistory_path = '{}'\n",
+                dir.join("jobs.sqlite").display()
+            ),
+            &HashMap::from([("SHUTUP_AND_RUN_TOKEN".to_string(), old_token.clone())]),
+        )
+        .unwrap();
+        // The defaults a Windows worker runs with.
+        assert_eq!(settings.auth_failures, 3);
+        assert_eq!(settings.ban_secs, 48 * 3600);
+        let runtime: Arc<dyn Runtime> = Arc::new(MockRuntime::new());
+        let launcher = Launcher::new(settings, runtime).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap().to_string();
+        let app = crate::api::router(launcher.clone())
+            .into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let probe = |token: String| {
+            let env = dir.join("env");
+            let listen = listen.clone();
+            async move {
+                std::fs::write(&env, render_env(&token, None)).unwrap();
+                let script = health_script(&env.display().to_string(), &listen, 20);
+                tokio::task::spawn_blocking(move || run("sh", &["-c", &script], None, SHORT))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+
+        // The env file of a new install, the service of the old one.
+        let out = probe("b".repeat(32)).await;
+        assert_eq!(out.status, Some(HEALTH_REFUSED), "{}", out.tail(5));
+        assert_eq!(out.text().trim(), "401");
+        assert!(launcher.list_bans().unwrap().is_empty());
+
+        // Not banned: the right token is served, and that clears the count.
+        let out = probe(old_token.clone()).await;
+        assert_eq!(out.status, Some(0), "{}", out.tail(5));
+        assert!(out.text().contains("\"slots_total\":1"), "{}", out.text());
+        assert!(service_check(out.status, &out.text()).ok);
+
+        // The rule itself did not move: three wrong tokens still ban, also
+        // from this machine, and a banned address is told so in one answer.
+        for _ in 0..3 {
+            assert_eq!(probe("c".repeat(32)).await.status, Some(HEALTH_REFUSED));
+        }
+        assert_eq!(launcher.list_bans().unwrap().len(), 1);
+        let out = probe(old_token).await;
+        assert_eq!(out.status, Some(HEALTH_REFUSED));
+        assert_eq!(out.text().trim(), "403");
+        // What `wsl install` runs inside the distribution after writing the env.
+        assert!(launcher.lift_ban("127.0.0.1").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

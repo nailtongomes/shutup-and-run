@@ -29,7 +29,7 @@ pub(crate) struct PollError(String);
 
 /// What a poll answer, or a manifest, turned out to be.
 #[derive(Debug)]
-enum Answer {
+pub(crate) enum Answer {
     Nothing,
     Task(Box<LaunchRequest>),
     /// Only a poll answer may carry this. A manifest that does is rejected.
@@ -229,7 +229,7 @@ fn total_memory_bytes() -> Option<u64> {
 /// A poll answer: nothing, a task, or `{"manifest_url": "..."}`. A manifest body
 /// goes through the same parse with `allow_manifest = false`, so a manifest
 /// cannot point at another manifest.
-fn answer_from_body(bytes: &[u8], allow_manifest: bool) -> Result<Answer, String> {
+pub(crate) fn answer_from_body(bytes: &[u8], allow_manifest: bool) -> Result<Answer, String> {
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Ok(Answer::Nothing);
     }

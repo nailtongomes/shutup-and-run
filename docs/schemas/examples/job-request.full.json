@@ -1,0 +1,19 @@
+{
+  "image": "ghcr.io/you/worker:1.4.2",
+  "job_key": "case-0001-attempt-1",
+  "env": {
+    "SCRIPT_URL": "https://scripts.example.com/protocolar.py",
+    "CUSTOMER_ID": "customer-placeholder",
+    "RESULT_URL": "https://n8n.example.com/webhook/n3-result/case-0001-attempt-1"
+  },
+  "command": [
+    "python",
+    "main.py",
+    "--once"
+  ],
+  "timeout_secs": 900,
+  "cpu": 1.5,
+  "memory": "2g",
+  "shm": "1g",
+  "callback_url": "https://n8n.example.com/webhook/n3-callback/REPLACE_WITH_CALLBACK_SECRET"
+}

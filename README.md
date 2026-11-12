@@ -308,7 +308,7 @@ POST {poll_url}
 Authorization: Bearer {SHUTUP_AND_RUN_POLL_TOKEN}
 Content-Type: application/json
 
-{"worker": "desk-07", "os": "linux", "arch": "x86_64", "version": "0.2.0", "max_slots": 2, "free_slots": 1, "cpus": 8, "memory_bytes": 16624934912}
+{"worker": "desk-07", "os": "linux", "arch": "x86_64", "version": "0.2.3", "max_slots": 2, "free_slots": 1, "cpus": 8, "memory_bytes": 16624934912}
 ```
 
 The body says who is asking, so one URL can serve every machine: `worker` is `worker_name` (default: the hostname), `os` is `worker_os` (default: the OS the binary was built for; the Windows worker says `windows`), and `free_slots` is how many tasks the machine could take right now. `arch`, `version`, `max_slots`, `cpus` and `memory_bytes` say what the machine is and could lend, so the server can decide whether its queue may serve it. The machine's address is not in the body: read it from the connection. A `401` or `403` means "not approved": the machine starts nothing and asks again, backing off to five minutes.
@@ -322,6 +322,8 @@ The task goes through the same checks as a POST. Offering a task is not an ackno
 `poll_any_image = true` lets a polled task name any image, allowlisted or not. The image name is still validated, and a pushed job is still held to the allowlist, which may then be empty. It needs `poll_url`. It is for a machine whose only source of work is your orchestrator, such as the Windows worker; on a server that also takes pushes, leave it off.
 
 Errors (connection failure, redirect, any other status, a body over 64 KiB) are logged, and the wait doubles up to 5 minutes. The process does not exit. The poll token is read from the environment only. Examples: `examples/kestra-poll.yml`, `examples/n8n-poll.json`. The setup commands are in [docs/RECIPES.md](docs/RECIPES.md).
+
+The whole contract for an orchestrator, push, poll, manifest and callback, with JSON Schemas and what is and is not guaranteed, is [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md). A poll URL with machine approval, a manifest and a callback receiver built in n8n, and a smoke test for both systems, are in [examples/n8n](examples/n8n/README.md).
 
 ## Configuration
 
@@ -474,6 +476,8 @@ A release is a `v*` tag pushed from `main`. It attaches the binary and `SHA256SU
 
 MIT license. More reading:
 
+- [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md): the contract for an orchestrator, with JSON Schemas in `docs/schemas`.
+- [examples/n8n](examples/n8n/README.md): n8n as the orchestrator, and a smoke test.
 - [docs/RECIPES.md](docs/RECIPES.md): copy-and-paste answers for common cases.
 - [docs/CONVENTIONS.md](docs/CONVENTIONS.md): what the operator agrees to.
 - [SECURITY.md](SECURITY.md): how the process defends itself.

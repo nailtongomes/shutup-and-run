@@ -264,6 +264,30 @@ Decided 2026-11-12. The owner's Windows workers run whatever the orchestrator na
 
 The cost is that on such a machine the orchestrator, not a file on the lender's disk, decides what runs. That is said in [CONVENTIONS.md](CONVENTIONS.md), and the Windows installer turns the flag on.
 
+## A re-install on Windows replaces the running service, and proves it
+
+Decided 2026-11-12. Two defects from re-installing on real PCs.
+
+`wsl install` on a machine that already had a worker could end with the old service still running on the old config. Ending the scheduled task did not always end the supervisor (one started by hand in a terminal is not the task's), the supervisor restarted the old service in the middle of apt, and that service was still there after the new files were written. The new supervisor then found the lock taken and left. The doctor's `service` line was soft, so the install said `done`.
+
+And the install makes a new API token every time. The doctor read it from the new env file and asked the old service for `/health` with it, up to 20 times. Three refusals ban an address for 48 hours, the address was `127.0.0.1`, and the ban is in SQLite, so it outlived the restart that would have fixed everything else.
+
+The install now takes the supervisor's own lock after ending the task and holds it until step 7. Halfway through the wait it runs `taskkill` on every other `shutup-and-run.exe`; if the lock still cannot be taken it stops with an error before step 3. Before step 6 writes the config and env, the service inside the distribution gets SIGTERM and the install waits until no such process is left. After step 7 the service must answer the new token within 60 seconds, or the install fails: the token is new with each install, so a service that accepts it was started after the files were written. The doctor asks until something answers and stops at the first `401` or `403`, with a line that says which it was and what to do. And step 6 runs `shutup-and-run bans lift 127.0.0.1` inside the distribution, for a machine an earlier install had already locked out.
+
+The ban rule itself did not change. Loopback is not exempt, the count and the 48 hours are the same for every address, and the lift is the documented `bans lift`, run as root inside a distribution whose listener is on localhost. A test starts the real router with the default limits and checks that a doctor with the wrong token is one failure, that the right token still works after it, and that three wrong ones still ban.
+
+The cost: a doctor run against a service with an older token is still one counted failure each time, so three such runs in a row, with no success between them, ban the address. The doctor now says to restart the service, and the next install lifts the ban. A re-install ends the jobs that were running, as before: step 3 restarts the distribution. `taskkill` by image name also ends a `shutup-and-run.exe` doing something else, a doctor in another terminal for instance. None of the `wsl.exe`, `schtasks.exe` and `taskkill.exe` steps can run in CI.
+
+## The contract is a document, schemas, and tests that hold them to the code
+
+Decided 2026-11-12. An orchestrator had to be written by reading `src/api.rs` and `src/poll.rs`.
+
+[INTEGRATION-CONTRACT.md](INTEGRATION-CONTRACT.md) is the specification, and `docs/schemas` holds JSON Schema Draft 2020-12 for the job, the poll request, the poll answer, the manifest and the job result. They describe what the runner did already. Nothing in the API changed: no `schema_version`, no register call, no new field. `src/contract.rs` sends every example file under `docs/schemas/examples` through the real router, poll parser and callback, checks what the runner emits against the schemas, and for a list of invalid bodies checks that the schema and the runner both refuse them.
+
+Limits found on the way are listed in the document and were left as they are: a polled task is never acknowledged, a busy worker is silent, a lost callback cannot be asked for again in pull mode, and a draining machine answers `503` before it looks up a `job_key`. Each would be a contract change with its own record here.
+
+The cost: `jsonschema` is a development dependency, about forty crates that the release binary does not link. A change to an answer or to a validation rule now has to change a schema, an example and the document in the same patch, which is the point.
+
 ## Smoke test against a running instance
 
 `scripts/accept.sh` starts its own instance. `scripts/smoke.sh` tests one that is already installed, through the API only, with the URL and token from the environment. It is safe on a live machine: its jobs echo and sleep under a short `timeout_secs`, it undrains what it drained, and it sends wrong tokens from `127.0.0.2`, never from the caller. What it cannot do from where it runs, it skips and says why.

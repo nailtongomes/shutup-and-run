@@ -1,0 +1,5 @@
+{
+  "image": "ghcr.io/nailtongomes/shutup-and-run-smoke",
+  "job_key": "smoke-002",
+  "timeout_secs": 120
+}
