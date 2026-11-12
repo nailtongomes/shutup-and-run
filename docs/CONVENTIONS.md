@@ -17,6 +17,8 @@ Read this with [SECURITY.md](../SECURITY.md). The record of why it stays this wa
 
 The commands for both sides are in [RECIPES.md](RECIPES.md).
 
+**A Windows machine someone lends.** The same agreement, with two differences the lender should hear before saying yes. The worker only polls your orchestrator, and it runs whatever image that orchestrator names: there is no allowlist on it (`poll_any_image`), so the lender is trusting your orchestrator, not a list on their disk. And everything runs inside a WSL2 VM that the lender can cap (`--wsl-memory`, `--wsl-processors`) and remove in one command (`shutup-and-run wsl uninstall --purge`). The containers cannot see the Windows drives. [WINDOWS.md](WINDOWS.md) is what the lender reads.
+
 **Images you own.** Every allowlist entry is a repository you control, under a registry namespace you control. Do not allowlist a public library image or someone else's repository. An entry is one repository (any tag, or exactly one tag or digest if you pin it). It is not a wildcard. `ghcr.io/you/worker` does not allow `ghcr.io/you/worker-evil` or `ghcr.io/you/other`. Add each repository yourself.
 
 **Secrets only in the task environment.** Pass secrets in the `env` object of the POST body or of the polled task. Do not bake them into the image. This process has no secret store. SQLite stores callback URLs and the last log lines, and those lines can contain whatever the container printed. The file is mode 600. Treat the disk that way. Tokens are not written to the log.
@@ -33,7 +35,9 @@ The commands for both sides are in [RECIPES.md](RECIPES.md).
 
 **Jobs can use the machine.** A job container is not given a host mount, a published port, or privileged mode. It still runs as whatever user the image selects, with Docker's default capability set, on the default bridge, and it can open outbound connections. If you omit `memory`, Docker does not cap the container. Set `memory` and `cpu` on the task when a runaway matters. The host Docker socket is not mounted into the job. You mount it only into this process, and only if you run this process as a container.
 
-**Pull is optional.** Leave `poll_url` unset and nothing calls out.
+**Pull is optional.** Leave `poll_url` unset and nothing calls out. When it is set, the poll body names this machine (`worker_name`, `worker_os`) and its free slots. A `manifest_url` in the answer is a URL your orchestrator chose; the poll token goes with that request only when the manifest is on the same origin as `poll_url`.
+
+**`poll_any_image` is for a machine with one source of work.** It makes a polled task's image whatever the poll answer says. Turn it on only where the orchestrator behind `poll_url` is the only caller, as on the Windows worker. A server that also accepts pushes keeps its allowlist, and the flag never loosens a push.
 
 ## The process always does this
 

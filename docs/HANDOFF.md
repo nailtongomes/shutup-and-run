@@ -8,14 +8,14 @@ shutup-and-run is one static Rust binary. It sits on one machine that has Docker
 
 A slot is a running container labeled `shutup-and-run=1`. The count is a Docker list, so a restart does not forget work that is still running. Finished jobs, the last log lines, the drain flag, and auth bans live in one SQLite file.
 
-When `poll_url` is set, the same process also asks that URL for one task on an interval, and only if a slot is free and the process is not draining. The task is the same JSON as `POST /v1/jobs` and goes through the same `launch` path. When `poll_url` is unset, nothing calls out.
+When `poll_url` is set, the same process also asks that URL for one task on an interval, and only if a slot is free and the process is not draining. The poll body names the machine (`worker_name`, `worker_os`, `free_slots`). The answer is a task, the same JSON as `POST /v1/jobs`, or a `manifest_url` that is fetched once and must be a task. Either goes through the same `launch` path, with `JobSource::Poll`, which is the only source `poll_any_image` can exempt from the allowlist. When `poll_url` is unset, nothing calls out.
 
 ## What this is not
 
 - Not a queue, a scheduler, or a multi-host control plane. A full machine is `429`. A draining machine is `503`.
 - Not a sandbox. It does not drop capabilities, set a user namespace, or verify image signatures. See [CONVENTIONS.md](CONVENTIONS.md).
 - Not multi-tenant. One bearer token is the whole ACL.
-- Not a Windows or macOS program. That idea is only [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md).
+- Not a native Windows service. On Windows the `.exe` is a supervisor that runs this same Linux binary inside a WSL2 distribution ([WINDOWS.md](WINDOWS.md)). macOS is only [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md).
 - Not a place to put client names, real hostnames, or tokens. Examples use placeholders.
 
 ## Architecture
@@ -30,6 +30,8 @@ A background task reaps containers past the deadline label with SIGKILL, purges 
 
 Pull mode is `spawn_poller` in `src/poll.rs`. It is not started when `poll_url` is unset. Errors back off. They do not end the process.
 
+`shutup-and-run wsl ...` is `src/wsl.rs`, the Windows 11 supervisor. It never touches Docker itself: it shells out to `wsl.exe` and `schtasks.exe`. `install` imports an Ubuntu rootfs as the distribution `shutup-and-run`, installs `docker.io` and the musl binary of the same release inside it, writes a pull-only config with `poll_any_image = true`, registers a logon task, and runs `doctor`. `doctor` checks WSL, the distribution, Docker, runs one container, and checks the binary, the config, the service and the task. `serve` runs the service inside the distribution and restarts it with backoff; `--background` detaches the console. The pure parts (flags, `wsl --list` decoding, rendered files, checksum lines) are unit tested on every platform.
+
 ## File map
 
 | Path | Role |
@@ -40,7 +42,8 @@ Pull mode is `spawn_poller` in `src/poll.rs`. It is not started when `poll_url` 
 | `src/api.rs` | Routes, auth middleware, client IP, shared job JSON parse (`launch_request_from_slice`). |
 | `src/auth.rs` | SHA-256 of the token, compared with `subtle`. Bearer parsing. |
 | `src/launcher.rs` | Slot mutex, `launch` (answers, then pulls and starts in a task), reaper, purge, prune, reconcile, metrics text. |
-| `src/poll.rs` | Optional outbound poll. Same launch path. |
+| `src/poll.rs` | Optional outbound poll. Worker body, `manifest_url` (one hop, token only on the poll origin). Same launch path, as `JobSource::Poll`. |
+| `src/wsl.rs` | Windows 11 supervisor: `wsl install`, `doctor`, `serve`, `start`, `stop`, `logs`, `uninstall`. Shells out to `wsl.exe` and `schtasks.exe`. |
 | `src/allowlist.rs` | Image name check and repository match (`repo` allows `repo:tag` and `repo@digest`, not `repo-evil` and not `repo:5000/x`; a pinned entry is exact). |
 | `src/runtime.rs` | `Runtime` trait and `StartSpec`. |
 | `src/bollard_rt.rs` | Docker create/start/kill/logs/prune. Host config is built here. |
@@ -52,17 +55,19 @@ Pull mode is `spawn_poller` in `src/poll.rs`. It is not started when `poll_url` 
 | `src/clock.rs` | Clock, plus a fake clock for tests. |
 | `src/mock.rs` | In-memory runtime for tests. |
 | `scripts/install.sh` | Ubuntu install: Docker, token, self-signed cert, systemd, optional ufw. |
+| `scripts/install.ps1` | Windows: download the `.exe`, check `SHA256SUMS`, put it on the PATH, run `wsl install`. |
 | `scripts/ci-apt.sh` | CI only. Bounded `apt-get`, then `archive.ubuntu.com`, then `mirrors.kernel.org`. |
 | `scripts/size.sh` | Measures launcher RSS and CPU. Not run in CI. |
 | `scripts/accept.sh` | End-to-end test against a real Docker daemon. Starts its own instance. `SHUTUP_AND_RUN_SMOKE=1` then runs `smoke.sh` on it. |
 | `scripts/smoke.sh` | Twelve scenarios against an instance that is already running, through the API only. |
 | `examples/smoke-image/` | The Python image `smoke.sh` runs by default. `image.yml` publishes it. |
 | `docs/RECIPES.md` | Copy-and-paste answers: firewall, pinning, NAT, a client's machine, stop everything. |
+| `docs/WINDOWS.md` | The Windows worker: what is on the machine, install, doctor, day to day, limits. |
 | `docs/REVIEW-2026-11-11.md` | The last run of the review prompt below, with issue text for what was deferred. |
 | `deploy/` | Example config and the systemd unit. |
-| `.github/workflows/ci.yml` | fmt, clippy, test, shellcheck, accept.sh with smoke.sh, musl static check, scratch image, install.sh from a local release with smoke.sh. |
+| `.github/workflows/ci.yml` | fmt, clippy, test, shellcheck, accept.sh with smoke.sh, musl static check, scratch image, install.sh from a local release with smoke.sh, and a Windows build whose `wsl doctor` must fail cleanly. |
 | `.github/workflows/image.yml` | GHCR image on `main` (`:edge`) and on `v*` tags, and the smoke image. |
-| `.github/workflows/release.yml` | `v*` tag attaches the musl binary and `SHA256SUMS`, then runs the one-line install and smoke.sh on a fresh runner. |
+| `.github/workflows/release.yml` | `v*` tag attaches the musl binary, the Windows `.exe` and one `SHA256SUMS`, then runs the one-line install and smoke.sh on a fresh runner. |
 
 ## Config
 
@@ -75,6 +80,8 @@ Pull, all optional:
 | `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Unset: no outbound poll. `http` or `https`, no userinfo. |
 | `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Default 15. Range 1 to 3600. Ignored for behavior when `poll_url` is unset, but an out-of-range value still fails startup. |
 | (not a toml key) | `SHUTUP_AND_RUN_POLL_TOKEN` | Sent as `Authorization: Bearer` only when `poll_url` is set. A `poll_token` key in the file is an unknown field and startup fails. When `poll_url` is unset the variable is ignored. |
+| `poll_any_image` | `SHUTUP_AND_RUN_POLL_ANY_IMAGE` | Default false. A polled task skips the allowlist; a push never does. Needs `poll_url`. Lets `allowlist` be empty. |
+| `worker_name`, `worker_os` | `SHUTUP_AND_RUN_WORKER_NAME`, `SHUTUP_AND_RUN_WORKER_OS` | In the poll body. Defaults: the hostname, the build OS. Printable ASCII, no spaces, at most 64 characters. |
 
 The poll request, empty response, and task response are specified in the README under "Pull". Examples: `examples/kestra-poll.yml`, `examples/n8n-poll.json`. The push-side examples remain `examples/kestra-dispatch.yml` and `examples/n8n-dispatch.json`.
 
@@ -148,7 +155,9 @@ Each heading in [DECISIONS.md](DECISIONS.md) is the context, the choice, and the
 - [No volumes, published ports, or privileged](DECISIONS.md#no-volumes-published-ports-or-privileged).
 - [Pull, optional](DECISIONS.md#pull-optional). Unset means the old behavior.
 - [Security is a convention](DECISIONS.md#security-is-a-convention). Do not add a sandbox in a drive-by review.
-- [Windows and macOS: the same product](DECISIONS.md#windows-and-macos-the-same-product). Decided, not built.
+- [Windows and macOS: the same product](DECISIONS.md#windows-and-macos-the-same-product). Windows is built; macOS is not.
+- [Windows is the Linux service inside WSL2](DECISIONS.md#windows-is-the-linux-service-inside-wsl2). The `.exe` is a supervisor, not a Docker client.
+- [The poll body names the worker](DECISIONS.md#the-poll-body-names-the-worker), [A poll answer may be a manifest URL](DECISIONS.md#a-poll-answer-may-be-a-manifest-url), and [`poll_any_image`](DECISIONS.md#poll_any_image-no-allowlist-on-a-machine-with-one-source-of-work).
 
 ## Known risks
 
@@ -160,6 +169,9 @@ These are accepted, not a bug list. A review should confirm they are still true 
 - `memory` is optional. An omitted limit does not cap the container.
 - `callback_url` is any http(s) URL the host can reach. No private-address block (`src/callback.rs`).
 - `poll_url` is an outbound POST to an operator-chosen URL. Unset token means no Authorization header. A redirect is not followed.
+- `manifest_url` is a second outbound GET to a URL the poll server chose. The token goes only to the poll origin. No private-address block, as with callbacks.
+- With `poll_any_image` the poll server decides the image. The allowlist is not consulted for that task. The flag cannot exist without `poll_url` and never applies to a push (`src/launcher.rs`, `JobSource`).
+- On Windows the containers live in a WSL2 VM that the installing user owns. `wsl stop` kills them. The service is up only while that user is logged on. The `.exe` is not signed.
 - A task can be lost if the server deletes it when it offers it and the launcher then refuses (slot taken, not allowlisted). An accepted task keeps its `job_key` even if the image fails to pull. The README tells the server to offer the same key until the callback.
 - A job answered with `202` and still pulling its image exists only in memory. A graceful stop waits 30 seconds for it. A crash, or a longer pull, ends it: the row is closed at the next start and the callback says so.
 - `202` does not mean the image exists. A wrong tag is a `start_failed` job, not an error on the POST.
@@ -176,7 +188,9 @@ These are accepted, not a bug list. A review should confirm they are still true 
 
 ## Open TODOs
 
-- The Windows and macOS client in [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md). No code. The open questions there are undecided. The integrity check (sha256 or signature) is required before that client runs a downloaded script.
+- macOS, and the deferred Windows script mode, in [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md). The integrity check (sha256 or signature) is required before any client runs a downloaded script.
+- The Windows install path (`wsl install`) is not exercised by CI, because a GitHub runner has no WSL2. It was built and clippy-checked for Windows; a run on a real Windows 11 25H2 machine is the acceptance test, and its doctor table belongs in the PR or the release notes.
+- The Windows service runs only while the installing user is logged on. A service account (`/RU SYSTEM` and a distribution registered for it) is the upgrade if a client wants it to survive a reboot without a logon.
 - GHCR: if a package was created private, the owner still has to switch it to public for anonymous pulls. That applies to `shutup-and-run` and to `shutup-and-run-smoke`. It is a registry setting, not a code change.
 
 ## Answered by the owner on 2026-11-11
@@ -186,14 +200,14 @@ These are accepted, not a bug list. A review should confirm they are still true 
 3. Cancel: no.
 4. Installer without an allowlist: it installs and warns.
 5. Smoke image: `hello-world`, or the Python image in `examples/smoke-image`.
-6. Windows and macOS: the same binary, with a script mode on Windows only. See DECISIONS and the roadmap.
+6. Windows and macOS: the same binary. On 2026-11-12 Windows became containers inside WSL2 and script mode was deferred. See DECISIONS and the roadmap.
 7. Lent machines: CONVENTIONS now covers them.
 
 ## Open questions for the owner
 
-1. Script mode on Windows. The roadmap requires a sha256 or a signature before a downloaded script runs. Where does the hash come from: the task JSON, a file beside the script, or a signature with a key you hold? Nothing should be built before this is answered.
-2. macOS. Your answer mentioned running a script on Windows or macOS and then said script mode is Windows only. It is recorded as Windows only, with containers on macOS. Say so if macOS should run scripts too.
-3. The script-mode allowlist. Containers are limited to allowlisted images. What limits scripts: a list of URL prefixes in the config?
+1. Script mode on Windows is deferred (2026-11-12: Windows runs containers inside WSL2). If it comes back, the roadmap requires a sha256 or a signature before a downloaded script runs, and the hash's source is still undecided.
+2. macOS. Containers, through Docker Desktop or colima, under launchd. Not built.
+3. The Windows worker without a logon: should the task run as a service account so it survives a reboot with nobody signed in? That needs administrator rights at install.
 4. The smoke image is pushed to GHCR by `image.yml` on `main`. The first push may create a private package. Make `shutup-and-run-smoke` public, or machines without a login will only run it from a local build.
 5. The four medium findings still open in the review (connection cap, log buffer, event reconnect, CI token). Fix them next?
 

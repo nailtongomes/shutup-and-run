@@ -30,6 +30,9 @@ const ENV_KEYS: &[&str] = &[
     "SHUTUP_AND_RUN_POLL_URL",
     "SHUTUP_AND_RUN_POLL_INTERVAL_SECS",
     "SHUTUP_AND_RUN_POLL_TOKEN",
+    "SHUTUP_AND_RUN_POLL_ANY_IMAGE",
+    "SHUTUP_AND_RUN_WORKER_NAME",
+    "SHUTUP_AND_RUN_WORKER_OS",
 ];
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
@@ -74,6 +77,13 @@ pub struct Settings {
     pub poll_interval: Duration,
     /// Bearer token for `poll_url`. Environment only, so it cannot be committed in TOML.
     pub poll_token: Option<PollToken>,
+    /// A task from `poll_url` skips the allowlist. Push jobs never do. Needs `poll_url`.
+    pub poll_any_image: bool,
+    /// Sent in the poll body so one URL can serve many machines. Default: the hostname.
+    pub worker_name: String,
+    /// Sent in the poll body. Default: the OS this binary was built for. The
+    /// Windows supervisor sets `windows` for the binary it runs inside WSL.
+    pub worker_os: String,
 }
 
 /// Outbound poll secret. Debug output is redacted.
@@ -120,6 +130,9 @@ struct FileConfig {
     trust_x_forwarded_for: Option<bool>,
     poll_url: Option<String>,
     poll_interval_secs: Option<u64>,
+    poll_any_image: Option<bool>,
+    worker_name: Option<String>,
+    worker_os: Option<String>,
 }
 
 impl Settings {
@@ -187,12 +200,16 @@ impl Settings {
             return Err(ConfigError("max_slots must be between 1 and 256".into()));
         }
 
+        let poll_any_image =
+            take_bool(env, "SHUTUP_AND_RUN_POLL_ANY_IMAGE", file.poll_any_image)?.unwrap_or(false);
         let allowlist = if let Some(raw) = env.get("SHUTUP_AND_RUN_ALLOWLIST") {
-            split_allowlist(raw)?
+            split_allowlist(raw, poll_any_image)?
         } else {
             file.allowlist.unwrap_or_default()
         };
-        if allowlist.is_empty() {
+        // With poll_any_image the poll URL decides the image, so the list may be
+        // empty. Then a push job has nothing to match and is refused.
+        if allowlist.is_empty() && !poll_any_image {
             return Err(ConfigError(
                 "allowlist is empty. List permitted images, for example ghcr.io/OWNER/selenium-worker.".into(),
             ));
@@ -301,6 +318,19 @@ impl Settings {
         if let Some(url) = &poll_url {
             validate_poll_url(url)?;
         }
+        if poll_any_image && poll_url.is_none() {
+            return Err(ConfigError(
+                "poll_any_image is set but poll_url is not. It only applies to tasks from poll_url.".into(),
+            ));
+        }
+        let worker_name = match take_string(env, "SHUTUP_AND_RUN_WORKER_NAME", file.worker_name) {
+            Some(name) => validate_worker_field("worker_name", &name)?,
+            None => default_worker_name(),
+        };
+        let worker_os = match take_string(env, "SHUTUP_AND_RUN_WORKER_OS", file.worker_os) {
+            Some(os) => validate_worker_field("worker_os", &os)?,
+            None => std::env::consts::OS.to_string(),
+        };
         let poll_interval_secs = match take_u64(
             env,
             "SHUTUP_AND_RUN_POLL_INTERVAL_SECS",
@@ -361,6 +391,9 @@ impl Settings {
             poll_url,
             poll_interval: Duration::from_secs(poll_interval_secs),
             poll_token,
+            poll_any_image,
+            worker_name,
+            worker_os,
         })
     }
 }
@@ -446,16 +479,56 @@ fn take_u64(
     Ok(file)
 }
 
-fn split_allowlist(raw: &str) -> Result<Vec<String>, ConfigError> {
+fn split_allowlist(raw: &str, may_be_empty: bool) -> Result<Vec<String>, ConfigError> {
     let items: Vec<String> = raw
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    if items.is_empty() {
+    if items.is_empty() && !may_be_empty {
         return Err(ConfigError("SHUTUP_AND_RUN_ALLOWLIST is empty".into()));
     }
     Ok(items)
+}
+
+/// `worker_name` and `worker_os` travel in the poll body. Printable ASCII, no
+/// spaces, at most 64 characters, so a server can log and compare them as is.
+fn validate_worker_field(key: &str, value: &str) -> Result<String, ConfigError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_graphic() && c != '"' && c != '\\')
+    {
+        return Err(ConfigError(format!(
+            "{key} must be 1 to 64 printable ASCII characters with no spaces or quotes"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+/// The machine's hostname, read without a crate. Inside WSL this is the
+/// Windows computer name. `unknown` when nothing answers.
+fn default_worker_name() -> String {
+    let from_env = ["HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok())
+        .filter(|value| !value.trim().is_empty());
+    let raw = from_env
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .unwrap_or_default();
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_graphic() && *c != '"' && *c != '\\')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".to_string()
+    } else {
+        cleaned
+    }
 }
 
 #[cfg(test)]
@@ -615,5 +688,75 @@ mod tests {
             Settings::from_toml_and_env(&base_toml("poll_interval_secs = 0"), &HashMap::new(),)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn poll_any_image_needs_poll_url_and_lets_the_allowlist_be_empty() {
+        let settings = Settings::from_toml_and_env(&base_toml(""), &HashMap::new()).unwrap();
+        assert!(!settings.poll_any_image);
+
+        let err = Settings::from_toml_and_env(&base_toml("poll_any_image = true"), &HashMap::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("poll_url"), "{err}");
+
+        let no_list = r#"
+            token = "token-from-the-file"
+            max_slots = 1
+            allowlist = []
+            poll_url = "http://127.0.0.1:9/poll"
+            poll_any_image = true
+            "#;
+        let settings = Settings::from_toml_and_env(no_list, &HashMap::new()).unwrap();
+        assert!(settings.poll_any_image);
+        assert!(settings.allowlist.is_empty());
+
+        // Without the flag an empty list is still refused, from the file and from the environment.
+        let still_required = r#"
+            token = "token-from-the-file"
+            max_slots = 1
+            allowlist = []
+            poll_url = "http://127.0.0.1:9/poll"
+            "#;
+        assert!(Settings::from_toml_and_env(still_required, &HashMap::new()).is_err());
+        assert!(Settings::from_toml_and_env(
+            &base_toml(""),
+            &env(&[("SHUTUP_AND_RUN_ALLOWLIST", " , ")]),
+        )
+        .is_err());
+        let settings = Settings::from_toml_and_env(
+            &base_toml("poll_url = \"http://127.0.0.1:9/poll\""),
+            &env(&[
+                ("SHUTUP_AND_RUN_ALLOWLIST", " , "),
+                ("SHUTUP_AND_RUN_POLL_ANY_IMAGE", "1"),
+            ]),
+        )
+        .unwrap();
+        assert!(settings.allowlist.is_empty());
+        assert!(settings.poll_any_image);
+    }
+
+    #[test]
+    fn worker_name_and_os_default_and_validate() {
+        let settings = Settings::from_toml_and_env(&base_toml(""), &HashMap::new()).unwrap();
+        assert!(!settings.worker_name.is_empty());
+        assert!(!settings.worker_name.contains(' '));
+        assert_eq!(settings.worker_os, std::env::consts::OS);
+
+        let settings = Settings::from_toml_and_env(
+            &base_toml("worker_name = \"desk-07\"\nworker_os = \"windows\""),
+            &env(&[("SHUTUP_AND_RUN_WORKER_NAME", "desk-08")]),
+        )
+        .unwrap();
+        assert_eq!(settings.worker_name, "desk-08");
+        assert_eq!(settings.worker_os, "windows");
+
+        for bad in ["", "has space", "a\"quote", &"x".repeat(65)] {
+            let toml_text = base_toml(&format!("worker_name = {}", serde_json::json!(bad)));
+            assert!(
+                Settings::from_toml_and_env(&toml_text, &HashMap::new()).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
+        assert_eq!(validate_worker_field("worker_os", " wsl ").unwrap(), "wsl");
     }
 }

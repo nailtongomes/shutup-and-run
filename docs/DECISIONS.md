@@ -124,17 +124,49 @@ The cost is that a deployer who skips the document is running whatever image the
 
 ## Windows and macOS: the same product
 
-Decided 2026-11-11. Nothing is built yet.
+Decided 2026-11-11. Windows was built on 2026-11-12, below. macOS is still only the roadmap.
 
 Windows and macOS get the same Rust binary and the same contract: accept a pushed job or poll for one, enforce slots and a timeout, keep history, call back. It is not a separate client.
 
 On macOS a job is a container, as on Linux.
 
-On Windows a job may instead be a script. The binary downloads it from a URL and runs it directly, with no WSL and no Docker around it. That is less isolation than a container, and it is a risk the machine's owner accepts in order to run the automation. This script mode is for Windows only.
+On Windows a job is a container too, inside WSL2. The 2026-11-11 idea of a script mode, where the binary downloads a script and runs it with no container around it, is deferred: it needs an integrity answer (sha256 or a signature) that nobody has given, and the owner chose WSL on 2026-11-12. [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md) keeps the idea and its open questions.
 
-[ROADMAP-windows-macos.md](ROADMAP-windows-macos.md) has the details and the questions that are still open. The one that must be answered before any script runs is integrity: how the binary knows the script it downloaded is the one that was published.
+## Windows is the Linux service inside WSL2
 
-The cost is a second kind of job with weaker isolation, inside a binary whose whole security story so far was "it only starts allowlisted containers".
+Decided 2026-11-12. The owner's Windows machines are lent by clients and only pull work; nothing is pushed to them.
+
+Docker on Windows 11 is either Docker Desktop or Docker Engine inside a WSL2 distribution. Docker Desktop needs a licence above a company size, is installed per user, and would make the `.exe` a second Docker client. The choice is Docker Engine inside a distribution of our own, named `shutup-and-run`, imported from the Ubuntu 24.04 WSL rootfs that Canonical publishes with a `SHA256SUMS`. The Linux musl binary runs inside it unchanged. The `.exe` (`src/wsl.rs`) is a supervisor: `wsl install` provisions the distribution, `wsl doctor` checks it and runs one container, `wsl serve` keeps the service up and restarts it with backoff, and a scheduled task runs `wsl serve --background` at logon. The distribution mounts no Windows drive and has interop off, so a container, and the token holder, see only the VM.
+
+The listener stays on, but on `127.0.0.1:8787` inside the distribution with `http = true`: the doctor and a shell use it, nothing outside can. The API token for it is generated at install and written beside the poll token in `/etc/shutup-and-run/env`, mode 600, inside the distribution. Neither token is passed on a command line.
+
+The `.exe` downloads the musl binary of its own version from the GitHub release, so the two halves never disagree about the poll contract, and checks it against that release's `SHA256SUMS`. `install.ps1` does the same for the `.exe`. The release carries both binaries and one `SHA256SUMS`.
+
+The costs. The service runs only while the installing user is logged on; a service account or a stored password would need administrator rights and was not worth it for the first version. `wsl stop` terminates the VM and so kills the containers, unlike a Linux server where the service and the containers are independent. The rootfs is a 340 MiB download and `apt-get install docker.io` runs on the client's machine. The `.exe` is not code signed, so SmartScreen warns once. And CI can build the `.exe` but cannot run WSL2 on a GitHub runner, so the install path is tested by hand on a Windows 11 machine, not by a workflow.
+
+## The poll body names the worker
+
+Decided 2026-11-12. The poll used to send `{}`; the server told machines apart only by their bearer token.
+
+With Windows workers spread across clients, one URL serves many machines and the server wants to know who is asking before it chooses a task. The body is now `{"worker": ..., "os": ..., "free_slots": n}`: `worker_name` (default: the hostname), `worker_os` (default: the build OS; the Windows worker says `windows`), and the slots the machine could fill. Nothing else: not the config, not the history, not a token. A server that ignored the old `{}` ignores this too.
+
+The cost is a contract change for anyone who validated the body as empty, and two more config keys.
+
+## A poll answer may be a manifest URL
+
+Decided 2026-11-12. A poll answer is a task inline, or `{"manifest_url": "..."}`. The machine fetches that URL once with a `GET` and the body must be a task in the same shape as `POST /v1/jobs`. A manifest cannot point at another manifest, so there is one hop, never a chain. Same 64 KiB cap, no redirects, same validation.
+
+The poll token is sent with the manifest request only when the manifest is on the same scheme, host and port as `poll_url`. A manifest on object storage or a CDN is fetched without it, so the worker's token does not land in a third party's access log. The orchestrator that wants a private manifest serves it from its own origin.
+
+The cost is a second request per task and one more URL the operator's orchestrator is trusted to choose.
+
+## `poll_any_image`: no allowlist on a machine with one source of work
+
+Decided 2026-11-12. The owner's Windows workers run whatever the orchestrator names; keeping an allowlist on each client machine in sync with the orchestrator was work with no reader.
+
+`poll_any_image = true` makes a polled task's image whatever the poll answer says. It applies to a task from `poll_url` only; a pushed job is still matched against the allowlist, which may now be empty, and then matches nothing. The image name is still validated. The flag needs `poll_url`, so it cannot be set by accident on a push-only server. The allowlist matcher itself is unchanged: there is no wildcard entry, and `repo` still does not allow `repo-evil`.
+
+The cost is that on such a machine the orchestrator, not a file on the lender's disk, decides what runs. That is said in [CONVENTIONS.md](CONVENTIONS.md), and the Windows installer turns the flag on.
 
 ## Smoke test against a running instance
 
