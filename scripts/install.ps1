@@ -54,7 +54,10 @@ if ($Actual -ne $Expected) {
 
 # A running copy cannot be overwritten. Stop the task first, then move.
 if (Test-Path $Exe) {
-    schtasks.exe /End /TN shutup-and-run 2>$null | Out-Null
+    # Through cmd: with $ErrorActionPreference = "Stop", Windows PowerShell 5.1
+    # turns the stderr of a native command redirected with 2> into an error,
+    # and a task that does not exist yet would end this script right here.
+    cmd.exe /c "schtasks.exe /End /TN shutup-and-run >nul 2>&1"
     Start-Sleep -Seconds 1
 }
 Move-Item -Force $Tmp $Exe

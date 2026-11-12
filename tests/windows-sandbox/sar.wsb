@@ -1,0 +1,22 @@
+<!-- Template. run.ps1 replaces __REPO__ and __RESULTS__ with absolute host
+     paths (a .wsb cannot hold a relative one) and opens the copy. -->
+<Configuration>
+  <Networking>Enable</Networking>
+  <VGpu>Disable</VGpu>
+  <ClipboardRedirection>Disable</ClipboardRedirection>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>__REPO__</HostFolder>
+      <SandboxFolder>C:\sar-repo</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <MappedFolder>
+      <HostFolder>__RESULTS__</HostFolder>
+      <SandboxFolder>C:\sar-sandbox-results</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\sar-repo\tests\windows-sandbox\in-sandbox.ps1</Command>
+  </LogonCommand>
+</Configuration>

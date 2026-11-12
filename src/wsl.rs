@@ -129,7 +129,10 @@ shutup-and-run wsl logs [--lines N]
     print the end of the supervisor log (default 100 lines).
 
 shutup-and-run wsl uninstall [--purge]
-    delete the task and the distribution. --purge also removes the data folder."
+    delete the task and the distribution. --purge also removes the data folder.
+
+shutup-and-run wsl task register | remove
+    only the logon task: what install and uninstall do with it. Needs no WSL."
 }
 
 pub async fn cli(args: &[String]) -> ExitCode {
@@ -148,6 +151,7 @@ pub async fn cli(args: &[String]) -> ExitCode {
         "stop" => stop_cli(),
         "logs" => logs_cli(rest),
         "uninstall" => uninstall_cli(rest),
+        "task" => task_cli(rest),
         "-h" | "--help" | "help" => {
             println!("{}", usage());
             return ExitCode::SUCCESS;
@@ -1342,64 +1346,91 @@ fn install_exe_copy(data: &Path) -> WslResult<PathBuf> {
     }
 }
 
-/// The schtasks command line. `/RL LIMITED`: no elevation. No `/RU`: the task
-/// runs as the user who installed, which is the user the distribution
-/// belongs to.
-pub(crate) fn schtasks_create_args(exe: &Path) -> Vec<String> {
-    let action = format!("\"{}\" wsl serve --background", exe.display());
-    vec![
-        "/Create".into(),
-        "/F".into(),
-        "/SC".into(),
-        "ONLOGON".into(),
-        "/TN".into(),
-        TASK_NAME.into(),
-        "/TR".into(),
-        action,
-        "/RL".into(),
-        "LIMITED".into(),
-    ]
-}
-
-/// `schtasks /Create` leaves defaults meant for a short job: the task does
-/// not start on battery, stops when the machine goes on battery, and is
-/// ended after 72 hours. This worker runs for as long as the user is logged
-/// on, so those are turned off. A second run of the task is ignored.
-pub(crate) fn task_settings_script() -> String {
+/// The PowerShell that registers the logon task. `schtasks /Create /SC
+/// ONLOGON` needs an administrator even with `/RL LIMITED`, because its
+/// trigger is "any user logs on". A trigger tied to one user does not, and
+/// `Register-ScheduledTask` can say that. The task runs as the user who
+/// installed, which is the user the distribution belongs to, with no
+/// elevation, and only while that user is logged on.
+///
+/// The settings undo defaults meant for a short job: do not start on battery,
+/// stop on battery, end after 72 hours. A second run of the task is ignored.
+///
+/// No double quote in the script: it travels as one command-line argument.
+pub(crate) fn task_register_script(exe: &Path) -> String {
+    let exe = exe.display().to_string().replace('\'', "''");
     format!(
-        "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
+        "$ErrorActionPreference = 'Stop'; \
+         $u = $env:USERDOMAIN + '\\' + $env:USERNAME; \
+         $a = New-ScheduledTaskAction -Execute '{exe}' -Argument 'wsl serve --background'; \
+         $t = New-ScheduledTaskTrigger -AtLogOn -User $u; \
+         $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
          -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew; \
-         Set-ScheduledTask -TaskName '{TASK_NAME}' -Settings $s | Out-Null"
+         Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $a -Trigger $t -Settings $s \
+         -RunLevel Limited -Force | Out-Null"
     )
 }
 
 fn register_task(exe: &Path) -> WslResult<()> {
-    let args = schtasks_create_args(exe);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = run("schtasks.exe", &refs, None, SHORT)?;
-    if !out.ok() {
-        return Err(step_failed("schtasks /Create", "schtasks /Create", &out));
-    }
-    // Soft: the task works without this, with the defaults described above.
-    let script = task_settings_script();
-    match run(
+    let script = task_register_script(exe);
+    let out = run(
         "powershell.exe",
         &["-NoProfile", "-NonInteractive", "-Command", &script],
         None,
         SHORT,
-    ) {
-        Ok(out) if out.ok() => {}
-        Ok(out) => println!(
-            "    could not change the task settings ({}). It will not start on battery and ends after 72 hours.",
-            out.one_line()
-        ),
-        Err(e) => println!("    could not change the task settings ({e})."),
+    )?;
+    if !out.ok() {
+        return Err(step_failed(
+            "registering the logon task",
+            &format!("powershell -Command {script}"),
+            &out,
+        ));
     }
     let out = run("schtasks.exe", &["/Run", "/TN", TASK_NAME], None, SHORT)?;
     if !out.ok() {
-        return Err(step_failed("schtasks /Run", "schtasks /Run", &out));
+        return Err(step_failed(
+            "schtasks /Run",
+            &format!("schtasks /Run /TN {TASK_NAME}"),
+            &out,
+        ));
     }
     Ok(())
+}
+
+/// End and delete the logon task. A task that is not there is not an error.
+fn remove_task() {
+    let _ = run("schtasks.exe", &["/End", "/TN", TASK_NAME], None, SHORT);
+    match run(
+        "schtasks.exe",
+        &["/Delete", "/F", "/TN", TASK_NAME],
+        None,
+        SHORT,
+    ) {
+        Ok(out) if out.ok() => println!("deleted task {TASK_NAME}"),
+        Ok(out) => println!("task {TASK_NAME}: {}", out.one_line()),
+        Err(e) => println!("task {TASK_NAME}: {e}"),
+    }
+}
+
+/// `wsl task register|remove`: step 7 of the install and the first step of
+/// the uninstall, alone. It needs no WSL, so a machine without it (CI, a
+/// Windows Sandbox) can test the one part that depends on the user's rights.
+fn task_cli(args: &[String]) -> WslResult<ExitCode> {
+    match args.first().map(String::as_str) {
+        Some("register") if args.len() == 1 => {
+            let data = data_dir();
+            std::fs::create_dir_all(&data).map_err(|e| err(format!("{}: {e}", data.display())))?;
+            let exe = install_exe_copy(&data)?;
+            register_task(&exe)?;
+            println!("registered and started task {TASK_NAME}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Some("remove") if args.len() == 1 => {
+            remove_task();
+            Ok(ExitCode::SUCCESS)
+        }
+        _ => Err(err("usage: shutup-and-run wsl task register|remove")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1600,17 +1631,7 @@ pub(crate) fn tail(text: &str, lines: usize) -> Vec<&str> {
 
 fn uninstall_cli(args: &[String]) -> WslResult<ExitCode> {
     let flags = parse_flags(args, &[], &["--purge"])?;
-    let _ = run("schtasks.exe", &["/End", "/TN", TASK_NAME], None, SHORT);
-    match run(
-        "schtasks.exe",
-        &["/Delete", "/F", "/TN", TASK_NAME],
-        None,
-        SHORT,
-    ) {
-        Ok(out) if out.ok() => println!("deleted task {TASK_NAME}"),
-        Ok(out) => println!("task {TASK_NAME}: {}", out.one_line()),
-        Err(e) => println!("task {TASK_NAME}: {e}"),
-    }
+    remove_task();
     if our_distro()?.is_some() {
         let _ = run("wsl.exe", &["--terminate", DISTRO], None, SHORT);
         let out = run("wsl.exe", &["--unregister", DISTRO], None, APT)?;
@@ -1842,27 +1863,24 @@ mod tests {
 
     #[test]
     fn task_command_line_and_report() {
-        let args = schtasks_create_args(Path::new(
-            r"C:\ProgramData\shutup-and-run\shutup-and-run.exe",
-        ));
-        assert_eq!(args[0], "/Create");
-        assert!(args.contains(&"ONLOGON".to_string()));
-        assert!(args.contains(&TASK_NAME.to_string()));
-        assert!(args.contains(
-            &r#""C:\ProgramData\shutup-and-run\shutup-and-run.exe" wsl serve --background"#
-                .to_string()
-        ));
-
         assert!(is_token(&"a".repeat(64)));
         assert!(!is_token("short"));
         assert!(!is_token("has space in it, and is long enough"));
 
-        let settings = task_settings_script();
-        assert!(settings.contains("-TaskName 'shutup-and-run'"));
-        assert!(settings.contains("-AllowStartIfOnBatteries"));
-        assert!(settings.contains("[TimeSpan]::Zero"));
-        assert!(settings.contains("IgnoreNew"));
-        assert!(!settings.contains('"'));
+        let script = task_register_script(Path::new(r"C:\ProgramData\shutup-and-run\it's.exe"));
+        assert!(script.contains(r"-Execute 'C:\ProgramData\shutup-and-run\it''s.exe'"));
+        assert!(script.contains("-Argument 'wsl serve --background'"));
+        // Tied to the current user, which is what a non-administrator may register.
+        assert!(script.contains(r"$u = $env:USERDOMAIN + '\' + $env:USERNAME"));
+        assert!(script.contains("New-ScheduledTaskTrigger -AtLogOn -User $u"));
+        assert!(script.contains("-TaskName 'shutup-and-run'"));
+        assert!(script.contains("-RunLevel Limited -Force"));
+        assert!(script.contains("-AllowStartIfOnBatteries"));
+        assert!(script.contains("-DontStopIfGoingOnBatteries"));
+        assert!(script.contains("[TimeSpan]::Zero"));
+        assert!(script.contains("IgnoreNew"));
+        assert!(!script.contains('"'));
+        assert!(!script.contains("ONLOGON"));
 
         let checks = vec![
             check("wsl", true, "ok"),
