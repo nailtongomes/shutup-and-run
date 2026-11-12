@@ -36,6 +36,9 @@ jobs:
           # A typo must not install anything.
           .\target\release\shutup-and-run.exe wsl install --pol-url https://x/poll
           if ($LASTEXITCODE -ne 1) { throw "wsl install with a bad flag exited $LASTEXITCODE, expected 1" }
+          # Both commands above are meant to exit 1, and the step would end
+          # with the last exit code.
+          exit 0
 
   accept:
     runs-on: ubuntu-latest

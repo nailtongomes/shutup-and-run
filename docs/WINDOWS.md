@@ -28,10 +28,9 @@ WSL2 must be enabled once, as administrator, then reboot:
 wsl --install --no-distribution
 ```
 
-Then, as the user who will stay logged on, with the token your orchestrator issued for this machine:
+Then, as the user who will stay logged on:
 
 ```powershell
-$env:SHUTUP_AND_RUN_POLL_TOKEN = "<token>"
 $env:SHUTUP_AND_RUN_POLL_URL = "https://orchestrator.example/poll"
 irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
 ```
@@ -56,7 +55,9 @@ shutup-and-run.exe wsl install --poll-url https://orchestrator.example/poll --ma
 | `--rootfs PATH`, `--bin PATH` | Skip the downloads. For an offline machine or a mirror. |
 | `--no-task` | Do not register the logon task. |
 
-`SHUTUP_AND_RUN_POLL_TOKEN` is read from the environment and written only to `/etc/shutup-and-run/env` inside the distribution, mode 600. It is never on a command line. The API token for the localhost listener is generated and written beside it. `SHUTUP_AND_RUN_URL` and `SHUTUP_AND_RUN_ROOTFS_URL` point the downloads at a mirror; `SHA256SUMS` is fetched from the same directory either way.
+The poll token, given or made, is written only to `/etc/shutup-and-run/env` inside the distribution, mode 600. It is never on a command line. The API token for the localhost listener is generated and written beside it. `SHUTUP_AND_RUN_URL` and `SHUTUP_AND_RUN_ROOTFS_URL` point the downloads at a mirror; `SHA256SUMS` is fetched from the same directory either way.
+
+**Enrollment.** With no `SHUTUP_AND_RUN_POLL_TOKEN` set, the install makes a random token for this machine, or keeps the one a previous install left, and starts polling with it. Your poll URL has never seen that token, so it records the machine as pending (token, `worker`, the address of the connection, what the body says) and answers `403` or nothing until you approve it. The worker keeps asking, at most every five minutes while refused. If your orchestrator issues tokens instead, set `SHUTUP_AND_RUN_POLL_TOKEN` before the install and that one is used.
 
 **Without a poll URL** the install does everything except give the machine work: no token is needed, nothing is polled, and the only container that runs is the doctor's smoke test. Use it to check a machine before your orchestrator exists. Run `wsl install --poll-url ...` again, with the token set, to turn polling on.
 
@@ -115,8 +116,12 @@ To upgrade, run `install.ps1` again. It replaces the `.exe`, and `wsl install` r
 Each poll is a `POST` with the token and this body:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "free_slots": 1}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.0", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
 ```
+
+`cpus` and `memory_bytes` are what the WSL2 VM has, which is what the machine lends. The body has no address, because the worker only knows the VM's private one and could claim any other. The server takes the public address from the connection.
+
+**The server decides.** Check the token before answering with anything. An unknown token is a pending machine, not a caller: record it, answer `403` (or `204`), and never put a task, an image name or a secret in that answer. Store a hash of the token, not the token. To retire a machine, stop serving its token.
 
 The answer is a task (the same JSON as `POST /v1/jobs`), `{"task": {...}}`, nothing, or `{"manifest_url": "https://..."}`. A manifest is fetched once with a `GET` and must be a task. See [Pull](../README.md#pull).
 
@@ -125,6 +130,15 @@ The answer is a task (the same JSON as `POST /v1/jobs`), `{"task": {...}}`, noth
 ## Shutdown, restart, sign-out
 
 Windows ends the WSL2 VM when the user signs out or the machine shuts down. **A running container is killed without a warning then**; only `wsl stop` gives it time. Nothing is left behind: a container is never restarted, and when the service next starts it closes the job's row, removes the container, and sends the callback. Such a job has `reason` `exited` with a non-zero `exit_code` (usually 137 or 255), or no `exit_code` if it was still pulling its image. The orchestrator offers the work again under a new `job_key`. Tasks should be safe to run twice.
+
+## The machine is not yours
+
+Treat a Windows worker as a computer you do not control. Its user is administrator of the VM: they can read the poll token, every task's `env` (`docker inspect`), the image layers, and what the container writes. So:
+
+- One token per machine, and the server knows which machine it is.
+- A task sent there carries only secrets you can afford that client to see: short-lived, scoped to that one task.
+- What comes back (callback, results, exit code) is a claim by that machine. Check it where it matters.
+- Keep work that needs real secrets on your own Linux machines. The queue behind the poll URL makes that choice, using what the poll body says.
 
 ## Limits
 

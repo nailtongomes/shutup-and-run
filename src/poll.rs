@@ -116,11 +116,7 @@ pub(crate) async fn poll_once(
     let mut request = client
         .post(&url)
         .header(reqwest::header::ACCEPT, "application/json")
-        .json(&poll_body(
-            &settings.worker_name,
-            &settings.worker_os,
-            slots.free,
-        ));
+        .json(&poll_body(settings, slots.free));
     if let Some(token) = settings.poll_token.as_ref() {
         request = request.bearer_auth(token.as_str());
     }
@@ -134,6 +130,13 @@ pub(crate) async fn poll_once(
         return Ok(PollOutcome::Idle);
     }
     let bytes = read_capped(response).await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        // The server decides which machines it serves. Until it approves this
+        // one, keep asking, slowly: the caller backs off up to five minutes.
+        return Err(PollError(format!(
+            "poll returned {status}: the poll URL has not approved this machine"
+        )));
+    }
     if status != reqwest::StatusCode::OK {
         return Err(PollError(format!("poll returned {status}")));
     }
@@ -196,13 +199,31 @@ async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, PollErr
     }
 }
 
-/// The poll request body. `free_slots` is what the server may hand out now.
-pub(crate) fn poll_body(worker: &str, os: &str, free_slots: usize) -> Value {
+/// The poll request body: who is asking and what the machine could lend, so
+/// the server can decide whether its queue may serve this machine at all.
+/// `free_slots` is what the server may hand out now. `cpus` and
+/// `memory_bytes` are what this process sees, which on Windows is the WSL2
+/// VM. There is no address here: the server reads the public one from the
+/// connection, which the machine cannot make up.
+pub(crate) fn poll_body(settings: &crate::config::Settings, free_slots: usize) -> Value {
     serde_json::json!({
-        "worker": worker,
-        "os": os,
+        "worker": settings.worker_name,
+        "os": settings.worker_os,
+        "arch": std::env::consts::ARCH,
+        "version": env!("CARGO_PKG_VERSION"),
+        "max_slots": settings.max_slots,
         "free_slots": free_slots,
+        "cpus": std::thread::available_parallelism().map(|n| n.get()).ok(),
+        "memory_bytes": total_memory_bytes(),
     })
+}
+
+/// `MemTotal` of `/proc/meminfo`. None where that file does not exist.
+fn total_memory_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|line| line.starts_with("MemTotal:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kib.checked_mul(1024)
 }
 
 /// A poll answer: nothing, a task, or `{"manifest_url": "..."}`. A manifest body
@@ -354,7 +375,7 @@ mod tests {
             allowlist = ["alpine"]
             default_timeout_secs = 30
             max_timeout_secs = 60
-            history_path = "{}"
+            history_path = '{}'
             {extra}
             "#,
             dir.join("jobs.sqlite").display()
@@ -534,7 +555,31 @@ mod tests {
         assert_eq!(body["worker"], launcher.settings().worker_name);
         assert_eq!(body["os"], std::env::consts::OS);
         assert_eq!(body["free_slots"], 2);
-        assert_eq!(body.as_object().unwrap().len(), 3);
+        assert_eq!(body["max_slots"], 2);
+        assert_eq!(body["arch"], std::env::consts::ARCH);
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert!(body["cpus"].as_u64().unwrap() >= 1);
+        // Identity and capacity only: no config, no token, no history.
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "arch",
+                "cpus",
+                "free_slots",
+                "max_slots",
+                "memory_bytes",
+                "os",
+                "version",
+                "worker"
+            ]
+        );
 
         let again = poll_once(&launcher, &http).await.unwrap();
         assert_eq!(again, PollOutcome::Existing);
@@ -542,6 +587,17 @@ mod tests {
         let body: Value =
             serde_json::from_str(server.body.lock().unwrap().as_deref().unwrap()).unwrap();
         assert_eq!(body["free_slots"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_machine_the_server_has_not_approved_starts_nothing_and_backs_off() {
+        let server = poll_server(StatusCode::FORBIDDEN, r#"{"image":"alpine"}"#).await;
+        let (launcher, mock) = launcher_for(1, &format!("poll_url = \"{}\"", server.url), &[]);
+        let refused = poll_once(&launcher, &client().unwrap()).await.unwrap_err();
+        assert!(refused
+            .to_string()
+            .contains("has not approved this machine"));
+        assert_eq!(mock.start_count().await, 0);
     }
 
     #[tokio::test]
@@ -558,10 +614,9 @@ mod tests {
         poll_once(&launcher, &client().unwrap()).await.unwrap();
         let body: Value =
             serde_json::from_str(server.body.lock().unwrap().as_deref().unwrap()).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({"worker": "desk-07", "os": "windows", "free_slots": 1})
-        );
+        assert_eq!(body["worker"], "desk-07");
+        assert_eq!(body["os"], "windows");
+        assert_eq!(body["free_slots"], 1);
     }
 
     #[tokio::test]

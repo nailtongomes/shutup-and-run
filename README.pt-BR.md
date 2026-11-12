@@ -283,10 +283,10 @@ POST {poll_url}
 Authorization: Bearer {SHUTUP_AND_RUN_POLL_TOKEN}
 Content-Type: application/json
 
-{"worker": "desk-07", "os": "linux", "free_slots": 1}
+{"worker": "desk-07", "os": "linux", "arch": "x86_64", "version": "0.2.0", "max_slots": 2, "free_slots": 1, "cpus": 8, "memory_bytes": 16624934912}
 ```
 
-O corpo diz quem está pedindo, para que uma URL atenda todas as máquinas: `worker` é o `worker_name` (padrão: o hostname), `os` é o `worker_os` (padrão: o sistema para o qual o binário foi compilado; o worker Windows diz `windows`) e `free_slots` é quantas tarefas a máquina aceitaria agora.
+O corpo diz quem está pedindo, para que uma URL atenda todas as máquinas: `worker` é o `worker_name` (padrão: o hostname), `os` é o `worker_os` (padrão: o sistema para o qual o binário foi compilado; o worker Windows diz `windows`) e `free_slots` é quantas tarefas a máquina aceitaria agora. `arch`, `version`, `max_slots`, `cpus` e `memory_bytes` dizem o que a máquina é e o que pode emprestar, para o servidor decidir se a fila pode atendê-la. O endereço da máquina não vai no corpo: leia da conexão. Um `401` ou `403` significa "não liberada": a máquina não inicia nada e pergunta de novo, espaçando até cinco minutos.
 
 - Nada a fazer: `204`, ou `200` com corpo vazio, `null`, `{}`, `{"task": null}` ou `{"manifest_url": null}`.
 - Uma tarefa: `200` com o mesmo JSON do `POST /v1/jobs`, ou `{"task": { ... }}`.
@@ -359,7 +359,7 @@ Também é publicada uma imagem em `ghcr.io/nailtongomes/shutup-and-run`, para q
 A release também traz `shutup-and-run-x86_64-pc-windows-msvc.exe`. Ele é um supervisor: importa uma distribuição WSL2 só dele, instala o Docker Engine e o binário Linux lá dentro e mantém o serviço rodando ali em modo pull. Sem Docker Desktop, sem porta aberta. Com o WSL2 habilitado (`wsl --install --no-distribution` como administrador, depois reiniciar):
 
 ```powershell
-$env:SHUTUP_AND_RUN_POLL_TOKEN = "<token emitido pelo seu orquestrador>"
+$env:SHUTUP_AND_RUN_POLL_TOKEN = "<token>"   # opcional: sem ele a máquina cria o próprio e espera a aprovação
 $env:SHUTUP_AND_RUN_POLL_URL = "https://orchestrator.example/poll"
 irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
 ```

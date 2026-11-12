@@ -751,7 +751,7 @@ mod tests {
                 allowlist = ["alpine", "ghcr.io/owner/selenium-worker"]
                 default_timeout_secs = 30
                 max_timeout_secs = 120
-                history_path = "{}"
+                history_path = '{}'
                 history_days = 30
                 "#,
                 dir.join("jobs.sqlite").display()

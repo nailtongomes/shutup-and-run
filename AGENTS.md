@@ -56,7 +56,8 @@ The scratch image is the Dockerfile with the musl binary copied to `./shutup-and
 
 - One machine, one bearer token. An allowlist entry is one repository. `repo` allows `repo:tag` and `repo@digest`. It does not allow `repo-evil`, a wildcard, or someone else's image. Do not loosen that match. The one way around the list is `poll_any_image`, which applies to a polled task only, never to a push, and needs `poll_url`. Do not widen it.
 - A request sets image, env, command, timeout, cpu, memory, and shm. It does not set mounts, ports, privileged, capabilities, or a network mode. Do not add those fields. A manifest is that same request, fetched once from `manifest_url`; it cannot point at another manifest.
-- The poll body is `worker`, `os`, `free_slots`. Do not put the machine's config, tokens, or job history in it.
+- The poll body is who is asking and what it could lend: `worker`, `os`, `arch`, `version`, `max_slots`, `free_slots`, `cpus`, `memory_bytes`. Do not put the machine's config, tokens, job history, or a self-reported address in it.
+- A Linux machine is the owner's and trusted. A Windows machine is a client's PC and is not: assume its user can read the poll token and every task's env. The poll URL decides which machines get work.
 - Unknown JSON fields and unknown TOML fields stay rejected. `poll_token` is not a TOML key. `SHUTUP_AND_RUN_POLL_TOKEN` is environment only.
 - On Windows a job is a container inside the `shutup-and-run` WSL2 distribution. The `.exe` is a supervisor; it does not talk to Docker and does not run scripts. No Docker Desktop path, no script mode.
 - No queue, no scheduler, no web UI, no second database, no cross-machine coordination, and no automatic restart of a container that exits.
