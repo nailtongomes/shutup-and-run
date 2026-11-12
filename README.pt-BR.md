@@ -334,6 +334,7 @@ Erros (falha de conexão, redirecionamento, qualquer outro status, corpo acima d
 | `tls_cert`, `tls_key` | `SHUTUP_AND_RUN_TLS_CERT`, `SHUTUP_AND_RUN_TLS_KEY` | Arquivos PEM. Obrigatórios, a não ser com `http = true`. |
 | `http` | `SHUTUP_AND_RUN_HTTP` | `true` serve sem TLS. Só para localhost. |
 | `trust_x_forwarded_for` | `SHUTUP_AND_RUN_TRUST_X_FORWARDED_FOR` | Só atrás de um proxy seu. Padrão false. |
+| `status_page` | `SHUTUP_AND_RUN_STATUS_PAGE` | Página de status em `/`, sem token, só para um navegador na própria máquina. Padrão false; a instalação no Windows liga. |
 | `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Opcional. Veja [Pull](#pull). |
 | `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Padrão 15. |
 | `poll_any_image` | `SHUTUP_AND_RUN_POLL_ANY_IMAGE` | Uma tarefa do poll pode usar qualquer imagem. Padrão false. Exige `poll_url`. Permite `allowlist` vazia. |

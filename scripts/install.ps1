@@ -64,6 +64,27 @@ Move-Item -Force $Tmp $Exe
 Remove-Item -Force $Sums
 Write-Host "installed $Exe"
 
+# An exit code as Windows writes it, with what the common ones mean. A program
+# that cannot start prints nothing, so the code is all there is to go on.
+function Describe-Exit([int]$Code) {
+    $Hex = "0x{0:X8}" -f ([int64]$Code -band 0xFFFFFFFFL)
+    $Hint = switch ($Hex) {
+        "0xC0000135" { "a DLL it needs is missing on this PC. Send this line to support." }
+        "0xC000007B" { "it is not a program for this kind of Windows (it needs 64-bit x86)." }
+        "0xC0000005" { "it crashed while starting." }
+        "0xC0000409" { "it crashed while starting." }
+        default { "" }
+    }
+    if ($Hint) { return "$Code ($Hex): $Hint" }
+    return "$Code ($Hex)"
+}
+
+# Does it start at all? Through cmd, for the same reason as above.
+cmd.exe /c "`"$Exe`" --help >nul 2>&1"
+if ($LASTEXITCODE -ne 0) {
+    throw "$Exe did not start: exit code $(Describe-Exit $LASTEXITCODE)"
+}
+
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (-not ($UserPath -split ";" | Where-Object { $_ -eq $Dir })) {
     [Environment]::SetEnvironmentVariable("Path", "$UserPath;$Dir", "User")
@@ -73,7 +94,7 @@ $env:Path = "$env:Path;$Dir"
 
 if ($env:SHUTUP_AND_RUN_POLL_URL) {
     & $Exe wsl install --poll-url $env:SHUTUP_AND_RUN_POLL_URL
-    if ($LASTEXITCODE -ne 0) { throw "shutup-and-run wsl install exited $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0) { throw "shutup-and-run wsl install failed: exit code $(Describe-Exit $LASTEXITCODE)" }
 } else {
     Write-Host ""
     Write-Host "next (set SHUTUP_AND_RUN_POLL_TOKEN first if your orchestrator issued one):"

@@ -1,0 +1,5 @@
+# The Windows .exe links the C runtime statically, so it does not need the
+# Visual C++ Redistributable (vcruntime140.dll), which a clean Windows 11
+# does not have. CI checks the import table, because its runner has it.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

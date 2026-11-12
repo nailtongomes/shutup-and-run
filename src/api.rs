@@ -17,6 +17,16 @@ use std::sync::Arc;
 const MAX_BODY: usize = 64 * 1024;
 
 pub fn router(launcher: Arc<Launcher>) -> Router {
+    let api = api_router(launcher.clone());
+    if launcher.settings().status_page {
+        // Its own router: the status page has no token and its own gate.
+        api.merge(crate::status::router(launcher))
+    } else {
+        api
+    }
+}
+
+fn api_router(launcher: Arc<Launcher>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -779,5 +789,137 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    fn local(
+        method: &str,
+        uri: &str,
+        ip: [u8; 4],
+        host: &str,
+        origin: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", host);
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        stamp(builder.body(Body::empty()).unwrap(), ip)
+    }
+
+    #[tokio::test]
+    async fn status_page_is_off_by_default_and_local_only_when_on() {
+        const LO: [u8; 4] = [127, 0, 0, 1];
+        const HOST: &str = "127.0.0.1:8787";
+
+        // Off: `/` is like any other path without a token.
+        let off = harness(1);
+        let response = off
+            .app
+            .clone()
+            .oneshot(local("GET", "/", LO, HOST, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let clock = Arc::new(FakeClock::new(1_700_000_000));
+        let cfg = settings_extra(1, "auth_failures = 3\nstatus_page = true");
+        let launcher = Launcher::with_clock(cfg, runtime, clock).unwrap();
+        let app = router(launcher.clone());
+
+        let response = app
+            .clone()
+            .oneshot(local("GET", "/", LO, HOST, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&bytes);
+        assert!(html.contains("RODANDO / RUNNING"), "{html}");
+        assert!(html.contains("0 / 1"));
+        assert!(!html.contains(TOKEN));
+
+        // A browser asks for the icon by itself. With three failures allowed,
+        // that must not be what bans this machine's own address.
+        for _ in 0..5 {
+            let response = app
+                .clone()
+                .oneshot(local("GET", "/favicon.ico", LO, HOST, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+        assert!(launcher.list_bans().unwrap().is_empty());
+
+        // Not from another machine, and not under a public host name.
+        for request in [
+            local("GET", "/", [203, 0, 113, 10], HOST, None),
+            local("GET", "/", LO, "worker.example.com", None),
+            local(
+                "POST",
+                "/local/pause",
+                [203, 0, 113, 10],
+                HOST,
+                Some("http://127.0.0.1:8787"),
+            ),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        // The button works from the page, and not from another site's form.
+        for origin in [None, Some("https://evil.example")] {
+            let response = app
+                .clone()
+                .oneshot(local("POST", "/local/pause", LO, HOST, origin))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        assert!(!launcher.draining().unwrap());
+        let response = app
+            .clone()
+            .oneshot(local(
+                "POST",
+                "/local/pause",
+                LO,
+                HOST,
+                Some("http://127.0.0.1:8787"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(launcher.draining().unwrap());
+        let response = app
+            .clone()
+            .oneshot(local(
+                "POST",
+                "/local/resume",
+                LO,
+                HOST,
+                Some("http://127.0.0.1:8787"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(!launcher.draining().unwrap());
+
+        // The API beside it still wants the token, also from loopback, and
+        // the page never counted as a failure.
+        let response = app
+            .clone()
+            .oneshot(get_from("/health", None, LO))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .clone()
+            .oneshot(get_from("/health", Some(TOKEN), LO))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

@@ -8,9 +8,9 @@ Uma VPS Linux (sua, confiável) e um PC com Windows 11 (tratado como PC de clien
 
 As instalações de uma linha baixam da última release do GitHub.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a `v0.2.2` ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a `v0.2.3` ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
-Se não estiver lá, crie a tag no `main`: `git tag v0.2.2 && git push origin v0.2.2`, e espere o workflow `release`.
+Se não estiver lá, crie a tag no `main`: `git tag v0.2.3 && git push origin v0.2.3`, e espere o workflow `release`.
 
 ## 1. VPS Linux: push
 
@@ -65,6 +65,16 @@ shutup-and-run wsl install
 - [ ] A tabela do doctor é toda `ok`, inclusive `container  hello-world ran: Hello from Docker!`.
 - [ ] Última linha: `done. No poll URL: the worker is installed and idle.`
 - [ ] Se o passo 7 imprimir `could not change the task settings`, anote a mensagem. A instalação funciona mesmo assim.
+
+Sem janela, e a página de status:
+
+```powershell
+Get-Process wsl, shutup-and-run, conhost, WindowsTerminal, OpenConsole -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Format-Table Name, Id, MainWindowTitle
+```
+
+- [ ] Só aparece o terminal em que você está digitando. Nenhuma janela com título `wsl.exe` apareceu durante a instalação, e nenhuma aparece depois de sair e entrar de novo ou depois de `shutup-and-run wsl start`.
+- [ ] `http://127.0.0.1:8787/` no navegador mostra `RODANDO / RUNNING`, `0 / 1` e a versão. O botão pausa (`PAUSADO / PAUSED`) e retoma.
+- [ ] `shutup-and-run wsl doctor` logo depois da instalação diz `ok   service`, e não "not running".
 
 Configurações da tarefa e instância única:
 
@@ -122,6 +132,10 @@ Quando o mock imprimir `TASK 1/1`, espere meio minuto pelo download da imagem e 
 - [ ] `Jobs now: 1` e `NAO DESLIGUE AGORA. / DO NOT TURN OFF NOW.` Tecle `P`.
 - [ ] `[PARADO / STOPPED]  PODE DESLIGAR O PC.` em uns 15 segundos.
 - [ ] Dois cliques de novo: ele inicia o serviço e diz `RUNNING`. O mock então imprime um `CALLBACK` do job interrompido, com `"status":"exited"` e `exit_code` diferente de zero.
+
+Inicie de novo uma tarefa longa, saia do Windows (logoff) enquanto ela roda e entre de novo.
+
+- [ ] `shutup-and-run wsl logs` tem `the session is ending; stopping the jobs`, e o mock recebeu um `CALLBACK` desse job.
 
 Reinicie o PC e faça logon.
 

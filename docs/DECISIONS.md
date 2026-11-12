@@ -160,7 +160,7 @@ Decided 2026-11-12. This is an internal tool, and the Windows half cannot be tes
 - `wsl stop` stops the service and runs `docker stop -t 10` on our containers inside the distribution before it terminates the VM.
 - The logon task's battery and 72 hour defaults are turned off with `Set-ScheduledTask` after `schtasks /Create`. It is a soft step, because it has not run in CI.
 - No tray icon. It would be a window message loop in `unsafe` Win32 that no workflow can run. `wsl doctor` and `wsl logs` answer "is it working".
-- No grace at sign-out or shutdown. Windows gives a process about five seconds there, and catching it needs the same hidden window. The job is killed, its row is closed at the next start with its exit code, and the callback is sent; there is no separate `reason` for it. Tasks sent to a lent machine must be safe to run twice.
+- No grace at sign-out or shutdown (v0.2.3 added three seconds of it, see "The Windows worker shows no window"). Windows gives a process about five seconds there, and catching it needs the same hidden window. The job is killed, its row is closed at the next start with its exit code, and the callback is sent; there is no separate `reason` for it. Tasks sent to a lent machine must be safe to run twice.
 
 The cost is that the person at the machine sees nothing on screen, and a job cut by a shutdown looks like a job that failed.
 
@@ -191,6 +191,34 @@ The task is now registered with `Register-ScheduledTask` and a logon trigger tie
 `install.ps1` ended a task that might not exist with `schtasks ... 2>$null`. Under `$ErrorActionPreference = "Stop"`, Windows PowerShell 5.1 turns that stderr into an error, so an update on a machine without the task stopped before it replaced the `.exe`. It goes through `cmd /c` now.
 
 The cost: the install depends on the ScheduledTasks PowerShell module, which Windows 11 has. CI's runner is an administrator, so the non-administrator path is only tested by hand, in `tests/windows-sandbox`, which cannot run WSL2.
+
+## The Windows worker shows no window
+
+Decided 2026-11-12, for v0.2.3. On a real PC the logon task opened a Windows Terminal window titled `wsl.exe`, and closing it killed the worker. The `.exe` is a console program. The task started it with a console, `--background` detached from that console, and the `wsl.exe` child, a console program left with none, was given a new one.
+
+Three things changed. The task's action is `conhost.exe --headless <exe> wsl serve --background`, which the owner tested: the process has a console and nobody sees it. Every child process is created with `CREATE_NO_WINDOW`; their output was already piped. And `--background` no longer detaches, because the console is now what delivers the sign-out and shutdown events: on those the supervisor stops the service and gives the containers SIGTERM and three seconds, inside the five Windows allows.
+
+The `.exe` stays one console program. A GUI-subsystem build, with `AttachConsole` for the command line, was weighed and left out: PowerShell and cmd do not wait for a GUI program and do not set `$LASTEXITCODE` for it, which would break `install.ps1`, the doctor's exit code and CI. A second, GUI binary would be one more release asset and checksum for the same result. There is still no tray icon.
+
+The cost: `conhost --headless` is not a documented switch, though Windows Terminal and others rely on it. The session-end handler cannot be tested in CI, and five seconds is what Windows gives, so a job that needs longer to finish cleanly still does not get it.
+
+## The Windows .exe links the C runtime statically
+
+Decided 2026-11-12, for v0.2.3. In Windows Sandbox the `.exe` exited with `0xC0000135` and printed nothing: it imported `vcruntime140.dll`, which comes with the Visual C++ Redistributable and is not on a clean Windows 11. The owner's PC and the CI runner both have it, which hid this.
+
+`.cargo/config.toml` sets `+crt-static` for `x86_64-pc-windows-msvc`. CI reads the built file and fails if it mentions `vcruntime140` or `msvcp140`, and checks that its PE subsystem is console. `install.ps1` now runs `--help` after installing and reports an exit code in hexadecimal with a hint.
+
+The cost is a slightly larger `.exe`.
+
+## A local status page, off by default
+
+Decided 2026-11-12, for v0.2.3. The person at a lent PC, and support asking them for a screenshot, need to see whether the worker is running and whether the PC may be turned off. The owner asked for a page at `http://127.0.0.1:8787/`.
+
+`status_page = true` adds `GET /`: state, slots, the last job (image, status, reason, exit code, age), the machine's name and the version, with one button that pauses or resumes taking work, which is the drain flag. No token, env or log is on it. The Windows install turns it on; a Linux server leaves it off.
+
+It is the one thing on the port without the bearer token, so it is fenced: the socket peer must be loopback, the `Host` header must name loopback, and the button's POST must carry the page's own `Origin`. Otherwise it is a 404 or a 403, and it never counts as an authentication failure. `/favicon.ico` is answered too, because a browser asks for it by itself and three unanswered asks would ban the machine's own address.
+
+The cost: "every route requires the token" now has an exception, and "no web UI" has one page. Anyone who can open a browser on that machine can pause the worker, which the person lending the PC could already do. Do not turn it on behind a reverse proxy on the same host that forwards `Host: localhost`.
 
 ## The poll body names the worker
 

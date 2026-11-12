@@ -129,6 +129,16 @@ The answer is a task (the same JSON as `POST /v1/jobs`), `{"task": {...}}`, noth
 
 ## For the person at the PC
 
+**No window.** The worker runs with no console or terminal window, at logon and after `wsl start`. To check, with no terminal of your own open on the worker:
+
+```powershell
+Get-Process wsl, shutup-and-run, conhost, WindowsTerminal, OpenConsole -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Format-Table Name, Id, MainWindowTitle
+```
+
+The terminal you type that in is listed; nothing titled `wsl.exe` or `shutup-and-run` should be.
+
+**Status page.** `http://127.0.0.1:8787/` in a browser on the PC shows whether the worker is running, how many jobs are running, whether the PC can be turned off, the last job, and the version. One button pauses or resumes taking new work. It opens only on that PC and shows no token. Ask for a screenshot of it when someone needs support.
+
 `scripts/shutup-and-run.bat` is a desktop shortcut for the machine's user. Double-clicked, it starts the worker if it is stopped and answers two questions in two lines: is it running, and can the PC be turned off. With a job running it says not to, and `P` stops the worker with the 10 second grace first. It reads nothing but the process list and `docker ps` inside the distribution.
 
 ```powershell
@@ -139,7 +149,7 @@ A full hand test of a Windows PC and a Linux server is in [TESTING.md](TESTING.m
 
 ## Shutdown, restart, sign-out
 
-Windows ends the WSL2 VM when the user signs out or the machine shuts down. **A running container is killed without a warning then**; only `wsl stop` gives it time. Nothing is left behind: a container is never restarted, and when the service next starts it closes the job's row, removes the container, and sends the callback. Such a job has `reason` `exited` with a non-zero `exit_code` (usually 137 or 255), or no `exit_code` if it was still pulling its image. The orchestrator offers the work again under a new `job_key`. Tasks should be safe to run twice.
+Windows ends the WSL2 VM when the user signs out or the machine shuts down. The supervisor hears that and stops the service, then gives each running container SIGTERM and **three seconds** before it is killed; Windows allows about five in all. `wsl stop` gives ten. A job that needs longer is cut. Nothing is left behind: a container is never restarted, and when the service next starts it closes the job's row, removes the container, and sends the callback. Such a job has `reason` `exited` with a non-zero `exit_code` (usually 137 or 255), or no `exit_code` if it was still pulling its image. The orchestrator offers the work again under a new `job_key`. Tasks should be safe to run twice.
 
 ## The machine is not yours
 

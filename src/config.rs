@@ -71,6 +71,8 @@ pub struct Settings {
     pub auth_failures: u32,
     pub ban_secs: u64,
     pub trust_forwarded: bool,
+    /// `GET /` for a loopback peer, with no token. Off unless set.
+    pub status_page: bool,
     pub token: TokenChecker,
     /// Unset means push only. The process does not call out.
     pub poll_url: Option<String>,
@@ -128,6 +130,7 @@ struct FileConfig {
     auth_failures: Option<u64>,
     ban_hours: Option<u64>,
     trust_x_forwarded_for: Option<bool>,
+    status_page: Option<bool>,
     poll_url: Option<String>,
     poll_interval_secs: Option<u64>,
     poll_any_image: Option<bool>,
@@ -387,6 +390,8 @@ impl Settings {
             auth_failures: auth_failures as u32,
             ban_secs: ban_hours.saturating_mul(3600),
             trust_forwarded,
+            status_page: take_bool(env, "SHUTUP_AND_RUN_STATUS_PAGE", file.status_page)?
+                .unwrap_or(false),
             token: TokenChecker::new(&token),
             poll_url,
             poll_interval: Duration::from_secs(poll_interval_secs),

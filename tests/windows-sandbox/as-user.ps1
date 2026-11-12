@@ -55,6 +55,28 @@ foreach ($Round in "install-fresh", "install-update") {
     Item $ok $Round "exit $code, installed hash: $got"
 }
 
+# 1b. What kind of program the .exe is, read from the file: a console program
+#     (subsystem 3), so install, doctor and logs print to the terminal, and
+#     with no import of the Visual C++ runtime, which a clean Windows lacks.
+$Probe = $Installed
+if (Test-Path (Join-Path $Work "given.exe")) { $Probe = Join-Path $Work "given.exe" }
+if (Test-Path $Probe) {
+    $bytes = [IO.File]::ReadAllBytes($Probe)
+    $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+    $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 0x5C)
+    Item ($subsystem -eq 3) "exe-is-a-console-program" "PE subsystem $subsystem"
+    $text = [Text.Encoding]::ASCII.GetString($bytes)
+    $needs = @("vcruntime140", "msvcp140" | Where-Object { $text -match "(?i)$_" })
+    Item ($needs.Count -eq 0) "exe-needs-no-vc-runtime" "mentions: $($needs -join ', ')"
+    $code = Run "cli-help" $Probe @("wsl", "--help")
+    $printed = Get-Content -Raw (Join-Path $Out "cli-help.stdout.log") -ErrorAction SilentlyContinue
+    Item (($code -eq 0) -and ($printed -match "wsl doctor")) "cli-prints-to-the-terminal" "wsl --help exit $code (0x$('{0:X8}' -f ([int64]$code -band 0xFFFFFFFFL)))"
+}
+
+# Windows that exist before the task starts, to tell new ones apart.
+$Watched = "shutup-and-run", "wsl", "conhost", "WindowsTerminal", "OpenConsole"
+$Before = @(Get-Process -Name $Watched -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { $_.Id })
+
 # 2. The logon task, by the same code as step 7 of `wsl install`.
 #    -Exe on the host replaces the released .exe for this part.
 $Exe = $Installed
@@ -62,7 +84,7 @@ $Given = Join-Path $Work "given.exe"
 if (Test-Path $Given) { $Exe = $Given }
 
 $code = Run "task-register" $Exe @("wsl", "task", "register")
-Item ($code -eq 0) "task-register" "exit $code, with $Exe (a release before v0.2.2 has no 'wsl task': pass -Exe)"
+Item ($code -eq 0) "task-register" "exit $code (0x$('{0:X8}' -f ([int64]$code -band 0xFFFFFFFFL))), with $Exe (a release before v0.2.2 has no 'wsl task': pass -Exe)"
 
 $t = Get-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
 Item ($null -ne $t) "task-exists" "Get-ScheduledTask $Task"
@@ -80,6 +102,10 @@ if ($t) {
     $info = Get-ScheduledTaskInfo -TaskName $Task -ErrorAction SilentlyContinue
     $proc = Get-Process -Name "shutup-and-run" -ErrorAction SilentlyContinue
     $ran = ("$($t.State)" -eq "Running") -or ($null -ne $proc) -or ($info -and $info.LastRunTime -gt (Get-Date).AddMinutes(-10))
+    # The worker must never show a window, not even the console host's.
+    $New = @(Get-Process -Name $Watched -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and $Before -notcontains $_.Id })
+    Item ($New.Count -eq 0) "task-opens-no-window" "new windows: $(($New | ForEach-Object { "$($_.Name)#$($_.Id)" }) -join ', ')"
+
     Item ([bool]$ran) "task-ran" "state $((Get-ScheduledTask -TaskName $Task).State), last run $($info.LastRunTime), process $(if ($proc) { 'yes' } else { 'no' })"
 }
 

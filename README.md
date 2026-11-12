@@ -207,7 +207,7 @@ How the process behaves is in [SECURITY.md](SECURITY.md). What you accept by run
 
 ## API
 
-Every route requires `Authorization: Bearer <token>`.
+Every route requires `Authorization: Bearer <token>`. The one exception is the local status page, when `status_page` is on.
 
 ### `POST /v1/jobs`
 
@@ -334,6 +334,7 @@ Errors (connection failure, redirect, any other status, a body over 64 KiB) are 
 | `tls_cert`, `tls_key` | `SHUTUP_AND_RUN_TLS_CERT`, `SHUTUP_AND_RUN_TLS_KEY` | PEM files. Required unless `http = true`. |
 | `http` | `SHUTUP_AND_RUN_HTTP` | `true` serves plaintext. For localhost only. |
 | `trust_x_forwarded_for` | `SHUTUP_AND_RUN_TRUST_X_FORWARDED_FOR` | Only behind a proxy you control. Default false. |
+| `status_page` | `SHUTUP_AND_RUN_STATUS_PAGE` | A status page at `/`, without the token, for a browser on the machine itself only. Default false; the Windows install turns it on. |
 | `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Optional. See [Pull](#pull). |
 | `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Default 15. |
 | (none) | `SHUTUP_AND_RUN_POLL_TOKEN` | Environment only. |

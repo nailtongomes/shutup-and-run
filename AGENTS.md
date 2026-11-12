@@ -60,7 +60,9 @@ The scratch image is the Dockerfile with the musl binary copied to `./shutup-and
 - A Linux machine is the owner's and trusted. A Windows machine is a client's PC and is not: assume its user can read the poll token and every task's env. The poll URL decides which machines get work.
 - Unknown JSON fields and unknown TOML fields stay rejected. `poll_token` is not a TOML key. `SHUTUP_AND_RUN_POLL_TOKEN` is environment only.
 - On Windows a job is a container inside the `shutup-and-run` WSL2 distribution. The `.exe` is a supervisor; it does not talk to Docker and does not run scripts. No Docker Desktop path, no script mode.
-- No queue, no scheduler, no web UI, no second database, no cross-machine coordination, and no automatic restart of a container that exits.
+- Every route needs the bearer token, except the local status page (`status_page = true`: `GET /`, `/favicon.ico`, `POST /local/pause|resume`), which answers only a loopback peer naming a loopback host. Do not add anything to that page that is not already visible to the person at the machine, and nothing else without the token.
+- The Windows `.exe` is one console-subsystem program with a static C runtime. The logon task runs it under `conhost.exe --headless`, and every child process is created with `CREATE_NO_WINDOW`. The worker must never show a window.
+- No queue, no scheduler, no web UI beyond that one status page, no second database, no cross-machine coordination, and no automatic restart of a container that exits.
 - No secrets, tokens, or credentials in the repo, in examples, or in logs. Do not print `SHUTUP_AND_RUN_TOKEN`.
 - Prefer a smaller patch. A shortcut in code is marked `// shortcut: <limit>, <when to upgrade>`.
 - A choice a later reader would second-guess goes in `docs/DECISIONS.md`: context, the decision, and what it costs.

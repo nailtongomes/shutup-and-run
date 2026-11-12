@@ -41,6 +41,25 @@ jobs:
           # Both commands above are meant to exit 1, and the step would end
           # with the last exit code.
           exit 0
+      # The runner has the Visual C++ Redistributable, so an .exe that needs
+      # it runs here and fails on a clean PC. Read the file instead.
+      - name: the .exe is a console program, needs no VC++ runtime, and prints
+        shell: powershell
+        run: |
+          $exe = "target\release\shutup-and-run.exe"
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 0x5C)
+          if ($subsystem -ne 3) { throw "PE subsystem is $subsystem, expected 3 (console)" }
+          $text = [Text.Encoding]::ASCII.GetString($bytes)
+          foreach ($dll in "vcruntime140", "msvcp140") {
+            if ($text -match "(?i)$dll") { throw "the .exe mentions $dll.dll: it would not start on a clean Windows" }
+          }
+          $help = (& $exe wsl --help) -join "`n"
+          if ($help -notmatch "wsl doctor") { throw "wsl --help printed nothing to the terminal" }
+          $doctor = (& $exe wsl doctor) -join "`n"
+          if ($doctor -notmatch "wsl") { throw "wsl doctor printed nothing to the terminal" }
+          exit 0
       - name: every .ps1 parses
         shell: powershell
         run: |
