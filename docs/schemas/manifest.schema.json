@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/docs/schemas/manifest.schema.json",
+  "title": "Manifest",
+  "description": "The body a manifest_url must return, with status 200: a JobRequest, bare or under 'task'. Nothing else. A manifest that names another manifest_url, or that is empty, null, {} or {\"task\": null}, is rejected and nothing runs.",
+  "oneOf": [
+    {
+      "$ref": "job-request.schema.json"
+    },
+    {
+      "type": "object",
+      "required": [
+        "task"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "task": {
+          "$ref": "job-request.schema.json"
+        }
+      }
+    }
+  ]
+}

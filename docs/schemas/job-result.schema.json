@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/docs/schemas/job-result.schema.json",
+  "title": "JobResult",
+  "description": "A job as the runner reports it: the body of 202 and 200 from POST /v1/jobs, of GET /v1/jobs/{id}, and of the POST to callback_url. The callback is the stricter form in $defs/callback. All nine keys are always present; 'logs' is added only by GET /v1/jobs/{id}?logs=true. It says what happened to a container, not whether the work inside it succeeded.",
+  "type": "object",
+  "required": [
+    "id",
+    "status",
+    "image",
+    "job_key",
+    "started_at",
+    "ended_at",
+    "exit_code",
+    "reason",
+    "duration_secs"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "description": "Chosen by the runner when it accepts the job. Unique on that machine. The container is named shutup-and-run-<id>.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "status": {
+      "description": "'running' from acceptance, image pull included, until the end is recorded. Then 'exited', whatever the reason.",
+      "enum": [
+        "running",
+        "exited"
+      ]
+    },
+    "image": {
+      "type": "string"
+    },
+    "job_key": {
+      "description": "As sent. null when the request had none.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "started_at": {
+      "description": "Unix seconds, UTC: when the job was accepted, before the image pull.",
+      "type": "integer"
+    },
+    "ended_at": {
+      "description": "Unix seconds, UTC. null while running.",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "exit_code": {
+      "description": "The container's exit code. 137 after a timeout kill. null while running, when the image could not be pulled or the container could not be started, and when the container was gone before the runner saw it end.",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "reason": {
+      "description": "null while running. 'exited': the container ended by itself or was killed by something other than the timeout; read exit_code. 'timeout_kill': SIGKILL at timeout_secs. 'start_failed': the pull or the start failed and no container ran.",
+      "enum": [
+        "exited",
+        "timeout_kill",
+        "start_failed",
+        null
+      ]
+    },
+    "duration_secs": {
+      "description": "ended_at minus started_at, so it includes the image pull. null while running.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "logs": {
+      "description": "Only from GET /v1/jobs/{id}?logs=true. Never in a callback.",
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "callback": {
+      "title": "Callback",
+      "description": "The body POSTed to callback_url: a JobResult that has ended, without logs.",
+      "allOf": [
+        {
+          "$ref": "#"
+        }
+      ],
+      "properties": {
+        "status": {
+          "const": "exited"
+        },
+        "ended_at": {
+          "type": "integer"
+        },
+        "reason": {
+          "enum": [
+            "exited",
+            "timeout_kill",
+            "start_failed"
+          ]
+        },
+        "duration_secs": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "not": {
+        "required": [
+          "logs"
+        ]
+      }
+    }
+  }
+}

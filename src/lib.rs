@@ -20,6 +20,8 @@ pub mod store;
 pub mod wsl;
 
 #[cfg(test)]
+mod contract;
+#[cfg(test)]
 pub mod mock;
 
 pub const LABEL_KEY: &str = "shutup-and-run";

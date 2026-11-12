@@ -22,6 +22,8 @@ cargo build --release --locked --target x86_64-pc-windows-gnu
 
 The parts of `src/wsl.rs` that shell out to `wsl.exe` and `schtasks.exe` can only run on Windows 11 with WSL2. Their pure parts (flag parsing, `wsl --list` decoding, the rendered config, checksum matching) are unit tested everywhere. `tests/poll-mock/poll_mock.py` is a stand-in poll URL for tests, and `tests/poll-mock/cycle.sh` runs it against a worker in CI. `tests/windows-sandbox/run.ps1` is a hand test in Windows Sandbox, as a user who is not an administrator, of `install.ps1` and the logon task; it cannot run WSL2. `shutup-and-run wsl doctor` on a machine without WSL must stop at its first line and exit 1; CI checks that on a Windows runner.
 
+`docs/INTEGRATION-CONTRACT.md` and `docs/schemas/*.schema.json` are the public contract. `src/contract.rs` holds them to the code: it sends every file in `docs/schemas/examples` through the real router, poll parser and callback, and checks what the runner emits against the schemas. A change to a request field, an answer body, a status code or a poll answer form changes the schema, an example and the document in the same patch. `jsonschema` is a development dependency only. `examples/n8n/*.json` were checked by hand against a local n8n; CI does not run n8n.
+
 The release binary is static musl. SQLite is bundled, so the link needs a C compiler and `musl-gcc`:
 
 ```bash
@@ -58,6 +60,7 @@ The scratch image is the Dockerfile with the musl binary copied to `./shutup-and
 - A request sets image, env, command, timeout, cpu, memory, and shm. It does not set mounts, ports, privileged, capabilities, or a network mode. Do not add those fields. A manifest is that same request, fetched once from `manifest_url`; it cannot point at another manifest.
 - The poll body is who is asking and what it could lend: `worker`, `os`, `arch`, `version`, `max_slots`, `free_slots`, `cpus`, `memory_bytes`. Do not put the machine's config, tokens, job history, or a self-reported address in it.
 - A Linux machine is the owner's and trusted. A Windows machine is a client's PC and is not: assume its user can read the poll token and every task's env. The poll URL decides which machines get work.
+- No `schema_version` and no register call. A request is not versioned; the poll body's `version` is how a server tells releases apart. Enrollment is the first poll with a token the server has not seen.
 - Unknown JSON fields and unknown TOML fields stay rejected. `poll_token` is not a TOML key. `SHUTUP_AND_RUN_POLL_TOKEN` is environment only.
 - On Windows a job is a container inside the `shutup-and-run` WSL2 distribution. The `.exe` is a supervisor; it does not talk to Docker and does not run scripts. No Docker Desktop path, no script mode.
 - Every route needs the bearer token, except the local status page (`status_page = true`: `GET /`, `/favicon.ico`, `POST /local/pause|resume`), which answers only a loopback peer naming a loopback host. Do not add anything to that page that is not already visible to the person at the machine, and nothing else without the token.

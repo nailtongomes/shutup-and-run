@@ -1,0 +1,282 @@
+{
+  "id": "sarPushLinux0001",
+  "name": "shutup-and-run: push a job to a Linux runner",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "ebd9cb38-4cca-5128-b2c7-2c6e3bcee8d8",
+      "name": "Manual",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"runner_url\": \"https://203.0.113.10:8787\",\n  \"runner_token\": \"REPLACE_WITH_RUNNER_TOKEN\",\n  \"job\": {\n    \"image\": \"ghcr.io/nailtongomes/shutup-and-run-smoke\",\n    \"job_key\": \"smoke-001\",\n    \"timeout_secs\": 120,\n    \"cpu\": 1,\n    \"memory\": \"512m\",\n    \"env\": {\n      \"CUSTOMER_ID\": \"customer-placeholder\"\n    },\n    \"callback_url\": \"https://n8n.example.com/webhook/n3-callback?secret=REPLACE_WITH_CALLBACK_SECRET\"\n  }\n}",
+        "options": {}
+      },
+      "id": "9ebb4b43-a752-5c9d-8038-78bed33edb08",
+      "name": "Job",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.runner_url }}/v1/jobs",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $json.runner_token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.job) }}",
+        "options": {
+          "allowUnauthorizedCerts": true,
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "89004f84-495b-57a7-b66e-5fe6719584ab",
+      "name": "POST /v1/jobs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// 202 accepted, 200 this job_key was already accepted: both mean \"it is there\".\n// 429 full and 503 draining: nothing was stored, try the next machine with the same job_key.\n// Anything else is an error to look at. No answer at all (a timeout) is ambiguous:\n// send the same job_key to the same machine again before trying another one.\nconst r = $input.first().json;\nconst code = r.statusCode;\nconst outcome = code === 202 || code === 200 ? 'accepted'\n  : code === 429 || code === 503 ? 'next_machine'\n  : 'error';\nreturn [{ json: { outcome, statusCode: code ?? null, job: r.body ?? null } }];\n"
+      },
+      "id": "074bd5c5-5650-5416-aa17-9162f192a9d5",
+      "name": "Read the answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "628adad8-ed12-55c9-ac37-89bf2347ead1",
+                    "leftValue": "={{ $json.outcome }}",
+                    "rightValue": "accepted",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "accepted"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "4d966a99-51f4-5ffb-a7d3-cc5faf450226",
+                    "leftValue": "={{ $json.outcome }}",
+                    "rightValue": "next_machine",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "next_machine"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "b2fbf15d-e2b9-51f1-90ae-3b7feb0e397c",
+                    "leftValue": "={{ $json.outcome }}",
+                    "rightValue": "error",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "error"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "38698dbb-13ae-531f-8b5c-7bf53726ac78",
+      "name": "Outcome",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "cda21336-08d4-58c8-bbc5-e3aaffe08e1e",
+      "name": "Accepted: wait for the callback",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        -160
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "ea4313f6-ed39-5668-8dca-131aa88ed9d5",
+      "name": "Full or draining: next machine",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "39d531a4-fe2a-54f3-8d32-5eac85f765a4",
+      "name": "Refused: read statusCode and job.error",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        160
+      ]
+    }
+  ],
+  "connections": {
+    "Manual": {
+      "main": [
+        [
+          {
+            "node": "Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Job": {
+      "main": [
+        [
+          {
+            "node": "POST /v1/jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "POST /v1/jobs": {
+      "main": [
+        [
+          {
+            "node": "Read the answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read the answer": {
+      "main": [
+        [
+          {
+            "node": "Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Outcome": {
+      "main": [
+        [
+          {
+            "node": "Accepted: wait for the callback",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Full or draining: next machine",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Refused: read statusCode and job.error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

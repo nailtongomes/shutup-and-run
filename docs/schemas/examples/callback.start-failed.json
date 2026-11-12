@@ -1,0 +1,11 @@
+{
+  "id": "9a8b7c6d5e4f30211203f4e5d6c7b8a9",
+  "job_key": null,
+  "image": "ghcr.io/you/missing:latest",
+  "status": "exited",
+  "exit_code": null,
+  "reason": "start_failed",
+  "started_at": 1700000000,
+  "ended_at": 1700000003,
+  "duration_secs": 3
+}

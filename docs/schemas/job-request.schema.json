@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/docs/schemas/job-request.schema.json",
+  "title": "JobRequest",
+  "description": "One container to run. The same object is the body of POST /v1/jobs, a task in a poll answer, and the body of a manifest. Unknown fields are rejected with 400 {\"error\":\"invalid JSON\"}. A null value is the same as leaving the field out, except for env, which must be an object when present. Lengths are checked in bytes by the runner; maxLength here counts characters, so keep to ASCII where a limit matters. Whether a valid request is accepted still depends on the machine: its allowlist, its max_timeout_secs, its free slots and its drain flag.",
+  "type": "object",
+  "required": [
+    "image"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "image": {
+      "description": "The image to pull and run. Lowercase, no whitespace or control characters, no '..' or '//', does not start with '-' or end with ':'. On a push it must match the machine's allowlist (403 otherwise). A polled task skips the allowlist only when the machine sets poll_any_image.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!-)(?!.*\\.\\.)(?!.*//)(?!.*:$)[^\\sA-Z]+$"
+    },
+    "job_key": {
+      "description": "Idempotency key on this one machine. While a job with this key is in the machine's history, the same key returns that job and starts nothing, whatever the rest of the request says.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "env": {
+      "description": "Environment of the container. Opaque strings: the runner does not read, interpret or log them. At most 128 variables. A value is at most 16384 bytes and holds no NUL.",
+      "type": "object",
+      "maxProperties": 128,
+      "propertyNames": {
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,255}$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 16384
+      },
+      "default": {}
+    },
+    "command": {
+      "description": "Docker Cmd: replaces the image's default command, not its entrypoint. Omitted, null or [] runs the image as built. An argument holds no NUL.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096
+      }
+    },
+    "timeout_secs": {
+      "description": "Seconds the container may run, counted from its start, then SIGKILL. The image pull has the same limit of its own. Default: the machine's default_timeout_secs (3600). Above the machine's max_timeout_secs (21600 by default, never above 604800) is a 400. Write it as an integer, with no fraction.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 604800
+    },
+    "cpu": {
+      "description": "CPU limit in cores, such as 0.5 or 2. No limit when omitted.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "exclusiveMinimum": 0,
+      "maximum": 128
+    },
+    "memory": {
+      "description": "Memory limit. Swap is set to the same value. Without it Docker does not cap the container.",
+      "$ref": "#/$defs/byteQuantity"
+    },
+    "shm": {
+      "description": "Size of /dev/shm. Docker's default (64 MiB) when omitted.",
+      "$ref": "#/$defs/byteQuantity"
+    },
+    "callback_url": {
+      "description": "Receives one POST with the JobResult when the job ends. http or https with a host. No header is added to that request, so a secret for it goes in the URL.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 2048,
+      "pattern": "^https?://\\S+$"
+    }
+  },
+  "$defs": {
+    "byteQuantity": {
+      "description": "A positive integer number of bytes, or a string with a binary unit: b, k, kb, kib, m, mb, mib, g, gb, gib, in either case. Every unit is a power of 1024. '512m', '1.5g', '2GiB'. A JSON number with a fraction is rejected; write it as a string.",
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?([kKmMgG]([iI]?[bB])?|[bB])?$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

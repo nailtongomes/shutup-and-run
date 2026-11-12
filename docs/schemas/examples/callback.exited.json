@@ -1,0 +1,11 @@
+{
+  "id": "5f479abd3087cf193ed4c1da8460784d",
+  "job_key": "case-0001-attempt-1",
+  "image": "ghcr.io/you/worker:1.4.2",
+  "status": "exited",
+  "exit_code": 0,
+  "reason": "exited",
+  "started_at": 1700000000,
+  "ended_at": 1700000042,
+  "duration_secs": 42
+}
