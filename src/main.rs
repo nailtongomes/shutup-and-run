@@ -147,6 +147,16 @@ async fn serve() -> ExitCode {
         tracing::warn!("plain HTTP on every interface; the token travels in clear text");
     }
 
+    // Before anything touches Docker or polls: a second start on the same
+    // history file must not reconcile, poll, or take a slot.
+    let _lock = match shutup_and_run::lock::acquire(&settings.history_path.with_extension("lock")) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("shutup-and-run: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
     let docker = match connect_docker() {
         Ok(docker) => docker,
         Err(err) => {
