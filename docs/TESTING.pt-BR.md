@@ -1,4 +1,4 @@
-# Teste manual da v0.2.0
+# Teste manual de uma release
 
 English: [TESTING.md](TESTING.md).
 
@@ -8,9 +8,9 @@ Uma VPS Linux (sua, confiável) e um PC com Windows 11 (tratado como PC de clien
 
 As instalações de uma linha baixam da última release do GitHub.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a `v0.2.0` e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a `v0.2.1` ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
-Se não estiver lá, crie a tag no `main`: `git tag v0.2.0 && git push origin v0.2.0`, e espere o workflow `release`.
+Se não estiver lá, crie a tag no `main`: `git tag v0.2.1 && git push origin v0.2.1`, e espere o workflow `release`.
 
 ## 1. VPS Linux: push
 

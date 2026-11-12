@@ -41,11 +41,44 @@ const LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 const RESTART_MIN: Duration = Duration::from_secs(5);
 const RESTART_MAX: Duration = Duration::from_secs(60);
 
+/// Step 4 of the install, in order. Ubuntu's docker.io has a systemd unit and
+/// no init script, so the daemon is started by systemd, which `/etc/wsl.conf`
+/// turns on. Each script is safe to run again on a machine that has it all.
+const DOCKER_STEPS: &[(&str, &str)] = &[
+    (
+        "apt-get update",
+        "DEBIAN_FRONTEND=noninteractive apt-get update -q",
+    ),
+    (
+        "apt-get install docker.io",
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io curl ca-certificates",
+    ),
+    (
+        "creating the config and data directories",
+        "mkdir -p /etc/shutup-and-run /var/lib/shutup-and-run",
+    ),
+    (
+        "starting docker with systemd",
+        "if [ ! -d /run/systemd/system ]; then \
+         echo 'systemd is not running in this distribution, so nothing can start docker.' >&2; \
+         echo 'It needs WSL 0.67.6 or newer: run `wsl --update`, then this install again.' >&2; \
+         exit 1; fi; \
+         systemctl enable --now docker 2>&1; \
+         i=0; until docker info >/dev/null 2>&1; do i=$((i + 1)); \
+         if [ \"$i\" -ge 60 ]; then \
+         echo 'dockerd did not answer within 60s' >&2; \
+         systemctl status docker --no-pager -l 2>&1 | tail -n 12; \
+         journalctl -u docker --no-pager -n 12 2>&1; \
+         exit 1; fi; sleep 1; done",
+    ),
+];
+
 /// Run inside the distribution by `wsl stop`, before the VM is terminated.
 const GRACEFUL_STOP: &str = "pkill -TERM -x shutup-and-run; \
      ids=$(docker ps -q --filter label=shutup-and-run=1 2>/dev/null); \
      [ -z \"$ids\" ] || docker stop -t 10 $ids >/dev/null";
 
+const FAIL_LINES: usize = 20;
 const SHORT: Duration = Duration::from_secs(30);
 const DISTRO_START: Duration = Duration::from_secs(120);
 const APT: Duration = Duration::from_secs(20 * 60);
@@ -285,6 +318,35 @@ impl Output {
             None => format!("timed out: {line}"),
         }
     }
+
+    /// For a step that failed: how it ended and the end of what it printed,
+    /// stdout then stderr. The end, because the start is the part that worked.
+    fn tail(&self, lines: usize) -> String {
+        let text = self.text();
+        let all: Vec<&str> = text
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let ended = match self.status {
+            Some(code) => format!("exit {code}"),
+            None => "timed out".to_string(),
+        };
+        let mut out = ended;
+        for line in &all[all.len().saturating_sub(lines)..] {
+            out.push_str("\n    ");
+            out.push_str(line);
+        }
+        out
+    }
+}
+
+/// The error of a failed step: what it was, the command, and its last lines.
+fn step_failed(what: &str, command: &str, out: &Output) -> WslError {
+    err(format!(
+        "{what} failed\n  command: {command}\n  {}",
+        out.tail(FAIL_LINES)
+    ))
 }
 
 /// `wsl.exe` writes UTF-16LE to a pipe for `--list` and `--status`, and UTF-8
@@ -398,7 +460,7 @@ fn put_file(path: &str, mode: &str, bytes: Vec<u8>) -> WslResult<()> {
     );
     let out = sh_in_distro(&script, Some(bytes), DISTRO_START)?;
     if !out.ok() {
-        return Err(err(format!("could not write {path}: {}", out.one_line())));
+        return Err(step_failed(&format!("writing {path}"), &script, &out));
     }
     Ok(())
 }
@@ -465,7 +527,7 @@ fn our_distro() -> WslResult<Option<Distro>> {
 /// container, and the token holder, see only this distribution.
 pub(crate) fn render_wsl_conf() -> String {
     "[boot]\n\
-     command = \"service docker start\"\n\
+     systemd = true\n\
      \n\
      [automount]\n\
      enabled = false\n\
@@ -487,7 +549,7 @@ pub(crate) fn render_serve_script() -> String {
          set +a\n\
          i=0\n\
          until docker info >/dev/null 2>&1; do\n\
-         \x20 [ \"$i\" -eq 0 ] && service docker start >/dev/null 2>&1\n\
+         \x20 [ \"$i\" -eq 0 ] && systemctl start docker >/dev/null 2>&1\n\
          \x20 i=$((i + 1))\n\
          \x20 if [ \"$i\" -ge 60 ]; then echo 'dockerd did not answer within 60s' >&2; exit 1; fi\n\
          \x20 sleep 1\n\
@@ -1097,7 +1159,7 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
                 APT,
             )?;
             if !out.ok() {
-                return Err(err(format!("wsl --import: {}", out.one_line())));
+                return Err(step_failed("wsl --import", "wsl --import", &out));
             }
             println!("    imported into {}", vhd.display());
         }
@@ -1115,15 +1177,18 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     std::thread::sleep(Duration::from_secs(8));
 
     println!("[4/8] docker engine inside the distribution (apt, a few minutes)");
-    let apt = sh_in_distro(
-        "export DEBIAN_FRONTEND=noninteractive; apt-get update -q && apt-get install -y -q docker.io curl ca-certificates && mkdir -p /etc/shutup-and-run /var/lib/shutup-and-run && (service docker status >/dev/null 2>&1 || service docker start)",
-        None,
-        APT,
-    )?;
-    if !apt.ok() {
-        return Err(err(format!("apt inside {DISTRO}: {}", apt.one_line())));
+    // One command per thing that can fail, so the error names the right one.
+    for (what, script) in DOCKER_STEPS {
+        let out = sh_in_distro(script, None, APT)?;
+        if !out.ok() {
+            return Err(step_failed(
+                &format!("{what} inside {DISTRO}"),
+                script,
+                &out,
+            ));
+        }
     }
-    println!("    installed");
+    println!("    installed and running");
 
     println!("[5/8] the Linux binary");
     let musl = obtain_musl(&client, &flags).await?;
@@ -1131,10 +1196,11 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     put_file(INNER_BIN, "755", bytes)?;
     let help = in_distro(&[INNER_BIN, "--help"], None, DISTRO_START)?;
     if !help.ok() {
-        return Err(err(format!(
-            "{INNER_BIN} does not run: {}",
-            help.one_line()
-        )));
+        return Err(step_failed(
+            "running the Linux binary",
+            &format!("{INNER_BIN} --help"),
+            &help,
+        ));
     }
     println!("    {INNER_BIN}");
 
@@ -1312,7 +1378,7 @@ fn register_task(exe: &Path) -> WslResult<()> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = run("schtasks.exe", &refs, None, SHORT)?;
     if !out.ok() {
-        return Err(err(format!("schtasks /Create: {}", out.one_line())));
+        return Err(step_failed("schtasks /Create", "schtasks /Create", &out));
     }
     // Soft: the task works without this, with the defaults described above.
     let script = task_settings_script();
@@ -1331,7 +1397,7 @@ fn register_task(exe: &Path) -> WslResult<()> {
     }
     let out = run("schtasks.exe", &["/Run", "/TN", TASK_NAME], None, SHORT)?;
     if !out.ok() {
-        return Err(err(format!("schtasks /Run: {}", out.one_line())));
+        return Err(step_failed("schtasks /Run", "schtasks /Run", &out));
     }
     Ok(())
 }
@@ -1485,7 +1551,7 @@ fn detach_console() {}
 fn start_cli() -> WslResult<ExitCode> {
     let out = run("schtasks.exe", &["/Run", "/TN", TASK_NAME], None, SHORT)?;
     if !out.ok() {
-        return Err(err(format!("schtasks /Run: {}", out.one_line())));
+        return Err(step_failed("schtasks /Run", "schtasks /Run", &out));
     }
     println!("started {TASK_NAME}");
     Ok(ExitCode::SUCCESS)
@@ -1508,7 +1574,7 @@ fn stop_cli() -> WslResult<ExitCode> {
     }
     let out = run("wsl.exe", &["--terminate", DISTRO], None, SHORT)?;
     if !out.ok() {
-        return Err(err(format!("wsl --terminate: {}", out.one_line())));
+        return Err(step_failed("wsl --terminate", "wsl --terminate", &out));
     }
     println!("stopped {TASK_NAME} and terminated {DISTRO}; its containers were stopped");
     Ok(ExitCode::SUCCESS)
@@ -1549,7 +1615,7 @@ fn uninstall_cli(args: &[String]) -> WslResult<ExitCode> {
         let _ = run("wsl.exe", &["--terminate", DISTRO], None, SHORT);
         let out = run("wsl.exe", &["--unregister", DISTRO], None, APT)?;
         if !out.ok() {
-            return Err(err(format!("wsl --unregister: {}", out.one_line())));
+            return Err(step_failed("wsl --unregister", "wsl --unregister", &out));
         }
         println!("unregistered {DISTRO}; its containers, images and job history are gone");
     } else {
@@ -1720,8 +1786,13 @@ mod tests {
         let conf = render_wsl_conf();
         assert!(conf.contains("[automount]\nenabled = false"));
         assert!(conf.contains("[interop]\nenabled = false"));
-        assert!(conf.contains("command = \"service docker start\""));
+        assert!(conf.contains("[boot]\nsystemd = true"));
+        assert!(!conf.contains("service docker"));
+        assert!(DOCKER_STEPS
+            .iter()
+            .any(|(_, s)| s.contains("systemctl enable --now docker")));
         let script = render_serve_script();
+        assert!(script.contains("systemctl start docker"));
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains(". /etc/shutup-and-run/env"));
         assert!(script.ends_with("exec /usr/local/bin/shutup-and-run serve\n"));
@@ -1818,6 +1889,25 @@ mod tests {
             stderr: b"oops\n".to_vec(),
         };
         assert_eq!(out.one_line(), "exit 1: first");
+        // A failed step shows how it ended and the end of its output.
+        let failed = step_failed("apt-get update", "apt-get update -q", &out);
+        assert!(failed
+            .to_string()
+            .starts_with("apt-get update failed\n  command: apt-get update -q\n  exit 1\n"));
+        assert!(failed.to_string().ends_with("    second\n    oops"));
+        let long = Output {
+            status: Some(2),
+            stdout: (1..=50)
+                .map(|i| format!("line {i}\n"))
+                .collect::<String>()
+                .into_bytes(),
+            stderr: b"the real reason\n".to_vec(),
+        };
+        let tail = long.tail(FAIL_LINES);
+        assert_eq!(tail.lines().count(), FAIL_LINES + 1);
+        assert!(!tail.contains("line 31\n"));
+        assert!(tail.contains("line 32\n"));
+        assert!(tail.ends_with("the real reason"));
         assert!(out.text().contains("oops"));
         let out = Output {
             status: None,

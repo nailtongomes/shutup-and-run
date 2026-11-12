@@ -174,6 +174,14 @@ A lock younger than `LOCK_TTL` minutes counts as held (exit 2) and is not delete
 
 The cost is remote code execution with no integrity check, on a machine whose user can already read anything the script writes, and a second Windows path that is easy to confuse with the product.
 
+## Docker in the Windows distribution is started by systemd
+
+Decided 2026-11-12, for v0.2.1. The first install on a real Windows 11 machine stopped at step 4. `/etc/wsl.conf` had `[boot] command = "service docker start"`, and the install ran the same command after apt. Ubuntu 24.04's `docker.io` ships a systemd unit and no init script, and the distribution had no systemd, so nothing could start `dockerd`. The error blamed apt and printed the first line of its output, which was the part that had worked.
+
+`/etc/wsl.conf` now says `[boot] systemd = true`, the install runs `systemctl enable --now docker` and waits for `docker info`, and the serve script uses `systemctl start docker`. That is how the Linux server starts Docker too. The service itself is still run by the Windows supervisor, not by a unit: the supervisor is what restarts it and holds the log. A failed step now prints the command and its last 20 lines.
+
+The cost: systemd in WSL needs WSL 0.67.6 or newer (`wsl --update`), and it is a few more processes in the VM. The install says so when `/run/systemd/system` is missing.
+
 ## The poll body names the worker
 
 Decided 2026-11-12. The poll used to send `{}`; the server told machines apart only by their bearer token.
