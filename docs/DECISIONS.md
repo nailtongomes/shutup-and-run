@@ -182,6 +182,16 @@ Decided 2026-11-12, for v0.2.1. The first install on a real Windows 11 machine s
 
 The cost: systemd in WSL needs WSL 0.67.6 or newer (`wsl --update`), and it is a few more processes in the VM. The install says so when `/run/systemd/system` is missing.
 
+## The logon task is registered for one user, without an administrator
+
+Decided 2026-11-12, for v0.2.2. On a real Windows 11 account that is not an administrator, step 7 failed with "Access is denied". `schtasks /Create /SC ONLOGON` makes a trigger for any user's logon, and that needs an administrator even with `/RL LIMITED`.
+
+The task is now registered with `Register-ScheduledTask` and a logon trigger tied to the installing user, which a standard user may create for themselves. The same call carries the settings that used to be a second, soft step (no battery rule, no 72 hour limit, ignore a second instance). `schtasks /Run` still starts it. `shutup-and-run wsl task register|remove` runs just that step, so CI and a Windows Sandbox can test it without WSL.
+
+`install.ps1` ended a task that might not exist with `schtasks ... 2>$null`. Under `$ErrorActionPreference = "Stop"`, Windows PowerShell 5.1 turns that stderr into an error, so an update on a machine without the task stopped before it replaced the `.exe`. It goes through `cmd /c` now.
+
+The cost: the install depends on the ScheduledTasks PowerShell module, which Windows 11 has. CI's runner is an administrator, so the non-administrator path is only tested by hand, in `tests/windows-sandbox`, which cannot run WSL2.
+
 ## The poll body names the worker
 
 Decided 2026-11-12. The poll used to send `{}`; the server told machines apart only by their bearer token.

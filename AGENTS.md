@@ -20,7 +20,7 @@ cargo clippy --all-targets --locked --target x86_64-pc-windows-gnu -- -D warning
 cargo build --release --locked --target x86_64-pc-windows-gnu
 ```
 
-The parts of `src/wsl.rs` that shell out to `wsl.exe` and `schtasks.exe` can only run on Windows 11 with WSL2. Their pure parts (flag parsing, `wsl --list` decoding, the rendered config, checksum matching) are unit tested everywhere. `shutup-and-run wsl doctor` on a machine without WSL must stop at its first line and exit 1; CI checks that on a Windows runner.
+The parts of `src/wsl.rs` that shell out to `wsl.exe` and `schtasks.exe` can only run on Windows 11 with WSL2. Their pure parts (flag parsing, `wsl --list` decoding, the rendered config, checksum matching) are unit tested everywhere. `tests/windows-sandbox/run.ps1` is a hand test in Windows Sandbox, as a user who is not an administrator, of `install.ps1` and the logon task; it cannot run WSL2. `shutup-and-run wsl doctor` on a machine without WSL must stop at its first line and exit 1; CI checks that on a Windows runner.
 
 The release binary is static musl. SQLite is bundled, so the link needs a C compiler and `musl-gcc`:
 

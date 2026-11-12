@@ -41,6 +41,71 @@ jobs:
           # Both commands above are meant to exit 1, and the step would end
           # with the last exit code.
           exit 0
+      - name: every .ps1 parses
+        shell: powershell
+        run: |
+          $bad = 0
+          Get-ChildItem -Recurse -Include *.ps1 scripts, tests | ForEach-Object {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors)
+            foreach ($e in $errors) { Write-Host "$($_.FullName): $e"; $bad++ }
+          }
+          if ($bad -ne 0) { throw "$bad PowerShell parse error(s)" }
+      # Windows PowerShell 5.1, which is what a client's PC has. The runner's
+      # user is an administrator, so this does not prove the non-administrator
+      # path; tests/windows-sandbox does that by hand.
+      - name: install.ps1 twice on PowerShell 5.1, then the logon task
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $asset = "shutup-and-run-x86_64-pc-windows-msvc.exe"
+          $rel = Join-Path $env:RUNNER_TEMP "release"
+          New-Item -ItemType Directory -Force -Path $rel | Out-Null
+          Copy-Item target\release\shutup-and-run.exe (Join-Path $rel $asset)
+          $want = (Get-FileHash -Algorithm SHA256 (Join-Path $rel $asset)).Hash.ToLower()
+          Set-Content -Encoding ascii -Path (Join-Path $rel "SHA256SUMS") -Value "$want  $asset"
+          $server = Start-Process python -ArgumentList "-m", "http.server", "8099", "--bind", "127.0.0.1", "--directory", $rel -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 3
+          $env:SHUTUP_AND_RUN_EXE_URL = "http://127.0.0.1:8099/$asset"
+          $env:SHUTUP_AND_RUN_POLL_URL = ""
+          $installed = Join-Path $env:ProgramData "shutup-and-run\shutup-and-run.exe"
+
+          # The second round is the one that used to abort: the .exe is there
+          # and the task is not.
+          foreach ($round in "fresh", "update") {
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1
+            if ($LASTEXITCODE -ne 0) { throw "install.ps1 ($round) exited $LASTEXITCODE" }
+            $got = (Get-FileHash -Algorithm SHA256 $installed).Hash.ToLower()
+            if ($got -ne $want) { throw "install.ps1 ($round): installed hash $got, expected $want" }
+          }
+
+          # A wrong checksum installs nothing and leaves the old .exe.
+          Set-Content -Encoding ascii -Path (Join-Path $rel "SHA256SUMS") -Value "$('0' * 64)  $asset"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1
+          if ($LASTEXITCODE -eq 0) { throw "install.ps1 accepted a wrong checksum" }
+          $got = (Get-FileHash -Algorithm SHA256 $installed).Hash.ToLower()
+          if ($got -ne $want) { throw "a refused install changed the .exe" }
+          Stop-Process -Id $server.Id -Force
+
+          # Step 7 of the install, alone: register, look, remove.
+          & $installed wsl task register
+          if ($LASTEXITCODE -ne 0) { throw "wsl task register exited $LASTEXITCODE" }
+          $task = Get-ScheduledTask -TaskName shutup-and-run
+          $trigger = $task.Triggers[0]
+          if ($trigger.CimClass.CimClassName -ne "MSFT_TaskLogonTrigger") { throw "trigger is $($trigger.CimClass.CimClassName)" }
+          if (-not $trigger.UserId) { throw "the logon trigger is not tied to a user" }
+          if ("$($task.Settings.ExecutionTimeLimit)" -ne "PT0S") { throw "ExecutionTimeLimit is $($task.Settings.ExecutionTimeLimit)" }
+          if ($task.Settings.DisallowStartIfOnBatteries) { throw "the task would not start on battery" }
+          if ("$($task.Settings.MultipleInstances)" -ne "IgnoreNew") { throw "MultipleInstances is $($task.Settings.MultipleInstances)" }
+          & $installed wsl task remove
+          if (Get-ScheduledTask -TaskName shutup-and-run -ErrorAction SilentlyContinue) { throw "the task survived wsl task remove" }
+          exit 0
+      # For tests/windows-sandbox/run.ps1 -Exe, before a release has this build.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shutup-and-run-windows-exe
+          path: target/release/shutup-and-run.exe
+          retention-days: 7
 
   accept:
     runs-on: ubuntu-latest
