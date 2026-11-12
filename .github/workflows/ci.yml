@@ -16,6 +16,8 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
       - run: shellcheck scripts/*.sh
+      - name: windows fallback launcher shape
+        run: python3 scripts/windows/check-sar-launcher.py
 
   # The Windows .exe is the WSL supervisor. The GitHub-hosted runner has no
   # usable WSL2, so the doctor must stop at its first check and exit 1.

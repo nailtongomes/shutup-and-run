@@ -2,9 +2,24 @@
 
 [Português](README.pt-BR.md)
 
-Push a job to a machine. It runs your container or tells you it is full. That is the whole product.
+Self-hosted container job runner for spare CPU and RAM on a home or office PC. On Linux, Kestra or n8n pushes a Docker task to an HTTP API. On Windows 11 the service runs inside WSL2 and pulls tasks. Slots cap how many run at once. A timeout kills a task that runs too long. A full machine answers `429`.
 
-shutup-and-run is one static binary that sits on a machine with Docker. Your orchestrator (Kestra, n8n, a shell script) keeps a list of machines and POSTs a job to the first one:
+For someone lending idle machines to RPA or Selenium workers, or running a few edge workers and comparing Nomad, GitLab Runner, and Tork.
+
+Not a queue, not a scheduler, not a CI system, and not a sandbox. No web UI. The binary starts an allowlisted image and does not know what the image does.
+
+## Similar projects
+
+Nearby tools. This one is a single process on a machine you already have. Your orchestrator chooses the machine.
+
+- **Nomad** (HashiCorp) schedules jobs across a cluster. Use it when one control plane should place the work.
+- **HTCondor** matchmakes high-throughput jobs across a pool. Use it for a batch or research pool.
+- **GitLab Runner** runs GitLab CI jobs, with shell, Docker, or Kubernetes executors. Use it when the work is a GitLab pipeline.
+- **GitHub Actions self-hosted runner** runs GitHub Actions workflows on your hardware. Use it when the work is a GitHub workflow.
+- **Tork** is a workflow engine: a coordinator queues container tasks and workers run them, on one machine or across machines through a broker. Use it when you want that queue, retries, and jobs made of several tasks.
+- **BOINC** is volunteer computing. A project server hands work to a client people install to donate CPU. Use it when strangers run a published workload. This project runs your images on machines you set up.
+
+Push a job to a machine. It runs your container or tells you it is full. Your orchestrator (Kestra, n8n, a shell script) keeps the list of machines and POSTs the job to the first one:
 
 | Answer | Meaning | What the caller does |
 | --- | --- | --- |
@@ -12,7 +27,7 @@ shutup-and-run is one static binary that sits on a machine with Docker. Your orc
 | `429` | Every slot is busy. | Try the next machine. |
 | `503` | The machine is draining for maintenance. | Try the next machine. |
 
-There is no queue, no scheduler, and no UI. The launcher does not know what your image does. It starts an allowlisted image, enforces the timeout and the slot limit, keeps a history, and calls you back when the job ends.
+The launcher does not know what your image does. It starts an allowlisted image, enforces the timeout and the slot limit, keeps a history, and calls you back when the job ends.
 
 ```text
  Kestra / n8n                 machine A                    machine B
@@ -366,6 +381,8 @@ irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/i
 
 `shutup-and-run wsl doctor` checks WSL, the distribution, Docker, runs one container, and checks the service. Leave the URL and the token out and run `shutup-and-run wsl install` to set a machine up idle, with only the smoke test. `wsl logs`, `wsl stop`, `wsl start`, `wsl uninstall`. Everything, including what a lent Windows machine gives up, is in [docs/WINDOWS.md](docs/WINDOWS.md). A step-by-step hand test is in [docs/TESTING.md](docs/TESTING.md).
 
+A PC that cannot run WSL2 cannot run the `.exe`. [`scripts/windows/sar-launcher.bat`](scripts/windows/sar-launcher.bat) is a fallback for that case: `cmd` downloads a Python script from a URL you set, caches it, and runs it. It does not use the allowlist, the slots, or the HTTP API, and it does not check a checksum. Use HTTPS and a host you control. Details: [docs/WINDOWS.md](docs/WINDOWS.md#when-the-exe-cannot-run).
+
 ## Testing
 
 `scripts/smoke.sh` checks a running instance through its API. It needs `curl` and `python3` where it runs, and one image on the instance's allowlist:
@@ -420,7 +437,7 @@ It is safe on a live machine. Its jobs only print and sleep, each with a `timeou
 - A timeout is SIGKILL. There is no grace period.
 - `job_key` is per machine. Another machine does not know it.
 - No cancel call, no queue, no retry of a job that failed.
-- Windows runs the Linux service inside WSL2, pull mode only, while the installing user is logged on. Stopping it kills the containers inside the VM. [docs/WINDOWS.md](docs/WINDOWS.md). macOS is planned: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md).
+- Windows runs the Linux service inside WSL2, pull mode only, while the installing user is logged on. Stopping it kills the containers inside the VM. A PC that cannot run WSL2 cannot run the `.exe`; the shell fallback is in [docs/WINDOWS.md](docs/WINDOWS.md#when-the-exe-cannot-run). macOS is planned: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md).
 
 ## Development
 
