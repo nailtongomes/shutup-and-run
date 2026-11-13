@@ -57,3 +57,24 @@ jobs:
           context: examples/selenium-probe
           push: true
           tags: ghcr.io/nailtongomes/shutup-and-run-selenium-probe:latest
+
+  cleanup:
+    needs: ghcr
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: cleanup-ghcr-images
+      cancel-in-progress: false
+
+    permissions:
+      packages: write
+
+    steps:
+      - name: Cleanup old GHCR images
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          packages: 'shutup-and-run'
+          keep-n-tagged: 5
+          exclude-tags: 'edge,v*,latest,prod,stable,deploy-*'
+          delete-untagged: false
+          dry-run: false
