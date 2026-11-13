@@ -1,17 +1,28 @@
-name: Cleanup PR Images
+
+name: Cleanup GHCR Images
+
 on:
-  pull_request:
-    types: [closed]
+  schedule:
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
 jobs:
   cleanup:
     runs-on: ubuntu-latest
+
     concurrency:
       group: cleanup-images
-    permissions:
-      packages: write
+      cancel-in-progress: false
+
     steps:
-      - uses: dataaxiom/ghcr-cleanup-action@v1
+      - name: Cleanup old GHCR images
+        uses: dataaxiom/ghcr-cleanup-action@v1
         with:
-          packages: 'tiecd/k8s'
-          delete-tags: '*-rc*'
-          keep-n-tagged: 3
+          packages: 'shutup-and-run'
+          keep-n-tagged: 5
+          exclude-tags: 'edge,v*,latest,prod,stable,deploy-*'
+          delete-untagged: false
+          dry-run: false
