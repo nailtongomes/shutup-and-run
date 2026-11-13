@@ -1,0 +1,17 @@
+{
+  "listen": "127.0.0.1:8787",
+  "http": true,
+  "status_page": true,
+  "max_slots": 2,
+  "allowlist": [
+    "hello-world"
+  ],
+  "poll_url": "https://queue.example/poll?user=ana",
+  "poll_interval_secs": 15,
+  "poll_any_image": true,
+  "worker_name": "DESK-07",
+  "worker_os": "windows",
+  "history_path": "/var/lib/shutup-and-run/jobs.sqlite",
+  "token": "REPLACE-WITH-32-RANDOM-CHARACTERS",
+  "poll_token": "REPLACE-WITH-THE-MACHINE-POLL-TOKEN"
+}

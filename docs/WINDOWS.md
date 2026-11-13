@@ -12,7 +12,7 @@ Tested target: Windows 11 Pro 25H2 with WSL2. Windows 10 is not a target.
  shutup-and-run.exe wsl serve   --------->  /usr/local/bin/shutup-and-run serve   (the Linux musl binary)
    scheduled task at logon                    polls your URL, listens on 127.0.0.1:8787 only
    restarts the service if it exits           Docker Engine (docker.io), started by systemd in it  
-   writes %ProgramData%\shutup-and-run\       /etc/shutup-and-run/config.toml, env (600)
+   writes %ProgramData%\shutup-and-run\       /etc/shutup-and-run/config.json (600)
      supervisor.log                           containers, images, jobs.sqlite
 ```
 
@@ -55,7 +55,7 @@ shutup-and-run.exe wsl install --poll-url https://orchestrator.example/poll --ma
 | `--rootfs PATH`, `--bin PATH` | Skip the downloads. For an offline machine or a mirror. |
 | `--no-task` | Do not register the logon task. |
 
-The poll token, given or made, is written only to `/etc/shutup-and-run/env` inside the distribution, mode 600. It is never on a command line. The API token for the localhost listener is generated and written beside it. `SHUTUP_AND_RUN_URL` and `SHUTUP_AND_RUN_ROOTFS_URL` point the downloads at a mirror; `SHA256SUMS` is fetched from the same directory either way.
+The poll token, given or made, is written to `/etc/shutup-and-run/config.json` inside the distribution, mode 600, with the rest of the config. It is never on a command line. The API token for the localhost listener is generated and written beside it. A copy of that file is kept in `%ProgramData%\shutup-and-run\config.backup.json`, which is what `wsl reset` and a later install put back. `SHUTUP_AND_RUN_URL` and `SHUTUP_AND_RUN_ROOTFS_URL` point the downloads at a mirror; `SHA256SUMS` is fetched from the same directory either way.
 
 **Enrollment.** With no `SHUTUP_AND_RUN_POLL_TOKEN` set, the install makes a random token for this machine, or keeps the one a previous install left, and starts polling with it. Your poll URL has never seen that token, so it records the machine as pending (token, `worker`, the address of the connection, what the body says) and answers `403` or nothing until you approve it. The worker keeps asking, at most every five minutes while refused. If your orchestrator issues tokens instead, set `SHUTUP_AND_RUN_POLL_TOKEN` before the install and that one is used.
 
@@ -77,7 +77,7 @@ ok   distribution           shutup-and-run (Running)
 ok   docker                 engine 27.5.1
 ok   container              hello-world ran: Hello from Docker!
 ok   binary                 /usr/local/bin/shutup-and-run
-ok   config                 /etc/shutup-and-run/config.toml
+ok   config                 /etc/shutup-and-run/config.json
 ok   service                answers on 127.0.0.1:8787: {"status":"ok","draining":false,...}
 ok   task                   shutup-and-run is registered
 the Windows worker is ready
@@ -85,12 +85,12 @@ the Windows worker is ready
 
 The doctor stops at the first hard failure and exits 1. `service` and `task` are soft: they say the service is not running yet or the task was skipped, and do not fail the doctor. `wsl install` is stricter: when it registered the task, the service must answer or the install fails.
 
-If the `service` line says the service `refuses the token`, it was started before the config was last written: `shutup-and-run wsl stop`, then `shutup-and-run wsl start`. The doctor asked once and stopped, because three wrong tokens ban an address for 48 hours. If it says this machine's own address `is banned`, run `wsl install` again with the same options, or lift it by hand: `wsl -d shutup-and-run -u root -e /usr/local/bin/shutup-and-run bans lift 127.0.0.1`. The `container` line is a real `docker run --rm` of the smoke image inside the distribution; pass `--smoke-image ghcr.io/you/worker` to run the image you will use. The container is labeled `shutup-and-run.doctor=1`, not `shutup-and-run=1`, so it never takes a slot.
+After the Windows-side checks, the doctor runs `shutup-and-run doctor` inside the distribution: the config file, the service (from its status file), a forgotten pause, bans, and whether the poll URL's host can be reached. It sends no token anywhere. Every failed line is followed by a `fix:` line, `--json` prints the same as one object, and `--report` adds a report without secrets and a link that opens a GitHub issue.
 
 From a Linux shell inside the distribution, the API is the same as on a server:
 
 ```powershell
-wsl -d shutup-and-run -u root -- sh -c '. /etc/shutup-and-run/env; curl -s -H "Authorization: Bearer $SHUTUP_AND_RUN_TOKEN" http://127.0.0.1:8787/health'
+wsl -d shutup-and-run -u root -- sh -c 'curl -s -H "Authorization: Bearer $(shutup-and-run config get token --reveal)" http://127.0.0.1:8787/health'
 ```
 
 ## Day to day
@@ -101,17 +101,22 @@ wsl -d shutup-and-run -u root -- sh -c '. /etc/shutup-and-run/env; curl -s -H "A
 | `shutup-and-run wsl stop` | Ends the task, stops the service, gives each running container SIGTERM and 10 seconds, then terminates the distribution. On a Linux server, stopping the service leaves containers alone; here the VM goes away with the service. |
 | `shutup-and-run wsl start` | Starts the task again. |
 | `shutup-and-run wsl uninstall` | Deletes the task and the distribution, with its images and job history. `--purge` also removes `%ProgramData%\shutup-and-run`. |
-| `wsl -d shutup-and-run -u root` | A root shell in the distribution. `docker ps`, `cat /etc/shutup-and-run/config.toml`. |
+| `wsl -d shutup-and-run -u root` | A root shell in the distribution. `docker ps`. |
 
-To change the config, edit it inside the distribution and restart:
+To change the config, use the CLI or the local page. Nothing is edited by hand, and nothing needs a re-install:
 
 ```powershell
-wsl -d shutup-and-run -u root -- nano /etc/shutup-and-run/config.toml
-shutup-and-run wsl stop
-shutup-and-run wsl start
+shutup-and-run config show
+shutup-and-run config set poll_url "https://queue.example/poll?user=ana" --apply
+shutup-and-run status
+shutup-and-run doctor
 ```
 
-To upgrade, or to change an option, run `install.ps1` or `wsl install` again. It replaces the `.exe` and the Linux binary, keeps the distribution, its job history and the machine's poll token, and rewrites the config from the options you pass. Pass all of them again: an option left out goes back to its default.
+`config`, `pause`, `resume` and `bans` run inside the distribution; the `.exe` forwards them. The page is `http://127.0.0.1:8787/`, and the install puts a `shutup-and-run` shortcut to it on the desktop. [FOR-AGENTS.md](FOR-AGENTS.md) lists the known problems and their fixes.
+
+When the machine itself broke (a power cut, a damaged distribution), `shutup-and-run wsl reset` deletes the distribution and installs it again, keeping the config and the machine's poll token. `--factory` forgets those too.
+
+To upgrade, run `install.ps1` or `wsl install` again. It replaces the `.exe` and the Linux binary and keeps the distribution, its job history and the whole config, the poll token included. Only the options you pass change. An install from 0.2.4 or earlier has its `config.toml` and env file carried over into `config.json`. A worker that was paused resumes.
 
 A re-install replaces the running worker, and checks that it did:
 

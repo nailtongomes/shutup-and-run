@@ -8,6 +8,7 @@ pub mod bollard_rt;
 pub mod bytesize;
 pub mod callback;
 pub mod cert;
+pub mod cli;
 pub mod clock;
 pub mod config;
 pub mod launcher;

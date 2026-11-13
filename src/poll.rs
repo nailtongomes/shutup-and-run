@@ -64,9 +64,13 @@ pub fn spawn_poller(launcher: Arc<Launcher>) {
         let mut wait = interval;
         loop {
             match poll_once(&launcher, &client).await {
-                Ok(_) => wait = interval,
+                Ok(_) => {
+                    launcher.set_poll_error(None);
+                    wait = interval;
+                }
                 Err(err) => {
                     tracing::warn!(error = %err, "poll");
+                    launcher.set_poll_error(Some(err.to_string()));
                     wait = next_wait(wait, interval, true);
                 }
             }
