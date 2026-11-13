@@ -147,6 +147,30 @@ shutup-and-run status --json
 - [ ] `shutup-and-run config set min_free_memory 900g --apply`: `status` mostra `waiting_for: low on memory`, o mock não recebe mais polls, e a linha `resources` do doctor é um aviso com `fix:`. `shutup-and-run config unset min_free_memory --apply` e os polls voltam.
 - [ ] Com um `.wslconfig` seu, com outras chaves e `memory=64GB`: `wsl limits` sai com 1; `wsl limits --apply` muda só `memory=` e `processors=`, e `.wslconfig.bak` é o arquivo antigo. O doctor diz `not in effect yet` até o PC reiniciar ou você mesmo rodar `wsl --shutdown`.
 
+### Repasse de certificado e as demos
+
+Ainda não rodou no Windows. No PC Windows, com um `.pfx` de teste (nunca um real para isto) numa pasta com espaço e acento no nome:
+
+```powershell
+shutup-and-run version --json
+shutup-and-run config check
+shutup-and-run demo
+shutup-and-run demo sign
+$env:SHUTUP_AND_RUN_CERT_PASSWORD = "a-senha-de-teste"
+shutup-and-run certificate set --file "C:\Users\VOCE\Área de Trabalho\cert teste.pfx" --accept-risk --apply
+shutup-and-run demo sign --configured
+```
+
+- [ ] `version --json` diz `"platform":"windows"` e `"runtime":"wsl2"`.
+- [ ] `demo` e `demo sign` terminam com `passed`, e `shutup-and-run-demo-signed.pdf` está na pasta atual do Windows e abre.
+- [ ] Sem `--accept-risk`, `certificate set` imprime o aviso e sai com 2. Com senha errada sai com 3 e `CERTIFICATE_PASSWORD_WRONG`; com um `.txt` renomeado para `.pfx`, `CERTIFICATE_INVALID`; com um caminho que não existe, o caminho e saída 1.
+- [ ] Depois do `set`: `certificate status` diz ON; `shutup-and-run config show` tem `certificate_enabled` e nenhuma senha; `shutup-and-run doctor --report` tem `certificate passthrough: ON` e não tem a senha.
+- [ ] Na página local, Configuração avançada, Certificado: o mesmo com o seletor de arquivo; salvar sem marcar a caixa é recusado; o campo de senha volta vazio.
+- [ ] Enfileire duas tarefas no mock (`--max-slots 2`) com o comando `sh -c 'ls -l $SHUTUP_AND_RUN_CERT_PATH; echo x >> $SHUTUP_AND_RUN_CERT_PATH || echo read-only'`: as duas listam o arquivo e imprimem `read-only`.
+- [ ] Com uma tarefa longa rodando, `certificate disable --apply`: a tarefa termina; a próxima não tem `/run/shutup-and-run/certificate`.
+- [ ] `wsl -d shutup-and-run -u root ls /run/shutup-and-run/jobs` fica vazio sem tarefa rodando, também depois de uma tarefa que estourou o tempo e depois de `wsl stop` / `wsl start`.
+- [ ] `shutup-and-run wsl reset`: a instalação diz que o repasse foi desligado; `certificate status` diz off.
+
 ## 5. Windows 11: o atalho, parar, desligar
 
 Ponha o atalho na área de trabalho:

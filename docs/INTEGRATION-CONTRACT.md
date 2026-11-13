@@ -1,6 +1,6 @@
 # Integration contract
 
-What an orchestrator (n8n, Kestra, your own API) needs in order to give work to a shutup-and-run machine and learn how it ended, without reading the Rust source. It describes what the runner does today, release 0.2.6. Where the behavior is awkward it is written down as it is, under [Limits](#9-limits-of-the-current-contract), and not as it might be wished.
+What an orchestrator (n8n, Kestra, your own API) needs in order to give work to a shutup-and-run machine and learn how it ended, without reading the Rust source. It describes what the runner does today, release 0.2.7. Where the behavior is awkward it is written down as it is, under [Limits](#9-limits-of-the-current-contract), and not as it might be wished.
 
 Machine-readable, JSON Schema Draft 2020-12:
 
@@ -71,6 +71,7 @@ Rules that hold for every field:
 
 - **Unknown fields are rejected.** `{"image": "x", "volumes": [...]}` is a `400`, not a job without volumes. There is no field for a mount, a published port, privileged mode, a capability, a network mode, a user, a restart policy or registry credentials, and a request cannot get them another way.
 - **`null` is the same as leaving the field out**, for every optional field except `env`, which must be an object if present.
+- **Two names in `env` are the machine's.** On a machine whose owner turned on certificate passthrough, `SHUTUP_AND_RUN_CERT_PATH` and `SHUTUP_AND_RUN_CERT_PASSWORD_FILE` are set by the runner in every container, to the paths of a read-only certificate and of a file holding its password. A request's own values for those two are dropped there. A request cannot ask for the certificate, and nothing in the contract says whether a machine has one: that is between the machine's owner and whoever runs the queue.
 - **`env` is opaque.** The runner passes the strings to the container and does nothing else with them. It does not read `SCRIPT_URL`, does not download anything a variable points at, does not recognise credentials or customer identifiers, and does not log names or values. What a variable means is between the orchestrator and the image.
 - Numbers are JSON numbers. `"timeout_secs": "60"` and `"cpu": "2"` are rejected. `timeout_secs` has no fraction (`900`, not `900.0`). A `memory` or `shm` with a fraction is a string (`"1.5g"`), not a number.
 - Lengths are counted in bytes of UTF-8.

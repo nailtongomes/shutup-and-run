@@ -42,6 +42,60 @@ shutup-and-run config get poll_url
 
 `--apply` restarts the service on the new file and waits until it is back. Running containers are not stopped. Other everyday keys: `max_slots`, `poll_interval_secs`, `worker_name`. An invalid value exits 3 with the reason and leaves the file as it was.
 
+## Quick start: prove the machine works
+
+After the install, and before any orchestrator sends work:
+
+```
+shutup-and-run version --json                 # which build, platform and runtime you are talking to
+shutup-and-run config check --json            # exit 0 ready; 3 the config is invalid; 1 something around it
+shutup-and-run demo --json                    # one container under the worker's rules; exit 0 when it passed
+shutup-and-run job validate task.json --json  # exit 3 and a code when this machine would refuse the task
+```
+
+Each prints `ok`, a top-level `code`, and `checks[]` with `name`, `code`, `status`, `detail`, `fix`. Act on `code`, show `detail` to a person, run `fix`. None of these changes the config or the job history. `demo` runs `hello-world`; with another image use `--image`, and if the answer is `DEMO_IMAGE_NOT_ALLOWED` its `fix` is the command that allows it. `job validate` is the static half of admission only: a `JOB_VALID` task can still meet a full or paused machine later.
+
+## Diagnostic codes
+
+`doctor --json`, `config check --json` and `demo --json` give every check a `code` that does not change between releases. A check that passed is `NAME_OK`. One that did not, and has no code of its own below, is `NAME_WARNING` or `NAME_FAILED`.
+
+| Code | Meaning | First thing to do |
+| --- | --- | --- |
+| `CONFIG_INVALID` | The config file does not validate | `shutup-and-run config validate`, then `config set` or `config reset` |
+| `CONFIG_FALLBACK_IN_USE` | The file was damaged; the service runs on an older copy or on defaults | `shutup-and-run config reset` |
+| `DOCKER_UNAVAILABLE` | Docker did not answer | Windows: `wsl stop`, `wsl start`. Linux: `systemctl start docker` |
+| `SERVICE_NOT_RUNNING`, `SERVICE_FAILED`, `SERVICE_PORT_IN_USE` | The service is down, crashed, or its port is taken | The check's `fix` |
+| `STORAGE_NOT_WRITABLE` | The service cannot write its history folder | Run as root; fix the folder's owner |
+| `LOW_MEMORY`, `LOW_DISK` | No new job starts until it clears | Wait, free disk, or lower `min_free_*` |
+| `SLOTS_EXCEED_MEMORY` | `max_slots` times `max_job_memory` does not fit | The `config set max_slots` in `fix` |
+| `POLL_URL_UNSET` | No poll URL: the worker is idle | `config set poll_url URL --apply` |
+| `POLL_UNREACHABLE` | The poll URL's host did not answer. The network or the server, not the config | Check the network, DNS, the URL |
+| `POLL_NOT_APPROVED` | The server has not approved this machine | Nothing here: the owner approves it |
+| `POLL_ERROR` | The poll URL answered with an error | Check the URL and its filter |
+| `WORKER_PAUSED` | Someone paused the worker | `shutup-and-run resume` |
+| `LOCAL_ADDRESS_BANNED`, `ADDRESS_BANNED` | Wrong tokens banned an address | `shutup-and-run bans lift IP` |
+| `WSL_UNAVAILABLE`, `DISTRIBUTION_MISSING`, `TASK_NOT_REGISTERED` | Windows: WSL, the distribution or the logon task is missing | `wsl --install --no-distribution`; `shutup-and-run wsl install`; `wsl task register` |
+| `WSL_LIMITS_ABOVE_BUDGET`, `WSL_LIMITS_NOT_IN_EFFECT` | `.wslconfig` lets WSL2 take too much, or WSL has not restarted | `shutup-and-run wsl limits --apply`; a restart of WSL |
+| `CERTIFICATE_MISSING`, `CERTIFICATE_INVALID`, `CERTIFICATE_PASSWORD_WRONG`, `CERTIFICATE_EXPIRED`, `CERTIFICATE_NO_PRIVATE_KEY` | Passthrough is on and the certificate cannot be used | `shutup-and-run certificate set --file PATH --accept-risk` with a good file, or `certificate disable` |
+| `OPENSSL_MISSING` | The openssl program is not installed where the service runs | `apt-get install -y openssl` |
+| `DEMO_IMAGE_NOT_ALLOWED`, `DEMO_IMAGE_UNAVAILABLE`, `DEMO_JOB_FAILED`, `DEMO_TIMEOUT`, `WORKER_BUSY`, `LIMITS_NOT_APPLIED`, `DEMO_CLEANUP_FAILED` | `demo`: which step failed | The check's `fix` |
+| `SIGNATURE_INVALID`, `CERTIFICATE_MOUNT_WRITABLE` | `demo sign`: the PDF did not verify, or the mount was not read-only | `doctor --report` and open the issue |
+| `JOB_VALID`, `JOB_INVALID_JSON`, `JOB_INVALID_FIELD`, `JOB_IMAGE_NOT_ALLOWED` | `job validate` | Fix the task, or the allowlist |
+
+## Certificate passthrough (only when the owner asks)
+
+Off by default, and it stays off unless the **owner of the machine** asks for it. Turning it on gives every container the owner's certificate and its password, and a container can copy the private key. Do not enable it on your own judgment, and do not pass `--accept-risk` unless the person told you they accept that. Say it to them in those words first.
+
+```
+SHUTUP_AND_RUN_CERT_PASSWORD='...' shutup-and-run certificate set --file "PATH\cert.pfx" --accept-risk --apply --json
+shutup-and-run certificate status --json
+shutup-and-run certificate validate --json     # exit 3 and a CERTIFICATE_* code when unusable
+shutup-and-run demo sign --configured --json   # a container signs a made-up PDF with it
+shutup-and-run certificate disable --forget --apply
+```
+
+The password goes in the environment variable or on stdin (`--password-stdin`), never in an argument, and never into a report, an issue or a chat. On Windows `--file` is a Windows path; spaces and accents are fine. A container reads the certificate at `/run/shutup-and-run/certificate/client.pfx` and the password in the file `/run/shutup-and-run/secrets/certificate-password`. Details and limits: [WINDOWS.md](WINDOWS.md#certificate-passthrough).
+
 ## Protect the PC: the shared-PC limits
 
 The machine is someone's everyday computer. Their work comes first. A Windows worker has the `shared-pc` profile without being told; a Linux desktop gets it with one command:
@@ -125,6 +179,8 @@ shutup-and-run doctor --report
 It prints a diagnostic report with tokens and passwords masked, and a URL that opens a new GitHub issue with that report filled in. You do not need the user's GitHub login: give the URL to the person, or open it in their browser, and they submit it. With `--json` the same are in `report` and `issue_url`.
 
 ## What the page can change
+
+The certificate section (Advanced settings, Certificate) does what `shutup-and-run certificate` does, behind the same login and a confirmation box.
 
 `http://127.0.0.1:8787/` opens only on the machine itself. Everyday keys (poll URL, interval, slots, machine name, pause) are edited directly under Settings. The dangerous ones (allowed images, any-image, time limits, both tokens, the admin login) are under Advanced settings and ask for a user and password: `admin` / `admin` until changed with
 

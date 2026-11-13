@@ -319,6 +319,29 @@ There are three layers, and each is something that already existed. The WSL2 VM 
 
 What it costs, and what it is not. The free-memory figure is the VM's, not Windows': the PC can be short while the VM looks fine. It is read once, at admission, not while the job runs. Disk and network use are not limited. There is no idle detection, no monitor, no resizing, and no job is killed for pressure; each of those is a daemon and a policy this project does not want yet. The four size keys are strings (`"2g"`, `"1"`) so the CLI and the file read the same, which makes `max_job_cpus` a quoted number in TOML.
 
+## Certificate passthrough: the owner's key, to every job or to none
+
+Some of the work these machines do is signing with the client's own A1 certificate, which lives on the client's PC and must not live on the orchestrator. The request was explicit: when the owner enables it, every container gets the certificate and the password, with no per-image list.
+
+- **It is a machine setting, never a request field.** A request still cannot set a mount. `StartSpec.binds` is filled only by `certificate::stage`, from two fixed files to two fixed paths, read-only. The orchestrator cannot turn it on, and never receives the certificate or the password.
+- **No per-image list.** A list would look like a control and be one only as strong as the orchestrator that picks the image, which on a Windows worker is already trusted with `poll_any_image`. Saying "every job" is the honest description, and the owner confirms exactly that sentence.
+- **An imported copy, not a mount of the original.** The WSL2 distribution mounts no Windows drive, by an earlier decision that keeps containers away from `C:`. So the supervisor or the browser reads the file once and the service keeps a copy. The requirement to mount the original read-only is met in spirit: the original is never written, and the container's view is read-only. It costs a second copy of the key on disk.
+- **The password is a 600 file beside the config, not in the Windows credential store.** The service that needs it at every job start runs as root inside WSL, where DPAPI does not reach, and the supervisor would have to hand it over at every start and keep it in memory. The PC's user is root in that distribution either way, so the store would add a moving part and no protection against the one person who could read it. It is kept out of `config.json` so that `config show`, the page, the backup copy on the Windows side and every report cannot carry it.
+- **Per-job copies under `/run`.** A container that does not run as root has to read the files, so they are mode 444 inside a directory only root can enter, one directory per job, deleted at the job's end. Binding the stored 600 files directly would fail for exactly the browser images these jobs use.
+- **openssl, not a crate.** Parsing PKCS#12 and X.509 in the binary would add a cryptography dependency tree to check a file a few times a year. The `openssl` program is already on every machine the service runs on (the Windows install now names it). The demo signs with it inside `python:3.12-slim` and verifies with it outside the container.
+- **The demo's claims are small on purpose.** `demo sign` produces `adbe.pkcs7.detached` and verifies the digest and the signer's key. It does not build PAdES, does not judge the chain, and does not mention ICP-Brasil as satisfied.
+
+## First-run commands reuse the worker's own path
+
+`demo`, `job validate` and `config check` exist so that a person or an agent can prove a machine works before an orchestrator is wired to it. Each could have been a shortcut around the worker. None is.
+
+- `job validate` calls `launcher::check_request`, the function `launch_from` now also calls. There is one copy of the rules. A test sends the same bodies to both and requires the same verdict.
+- `demo` builds a `Launcher` on the machine's Docker with the machine's settings and a history file in a temporary folder. The allowlist, the limits, the slots and the memory check apply. An image that is not allowed fails the demo with the command that allows it. The worker's own history and config are not opened for writing.
+- `config check` is the doctor's config and Docker checks plus four that need no running service. It writes nothing; storage is asked of the kernel with `access`.
+- Diagnostic codes are a field added to each check. `name`, `status`, `detail`, `fix` and the exit codes are as they were.
+
+The cost: a demo container carries the worker's label, so a running service counts it against `max_slots` for the seconds it lives, and a service with pruning on could remove it first.
+
 ## Smoke test against a running instance
 
 `scripts/accept.sh` starts its own instance. `scripts/smoke.sh` tests one that is already installed, through the API only, with the URL and token from the environment. It is safe on a live machine: its jobs echo and sleep under a short `timeout_secs`, it undrains what it drained, and it sends wrong tokens from `127.0.0.2`, never from the caller. What it cannot do from where it runs, it skips and says why.

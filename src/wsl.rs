@@ -1756,6 +1756,26 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
         }
     }
 
+    // A config kept from before a reset may say passthrough is on while the
+    // certificate went with the old distribution. Every job would then fail
+    // to start, so it is turned off, and the owner imports the file again.
+    let enabled = text.contains("\"certificate_enabled\": true");
+    if enabled
+        && !sh_in_distro(
+            "test -f /etc/shutup-and-run/certificate/client.pfx",
+            None,
+            SHORT,
+        )
+        .is_ok_and(|out| out.ok())
+    {
+        let _ = in_distro(&[INNER_BIN, "certificate", "disable"], None, SHORT);
+        let _ = refresh_host_backup();
+        println!(
+            "    certificate passthrough was on, and the certificate is not in this distribution: \
+             turned off. Import it again with `shutup-and-run certificate set`."
+        );
+    }
+
     println!("[7/8] scheduled task {TASK_NAME} (at logon)");
     let exe = install_exe_copy(&data)?;
     // The new supervisor needs the lock this install has been holding.

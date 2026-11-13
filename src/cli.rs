@@ -76,6 +76,9 @@ that asks for more than the machine's limit is refused with the limit in the
 answer. `status --json` shows the limits in force under `limits`, and
 `waiting_for` says why no job starts while memory or disk is short.
 
+First run, with no orchestrator: `shutup-and-run demo --help` documents
+version, config check, job validate, demo, demo sign and certificate.
+
 The config is one JSON file: /etc/shutup-and-run/config.json (on Windows,
 inside the shutup-and-run WSL distribution). Schema:
 docs/schemas/worker-config.schema.json. Guide: docs/FOR-AGENTS.md."

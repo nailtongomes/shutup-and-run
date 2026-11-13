@@ -147,6 +147,30 @@ shutup-and-run status --json
 - [ ] `shutup-and-run config set min_free_memory 900g --apply`: `status` shows `waiting_for: low on memory`, the mock gets no more polls, and the doctor's `resources` line is a warning with a `fix:`. `shutup-and-run config unset min_free_memory --apply` and the polls come back.
 - [ ] With a `.wslconfig` of your own that has other keys and `memory=64GB`: `wsl limits` exits 1; `wsl limits --apply` changes only `memory=` and `processors=`, and `.wslconfig.bak` is the old file. The doctor says `not in effect yet` until the PC restarts or you run `wsl --shutdown` yourself.
 
+### Certificate passthrough and the demos
+
+Not run on Windows yet. On the Windows PC, with a test `.pfx` (never a real one for this) in a folder whose name has a space and an accent:
+
+```powershell
+shutup-and-run version --json
+shutup-and-run config check
+shutup-and-run demo
+shutup-and-run demo sign
+$env:SHUTUP_AND_RUN_CERT_PASSWORD = "the-test-password"
+shutup-and-run certificate set --file "C:\Users\YOU\Área de Trabalho\test cert.pfx" --accept-risk --apply
+shutup-and-run demo sign --configured
+```
+
+- [ ] `version --json` says `"platform":"windows"` and `"runtime":"wsl2"`.
+- [ ] `demo` and `demo sign` end with `passed`, and `shutup-and-run-demo-signed.pdf` is in the current Windows folder and opens.
+- [ ] Without `--accept-risk`, `certificate set` prints the warning and exits 2. With a wrong password it exits 3 with `CERTIFICATE_PASSWORD_WRONG`; with a `.txt` renamed to `.pfx`, `CERTIFICATE_INVALID`; with a path that does not exist, the path and exit 1.
+- [ ] After `set`: `certificate status` says ON; `shutup-and-run config show` has `certificate_enabled` and no password; `shutup-and-run doctor --report` has `certificate passthrough: ON` and not the password.
+- [ ] The local page, Advanced settings, Certificate: the same with the file chooser; saving without the box ticked is refused; the password field comes back empty.
+- [ ] Queue two jobs from the mock (`--max-slots 2`) whose command is `sh -c 'ls -l $SHUTUP_AND_RUN_CERT_PATH; echo x >> $SHUTUP_AND_RUN_CERT_PATH || echo read-only'`: both list the file and print `read-only`.
+- [ ] While a long job runs, `certificate disable --apply`: the job finishes; the next job has no `/run/shutup-and-run/certificate`.
+- [ ] `wsl -d shutup-and-run -u root ls /run/shutup-and-run/jobs` is empty when no job runs, also after a job that timed out and after `wsl stop` / `wsl start`.
+- [ ] `shutup-and-run wsl reset`: the install says passthrough was turned off; `certificate status` says off.
+
 ## 5. Windows 11: the shortcut, stop, shutdown
 
 Put the shortcut on the desktop:
