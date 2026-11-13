@@ -155,8 +155,12 @@ shutup-and-run wsl install [--poll-url URL] [options]
       --smoke-image IMAGE        default hello-world
       --rootfs PATH              a downloaded Ubuntu WSL rootfs (skips the download)
       --bin PATH                 the musl binary (skips the download)
-      --wsl-memory SIZE          write memory=SIZE to %UserProfile%\\.wslconfig
-      --wsl-processors N         write processors=N to %UserProfile%\\.wslconfig
+      --wsl-memory SIZE          the WSL2 memory limit, like 4GB (default: 40% of the RAM)
+      --wsl-processors N         the WSL2 processor limit (default: half of them)
+                                 Both go to %UserProfile%\\.wslconfig when that file does
+                                 not exist. A file that exists is never changed here,
+                                 and without these options none is written on a PC
+                                 that has other WSL distributions: see `wsl limits`.
       --no-task                  do not register the scheduled task
 
 shutup-and-run wsl reset [--factory] [install options]
@@ -181,6 +185,15 @@ shutup-and-run wsl logs [--lines N]
 shutup-and-run wsl uninstall [--purge]
     delete the task and the distribution. --purge also removes the data folder.
 
+shutup-and-run wsl limits [--memory SIZE] [--processors N] [--apply] [--json]
+    how much of this PC WSL2 may take. Prints the PC's RAM and processors,
+    the budget (40% of the RAM, half the processors, or what the flags say)
+    and what %UserProfile%\\.wslconfig says. Exit 1 when the file lets WSL2
+    take more. --apply writes memory= and processors= under [wsl2], keeps
+    every other line and saves the old file as .wslconfig.bak. .wslconfig
+    covers every WSL2 distribution of this user, and a change takes effect
+    when WSL restarts; this program never runs `wsl --shutdown`.
+
 shutup-and-run wsl task register | remove
     only the logon task: what install and uninstall do with it. Needs no WSL."
 }
@@ -203,6 +216,7 @@ pub async fn cli(args: &[String]) -> ExitCode {
         "logs" => logs_cli(rest),
         "uninstall" => uninstall_cli(rest),
         "task" => task_cli(rest),
+        "limits" => limits_cli(rest),
         "-h" | "--help" | "help" => {
             println!("{}", usage());
             return ExitCode::SUCCESS;
@@ -689,19 +703,6 @@ pub(crate) fn shortcut_text(listen: &str) -> String {
     format!("[InternetShortcut]\r\nURL=http://127.0.0.1:{port}/\r\n")
 }
 
-/// `%UserProfile%\.wslconfig` is per user and global to WSL2, so it is written
-/// only when it does not exist. Otherwise the lines to add are printed.
-pub(crate) fn render_wslconfig(memory: Option<&str>, processors: Option<u64>) -> String {
-    let mut text = String::from("[wsl2]\n");
-    if let Some(memory) = memory {
-        text.push_str(&format!("memory={memory}\n"));
-    }
-    if let Some(processors) = processors {
-        text.push_str(&format!("processors={processors}\n"));
-    }
-    text
-}
-
 fn validate_wsl_memory(raw: &str) -> WslResult<String> {
     let value = raw.trim();
     let digits = value.trim_end_matches(['G', 'M', 'g', 'm', 'B', 'b']);
@@ -709,6 +710,361 @@ fn validate_wsl_memory(raw: &str) -> WslResult<String> {
         return Err(err("--wsl-memory looks like 4GB or 512MB"));
     }
     Ok(value.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// The WSL2 budget of a shared PC
+
+/// What WSL2 may take of a PC its owner is working on: about 40% of the RAM
+/// and half the logical processors. Below 5 GiB of RAM the 40% is too little
+/// to run Docker and one job, so the floor is 2 GiB or half the RAM.
+/// Returns megabytes and processors.
+pub(crate) fn wsl_budget(ram_bytes: u64, cpus: u64) -> (u64, u64) {
+    const MIB: u64 = 1024 * 1024;
+    let ram_mb = ram_bytes / MIB;
+    let memory = (ram_mb * 2 / 5).max(2048.min(ram_mb / 2));
+    (memory, (cpus / 2).max(1))
+}
+
+/// Physical RAM of this PC. None when it cannot be read.
+#[cfg(windows)]
+fn host_memory_bytes() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    // SAFETY: the struct is the documented MEMORYSTATUSEX, zeroed, with its
+    // own size in the first field as the call requires.
+    unsafe {
+        let mut status: MemoryStatusEx = std::mem::zeroed();
+        status.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+        (GlobalMemoryStatusEx(&mut status) != 0).then_some(status.total_phys)
+    }
+}
+
+#[cfg(not(windows))]
+fn host_memory_bytes() -> Option<u64> {
+    crate::resources::memory_total()
+}
+
+fn host_cpus() -> u64 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u64)
+        .unwrap_or(1)
+}
+
+/// `memory` and `processors` under `[wsl2]`, as written. Keys and the section
+/// name are matched without case, as WSL does.
+pub(crate) fn wslconfig_values(text: &str) -> (Option<String>, Option<String>) {
+    let (mut memory, mut processors) = (None, None);
+    let mut in_wsl2 = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_wsl2 = line.eq_ignore_ascii_case("[wsl2]");
+        } else if in_wsl2 && !line.starts_with('#') {
+            if let Some((key, value)) = line.split_once('=') {
+                let value = value.trim().to_string();
+                match key.trim().to_ascii_lowercase().as_str() {
+                    "memory" => memory = Some(value),
+                    "processors" => processors = Some(value),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (memory, processors)
+}
+
+/// The file with `memory` and `processors` set under `[wsl2]`. Every other
+/// line, comment and section stays where it was.
+pub(crate) fn merge_wslconfig(existing: &str, memory: &str, processors: u64) -> String {
+    let newline = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let wanted = [
+        ("memory", memory.to_string()),
+        ("processors", processors.to_string()),
+    ];
+    let mut done = [false, false];
+    let mut out: Vec<String> = Vec::new();
+    let mut in_wsl2 = false;
+    let mut seen_wsl2 = false;
+    // Where the missing keys go: right under the [wsl2] line.
+    let mut header_at = None;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_wsl2 = trimmed.eq_ignore_ascii_case("[wsl2]");
+            if in_wsl2 && !seen_wsl2 {
+                seen_wsl2 = true;
+                header_at = Some(out.len() + 1);
+            }
+        } else if in_wsl2 && !trimmed.starts_with('#') {
+            if let Some((key, _)) = trimmed.split_once('=') {
+                let key = key.trim().to_ascii_lowercase();
+                if let Some(i) = wanted.iter().position(|(name, _)| *name == key) {
+                    out.push(format!("{}={}", wanted[i].0, wanted[i].1));
+                    done[i] = true;
+                    continue;
+                }
+            }
+        }
+        out.push(line.to_string());
+    }
+    let missing: Vec<String> = wanted
+        .iter()
+        .zip(done)
+        .filter(|(_, done)| !done)
+        .map(|((key, value), _)| format!("{key}={value}"))
+        .collect();
+    match header_at {
+        Some(at) => {
+            for (i, line) in missing.into_iter().enumerate() {
+                out.insert(at + i, line);
+            }
+        }
+        None => {
+            out.push("[wsl2]".to_string());
+            out.extend(missing);
+        }
+    }
+    let mut text = out.join(newline);
+    text.push_str(newline);
+    text
+}
+
+/// How the PC's `.wslconfig` stands against the budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WslLimits {
+    pub host_memory_bytes: Option<u64>,
+    pub host_cpus: u64,
+    /// The budget: megabytes and processors.
+    pub budget: (u64, u64),
+    /// What `.wslconfig` says now.
+    pub memory: Option<String>,
+    pub processors: Option<String>,
+    /// Empty when the file keeps WSL2 inside the budget.
+    pub problems: Vec<String>,
+}
+
+impl WslLimits {
+    fn within(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
+/// `wanted` is what the operator asked for with flags; without it the budget
+/// is worked out from the PC. A value in the file at or below the budget is
+/// fine: the owner may have chosen less.
+pub(crate) fn wsl_limits(
+    ram_bytes: Option<u64>,
+    cpus: u64,
+    wslconfig: Option<&str>,
+    wanted: (Option<u64>, Option<u64>),
+) -> WslLimits {
+    let worked_out = wsl_budget(ram_bytes.unwrap_or(8 * crate::resources::GIB), cpus);
+    let budget = (
+        wanted.0.unwrap_or(worked_out.0),
+        wanted.1.unwrap_or(worked_out.1),
+    );
+    let (memory, processors) = wslconfig.map(wslconfig_values).unwrap_or_default();
+    let mut problems = Vec::new();
+    let memory_mb = memory
+        .as_deref()
+        .and_then(|m| crate::bytesize::parse_qty(m).ok())
+        .map(|bytes| bytes as u64 / (1024 * 1024));
+    match (&memory, memory_mb) {
+        (None, _) => problems.push(format!(
+            "no memory limit: WSL2 may take half of this PC's RAM; the budget is {}MB",
+            budget.0
+        )),
+        (Some(text), None) => problems.push(format!("memory={text} is not a size WSL reads")),
+        (Some(text), Some(mb)) if mb > budget.0 => problems.push(format!(
+            "memory={text} is above the budget of {}MB",
+            budget.0
+        )),
+        _ => {}
+    }
+    match (&processors, processors.as_deref().map(str::parse::<u64>)) {
+        (None, _) => problems.push(format!(
+            "no processor limit: WSL2 may use every processor; the budget is {}",
+            budget.1
+        )),
+        (Some(text), Some(Ok(n))) if n > budget.1 => problems.push(format!(
+            "processors={text} is above the budget of {}",
+            budget.1
+        )),
+        (Some(text), Some(Err(_))) => problems.push(format!("processors={text} is not a number")),
+        _ => {}
+    }
+    WslLimits {
+        host_memory_bytes: ram_bytes,
+        host_cpus: cpus,
+        budget,
+        memory,
+        processors,
+        problems,
+    }
+}
+
+const LIMITS_APPLY: &str = "`shutup-and-run wsl limits --apply` (it keeps every other line of \
+     .wslconfig and saves the old file as .wslconfig.bak)";
+/// Never run by this program: it stops every WSL distribution of the user.
+const WSL_RESTART: &str = "the limits take effect when WSL restarts: restart the PC, or run \
+     `wsl --shutdown` at a moment when no other WSL work and no job is running";
+
+fn read_wslconfig() -> Option<String> {
+    wslconfig_path().and_then(|path| std::fs::read_to_string(path).ok())
+}
+
+fn parse_wsl_memory_mb(flags: &Flags, key: &str) -> WslResult<Option<u64>> {
+    flags
+        .get(key)
+        .map(|raw| {
+            let text = validate_wsl_memory(raw)?;
+            crate::bytesize::parse_qty(&text)
+                .map(|bytes| (bytes as u64 / (1024 * 1024)).max(1))
+                .map_err(|e| err(format!("{key}: {e}")))
+        })
+        .transpose()
+}
+
+/// Write the budget into `.wslconfig`, keeping the rest of the file. An
+/// existing file is copied to `.wslconfig.bak` first.
+fn apply_wsl_limits(limits: &WslLimits) -> WslResult<PathBuf> {
+    let path = wslconfig_path().ok_or_else(|| err("USERPROFILE is unset; no .wslconfig"))?;
+    let old = std::fs::read_to_string(&path).ok();
+    if old.is_some() {
+        let backup = path.with_file_name(".wslconfig.bak");
+        std::fs::copy(&path, &backup).map_err(|e| err(format!("{}: {e}", backup.display())))?;
+    }
+    let text = merge_wslconfig(
+        old.as_deref().unwrap_or(""),
+        &format!("{}MB", limits.budget.0),
+        limits.budget.1,
+    );
+    std::fs::write(&path, text).map_err(|e| err(format!("{}: {e}", path.display())))?;
+    Ok(path)
+}
+
+/// The doctor's line. `vm` is what the running VM has: bytes and processors.
+pub(crate) fn wsl_limits_check(limits: &WslLimits, vm: Option<(u64, u64)>) -> Check {
+    use crate::resources::human;
+    let host = format!(
+        "this PC: {}, {} processors; budget for WSL2: {}MB, {} processors",
+        limits
+            .host_memory_bytes
+            .map(human)
+            .unwrap_or_else(|| "RAM unknown".to_string()),
+        limits.host_cpus,
+        limits.budget.0,
+        limits.budget.1
+    );
+    let now = vm
+        .map(|(bytes, cpus)| format!("; the VM now has {}, {cpus} processors", human(bytes)))
+        .unwrap_or_default();
+    if !limits.within() {
+        return soft(
+            "wsl-limits",
+            false,
+            format!(".wslconfig: {}. {host}{now}", limits.problems.join("; ")),
+        )
+        .fix(format!("{LIMITS_APPLY}. Then {WSL_RESTART}"));
+    }
+    // The file is right. Is the VM still running on what it had before?
+    let budget_bytes = limits.budget.0 * 1024 * 1024;
+    if let Some((bytes, cpus)) = vm {
+        if bytes > budget_bytes + budget_bytes / 10 || cpus > limits.budget.1 {
+            return soft(
+                "wsl-limits",
+                false,
+                format!(".wslconfig is within the budget, but not in effect yet. {host}{now}"),
+            )
+            .fix(WSL_RESTART);
+        }
+    }
+    soft("wsl-limits", true, format!("{host}{now}"))
+}
+
+fn vm_size() -> Option<(u64, u64)> {
+    let out = sh_in_distro("grep MemTotal: /proc/meminfo; nproc", None, SHORT).ok()?;
+    let text = out.text();
+    let bytes = crate::resources::meminfo_field(&text, "MemTotal:")?;
+    let cpus = text.lines().last()?.trim().parse().ok()?;
+    Some((bytes, cpus))
+}
+
+fn limits_cli(args: &[String]) -> WslResult<ExitCode> {
+    let flags = parse_flags(args, &["--memory", "--processors"], &["--apply", "--json"])?;
+    let wanted = (
+        parse_wsl_memory_mb(&flags, "--memory")?,
+        flags
+            .get("--processors")
+            .map(|_| parse_count(&flags, "--processors", 1, 1..=256))
+            .transpose()?,
+    );
+    let read = || {
+        wsl_limits(
+            host_memory_bytes(),
+            host_cpus(),
+            read_wslconfig().as_deref(),
+            wanted,
+        )
+    };
+    let mut limits = read();
+    let mut applied = None;
+    // With a size given, --apply sets exactly that, even downwards or upwards.
+    let explicit = wanted.0.is_some() || wanted.1.is_some();
+    if flags.has("--apply") && (!limits.within() || explicit) {
+        applied = Some(apply_wsl_limits(&limits)?);
+        limits = read();
+    }
+    let path = wslconfig_path();
+    if flags.has("--json") {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": limits.within(),
+                "error": (!limits.within()).then(|| limits.problems.join("; ")),
+                "host": {"memory_bytes": limits.host_memory_bytes, "cpus": limits.host_cpus},
+                "budget": {"memory_mb": limits.budget.0, "processors": limits.budget.1},
+                "wslconfig": {
+                    "path": path,
+                    "memory": limits.memory,
+                    "processors": limits.processors,
+                },
+                "applied": applied.is_some(),
+                "restart_needed": applied.is_some(),
+                "fix": (!limits.within()).then_some(LIMITS_APPLY),
+                "note": WSL_RESTART,
+            })
+        );
+    } else {
+        let check = wsl_limits_check(&limits, None);
+        println!("{}", report(std::slice::from_ref(&check)).0.trim_end());
+        println!(
+            ".wslconfig now: memory={}, processors={}",
+            limits.memory.as_deref().unwrap_or("(not set)"),
+            limits.processors.as_deref().unwrap_or("(not set)")
+        );
+        if let Some(path) = &applied {
+            println!("wrote {}. {WSL_RESTART}", path.display());
+        }
+    }
+    Ok(ExitCode::from(if limits.within() { 0 } else { 1 }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,6 +1450,15 @@ fn doctor(
         .fix("`shutup-and-run wsl task register`"),
         Err(e) => soft("task", false, e.to_string()),
     });
+    checks.push(wsl_limits_check(
+        &wsl_limits(
+            host_memory_bytes(),
+            host_cpus(),
+            read_wslconfig().as_deref(),
+            (None, None),
+        ),
+        vm_size(),
+    ));
 
     Ok((checks, inner))
 }
@@ -1144,14 +1509,13 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     };
     let computer = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-worker".to_string());
     let smoke_image = flags.get("--smoke-image").unwrap_or(DEFAULT_SMOKE_IMAGE);
-    let wsl_memory = flags
-        .get("--wsl-memory")
-        .map(validate_wsl_memory)
-        .transpose()?;
-    let wsl_processors = flags
-        .get("--wsl-processors")
-        .map(|_| parse_count(&flags, "--wsl-processors", 1, 1..=256))
-        .transpose()?;
+    let wsl_wanted = (
+        parse_wsl_memory_mb(&flags, "--wsl-memory")?,
+        flags
+            .get("--wsl-processors")
+            .map(|_| parse_count(&flags, "--wsl-processors", 1, 1..=256))
+            .transpose()?,
+    );
 
     // The same checks the service applies, before anything is downloaded.
     crate::config::Settings::from_json_map(&install_config(None, &options, &computer, smoke_image))
@@ -1169,6 +1533,55 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
         )));
     }
     println!("    {}", status.one_line());
+    // Before the distribution starts, so a PC with no WSL running yet gets
+    // the limits from its first boot. `.wslconfig` is the user's and covers
+    // every WSL2 distribution: a file that exists is reported on, not edited.
+    let limits = wsl_limits(
+        host_memory_bytes(),
+        host_cpus(),
+        read_wslconfig().as_deref(),
+        wsl_wanted,
+    );
+    // Someone else's distribution (Docker Desktop, a developer's Ubuntu)
+    // would be capped by the same file, so then it is the owner's call.
+    let others: Vec<String> = list_distros()?
+        .into_iter()
+        .map(|d| d.name)
+        .filter(|name| name != DISTRO)
+        .collect();
+    match wslconfig_path() {
+        // Unless the operator named a size: then it was asked for.
+        Some(path) if !path.exists() && !others.is_empty() && wsl_wanted == (None, None) => {
+            println!(
+                "    {} does not exist and was not written, because it would also limit {}: {}",
+                path.display(),
+                others.join(", "),
+                limits.problems.join("; ")
+            );
+            println!("    to set the limits: {LIMITS_APPLY}");
+        }
+        Some(path) if !path.exists() => {
+            apply_wsl_limits(&limits)?;
+            println!(
+                "    wrote {}: memory={}MB, processors={}",
+                path.display(),
+                limits.budget.0,
+                limits.budget.1
+            );
+        }
+        Some(path) if limits.within() => {
+            println!("    {} keeps WSL2 inside the budget", path.display())
+        }
+        Some(path) => {
+            println!(
+                "    {} exists and was not changed: {}",
+                path.display(),
+                limits.problems.join("; ")
+            );
+            println!("    to set the limits: {LIMITS_APPLY}");
+        }
+        None => println!("    USERPROFILE is unset; .wslconfig was not written"),
+    }
 
     println!("[2/8] distribution {DISTRO}");
     let client = http_client()?;
@@ -1328,27 +1741,6 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     if let Ok(out) = in_distro(&[INNER_BIN, "bans", "lift", "127.0.0.1"], None, SHORT) {
         if out.ok() && out.text().contains("lifted") {
             println!("    lifted a ban on 127.0.0.1 left by an earlier install");
-        }
-    }
-
-    if wsl_memory.is_some() || wsl_processors.is_some() {
-        let text = render_wslconfig(wsl_memory.as_deref(), wsl_processors);
-        match wslconfig_path() {
-            Some(path) if !path.exists() => {
-                std::fs::write(&path, &text)
-                    .map_err(|e| err(format!("{}: {e}", path.display())))?;
-                println!("    wrote {}", path.display());
-            }
-            Some(path) => {
-                println!(
-                    "    {} exists and was not changed. Add under [wsl2]:",
-                    path.display()
-                );
-                for line in text.lines().skip(1) {
-                    println!("        {line}");
-                }
-            }
-            None => println!("    USERPROFILE is unset; .wslconfig was not written"),
         }
     }
 
@@ -2270,15 +2662,116 @@ mod tests {
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(!script.contains("/etc/shutup-and-run/env"));
         assert!(script.ends_with("exec /usr/local/bin/shutup-and-run serve\n"));
-        assert_eq!(
-            render_wslconfig(Some("4GB"), Some(2)),
-            "[wsl2]\nmemory=4GB\nprocessors=2\n"
-        );
-        assert_eq!(render_wslconfig(None, Some(2)), "[wsl2]\nprocessors=2\n");
         assert_eq!(validate_wsl_memory("4GB").unwrap(), "4GB");
         assert_eq!(validate_wsl_memory("512MB").unwrap(), "512MB");
         assert!(validate_wsl_memory("lots").is_err());
         assert!(validate_wsl_memory("").is_err());
+    }
+
+    const GIB: u64 = crate::resources::GIB;
+
+    #[test]
+    fn the_wsl2_budget_is_about_40_percent_of_the_ram_and_half_the_processors() {
+        assert_eq!(wsl_budget(16 * GIB, 8), (6553, 4));
+        assert_eq!(wsl_budget(8 * GIB, 4), (3276, 2));
+        assert_eq!(wsl_budget(32 * GIB, 16), (13107, 8));
+        // Too small for 40% to hold Docker and a job: 2 GiB, or half the RAM.
+        assert_eq!(wsl_budget(4 * GIB, 2), (2048, 1));
+        assert_eq!(wsl_budget(3 * GIB, 1), (1536, 1));
+        // What the service then gives one job inside such a VM.
+        let job =
+            |ram| crate::resources::shared_pc_memory(Some(wsl_budget(ram, 4).0 * 1024 * 1024));
+        assert_eq!(job(16 * GIB), 2 * GIB);
+        assert_eq!(job(8 * GIB), 3276 * 1024 * 1024 / 2);
+        assert_eq!(job(4 * GIB), GIB);
+    }
+
+    #[test]
+    fn an_existing_wslconfig_keeps_everything_that_is_not_ours() {
+        let theirs = "# my settings\r\n[wsl2]\r\nswap=0\r\nMemory = 12GB\r\n# processors=99\r\n\r\n[experimental]\r\nsparseVhd=true\r\nmemory=1GB\r\n";
+        assert_eq!(wslconfig_values(theirs), (Some("12GB".to_string()), None));
+        let merged = merge_wslconfig(theirs, "6553MB", 4);
+        assert_eq!(
+            merged,
+            "# my settings\r\n[wsl2]\r\nprocessors=4\r\nswap=0\r\nmemory=6553MB\r\n# processors=99\r\n\r\n[experimental]\r\nsparseVhd=true\r\nmemory=1GB\r\n"
+        );
+        // Merging again changes nothing.
+        assert_eq!(merge_wslconfig(&merged, "6553MB", 4), merged);
+        assert_eq!(
+            wslconfig_values(&merged),
+            (Some("6553MB".to_string()), Some("4".to_string()))
+        );
+
+        // No [wsl2] section: it is added after what is there.
+        assert_eq!(
+            merge_wslconfig("[experimental]\nsparseVhd=true\n", "4GB", 2),
+            "[experimental]\nsparseVhd=true\n[wsl2]\nmemory=4GB\nprocessors=2\n"
+        );
+        // No file.
+        assert_eq!(
+            merge_wslconfig("", "3276MB", 2),
+            "[wsl2]\nmemory=3276MB\nprocessors=2\n"
+        );
+    }
+
+    #[test]
+    fn wsl_limits_report_a_file_that_lets_wsl2_take_more() {
+        let none = (None, None);
+        // No file: both limits are missing.
+        let limits = wsl_limits(Some(16 * GIB), 8, None, none);
+        assert_eq!(limits.budget, (6553, 4));
+        assert_eq!(limits.problems.len(), 2);
+        let check = wsl_limits_check(&limits, None);
+        assert!(!check.ok && check.soft);
+        assert!(check.fix.contains("shutup-and-run wsl limits --apply"));
+        assert!(check.fix.contains("wsl --shutdown"));
+
+        // A file above the budget, and one the owner set lower.
+        let limits = wsl_limits(
+            Some(16 * GIB),
+            8,
+            Some("[wsl2]\nmemory=12GB\nprocessors=8\n"),
+            none,
+        );
+        assert_eq!(
+            limits.problems,
+            vec![
+                "memory=12GB is above the budget of 6553MB",
+                "processors=8 is above the budget of 4"
+            ]
+        );
+        let lower = wsl_limits(
+            Some(16 * GIB),
+            8,
+            Some("[wsl2]\nmemory=4GB\nprocessors=2\n"),
+            none,
+        );
+        assert!(lower.within());
+        assert!(wsl_limits_check(&lower, Some((4 * GIB, 2))).ok);
+        let junk = wsl_limits(
+            Some(16 * GIB),
+            8,
+            Some("[wsl2]\nmemory=lots\nprocessors=x\n"),
+            none,
+        );
+        assert_eq!(junk.problems.len(), 2);
+
+        // The file is right but the VM booted before it was written.
+        let stale = wsl_limits_check(&lower, Some((8 * GIB, 8)));
+        assert!(!stale.ok && stale.soft);
+        assert!(stale.detail.contains("not in effect yet"));
+        assert!(!stale.fix.contains("--apply"));
+
+        // What the operator asked for replaces the worked-out budget.
+        let asked = wsl_limits(
+            Some(16 * GIB),
+            8,
+            Some("[wsl2]\nmemory=8GB\nprocessors=6\n"),
+            (Some(8192), Some(6)),
+        );
+        assert!(asked.within());
+        // A PC whose RAM cannot be read is treated as 8 GiB.
+        assert_eq!(wsl_limits(None, 4, None, none).budget, (3276, 2));
     }
 
     #[test]

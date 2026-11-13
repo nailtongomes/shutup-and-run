@@ -130,6 +130,23 @@ Abra um segundo PowerShell, rode `shutup-and-run wsl stop` e depois `shutup-and-
 
 O mesmo cadastro, fila e callback contra o n8n, sem o mock: [examples/n8n/README.md](../examples/n8n/README.md#7-smoke-test).
 
+### Limites de PC compartilhado
+
+Esta parte só rodou no Linux e em testes unitários. No PC Windows:
+
+```powershell
+shutup-and-run wsl limits
+Get-Content $env:USERPROFILE\.wslconfig
+shutup-and-run status --json
+```
+
+- [ ] `wsl limits` imprime a RAM e os processadores deste PC, e um orçamento de cerca de 40% da RAM e metade dos processadores. Anote se a instalação escreveu o `.wslconfig`, ou por que não escreveu (já havia um arquivo, ou existe outra distribuição).
+- [ ] `status --json` tem `"limits"` com `"profile":"shared-pc"`, `"max_job_cpus":1.0`, e `"waiting_for":null`.
+- [ ] Com uma tarefa do mock rodando: `wsl -d shutup-and-run -u root docker inspect -f '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}' $(wsl -d shutup-and-run -u root docker ps -q)` imprime `1000000000` e o mesmo número duas vezes (2147483648 num PC de 16 GiB).
+- [ ] Inicie o mock com `--memory 8g`: nenhuma tarefa começa, e `shutup-and-run wsl logs` tem `poll task rejected`.
+- [ ] `shutup-and-run config set min_free_memory 900g --apply`: `status` mostra `waiting_for: low on memory`, o mock não recebe mais polls, e a linha `resources` do doctor é um aviso com `fix:`. `shutup-and-run config unset min_free_memory --apply` e os polls voltam.
+- [ ] Com um `.wslconfig` seu, com outras chaves e `memory=64GB`: `wsl limits` sai com 1; `wsl limits --apply` muda só `memory=` e `processors=`, e `.wslconfig.bak` é o arquivo antigo. O doctor diz `not in effect yet` até o PC reiniciar ou você mesmo rodar `wsl --shutdown`.
+
 ## 5. Windows 11: o atalho, parar, desligar
 
 Ponha o atalho na área de trabalho:

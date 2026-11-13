@@ -2,7 +2,7 @@
   "listen": "127.0.0.1:8787",
   "http": true,
   "status_page": true,
-  "max_slots": 2,
+  "max_slots": 1,
   "allowlist": [
     "hello-world"
   ],
@@ -11,6 +11,11 @@
   "poll_any_image": true,
   "worker_name": "DESK-07",
   "worker_os": "windows",
+  "resource_profile": "shared-pc",
+  "max_job_cpus": "1",
+  "max_job_memory": "2g",
+  "min_free_memory": "2g",
+  "min_free_disk": "5g",
   "history_path": "/var/lib/shutup-and-run/jobs.sqlite",
   "token": "REPLACE-WITH-32-RANDOM-CHARACTERS",
   "poll_token": "REPLACE-WITH-THE-MACHINE-POLL-TOKEN"

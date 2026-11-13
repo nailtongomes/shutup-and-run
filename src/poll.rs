@@ -115,6 +115,12 @@ pub(crate) async fn poll_once(
         tracing::debug!(free = slots.free, draining = slots.draining, "poll skipped");
         return Ok(PollOutcome::Idle);
     }
+    // Do not ask for a task the machine could not start: a task that was
+    // handed out and then refused here is lost to the server.
+    if let Some(shortage) = launcher.shortage() {
+        tracing::debug!(%shortage, "poll skipped");
+        return Ok(PollOutcome::Idle);
+    }
 
     let settings = launcher.settings();
     let mut request = client
@@ -218,16 +224,8 @@ pub(crate) fn poll_body(settings: &crate::config::Settings, free_slots: usize) -
         "max_slots": settings.max_slots,
         "free_slots": free_slots,
         "cpus": std::thread::available_parallelism().map(|n| n.get()).ok(),
-        "memory_bytes": total_memory_bytes(),
+        "memory_bytes": crate::resources::memory_total(),
     })
-}
-
-/// `MemTotal` of `/proc/meminfo`. None where that file does not exist.
-fn total_memory_bytes() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = text.lines().find(|line| line.starts_with("MemTotal:"))?;
-    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    kib.checked_mul(1024)
 }
 
 /// A poll answer: nothing, a task, or `{"manifest_url": "..."}`. A manifest body
@@ -380,6 +378,7 @@ mod tests {
             default_timeout_secs = 30
             max_timeout_secs = 60
             history_path = '{}'
+            resource_profile = "none"
             {extra}
             "#,
             dir.join("jobs.sqlite").display()
@@ -808,6 +807,38 @@ mod tests {
         let outcome = poll_once(&launcher, &client().unwrap()).await.unwrap();
         assert_eq!(outcome, PollOutcome::Idle);
         assert_eq!(server.hits.load(Ordering::Relaxed), 0);
+        assert_eq!(mock.start_count().await, 0);
+    }
+
+    /// A task is not asked for while the machine could not start it: the
+    /// server keeps it for a machine that can.
+    #[tokio::test]
+    async fn skips_poll_when_memory_or_disk_is_short() {
+        for extra in [
+            "min_free_memory = \"4000000g\"",
+            "min_free_disk = \"4000000g\"",
+        ] {
+            // The readings come from /proc/meminfo and statvfs.
+            if !cfg!(target_os = "linux") {
+                continue;
+            }
+            let server = poll_server(StatusCode::OK, r#"{"image":"alpine"}"#).await;
+            let (launcher, mock) =
+                launcher_for(1, &format!("poll_url = \"{}\"\n{extra}", server.url), &[]);
+            let outcome = poll_once(&launcher, &client().unwrap()).await.unwrap();
+            assert_eq!(outcome, PollOutcome::Idle, "{extra}");
+            assert_eq!(server.hits.load(Ordering::Relaxed), 0, "{extra}");
+            assert_eq!(mock.start_count().await, 0);
+        }
+        // A polled task above the machine's limit is refused like a push.
+        let server = poll_server(StatusCode::OK, r#"{"image":"alpine","memory":"3g"}"#).await;
+        let (launcher, mock) = launcher_for(
+            1,
+            &format!("poll_url = \"{}\"\nmax_job_memory = \"2g\"", server.url),
+            &[],
+        );
+        let outcome = poll_once(&launcher, &client().unwrap()).await.unwrap();
+        assert_eq!(outcome, PollOutcome::Rejected);
         assert_eq!(mock.start_count().await, 0);
     }
 }

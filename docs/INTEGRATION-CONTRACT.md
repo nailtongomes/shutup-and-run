@@ -1,6 +1,6 @@
 # Integration contract
 
-What an orchestrator (n8n, Kestra, your own API) needs in order to give work to a shutup-and-run machine and learn how it ended, without reading the Rust source. It describes what the runner does today, release 0.2.4. Where the behavior is awkward it is written down as it is, under [Limits](#9-limits-of-the-current-contract), and not as it might be wished.
+What an orchestrator (n8n, Kestra, your own API) needs in order to give work to a shutup-and-run machine and learn how it ended, without reading the Rust source. It describes what the runner does today, release 0.2.6. Where the behavior is awkward it is written down as it is, under [Limits](#9-limits-of-the-current-contract), and not as it might be wished.
 
 Machine-readable, JSON Schema Draft 2020-12:
 
@@ -46,7 +46,7 @@ The runner starts a container and reports how the container ended. It keeps no q
   },
   "command": ["python", "main.py", "--once"],
   "timeout_secs": 900,
-  "cpu": 1.5,
+  "cpu": 1,
   "memory": "2g",
   "shm": "1g",
   "callback_url": "https://n8n.example.com/webhook/n3-callback/REPLACE_WITH_CALLBACK_SECRET"
@@ -62,8 +62,8 @@ The smallest one is `{"image": "ghcr.io/nailtongomes/shutup-and-run-smoke"}`.
 | `env` | no | object of string to string, at most 128 entries | `{}` | A name matches `^[A-Za-z_][A-Za-z0-9_]*$`, at most 256 bytes. A value is at most 16384 bytes and has no NUL. |
 | `command` | no | array of at most 32 strings, each 1 to 4096 bytes, no NUL | the image's own | Docker `Cmd`. It replaces the image's default command, not its entrypoint. `[]` is the same as leaving it out. |
 | `timeout_secs` | no | integer, 1 to the machine's `max_timeout_secs` | the machine's `default_timeout_secs` (3600) | `max_timeout_secs` is 21600 by default and never above 604800. Counted from the container's start. Then SIGKILL, with no grace. The image pull has the same limit, separately. |
-| `cpu` | no | number, above 0, at most 128 | no limit | Cores. `0.5`, `2`. |
-| `memory` | no | positive integer of bytes, or a string such as `512m`, `1.5g`, `2GiB` | no limit | Units `b k kb kib m mb mib g gb gib`, any case, all powers of 1024. Swap is set to the same value. |
+| `cpu` | no | number, above 0, at most 128 and at most the machine's `max_job_cpus` | the machine's `max_job_cpus`; no limit when it has none | Cores. `0.5`, `1`. A shared PC allows 1 by default. |
+| `memory` | no | positive integer of bytes, or a string such as `512m`, `1.5g`, `2GiB`, at most the machine's `max_job_memory` | the machine's `max_job_memory`; no limit when it has none | Units `b k kb kib m mb mib g gb gib`, any case, all powers of 1024. Swap is set to the same value, so the container gets no swap beyond it. A shared PC allows `2g` by default, less on a small one. See [Resource limits](#resource-limits-of-a-machine). |
 | `shm` | no | as `memory` | Docker's 64 MiB | Size of `/dev/shm`. A browser usually needs `1g` or more. |
 | `callback_url` | no | string, at most 2048 bytes, `http` or `https` with a host, no whitespace | none | See [section 5](#5-callback). |
 
@@ -109,12 +109,22 @@ Content-Type: application/json
 | `413` | plain text | The body is over 64 KiB. | Fix the request. |
 | `429` | `{"error":"no free slots","slots_total":2,"slots_used":2,"slots_free":0}` | Full. Nothing was stored, the `job_key` included. | Try the next machine, or this one later. |
 | `503` | `{"error":"draining","draining":true}` | Draining for maintenance. Nothing was stored. | Try the next machine. |
+| `503` | `{"error":"insufficient resources","resource":"memory","free_bytes":536870912,"needed_bytes":2147483648}` | The machine is short of memory or disk right now (`resource` is `memory` or `disk`). Nothing was stored, the `job_key` included. It clears by itself. | Try the next machine, or this one later. |
 | `502` | `{"error":"docker is unavailable"}` | The Docker daemon did not answer. | Try the next machine. Tell a person. |
 | `502` | `{"error":"job history is unavailable"}` | The SQLite file could not be read or written. | Same. |
 
-A request is checked in this order, and the first failure answers: ban, token, body size, JSON shape, `image` name, allowlist, `timeout_secs`, `env`, `command`, `job_key`, `callback_url`, `cpu`, drain, `job_key` lookup, slots. Two consequences: a draining machine answers `503` even for a `job_key` it already holds, and a repeat of a known `job_key` with an invalid body is a `400`.
+A request is checked in this order, and the first failure answers: ban, token, body size, JSON shape, `image` name, allowlist, `timeout_secs`, `env`, `command`, `job_key`, `callback_url`, `cpu`, `memory`, drain, `job_key` lookup, slots, free memory and disk. Two consequences: a draining machine answers `503` even for a `job_key` it already holds, and a repeat of a known `job_key` with an invalid body is a `400`.
 
-The `400` messages: `invalid image name`, `timeout_secs must be greater than zero`, `timeout_secs <n> is above the maximum <max>`, `env accepts at most 128 variables`, `invalid environment variable: <name>`, `invalid value for <name>`, `command accepts at most 32 arguments`, `invalid command argument`, `job_key must be 1-200 characters of letters, digits, '.', '_', ':' or '-'`, `callback_url is invalid`, `callback_url must be http or https`, `cpu must be a number between 0 and 128`, `cpu is invalid`. Match on the status, not on the text.
+The `400` messages: `invalid image name`, `timeout_secs must be greater than zero`, `timeout_secs <n> is above the maximum <max>`, `env accepts at most 128 variables`, `invalid environment variable: <name>`, `invalid value for <name>`, `command accepts at most 32 arguments`, `invalid command argument`, `job_key must be 1-200 characters of letters, digits, '.', '_', ':' or '-'`, `callback_url is invalid`, `callback_url must be http or https`, `cpu must be a number between 0 and 128`, `cpu is invalid`, `cpu <n> is above this machine's limit of <max> per job`, `memory <bytes> is above this machine's limit of <max> bytes per job`. Match on the status, not on the text.
+
+### Resource limits of a machine
+
+A machine may cap what one job gets (`max_job_cpus`, `max_job_memory`) and refuse to start a job while it is short of memory or disk (`min_free_memory`, `min_free_disk`). The `shared-pc` profile sets all four, and is the default on Windows: 1 CPU and `2g` per job, and a new job needs `2g` of memory and `5g` of disk free. On a machine (on Windows, the WSL2 VM) with under 4 GiB, the two memory figures are half of what it has. A Linux machine has none of this unless its config asks for it.
+
+- A job that names no `cpu` or `memory` gets the machine's limit. Every container on such a machine runs limited.
+- A job that names more than the limit is a `400`, on a push and on a polled task alike. It is not cut down silently: the sender should know the machine is smaller than it thought.
+- Short of memory or disk, a push gets the `503` above, and a pull worker **does not poll**, the same as when it has no free slot. A task is never asked for and then dropped for lack of memory.
+- The limits are not in the poll body. An orchestrator that serves shared PCs sends tasks that fit the defaults, or names `cpu` and `memory` at or below them.
 
 ### Acceptance is not a started container
 
@@ -266,7 +276,7 @@ Content-Type: application/json
 | `arch` | string | `x86_64`, `aarch64`. |
 | `version` | string | The runner's version, such as `0.2.4`. |
 | `max_slots` | integer, 1 to 256 | Containers the machine runs at once. |
-| `free_slots` | integer, 1 to `max_slots` | Free when the poll was sent. Never `0`: a full machine does not poll. |
+| `free_slots` | integer, 1 to `max_slots` | Free when the poll was sent. Never `0`: a full machine does not poll. Neither does one that is short of memory or disk. |
 | `cpus` | integer or `null` | What the process sees. On Windows that is the WSL2 VM. |
 | `memory_bytes` | integer or `null` | Same. |
 
@@ -321,7 +331,7 @@ A manifest reference:
 
 `{"task": ...}` and `{"manifest_url": ...}` must be the only key in the object. `{"task": {...}, "lease": "abc"}` is rejected whole. One task per poll: there is no array form, and `free_slots: 3` still gets one.
 
-A `200` body that is none of the forms above (not JSON, an array, a task with an unknown field, a bad `manifest_url`) is **dropped**: the worker logs `poll task rejected`, starts nothing, and asks again after the normal interval. The server is not told. The same happens when the task is well formed and the machine then refuses it, for the reasons a push gets `400`, `403`, `429` or `503`.
+A `200` body that is none of the forms above (not JSON, an array, a task with an unknown field, a bad `manifest_url`) is **dropped**: the worker logs `poll task rejected`, starts nothing, and asks again after the normal interval. The server is not told. The same happens when the task is well formed and the machine then refuses it, for the reasons a push gets `400`, `403`, `429` or `503`. That includes a task whose `cpu` or `memory` is above the machine's limit.
 
 ### Timing and limits
 
@@ -482,7 +492,7 @@ What the schemas do not express, and the runner still checks: control characters
 Found while writing this document. None was changed here. Each is something an orchestrator has to design around today.
 
 1. **No acknowledgement in pull mode.** The server never learns that an offered task was accepted, dropped or invalid. A task with a typo is dropped on every poll, forever, with only a line in the worker's own log. Test a new task shape with a push to a Linux machine, or against the schema, before queueing it for a Windows worker.
-2. **A busy worker is silent.** A machine with no free slot does not poll. With `max_slots = 1`, a job that runs for an hour is an hour without a poll. The server cannot tell busy from switched off. Use the offered job's own deadline, not the time since the last poll, to decide a machine is gone.
+2. **A busy worker is silent.** A machine with no free slot, or short of memory or disk, does not poll. With `max_slots = 1`, a job that runs for an hour is an hour without a poll. The server cannot tell busy from switched off. Use the offered job's own deadline, not the time since the last poll, to decide a machine is gone.
 3. **A lost callback cannot be recovered in pull mode.** Nothing outside the PC can call `GET /v1/jobs/{id}` on a Windows worker, and offering the same `job_key` again returns the stored job to nobody: the callback is not sent a second time. If the three tries fail, the result exists only on that PC. Have the container report its own result.
 4. **Callbacks are not authenticated or signed**, and are neither persisted nor retried beyond three quick tries. See [section 5](#5-callback).
 5. **Drain hides `job_key`.** `503` comes before the key lookup. See [section 6](#6-idempotency-and-delivery).
@@ -492,8 +502,10 @@ Found while writing this document. None was changed here. Each is something an o
 9. **The poll needs a public certificate.** See the TLS row in [section 3](#3-poll). An n8n behind a private certificate authority cannot be polled over `https`.
 10. **One task per poll, no jitter.** Many machines started at the same moment poll at the same moment. With hundreds of them, spread the load at the server.
 11. **`reason` is coarse.** A job cut by a shutdown, by an out-of-memory kill or by `docker kill` is `exited` with a non-zero or `null` `exit_code`. There is no separate reason for them.
-12. **A machine's limits are not discoverable.** The poll body does not carry `max_timeout_secs` or the allowlist, by decision. A task over a machine's timeout limit is dropped there (limit 1 applies).
+12. **A machine's limits are not discoverable.** The poll body does not carry `max_timeout_secs`, `max_job_cpus`, `max_job_memory` or the allowlist, by decision. A task over a machine's timeout, CPU or memory limit is dropped there (limit 1 applies).
 13. **A re-install on Windows ends the jobs that are running.** `shutup-and-run wsl install` restarts the WSL2 distribution. Their callbacks are sent when the service comes back, as `exited` with a non-zero or `null` `exit_code`.
+14. **Free memory is measured where the service runs.** On Windows that is the WSL2 VM, not the PC: the VM can have memory free while Windows is short, and the check does not see it. `.wslconfig` is what bounds the VM. The check is also taken once, at admission: a job that grows later is held by its own memory limit, and a PC can still slow down.
+15. **A task claimed in the instant memory runs out is dropped.** The worker checks before it polls and again when it starts the task. Between the two, another program can take the memory. The window is one HTTP round trip (limit 1 applies).
 
 One constant in the source, `launcher_kill`, is a `reason` that no code path emits. It is not part of the contract.
 
@@ -502,7 +514,7 @@ One constant in the source, `launcher_kill`, is a `reason` that no code path emi
 What an orchestrator may rely on, and what `src/contract.rs` fails on if it changes:
 
 - The nine keys of a JobResult, the eight keys of the poll body, and the five keys of `/health`.
-- The status codes and error bodies in [section 2](#2-push-post-v1jobs).
+- The status codes and error bodies in [section 2](#2-push-post-v1jobs). `503` `insufficient resources` and the two `above this machine's limit` messages were added in 0.2.6; a caller that already routes on `400` and `503` needs no change.
 - Every poll answer form in [section 3](#3-poll), the bare task and the empty forms included.
 - Unknown fields rejected in a JobRequest, a poll answer and a manifest.
 - No `schema_version`, no register call, no new required field.

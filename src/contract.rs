@@ -136,6 +136,7 @@ fn machine(slots: usize, extra: &str, env: &[(&str, &str)]) -> Machine {
         allowlist = ["alpine", "ghcr.io/you/worker", "ghcr.io/nailtongomes/shutup-and-run-smoke"]
         auth_failures = 30
         history_path = '{}'
+        resource_profile = "none"
         {extra}
         "#,
         dir.join("jobs.sqlite").display()
@@ -518,6 +519,46 @@ async fn push_refusals_have_the_documented_status_and_body() {
         .await;
     assert_eq!(push(&m.app, held).await.0, StatusCode::ACCEPTED);
     m.launcher.settled().await;
+
+    // A machine short of memory or disk: 503, nothing stored, safe elsewhere.
+    for (resource, extra) in [
+        ("memory", "min_free_memory = \"4000000g\""),
+        ("disk", "min_free_disk = \"4000000g\""),
+    ] {
+        // The readings come from /proc/meminfo and statvfs.
+        if !cfg!(target_os = "linux") {
+            continue;
+        }
+        let m = machine(1, extra, &[]);
+        let (status, body) = push(&m.app, held).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "insufficient resources");
+        assert_eq!(body["resource"], resource);
+        assert_eq!(body["needed_bytes"], 4_000_000u64 << 30);
+        assert!(body["free_bytes"].as_u64().unwrap() < 4_000_000u64 << 30);
+        assert_eq!(body.as_object().unwrap().len(), 4);
+        assert_eq!(m.launcher.counts().unwrap().started, 0);
+    }
+
+    // A job that asks for more than the machine gives one job: 400, with the limit.
+    let limited = machine(1, "max_job_cpus = \"1\"\nmax_job_memory = \"2g\"", &[]);
+    let (status, body) = push(&limited.app, r#"{"image":"alpine","cpu":2}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body,
+        json!({"error": "cpu 2 is above this machine's limit of 1 per job"})
+    );
+    let (status, body) = push(&limited.app, r#"{"image":"alpine","memory":"3g"}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body,
+        json!({"error": "memory 3221225472 is above this machine's limit of 2147483648 bytes per job"})
+    );
+    // The full example asks for less than that and still starts.
+    let (name, text) = example!("job-request.full.json");
+    let _ = name;
+    assert_eq!(push(&limited.app, text).await.0, StatusCode::ACCEPTED);
+    limited.launcher.settled().await;
     call(
         &m.app,
         "POST",
@@ -1050,6 +1091,12 @@ fn the_config_schema_matches_the_keys_and_the_validation() {
         ("token", json!("short")),
         ("allowlist", json!("alpine")),
         ("no_such_key", json!(true)),
+        ("resource_profile", json!("gaming-pc")),
+        ("max_job_cpus", json!(1)),
+        ("max_job_cpus", json!("many")),
+        ("max_job_memory", json!("lots")),
+        ("min_free_memory", json!(2)),
+        ("min_free_disk", json!("5 apples")),
     ] {
         let mut map = config::default_map();
         map.insert(key.to_string(), bad.clone());

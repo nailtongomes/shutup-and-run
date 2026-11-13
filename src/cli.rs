@@ -64,6 +64,18 @@ shutup-and-run doctor [--report]
 shutup-and-run pause | resume
     stop or start taking new work. Running containers are left alone.
 
+Resource limits, for a machine someone is working on:
+    shutup-and-run config set resource_profile shared-pc --apply
+turns on the shared-PC profile (the default on Windows): each job gets at most
+1 CPU and 2g of memory with no extra swap, and no new job starts with less
+than 2g of memory or 5g of disk free. On a machine with under 4g the two
+memory figures are half of what it has. `none` turns the profile off. Each
+figure has its own key: max_job_cpus, max_job_memory, min_free_memory,
+min_free_disk (sizes like 2g or 512m; 0 turns a min_free check off). A job
+that asks for more than the machine's limit is refused with the limit in the
+answer. `status --json` shows the limits in force under `limits`, and
+`waiting_for` says why no job starts while memory or disk is short.
+
 The config is one JSON file: /etc/shutup-and-run/config.json (on Windows,
 inside the shutup-and-run WSL distribution). Schema:
 docs/schemas/worker-config.schema.json. Guide: docs/FOR-AGENTS.md."
@@ -510,7 +522,13 @@ pub fn status_out(path: &Path, now: i64) -> Out {
         status["slots_used"],
         status["slots_total"]
     );
-    for field in ["last_error", "poll_error", "config_warning"] {
+    if let Some(limits) = serde_json::from_value::<crate::status::Limits>(status["limits"].clone())
+        .ok()
+        .filter(|limits| !limits.profile.is_empty())
+    {
+        text.push_str(&format!("limits: {}\n", limits.line()));
+    }
+    for field in ["last_error", "poll_error", "waiting_for", "config_warning"] {
         if let Some(value) = status[field].as_str() {
             text.push_str(&format!("{field}: {value}\n"));
         }
@@ -883,6 +901,11 @@ async fn examine() -> Found {
         )),
         _ => check("service", false, "not running").fix(start),
     });
+    checks.push(resources_check(
+        &settings,
+        crate::resources::memory_total(),
+        crate::resources::read(&crate::resources::disk_path(&settings.history_path)),
+    ));
     if let Some(warning) = &settings.config_warning {
         checks.push(
             soft("config-in-use", false, warning.clone())
@@ -964,6 +987,62 @@ async fn examine() -> Found {
         status,
         secrets,
     }
+}
+
+/// The limits in force, and whether the machine can take a job under them
+/// right now. Never a hard failure: the worker runs, and waits.
+pub fn resources_check(
+    settings: &Settings,
+    memory_total: Option<u64>,
+    free: crate::resources::Free,
+) -> Check {
+    use crate::resources::human;
+    let limits = crate::status::Limits::of(settings).line();
+    if let Some(short) =
+        crate::resources::shortage(free, settings.min_free_memory, settings.min_free_disk)
+    {
+        let fix = if short.resource == "disk" {
+            "free disk space: `docker image prune -af` removes images no job is using (on \
+             Windows: `wsl -d shutup-and-run -u root docker image prune -af`). To ask for \
+             less: `shutup-and-run config set min_free_disk 2g --apply`"
+        } else {
+            "it clears when programs close or a job ends; nothing is lost meanwhile. To ask \
+             for less: `shutup-and-run config set min_free_memory 1g --apply`. On Windows, \
+             `shutup-and-run wsl limits` shows how much memory WSL2 has"
+        };
+        return soft(
+            "resources",
+            false,
+            format!("{short}: no new job starts until it clears. {limits}"),
+        )
+        .fix(fix);
+    }
+    if let (Some(per_job), Some(total)) = (settings.max_job_memory, memory_total) {
+        let fit = (total / per_job.max(1)).max(1);
+        if settings.max_slots as u64 > fit {
+            return soft(
+                "resources",
+                false,
+                format!(
+                    "{} jobs of {} each is more than the {} this machine has. {limits}",
+                    settings.max_slots,
+                    human(per_job),
+                    human(total)
+                ),
+            )
+            .fix(format!(
+                "`shutup-and-run config set max_slots {fit} --apply`, or a smaller \
+                 `max_job_memory`"
+            ));
+        }
+    }
+    let free_now = match (free.memory, free.disk) {
+        (Some(memory), Some(disk)) => {
+            format!("; free now: memory {}, disk {}", human(memory), human(disk))
+        }
+        _ => String::new(),
+    };
+    check("resources", true, format!("{limits}{free_now}"))
 }
 
 /// Can a TCP connection be opened to the poll URL's host? Nothing is sent,
@@ -1193,6 +1272,96 @@ mod tests {
         assert_eq!(stale.code, EXIT_FAILED);
         assert_eq!(stale.json["ok"], false);
         assert_eq!(stale.json["stale"], true);
+    }
+
+    #[test]
+    fn the_resource_profile_is_set_and_inspected_from_the_cli() {
+        let path = temp("resources");
+        let set = |words: &[&str]| config_command(&path, words, false);
+        assert_eq!(set(&["set", "resource_profile", "shared-pc"]).code, 0);
+        assert_eq!(set(&["set", "max_job_memory", "1g"]).code, 0);
+        assert_eq!(set(&["set", "max_job_cpus", "0.5"]).code, 0);
+        let before = std::fs::read_to_string(&path).unwrap();
+        for (key, bad) in [
+            ("resource_profile", "gaming"),
+            ("max_job_cpus", "lots"),
+            ("max_job_memory", "1m"),
+            ("min_free_disk", "five"),
+        ] {
+            let out = set(&["set", key, bad]);
+            assert_eq!(out.code, EXIT_INVALID, "{key}={bad}");
+            assert!(out.json["error"].as_str().unwrap().contains(key));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(set(&["get", "max_job_memory"]).text, "1g");
+        let keys = set(&["keys"]).text;
+        for key in ["resource_profile", "max_job_cpus", "min_free_memory"] {
+            assert!(keys.contains(key), "{key}");
+        }
+        let settings = Settings::from_json_map(&config::read_json(&path).unwrap()).unwrap();
+        assert_eq!(settings.max_job_memory, Some(1 << 30));
+        assert_eq!(set(&["unset", "max_job_memory"]).code, 0);
+
+        // The doctor's line: fine, short of memory, short of disk, too many slots.
+        const GIB: u64 = 1 << 30;
+        let mut settings = settings;
+        settings.max_job_memory = Some(2 * GIB);
+        settings.min_free_memory = 2 * GIB;
+        settings.min_free_disk = 5 * GIB;
+        let free = |memory, disk| crate::resources::Free {
+            memory: Some(memory),
+            disk: Some(disk),
+        };
+        let fine = resources_check(&settings, Some(8 * GIB), free(4 * GIB, 50 * GIB));
+        assert!(fine.ok, "{}", fine.detail);
+        assert!(fine.detail.starts_with(
+            "profile shared-pc; per job: cpu 0.5, memory 2.0 GiB; a new job needs free memory 2.0 GiB, free disk 5.0 GiB; free now: memory 4.0 GiB, disk 50.0 GiB"
+        ));
+        let low = resources_check(&settings, Some(8 * GIB), free(GIB, 50 * GIB));
+        assert!(!low.ok && low.soft);
+        assert!(low
+            .detail
+            .starts_with("low on memory: 1.0 GiB free, 2.0 GiB needed"));
+        assert!(low.fix.contains("min_free_memory"));
+        let full = resources_check(&settings, Some(8 * GIB), free(4 * GIB, GIB));
+        assert!(full.detail.starts_with("low on disk"));
+        assert!(full.fix.contains("docker image prune"));
+        settings.max_slots = 3;
+        let many = resources_check(&settings, Some(4 * GIB), free(4 * GIB, 50 * GIB));
+        assert!(!many.ok && many.soft);
+        assert!(
+            many.fix.contains("config set max_slots 2 --apply"),
+            "{}",
+            many.fix
+        );
+        // A soft line never makes the doctor exit 1.
+        assert!(report(&[many]).1);
+    }
+
+    #[test]
+    fn status_shows_the_limits_and_why_the_worker_waits() {
+        let path = temp("status-limits").with_file_name("status.json");
+        let now = 1_700_000_000;
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "state": "idle", "slots_total": 1, "slots_used": 0,
+                "updated_at": crate::status::unix_to_iso(now),
+                "waiting_for": "low on memory: 512 MiB free, 2.0 GiB needed",
+                "limits": {"profile": "shared-pc", "max_job_cpus": 1.0,
+                    "max_job_memory_bytes": 2147483648u64,
+                    "min_free_memory_bytes": 2147483648u64, "min_free_disk_bytes": 0},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let out = status_out(&path, now);
+        assert_eq!(out.code, 0);
+        assert!(out
+            .text
+            .contains("limits: profile shared-pc; per job: cpu 1, memory 2.0 GiB"));
+        assert!(out.text.contains("waiting_for: low on memory"));
+        assert_eq!(out.json["limits"]["max_job_cpus"], 1.0);
     }
 
     #[test]

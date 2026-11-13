@@ -13,6 +13,7 @@ struct Inner {
     removed_images: Vec<String>,
     pulls: Vec<String>,
     starts: u64,
+    specs: Vec<StartSpec>,
     fail_list: bool,
     fail_start: bool,
 }
@@ -40,6 +41,7 @@ impl MockRuntime {
                 removed_images: Vec::new(),
                 pulls: Vec::new(),
                 starts: 0,
+                specs: Vec::new(),
                 fail_list: false,
                 fail_start: false,
             }),
@@ -56,6 +58,11 @@ impl MockRuntime {
 
     pub async fn start_count(&self) -> u64 {
         self.inner.lock().await.starts
+    }
+
+    /// What each started container was given, in start order.
+    pub async fn specs(&self) -> Vec<StartSpec> {
+        self.inner.lock().await.specs.clone()
     }
 
     pub async fn pulls(&self) -> Vec<String> {
@@ -108,6 +115,7 @@ impl Runtime for MockRuntime {
             return Err(RuntimeError::new("start failed"));
         }
         inner.starts += 1;
+        inner.specs.push(spec.clone());
         let id = id.to_string();
         inner.running.insert(id.clone(), spec.deadline_unix);
         inner.logs.insert(id.clone(), format!("log {id}\n"));

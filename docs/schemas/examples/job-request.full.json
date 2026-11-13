@@ -12,7 +12,7 @@
     "--once"
   ],
   "timeout_secs": 900,
-  "cpu": 1.5,
+  "cpu": 1,
   "memory": "2g",
   "shm": "1g",
   "callback_url": "https://n8n.example.com/webhook/n3-callback/REPLACE_WITH_CALLBACK_SECRET"

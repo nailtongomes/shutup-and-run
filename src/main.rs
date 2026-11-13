@@ -213,6 +213,10 @@ async fn serve() -> ExitCode {
         Err(err) => tracing::warn!(error = %err, "cleanup of created containers"),
     }
 
+    tracing::info!(
+        limits = %shutup_and_run::status::Limits::of(&settings).line(),
+        "resource limits"
+    );
     let listen = settings.listen;
     let http_plain = settings.http_plain;
     let tls_cert = settings.tls_cert.clone();

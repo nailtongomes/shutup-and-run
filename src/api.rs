@@ -190,6 +190,15 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
             "draining",
             Some(json!({"draining": true})),
         ),
+        Err(LaunchError::LowResources(shortage)) => error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "insufficient resources",
+            Some(json!({
+                "resource": shortage.resource,
+                "free_bytes": shortage.free_bytes,
+                "needed_bytes": shortage.needed_bytes,
+            })),
+        ),
         Err(LaunchError::Unavailable(msg)) => error_body(StatusCode::BAD_GATEWAY, &msg, None),
     }
 }
@@ -364,6 +373,7 @@ mod tests {
                 default_timeout_secs = 30
                 max_timeout_secs = 60
                 history_path = '{}'
+                resource_profile = "none"
                 {extra}
                 "#,
                 dir.join("jobs.sqlite").display()

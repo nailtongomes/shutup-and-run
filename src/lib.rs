@@ -15,6 +15,7 @@ pub mod launcher;
 pub mod lock;
 pub mod poll;
 pub mod registry;
+pub mod resources;
 pub mod runtime;
 pub mod status;
 pub mod store;

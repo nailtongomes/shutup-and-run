@@ -62,7 +62,7 @@
       "maximum": 604800
     },
     "cpu": {
-      "description": "CPU limit in cores, such as 0.5 or 2. No limit when omitted.",
+      "description": "CPU limit in cores, such as 0.5 or 1. Omitted: the machine's max_job_cpus, or no limit when the machine has none. Above the machine's max_job_cpus the request is refused with 400.",
       "type": [
         "number",
         "null"
@@ -71,7 +71,7 @@
       "maximum": 128
     },
     "memory": {
-      "description": "Memory limit. Swap is set to the same value. Without it Docker does not cap the container.",
+      "description": "Memory limit. Swap is set to the same value. Omitted: the machine's max_job_memory, or no cap when the machine has none. Above the machine's max_job_memory the request is refused with 400.",
       "$ref": "#/$defs/byteQuantity"
     },
     "shm": {
