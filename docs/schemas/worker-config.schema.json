@@ -112,6 +112,34 @@
       "minLength": 1,
       "maxLength": 64
     },
+    "resource_profile": {
+      "type": "string",
+      "enum": [
+        "shared-pc",
+        "none"
+      ],
+      "description": "shared-pc: the machine is someone's everyday computer. Each job gets at most 1 CPU and 2g of memory with no extra swap, and no new job starts with less than 2g of memory or 5g of disk free; on a machine (on Windows, the WSL2 VM) with under 4g the two memory figures are half of what it has. none: no such defaults. Default: shared-pc when worker_os is windows, otherwise none. The four keys below replace one figure each, under either profile."
+    },
+    "max_job_cpus": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?$",
+      "description": "The most CPU one job may ask for, and what a job that asks for none gets, as `docker run --cpus` counts: \"1\", \"0.5\". From 0.01 to 128. A job that asks for more is refused. A string, so it reads the same in the CLI and the file."
+    },
+    "max_job_memory": {
+      "type": "string",
+      "pattern": "^(0|[0-9]+(\\.[0-9]+)?\\s*([kKmMgG]([iI]?[bB])?|[bB])?)$",
+      "description": "The same for memory: \"2g\", \"512m\". At least 6m. The container gets no swap beyond it."
+    },
+    "min_free_memory": {
+      "type": "string",
+      "pattern": "^(0|[0-9]+(\\.[0-9]+)?\\s*([kKmMgG]([iI]?[bB])?|[bB])?)$",
+      "description": "No new job starts while less memory than this is available (MemAvailable where the service runs; on Windows that is the WSL2 VM, not the PC). \"0\" turns the check off."
+    },
+    "min_free_disk": {
+      "type": "string",
+      "pattern": "^(0|[0-9]+(\\.[0-9]+)?\\s*([kKmMgG]([iI]?[bB])?|[bB])?)$",
+      "description": "No new job starts while the disk Docker writes to has less than this free. \"0\" turns the check off."
+    },
     "history_path": {
       "type": "string",
       "description": "SQLite job history. status.json is written beside it.",

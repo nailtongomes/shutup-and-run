@@ -56,6 +56,9 @@ pub enum LaunchError {
     NoSlots { total: usize, used: usize },
     #[error("draining")]
     Draining,
+    /// The machine is short of memory or disk right now. Nothing was stored.
+    #[error("{0}")]
+    LowResources(crate::resources::Shortage),
     #[error("{0}")]
     Unavailable(String),
 }
@@ -166,6 +169,17 @@ impl Launcher {
         })
     }
 
+    /// Set when the machine has too little memory or disk for one more job.
+    /// Read fresh every time: it is two small reads, and it clears by itself.
+    pub fn shortage(&self) -> Option<crate::resources::Shortage> {
+        let (memory, disk) = (self.settings.min_free_memory, self.settings.min_free_disk);
+        if memory == 0 && disk == 0 {
+            return None;
+        }
+        let path = crate::resources::disk_path(&self.settings.history_path);
+        crate::resources::shortage(crate::resources::read(&path), memory, disk)
+    }
+
     pub fn set_poll_error(&self, error: Option<String>) {
         *self.poll_error.lock().expect("poll error") = error;
     }
@@ -200,6 +214,8 @@ impl Launcher {
             docker_error,
             last,
             poll_error: self.poll_error.lock().expect("poll error").clone(),
+            waiting_for: self.shortage().map(|s| s.to_string()),
+            limits: crate::status::Limits::of(&self.settings),
             config_warning: self.settings.config_warning.clone(),
         }
     }
@@ -234,7 +250,8 @@ impl Launcher {
         let command = validate_command(req.command)?;
         let job_key = validate_job_key(req.job_key)?;
         let callback_url = validate_callback(req.callback_url)?;
-        let nano_cpus = req.cpu.map(nano_cpus).transpose()?;
+        let nano_cpus = limit_cpu(req.cpu, self.settings.max_job_cpus)?;
+        let memory_bytes = limit_memory(req.memory_bytes, self.settings.max_job_memory)?;
 
         let spec = StartSpec {
             image: req.image.clone(),
@@ -243,7 +260,7 @@ impl Launcher {
             // Set when the container starts. Pull time does not count.
             deadline_unix: 0,
             nano_cpus,
-            memory_bytes: req.memory_bytes,
+            memory_bytes,
             shm_bytes: req.shm_bytes,
         };
 
@@ -262,6 +279,11 @@ impl Launcher {
                 total: self.settings.max_slots,
                 used,
             });
+        }
+        // Inside the slot lock, so two requests cannot both pass on the
+        // memory that only one of them will get.
+        if let Some(shortage) = self.shortage() {
+            return Err(LaunchError::LowResources(shortage));
         }
         let id = random_id();
         let record = NewJob {
@@ -716,6 +738,30 @@ fn validate_callback(callback_url: Option<String>) -> Result<Option<String>, Lau
     Ok(Some(url))
 }
 
+/// A job that names no limit gets the machine's; one that names more than the
+/// machine's is refused, not quietly cut, so its sender learns the limit.
+fn limit_cpu(requested: Option<f64>, max: Option<f64>) -> Result<Option<i64>, LaunchError> {
+    if let (Some(cpu), Some(max)) = (requested, max) {
+        if cpu > max {
+            return Err(LaunchError::BadRequest(format!(
+                "cpu {cpu} is above this machine's limit of {max} per job"
+            )));
+        }
+    }
+    requested.or(max).map(nano_cpus).transpose()
+}
+
+fn limit_memory(requested: Option<i64>, max: Option<u64>) -> Result<Option<i64>, LaunchError> {
+    if let (Some(bytes), Some(max)) = (requested, max) {
+        if bytes as u64 > max {
+            return Err(LaunchError::BadRequest(format!(
+                "memory {bytes} is above this machine's limit of {max} bytes per job"
+            )));
+        }
+    }
+    Ok(requested.or(max.map(|max| max.min(i64::MAX as u64) as i64)))
+}
+
 fn nano_cpus(cpu: f64) -> Result<i64, LaunchError> {
     if !cpu.is_finite() || cpu <= 0.0 || cpu > 128.0 {
         return Err(LaunchError::BadRequest(
@@ -823,6 +869,154 @@ mod tests {
             job_key: None,
             callback_url: None,
         }
+    }
+
+    fn harness_with(
+        slots: usize,
+        change: impl FnOnce(&mut Settings),
+    ) -> (Arc<Launcher>, Arc<MockRuntime>) {
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let mut settings = settings(slots);
+        change(&mut settings);
+        let clock = Arc::new(FakeClock::new(1_700_000_000));
+        (
+            Launcher::with_clock(settings, runtime, clock).unwrap(),
+            mock,
+        )
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[tokio::test]
+    async fn every_job_gets_the_machines_limits_and_none_gets_more() {
+        let limited = |s: &mut Settings| {
+            s.max_job_cpus = Some(1.0);
+            s.max_job_memory = Some(1024 * MIB);
+            s.poll_url = Some("http://127.0.0.1:9/poll".into());
+            s.poll_any_image = true;
+        };
+        let (launcher, mock) = harness_with(4, limited);
+        // No limits asked: the machine's. A push and a polled task alike.
+        launcher.launch(job("alpine", None)).await.unwrap();
+        launcher
+            .launch_from(job("some/other-image", None), JobSource::Poll)
+            .await
+            .unwrap();
+        // Less than the machine's: what was asked.
+        let mut small = job("alpine", None);
+        small.cpu = Some(0.5);
+        small.memory_bytes = Some((256 * MIB) as i64);
+        launcher.launch(small).await.unwrap();
+        // Exactly the machine's is allowed.
+        let mut exact = job("alpine", None);
+        exact.cpu = Some(1.0);
+        exact.memory_bytes = Some((1024 * MIB) as i64);
+        launcher.launch(exact).await.unwrap();
+        launcher.settled().await;
+        let mut given: Vec<(Option<i64>, Option<i64>)> = mock
+            .specs()
+            .await
+            .iter()
+            .map(|spec| (spec.nano_cpus, spec.memory_bytes))
+            .collect();
+        given.sort();
+        let full = (Some(1_000_000_000), Some((1024 * MIB) as i64));
+        assert_eq!(
+            given,
+            vec![
+                (Some(500_000_000), Some((256 * MIB) as i64)),
+                full,
+                full,
+                full
+            ]
+        );
+
+        // More than the machine's is refused, with the limit, from either source.
+        let (launcher, mock) = harness_with(4, limited);
+        for source in [JobSource::Push, JobSource::Poll] {
+            let mut greedy = job("alpine", None);
+            greedy.cpu = Some(2.0);
+            match launcher.launch_from(greedy, source).await {
+                Err(LaunchError::BadRequest(msg)) => {
+                    assert_eq!(msg, "cpu 2 is above this machine's limit of 1 per job")
+                }
+                other => panic!("{other:?}"),
+            }
+            let mut greedy = job("alpine", None);
+            greedy.memory_bytes = Some((2048 * MIB) as i64);
+            match launcher.launch_from(greedy, source).await {
+                Err(LaunchError::BadRequest(msg)) => assert!(
+                    msg.starts_with("memory 2147483648 is above this machine's limit of"),
+                    "{msg}"
+                ),
+                other => panic!("{other:?}"),
+            }
+            let mut invalid = job("alpine", None);
+            invalid.cpu = Some(0.0);
+            assert!(matches!(
+                launcher.launch_from(invalid, source).await,
+                Err(LaunchError::BadRequest(_))
+            ));
+        }
+        launcher.settled().await;
+        assert_eq!(mock.start_count().await, 0);
+        assert_eq!(launcher.counts().unwrap().started, 0);
+
+        // Without the profile nothing is added and nothing is refused.
+        let (launcher, mock) = harness_with(1, |_| {});
+        let mut big = job("alpine", None);
+        big.cpu = Some(8.0);
+        launcher.launch(big).await.unwrap();
+        launcher.settled().await;
+        let spec = &mock.specs().await[0];
+        assert_eq!(
+            (spec.nano_cpus, spec.memory_bytes),
+            (Some(8_000_000_000), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_machine_short_of_memory_or_disk_takes_no_job() {
+        // More than any machine has free, so the real reading is always short.
+        const NEVER: u64 = u64::MAX / 2;
+        for (resource, change) in [
+            (
+                "memory",
+                (|s| s.min_free_memory = NEVER) as fn(&mut Settings),
+            ),
+            ("disk", |s| s.min_free_disk = NEVER),
+        ] {
+            let (launcher, mock) = harness_with(2, change);
+            let mut keyed = job("alpine", None);
+            keyed.job_key = Some("k1".into());
+            match launcher.launch(keyed).await {
+                Err(LaunchError::LowResources(short)) => {
+                    assert_eq!(short.resource, resource);
+                    assert_eq!(short.needed_bytes, NEVER);
+                }
+                other => panic!("{resource}: {other:?}"),
+            }
+            launcher.settled().await;
+            // Nothing was stored, the job_key included, and no slot is held.
+            assert_eq!(mock.start_count().await, 0);
+            assert_eq!(launcher.counts().unwrap().started, 0);
+            assert_eq!(launcher.slots().await.unwrap().free, 2);
+            let live = launcher.live_status().await;
+            assert!(live
+                .waiting_for
+                .unwrap()
+                .starts_with(&format!("low on {resource}")));
+        }
+        // A bar the machine clears lets the job in.
+        let (launcher, mock) = harness_with(1, |s| {
+            s.min_free_memory = 1;
+            s.min_free_disk = 1;
+        });
+        launcher.launch(job("alpine", None)).await.unwrap();
+        launcher.settled().await;
+        assert_eq!(mock.start_count().await, 1);
+        assert!(launcher.live_status().await.waiting_for.is_none());
     }
 
     #[tokio::test]

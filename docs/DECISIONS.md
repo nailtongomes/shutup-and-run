@@ -304,6 +304,21 @@ So the premise changed, narrowly:
 
 What it costs. The tokens are now in a file a re-install does not rotate, on a machine whose user could always read them. The page is more code on a port, guarded by loopback, Host and Origin checks, and its "login" must never be mistaken for a control. A changed port needs the desktop shortcut rewritten, which `config apply` does on Windows. Linux gets the CLI and the page only with `config.json`; `install.sh` still writes `config.toml`, and there is no converter. Lease, heartbeat and idempotency are not part of this.
 
+## A shared PC: limits on every job, and no job into a full machine
+
+A Windows worker is a client's everyday computer, and a job used to run there with no limit unless the task named one. One browser job could take all the memory of the WSL2 VM, and the VM half the PC's RAM. The rule now is that the person at the PC comes first and throughput second.
+
+There are three layers, and each is something that already existed. The WSL2 VM is bounded by `.wslconfig` (40% of the RAM, half the processors). Each container is bounded by Docker's own `NanoCpus`, `Memory` and `MemorySwap`, which the runtime already set when a task asked: the `shared-pc` profile gives a default and a ceiling (`max_job_cpus` 1, `max_job_memory` 2g). And a job is not admitted while `MemAvailable` or the free disk is under a floor (`min_free_memory` 2g, `min_free_disk` 5g), checked inside the same lock that counts slots.
+
+- **One figure is both the default and the maximum.** A job that names nothing gets the machine's limit, and a job may ask for less. Two keys per resource (default and maximum) would be a second thing to get wrong for no case we have.
+- **A request above the limit is refused, not cut down.** A browser given half the memory it asked for fails later and in a stranger way. A `400` with the limit in it tells the sender now.
+- **The profile is the default on Windows only, by `worker_os`.** A worker installed before this gets the limits when its binary is replaced, with no config change. A Linux machine is the owner's server and keeps running as before unless `resource_profile = shared-pc` is set. The cost: a Windows worker whose tasks asked for more than 1 CPU or 2g starts refusing them after the upgrade, until the tasks or the keys change.
+- **Memory defaults shrink on a small machine**: half of `MemTotal` under 4 GiB. An 8 GiB PC gives WSL2 about 3.2 GiB, and a 2 GiB job plus a 2 GiB floor would never start there.
+- **A pull worker that is short does not poll.** The poll body stays at its eight keys and the protocol has no "busy" answer. Not asking is what a full worker already did. It cannot claim a task and then drop it, except in the one round trip between the check before the poll and the check at the start.
+- **`.wslconfig` is the user's file.** The install writes it only when it does not exist and the PC has no other distribution. Otherwise it reports, and `wsl limits --apply` is the explicit step: it replaces two keys, keeps every other line and leaves a `.wslconfig.bak`. Nothing runs `wsl --shutdown`, which would stop the user's other distributions; the doctor says `not in effect yet` until WSL restarts by itself.
+
+What it costs, and what it is not. The free-memory figure is the VM's, not Windows': the PC can be short while the VM looks fine. It is read once, at admission, not while the job runs. Disk and network use are not limited. There is no idle detection, no monitor, no resizing, and no job is killed for pressure; each of those is a daemon and a policy this project does not want yet. The four size keys are strings (`"2g"`, `"1"`) so the CLI and the file read the same, which makes `max_job_cpus` a quoted number in TOML.
+
 ## Smoke test against a running instance
 
 `scripts/accept.sh` starts its own instance. `scripts/smoke.sh` tests one that is already installed, through the API only, with the URL and token from the environment. It is safe on a live machine: its jobs echo and sleep under a short `timeout_secs`, it undrains what it drained, and it sends wrong tokens from `127.0.0.2`, never from the caller. What it cannot do from where it runs, it skips and says why.

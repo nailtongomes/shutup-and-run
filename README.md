@@ -2,398 +2,287 @@
 
 [Português](README.pt-BR.md)
 
-Self-hosted container job runner for spare CPU and RAM on a home or office PC. On Linux, Kestra or n8n pushes a Docker task to an HTTP API. On Windows 11 the service runs inside WSL2 and pulls tasks. Slots cap how many run at once. A timeout kills a task that runs too long. A full machine answers `429`.
+A small, self-hosted Docker job runner, in Rust, for the spare capacity of computers people already own.
 
-For someone lending idle machines to RPA or Selenium workers, or running a few edge workers and comparing Nomad, GitLab Runner, and Tork.
+A customer has PCs that sit mostly idle. Their automations (RPA, Selenium, scripts in a container) need somewhere to run. shutup-and-run turns such a PC, Windows 11 or Linux, into a worker: an orchestrator you already use, such as n8n or Kestra, decides what runs and where; this program starts the container on the customer's own machine, limits it, times it out, and reports how it ended.
 
-Not a queue, not a scheduler, not a CI system, and not a sandbox. No web UI. The binary starts an allowlisted image and does not know what the image does.
+It is built for a **shared PC**. Someone may be working on the machine while a job runs, and their work comes first: one job at a time, a CPU and a memory limit on every container, and no new job while memory or disk is short.
 
-## Similar projects
+It is also built to be run by the customer's own **AI agent**. Every command is non-interactive, prints JSON, and has a fixed exit code. The config is one file that is never edited by hand. A doctor names each problem with the command that fixes it.
 
-Nearby tools. This one is a single process on a machine you already have. Your orchestrator chooses the machine.
+## What it is, and is not
 
-- **Nomad** (HashiCorp) schedules jobs across a cluster. Use it when one control plane should place the work.
-- **HTCondor** matchmakes high-throughput jobs across a pool. Use it for a batch or research pool.
-- **GitLab Runner** runs GitLab CI jobs, with shell, Docker, or Kubernetes executors. Use it when the work is a GitLab pipeline.
-- **GitHub Actions self-hosted runner** runs GitHub Actions workflows on your hardware. Use it when the work is a GitHub workflow.
-- **Tork** is a workflow engine: a coordinator queues container tasks and workers run them, on one machine or across machines through a broker. Use it when you want that queue, retries, and jobs made of several tasks.
-- **BOINC** is volunteer computing. A project server hands work to a client people install to donate CPU. Use it when strangers run a published workload. This project runs your images on machines you set up.
+| It does | It does not |
+| --- | --- |
+| Start an allowlisted container image with the env, command, timeout and limits a task names | Queue, schedule, retry or chain tasks. Your orchestrator does that |
+| Take work two ways: **push** (`POST /v1/jobs`) and **pull** (the worker polls a URL of yours) | Coordinate machines. Each worker knows only itself |
+| Cap concurrency (`max_slots`), time (`timeout_secs`, then SIGKILL), CPU and memory per job | Sandbox the job. A container has Docker's default privileges and network |
+| Refuse work when full, draining, or short of memory or disk | Mount host folders, publish ports, or run privileged. There are no such fields |
+| Keep a job history in SQLite and call a webhook when a job ends | Return a job's output. A job reports an exit code; its data is sent by the container |
+| Show a local page with status and settings, on the machine only | Offer a dashboard, or any page reachable from the network |
 
-Push a job to a machine. It runs your container or tells you it is full. Your orchestrator (Kestra, n8n, a shell script) keeps the list of machines and POSTs the job to the first one:
-
-| Answer | Meaning | What the caller does |
-| --- | --- | --- |
-| `202` | Accepted. A slot is taken and the container is being started. | Done. |
-| `429` | Every slot is busy. | Try the next machine. |
-| `503` | The machine is draining for maintenance. | Try the next machine. |
-
-The launcher does not know what your image does. It starts an allowlisted image, enforces the timeout and the slot limit, keeps a history, and calls you back when the job ends.
+## How it works
 
 ```text
- Kestra / n8n                 machine A                    machine B
- ------------                 ---------                    ---------
- POST /v1/jobs  ------------> 429 (full)
- POST /v1/jobs  -----------------------------------------> 202 (accepted)
-                                                           pull image, run container
- webhook        <----------------------------------------- callback when it ends
+            your orchestrator (n8n, Kestra, your own API)
+            ---------------------------------------------
+              keeps the queue, picks the machine, gets the callback
+                 |                                   ^         ^
+   push: POST /v1/jobs                  pull: POST poll_url    | callback_url
+   202 accepted / 429 full / 503        "any work for me?"     | when a job ends
+                 v                                   |         |
+   Linux server (yours, trusted)        Windows 11 PC (a customer's, shared)
+   -----------------------------        ------------------------------------
+   shutup-and-run.service               shutup-and-run.exe: supervisor, logon task
+   HTTPS :8787, bearer token              WSL2 distribution "shutup-and-run"
+   Docker Engine                            the same Linux binary, in pull mode
+                                            Docker Engine (no Docker Desktop)
+                                            local page on 127.0.0.1:8787
 ```
 
-A machine behind NAT can ask for work instead of being called. See [Pull](#pull). A Windows 11 machine runs the same thing in pull mode inside WSL2: [docs/WINDOWS.md](docs/WINDOWS.md).
+- **Linux** runs the service under systemd. It usually takes pushes over HTTPS. It can also pull, for a machine behind NAT.
+- **Windows 11** runs the same Linux binary inside a WSL2 distribution of its own, in pull mode only. No port is opened on the PC and nothing is pushed to it. The `.exe` is a supervisor: it installs the distribution, keeps the service running while the user is logged on, and never shows a window. Details: [docs/WINDOWS.md](docs/WINDOWS.md).
+- **A job** is one container. `202` means the machine took it and holds a slot; the image is pulled afterwards. When it ends, by itself, at its timeout, or because it could not start, the result is POSTed to the task's `callback_url`.
+- **The contract** for an orchestrator, with JSON Schemas, is [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md). A complete n8n example, with worker approval, is in [examples/n8n](examples/n8n/README.md).
 
-## Quickstart
+## Quick start
 
-Everything here is copy and paste. Replace `ghcr.io/you/worker` with an image you own and `203.0.113.10` with the machine's address.
+### Windows 11 PC, pull mode
 
-### 1. Install, on the machine
+WSL2 has to be enabled once, as administrator, followed by a reboot: `wsl --install --no-distribution`. Then, in PowerShell, as the user who stays logged on:
 
-Ubuntu, with a public address. Needs a published release (a `v*` tag).
+```powershell
+irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
+```
+
+```powershell
+shutup-and-run wsl install --poll-url "https://orchestrator.example/poll?user=ana"
+```
+
+The first line downloads the `.exe`, checks its SHA-256 and puts it on the user's `PATH` (open a new terminal if `shutup-and-run` is not found). The second takes a few minutes and ends with the doctor. It is safe to run again. Leave `--poll-url` out to install a machine idle and check it first.
+
+```powershell
+shutup-and-run doctor
+```
+
+The worker now polls your URL with a token of its own. Your orchestrator sees an unknown token and approves the machine or not: [enrollment](docs/WINDOWS.md#install). The person at the PC has a desktop shortcut to the local page, `http://127.0.0.1:8787/`.
+
+### Linux server, push mode
+
+Ubuntu with a public address:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.sh | sudo SHUTUP_AND_RUN_ALLOWLIST=ghcr.io/you/worker bash
 ```
 
-It installs Docker if needed, starts the service on port 8787 over HTTPS, and prints the URL and the certificate fingerprint. The token is not printed. Read it with:
+It installs Docker if needed, starts the service on port 8787 over HTTPS with a self-signed certificate, and prints the URL and the certificate fingerprint. Read the token, then send a job from anywhere:
 
 ```bash
 sudo sed -n 's/^SHUTUP_AND_RUN_TOKEN=//p' /etc/shutup-and-run/env
 ```
 
-### 2. First job, from anywhere
-
 ```bash
-export SAR=https://203.0.113.10:8787
+curl -sk -X POST https://203.0.113.10:8787/v1/jobs -H "Authorization: Bearer $SAR_TOKEN" -H 'Content-Type: application/json' -d '{"image":"ghcr.io/you/worker","timeout_secs":600,"job_key":"hello-1","env":{"JOB_NAME":"hello"}}'
 ```
 
 ```bash
-export SAR_TOKEN=paste-the-token-here
+curl -sk -H "Authorization: Bearer $SAR_TOKEN" "https://203.0.113.10:8787/v1/jobs/PASTE_ID?logs=true"
 ```
 
-```bash
-curl -sk -X POST "$SAR/v1/jobs" -H "Authorization: Bearer $SAR_TOKEN" -H 'Content-Type: application/json' -d '{"image":"ghcr.io/you/worker","timeout_secs":600,"env":{"JOB_NAME":"hello"}}'
+`-k` skips certificate verification; pinning the fingerprint is in [docs/RECIPES.md](docs/RECIPES.md). Ready-made flows: [examples/kestra-dispatch.yml](examples/kestra-dispatch.yml), [examples/n8n-dispatch.json](examples/n8n-dispatch.json), and for pull [examples/kestra-poll.yml](examples/kestra-poll.yml), [examples/n8n-poll.json](examples/n8n-poll.json).
+
+## Protecting the PC
+
+The customer's interactive work has priority over job throughput. On a shared PC these layers enforce that:
+
+| Layer | `shared-pc` default | Set with |
+| --- | --- | --- |
+| The WSL2 VM (Windows only) | about 40% of the RAM, half the logical processors | `%UserProfile%\.wslconfig`, through `shutup-and-run wsl limits` |
+| Each job | 1 CPU, 2 GiB of memory, no swap beyond it | `max_job_cpus`, `max_job_memory` |
+| Jobs at once | 1 | `max_slots` |
+| Starting a job | only with 2 GiB of memory and 5 GiB of disk free | `min_free_memory`, `min_free_disk` |
+
+- The limits are enforced by Docker (`NanoCpus`, `Memory`, `MemorySwap`), on a pushed job and on a pulled one. A task that names no `cpu` or `memory` gets the machine's limit; one that names less gets what it asked; one that names more is refused with the limit in the answer.
+- While memory or disk is short, a push is answered `503` `insufficient resources` and a pull worker simply does not ask for work, so no task is claimed and then dropped. It resumes by itself. `status` shows `waiting_for`.
+- Where the service sees under 4 GiB (an 8 GiB PC gives WSL2 about 3.2 GiB), the two memory figures are half of what it sees. Not every PC can run a 2 GiB job.
+- The `shared-pc` profile is the default on Windows, also for a worker installed before 0.2.6. On a Linux desktop: `shutup-and-run config set resource_profile shared-pc --apply`. A Linux server is unchanged unless you set it.
+- `.wslconfig` belongs to the user and covers every WSL2 distribution. The install writes it only when it does not exist and the PC has no other distribution. An existing file is changed only by `shutup-and-run wsl limits --apply`, which keeps every other line and a backup. A change takes effect when WSL restarts; this program never runs `wsl --shutdown`.
+
+```
+shutup-and-run status --json          # "limits" in force, and "waiting_for"
+shutup-and-run doctor                 # the "resources" line; on Windows also "wsl-limits"
+shutup-and-run config set max_job_memory 1g --apply
+shutup-and-run wsl limits             # Windows: the PC, the budget, what .wslconfig says
 ```
 
-The answer has an `id`. Status and the last log lines:
+**This reduces the risk; it does not remove it.** Free memory is measured inside the WSL2 VM, which is not the same as free memory on the Windows host, and only at the moment a job starts. Disk and network use of a job are not limited. There is no idle detection, no monitoring daemon, and a running job is never stopped to make room. A PC can still get slow. The pause button on the local page, or `shutup-and-run pause`, is how the person at the PC says "not now". More: [docs/WINDOWS.md](docs/WINDOWS.md#sharing-the-pc).
 
-```bash
-curl -sk -H "Authorization: Bearer $SAR_TOKEN" "$SAR/v1/jobs/PASTE_ID?logs=true"
+## The local page
+
+With `status_page = true` (the Windows install turns it on; a Linux install does not), the service answers a browser **on the machine itself** at `http://127.0.0.1:8787/`, the address in `listen`. On Windows the install puts a `shutup-and-run` shortcut to it on the desktop.
+
+| Page | What is there | Login |
+| --- | --- | --- |
+| `/` | Running, paused or Docker down. Whether the PC can be turned off. Jobs now, the last job, whether the queue answers, the machine's name. A button to pause or resume taking jobs. Reloads every 10 seconds | none |
+| Settings (`/local/config`) | Poll URL, poll interval, jobs at once, machine name | none |
+| Advanced settings (`/local/advanced`) | Allowed images, any-image, time limits, both tokens, the admin login | `admin` / `admin` until changed |
+
+- The page edits the same `config.json` as the CLI, through the same validation. A saved change restarts the service on the new file; running containers are left alone. An invalid value is refused and nothing is written.
+- Change the admin password with `shutup-and-run config set admin_password "NEW" --apply`.
+- The resource limits and the other keys are CLI only. `shutup-and-run config keys` says where each key can be edited.
+- It is in English or Portuguese, one at a time; a link switches and the choice is remembered.
+
+Security of the page, plainly. It needs no token, so it answers only a loopback connection that names a loopback host, and accepts a form only from its own origin. It never shows a token, a job's env or logs. The admin login keeps a curious person out and is **not** a security boundary: whoever uses the PC can read the config file. Nothing on it is reachable from the network, and it is not meant to be put behind a proxy. On a machine set up with `config.toml` the page shows status only.
+
+## Configuration
+
+A machine has one config source.
+
+**`config.json`** holds every setting, tokens included, mode 600, with no environment on top. It is `/etc/shutup-and-run/config.json`; on Windows that path is inside the WSL distribution, and the same commands reach it. The Windows install writes it. It changes only through the CLI or the local page. Schema: [docs/schemas/worker-config.schema.json](docs/schemas/worker-config.schema.json).
+
+```
+shutup-and-run config show                      # the whole file, secrets as ***
+shutup-and-run config keys                      # every key, its type, where it is edited
+shutup-and-run config get max_slots
+shutup-and-run config set poll_url "https://queue.example/poll?user=ana" --apply
+shutup-and-run config unset max_job_memory --apply
+shutup-and-run config validate                  # exit 3 and the reason when invalid
+shutup-and-run config apply                     # restart on the file; containers are left alone
+shutup-and-run config reset                     # factory config; tokens, name and address kept
+shutup-and-run status                           # idle, active, draining, failed, stopped
+shutup-and-run doctor [--report]                # every failed line has a fix
+shutup-and-run pause | resume
 ```
 
-`-k` skips certificate verification. To pin the installer's certificate instead, see [docs/RECIPES.md](docs/RECIPES.md).
+All are non-interactive and take `--json`. Exit codes: `0` done, `1` failed or unhealthy, `2` wrong command line, `3` invalid config or value (nothing written). An invalid value is never saved, and a file damaged some other way does not stop the service: it runs on the copy from the last save, or on idle defaults, and says so.
 
-### 3. Kestra
+**`config.toml` plus environment** is what the Linux installer still writes: `/etc/shutup-and-run/config.toml`, or the file named by `SHUTUP_AND_RUN_CONFIG`. Environment variables override the file. After a change: `sudo systemctl restart shutup-and-run`; running jobs survive. On such a machine `shutup-and-run config` refuses and says so; `status`, `doctor`, `pause`, `resume` and `bans` work. A Linux machine uses `config.json` instead when that file exists and `SHUTUP_AND_RUN_CONFIG` does not name a TOML file. There is no converter.
 
-Create the secret `SHUTUP_AND_RUN_TOKEN`. One task per machine. The second runs only when the first said full or draining. The full flow with retries is `examples/kestra-dispatch.yml`.
+The keys are the same in both. An unknown key is refused.
 
-```yaml
-id: push_job
-namespace: example.jobs
+| Key | Environment | Meaning |
+| --- | --- | --- |
+| `listen` | `SHUTUP_AND_RUN_LISTEN` | `ip:port`. Default `127.0.0.1:8787`. The Linux installer writes `0.0.0.0:8787`. |
+| `token` | `SHUTUP_AND_RUN_TOKEN` | Required. At least 16 characters. The Linux installer keeps it in `/etc/shutup-and-run/env`. |
+| `max_slots` | `SHUTUP_AND_RUN_MAX_SLOTS` | Required. 1 to 256. Windows installs 1. The Linux installer suggests one per CPU and 2 GiB. |
+| `allowlist` | `SHUTUP_AND_RUN_ALLOWLIST` | Images that may run. Required unless `poll_any_image`. Comma-separated in the environment. |
+| `resource_profile` | `SHUTUP_AND_RUN_RESOURCE_PROFILE` | `shared-pc` or `none`. Default `shared-pc` when `worker_os` is `windows`, otherwise `none`. See [Protecting the PC](#protecting-the-pc). |
+| `max_job_cpus` | `SHUTUP_AND_RUN_MAX_JOB_CPUS` | Most CPU per job, and the default: `"1"`, `"0.5"`. Unset under `none`: no limit. |
+| `max_job_memory` | `SHUTUP_AND_RUN_MAX_JOB_MEMORY` | The same for memory: `"2g"`, `"512m"`. |
+| `min_free_memory` | `SHUTUP_AND_RUN_MIN_FREE_MEMORY` | No new job below this much available memory. `"0"`: not checked. |
+| `min_free_disk` | `SHUTUP_AND_RUN_MIN_FREE_DISK` | The same for the disk Docker writes to. |
+| `default_timeout_secs` | `SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS` | Default 3600. |
+| `max_timeout_secs` | `SHUTUP_AND_RUN_MAX_TIMEOUT_SECS` | Default 21600. At most 7 days. |
+| `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Optional. Turns pull mode on. |
+| `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Default 15. |
+| `poll_token` (JSON only) | `SHUTUP_AND_RUN_POLL_TOKEN` | Who this machine is to the poll URL. Not a TOML key. |
+| `poll_any_image` | `SHUTUP_AND_RUN_POLL_ANY_IMAGE` | A polled task may name any image. Needs `poll_url`. Lets `allowlist` be empty. Never applies to a push. |
+| `worker_name`, `worker_os` | `SHUTUP_AND_RUN_WORKER_NAME`, `_WORKER_OS` | Sent in the poll body. Defaults: the hostname, the build OS. |
+| `status_page` | `SHUTUP_AND_RUN_STATUS_PAGE` | The local page. Default false. |
+| `admin_user`, `admin_password` (JSON only) | | The login of the page's advanced settings. |
+| `http` | `SHUTUP_AND_RUN_HTTP` | `true` serves plaintext. For localhost only. |
+| `tls_cert`, `tls_key` | `SHUTUP_AND_RUN_TLS_CERT`, `_TLS_KEY` | PEM files. Required unless `http = true`. |
+| `auth_failures`, `ban_hours` | `SHUTUP_AND_RUN_AUTH_FAILURES`, `_BAN_HOURS` | Wrong tokens before a ban (3), and its length (48). |
+| `trust_x_forwarded_for` | `SHUTUP_AND_RUN_TRUST_X_FORWARDED_FOR` | Only behind a proxy you control. Default false. |
+| `history_path`, `history_days` | `SHUTUP_AND_RUN_HISTORY_PATH`, `_HISTORY_DAYS` | The SQLite file, and how long finished jobs are kept (30). |
+| `log_lines` | `SHUTUP_AND_RUN_LOG_LINES` | Log lines kept per job. Default 200. |
+| `prune_interval_secs` | `SHUTUP_AND_RUN_PRUNE_INTERVAL_SECS` | Remove finished containers and unused images this often. Default 0, off. |
+| `reaper_interval_secs`, `purge_interval_secs` | `SHUTUP_AND_RUN_REAPER_INTERVAL_SECS`, `_PURGE_INTERVAL_SECS` | How often timeouts are enforced (2) and old history deleted (3600). |
+| `docker_config` | `SHUTUP_AND_RUN_DOCKER_CONFIG` | Path to Docker's `config.json`, for private images. |
 
-tasks:
-  - id: host_1
-    type: io.kestra.plugin.core.http.Request
-    uri: https://203.0.113.10:8787/v1/jobs
-    method: POST
-    contentType: application/json
-    allowFailure: true
-    options:
-      allowFailed: true
-      ssl:
-        insecureTrustAllCertificates: true
-    headers:
-      Authorization: "Bearer {{ secret('SHUTUP_AND_RUN_TOKEN') }}"
-    body: |
-      {{ { "image": "ghcr.io/you/worker", "job_key": execution.id, "timeout_secs": 3600 } }}
+**Allowlist.** `ghcr.io/you/worker` allows any tag or digest of that repository and nothing else: not `ghcr.io/you/worker-evil`, not `ghcr.io/you/other`. An entry with a tag allows exactly that string. A Windows worker has `poll_any_image` instead: its one source of work is your poll URL.
 
-  - id: host_2
-    type: io.kestra.plugin.core.http.Request
-    runIf: "{{ outputs.host_1.code == 429 or outputs.host_1.code == 503 }}"
-    uri: https://203.0.113.11:8787/v1/jobs
-    method: POST
-    contentType: application/json
-    options:
-      ssl:
-        insecureTrustAllCertificates: true
-    headers:
-      Authorization: "Bearer {{ secret('SHUTUP_AND_RUN_TOKEN') }}"
-    body: |
-      {{ { "image": "ghcr.io/you/worker", "job_key": execution.id, "timeout_secs": 3600 } }}
-```
+**Private images.** `sudo docker login ghcr.io -u YOU` on the machine. A task cannot supply registry credentials.
 
-### 4. n8n
+**Logs.** Linux: `journalctl -u shutup-and-run -f`. Windows: `shutup-and-run wsl logs`. The token and job environment are never logged.
 
-Copy this and paste it onto the canvas. It is one HTTP Request node. Set `SHUTUP_AND_RUN_TOKEN` on the n8n process (with `N8N_BLOCK_ENV_ACCESS_IN_NODE=false`), or swap the header for a Header Auth credential. The two-machine workflow is `examples/n8n-dispatch.json`.
+## For an AI agent
 
-```json
-{
-  "nodes": [
-    {
-      "name": "Push job",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [260, 300],
-      "retryOnFail": true,
-      "maxTries": 3,
-      "waitBetweenTries": 2000,
-      "parameters": {
-        "method": "POST",
-        "url": "https://203.0.113.10:8787/v1/jobs",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SHUTUP_AND_RUN_TOKEN }}" },
-            { "name": "Content-Type", "value": "application/json" }
-          ]
-        },
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ image: 'ghcr.io/you/worker', job_key: $execution.id, timeout_secs: 3600 }) }}",
-        "options": {
-          "allowUnauthorizedCerts": true,
-          "timeout": 20000,
-          "response": { "response": { "fullResponse": true, "neverError": true } }
-        }
-      }
-    }
-  ],
-  "connections": {}
-}
-```
-
-The node's output has `statusCode`. Route `429` and `503` to a copy of the node that points at the next machine.
-
-### 5. Locked out
-
-Three wrong tokens ban the caller's address for 48 hours. On the machine, over SSH:
-
-```bash
-sudo shutup-and-run bans
-```
-
-```bash
-sudo shutup-and-run bans lift 203.0.113.5
-```
-
-### 6. Check the machine
-
-Twelve checks against the running service. See [Testing](#testing) for the image it uses.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/smoke.sh | sudo SMOKE_LOCAL=1 SMOKE_IMAGE=ghcr.io/you/worker bash
-```
-
-### 7. Stop everything
-
-The service, then every job it started:
-
-```bash
-sudo systemctl stop shutup-and-run
-```
-
-```bash
-sudo docker ps -q --filter label=shutup-and-run=1 | xargs -r sudo docker kill
-```
-
-More cases are in [docs/RECIPES.md](docs/RECIPES.md): the firewall rule, a machine behind NAT, a machine a client lends you, draining, rotating the token.
-
-## Security in one minute
-
-- The token is a root password for the machine. Anyone who holds it can run any allowlisted image with any environment. Every route needs it, `/health` and `/metrics` included.
-- Three wrong tokens from one address ban it for 48 hours. A banned address gets `403` with an empty body, even with the right token.
-- The service speaks HTTPS with a self-signed certificate the installer generates. Pin the fingerprint it prints.
-- A job cannot mount the host, publish a port, or run privileged. It is still not a sandbox: the container has Docker's default privileges and network.
-- The port is open to the internet unless you firewall it. Allow only your orchestrator. The command is in [docs/RECIPES.md](docs/RECIPES.md).
-
-How the process behaves is in [SECURITY.md](SECURITY.md). What you accept by running it is in [docs/CONVENTIONS.md](docs/CONVENTIONS.md).
-
-## API
-
-Every route requires `Authorization: Bearer <token>`. The one exception is the local status page, when `status_page` is on.
-
-A script on the machine reads `status.json` and does not call HTTP. On Linux the file is next to the history file, `/var/lib/shutup-and-run/status.json` by default, and the directory is root-only. On Windows the supervisor writes `C:\ProgramData\shutup-and-run\status.json`, which the logged-on user can read without an administrator. It is the same facts as the status page. `state` is `active` (a job holds a slot), `idle`, `draining`, `failed`, or `stopped`. The other fields are `slots_total`, `slots_used`, `job_ids`, `last_job_at`, `last_error`, `version`, `pid`, and `updated_at` (UTC, `YYYY-MM-DDThh:mm:ssZ`). The file is replaced at least every 30 seconds and within a second of a change, by writing a temporary file and renaming it over the old one. If `updated_at` is more than 60 seconds ago, the worker is dead. `stopped` with a fresh `updated_at` is a graceful stop. On Windows, once the distribution or the service has died, `state` is `failed` and `last_error` says why.
-
-```sh
-sudo sed -n 's/.*"state":"\([^"]*\)".*/\1/p' /var/lib/shutup-and-run/status.json
-```
+[docs/FOR-AGENTS.md](docs/FOR-AGENTS.md) is the guide: install, the known problems and their fixes. The whole loop on a Windows PC, with no question asked and nothing edited by hand:
 
 ```powershell
-(Get-Content C:\ProgramData\shutup-and-run\status.json -Raw | ConvertFrom-Json).state
+# 1. Install. Exit 0 only when the worker runs.
+irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
+shutup-and-run wsl install --poll-url "https://queue.example/poll?user=ana"
+
+# 2. Configure. Exit 3 and a reason on an invalid value; nothing is written then.
+shutup-and-run config set max_job_memory 1g --apply --json
+
+# 3. Inspect what is in force.
+shutup-and-run status --json        # state, slots, limits, waiting_for, poll_error
+shutup-and-run wsl limits --json    # the PC, the WSL2 budget, .wslconfig
+
+# 4. Diagnose. checks[] has status ok|warn|fail, detail, and fix for each problem.
+shutup-and-run doctor --json
+
+# 5. Repair with the command in "fix", then run the doctor again. Still stuck:
+shutup-and-run doctor --report      # a report with secrets masked, and an issue link
+
+# 6. Factory reset, from mild to complete.
+shutup-and-run config reset         # the config only; tokens kept
+shutup-and-run wsl reset            # rebuild the distribution; config kept
+shutup-and-run wsl reset --factory  # forget the config too; needs approval again
 ```
 
-### `POST /v1/jobs`
+On Linux the same `status`, `doctor`, `pause`, `resume` and `config` commands run as root. Secrets print as `***` everywhere, `doctor --report` included.
+
+## Push, pull and the API
+
+Every route needs `Authorization: Bearer <token>`. The one exception is the local page.
+
+| Route | |
+| --- | --- |
+| `POST /v1/jobs` | Start a job. `202` accepted, `200` this `job_key` is already here, `429` full, `503` draining or short of memory or disk, `400` invalid or above the machine's limits, `403` image not allowed. |
+| `GET /v1/jobs/{id}` | Status, exit code, reason. `?logs=true` adds the last log lines. |
+| `GET /health` | `{"status":"ok","draining":false,"slots_total":2,"slots_used":1,"slots_free":1}` |
+| `GET /metrics` | Prometheus text. |
+| `POST /v1/drain` | `{"draining": true}` refuses new jobs and lets running ones finish. |
+
+A task, the same JSON on a push, in a poll answer, and in a manifest:
 
 ```json
 {
-  "image": "ghcr.io/you/worker:latest",
+  "image": "ghcr.io/you/worker:1.4.2",
   "job_key": "order-1001",
   "env": {"JOB_NAME": "example"},
   "command": ["python", "main.py"],
   "timeout_secs": 3600,
   "cpu": 1,
   "memory": "2g",
-  "shm": "2g",
+  "shm": "1g",
   "callback_url": "https://n8n.example/webhook/done"
 }
 ```
 
-| Field | |
-| --- | --- |
-| `image` | Required. Must be on the allowlist. Lowercase. |
-| `job_key` | Optional. Makes a retry safe: the same key returns the same job. 1 to 200 characters: letters, digits, `.`, `_`, `:`, `-`. |
-| `env` | Optional object of strings. Put secrets here, not in the image. |
-| `command` | Optional Docker `Cmd`. Omit it to run the image as built. |
-| `timeout_secs` | Optional. The container is killed after this long. Default 3600, at most `max_timeout_secs`. |
-| `cpu` | Optional CPU count, such as `0.5` or `2`. |
-| `memory`, `shm` | Optional. Bytes, or `512m`, `1g`. Without `memory` the container is not capped. |
-| `callback_url` | Optional. Receives the final job JSON when the job ends. |
+Only `image` is required. Unknown fields are refused. `job_key` makes a retry safe on that one machine: the same key returns the same job and starts nothing. `reason` in the result is `exited`, `timeout_kill` or `start_failed`. There is no cancel call.
 
-Unknown fields are refused.
-
-| Code | Body | Meaning |
-| --- | --- | --- |
-| `202` | the job | Accepted. The slot is taken. The image is pulled and the container started after this answer. |
-| `200` | the job | This `job_key` was already accepted. Nothing new starts. |
-| `429` | `{"error":"no free slots","slots_total":2,"slots_used":2,"slots_free":0}` | Full. |
-| `503` | `{"error":"draining","draining":true}` | Draining. |
-| `403` | `{"error":"image is not allowlisted"}` | |
-| `400` | `{"error":"..."}` | Bad body, timeout, key, or callback URL. |
-| `401` | `{"error":"unauthorized"}` | Counts toward a ban. |
-| `502` | `{"error":"docker is unavailable"}` | Docker or the history file cannot be reached. |
-
-The job:
+**Pull.** With `poll_url` set, the machine POSTs to it every `poll_interval_secs`, only when it has a free slot, is not paused and is not short of memory or disk:
 
 ```json
-{"id":"5f479abd3087cf193ed4c1da8460784d","status":"running","image":"ghcr.io/you/worker:latest","job_key":"order-1001","started_at":1700000000,"ended_at":null,"exit_code":null,"reason":null,"duration_secs":null}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.6", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
-`202` is an answer in milliseconds. It does not wait for the registry. If the pull or the start then fails, the job ends with `reason` `start_failed`, its `logs` say why, and the callback is sent. The `job_key` of a failed job stays taken; use a new key for a new attempt. `timeout_secs` starts counting when the container starts.
+The answer is nothing (`204`), a task, `{"task": {...}}`, or `{"manifest_url": "https://..."}`, which is fetched once and must be a task. `401` or `403` means "not approved yet": the worker starts nothing and keeps asking, backing off to five minutes. The server decides which machines get work; the worker's token is its identity.
 
-### `GET /v1/jobs/{id}`
+Field limits, every status code, the callback, idempotency, and what is not guaranteed: [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md).
 
-Add `?logs=true` for the last 200 log lines.
+**`status.json`** has the same facts as the local page, for a script that should not call HTTP: `state` (`idle`, `active`, `draining`, `failed`, `stopped`), `slots_total`, `slots_used`, `job_ids`, `last_job_at`, `last_error`, `poll_error`, `waiting_for`, `limits`, `config_warning`, `version`, `pid`, `started_at`, `updated_at`. Linux: beside the history file, `/var/lib/shutup-and-run/status.json`, root only. Windows: `C:\ProgramData\shutup-and-run\status.json`, readable by the user. If `updated_at` is more than 60 seconds old, the worker is dead. `shutup-and-run status --json` reads it for you.
 
-```json
-{"id":"5f479abd3087cf193ed4c1da8460784d","status":"exited","image":"ghcr.io/you/worker:latest","job_key":"order-1001","started_at":1700000000,"ended_at":1700000012,"exit_code":0,"reason":"exited","duration_secs":12,"logs":"..."}
-```
+## Security
 
-`status` is `running` or `exited`. `reason` is `exited`, `timeout_kill`, or `start_failed`. History is in SQLite, so this works after a restart, for 30 days by default. An unknown id is `404` `{"id":"...","status":"not_found"}`.
+- **The API token is a root password for the machine.** Whoever holds it can run any allowlisted image with any environment. Every route needs it, `/health` and `/metrics` included.
+- Three wrong tokens from one address ban it for 48 hours; a banned address gets `403` even with the right token. `sudo shutup-and-run bans`, `sudo shutup-and-run bans lift 203.0.113.5`.
+- A Linux install speaks HTTPS with a self-signed certificate. Pin the fingerprint it prints, and firewall the port to your orchestrator.
+- A job cannot mount the host, publish a port or run privileged. It is still not a sandbox.
+- **A Windows worker is a computer you do not control.** Its user can read the poll token, every task's env and the image layers. Send it only short-lived secrets scoped to one task, and treat what comes back as a claim. Keep work with real secrets on your own Linux machines.
+- **The customer is trusting your orchestrator.** With `poll_any_image`, the poll URL decides which image runs on their PC.
+- The local page is for the person at the machine and is not a security boundary. See [The local page](#the-local-page).
 
-There is no cancel call. To end a job early, kill its container on the machine: it is named `shutup-and-run-<id>`.
+How the process defends itself: [SECURITY.md](SECURITY.md). What an operator accepts by running it: [docs/CONVENTIONS.md](docs/CONVENTIONS.md).
 
-### Callback
+## Installers
 
-When a job ends, the same JSON (without logs) is POSTed to `callback_url`. Three tries, no redirects. Point it at a Kestra or n8n webhook.
-
-### `GET /health`
-
-```json
-{"status":"ok","draining":false,"slots_total":2,"slots_used":1,"slots_free":1}
-```
-
-A used slot is a running container labeled `shutup-and-run=1`, or a job that was accepted and is still pulling its image. `503` when Docker cannot be reached.
-
-### `GET /metrics`
-
-Prometheus text: `shutup_and_run_slots_total`, `_slots_used`, `_slots_free`, `_draining`, `_jobs_started_total`, `_jobs_finished_total`, `_jobs_timeout_total`.
-
-### `POST /v1/drain`
-
-`{"draining": true}` refuses new jobs with `503` and lets running ones finish. `{"draining": false}` goes back. The flag survives a restart.
-
-## Pull
-
-For a machine that cannot be reached from outside. Set `poll_url`, and the machine asks that URL for one task every `poll_interval_secs`, only when a slot is free and it is not draining. Leave it unset and nothing calls out.
-
-```http
-POST {poll_url}
-Authorization: Bearer {SHUTUP_AND_RUN_POLL_TOKEN}
-Content-Type: application/json
-
-{"worker": "desk-07", "os": "linux", "arch": "x86_64", "version": "0.2.4", "max_slots": 2, "free_slots": 1, "cpus": 8, "memory_bytes": 16624934912}
-```
-
-The body says who is asking, so one URL can serve every machine: `worker` is `worker_name` (default: the hostname), `os` is `worker_os` (default: the OS the binary was built for; the Windows worker says `windows`), and `free_slots` is how many tasks the machine could take right now. `arch`, `version`, `max_slots`, `cpus` and `memory_bytes` say what the machine is and could lend, so the server can decide whether its queue may serve it. The machine's address is not in the body: read it from the connection. A `401` or `403` means "not approved": the machine starts nothing and asks again, backing off to five minutes.
-
-- Nothing to do: `204`, or `200` with an empty body, `null`, `{}`, `{"task": null}`, or `{"manifest_url": null}`.
-- A task: `200` with the same JSON as `POST /v1/jobs`, or `{"task": { ... }}`.
-- A manifest: `200` with `{"manifest_url": "https://..."}`. The machine fetches that URL once with a `GET` and the body must be a task, in either shape above. A manifest cannot name another manifest. The poll token goes with the `GET` only when the manifest is on the same scheme, host and port as `poll_url`; a manifest on object storage or a CDN is fetched without it. Same 64 KiB cap, no redirects.
-
-The task goes through the same checks as a POST. Offering a task is not an acknowledgement: the machine may refuse it (slot just taken, image not allowlisted). Keep offering the same `job_key` until its callback arrives. Once accepted, that key never starts a second container.
-
-`poll_any_image = true` lets a polled task name any image, allowlisted or not. The image name is still validated, and a pushed job is still held to the allowlist, which may then be empty. It needs `poll_url`. It is for a machine whose only source of work is your orchestrator, such as the Windows worker; on a server that also takes pushes, leave it off.
-
-Errors (connection failure, redirect, any other status, a body over 64 KiB) are logged, and the wait doubles up to 5 minutes. The process does not exit. The poll token is read from the environment only. Examples: `examples/kestra-poll.yml`, `examples/n8n-poll.json`. The setup commands are in [docs/RECIPES.md](docs/RECIPES.md).
-
-The whole contract for an orchestrator, push, poll, manifest and callback, with JSON Schemas and what is and is not guaranteed, is [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md). A poll URL with machine approval, a manifest and a callback receiver built in n8n, and a smoke test for both systems, are in [examples/n8n](examples/n8n/README.md).
-
-## Configuration
-
-A machine has one config source. Either `config.json`, described here first, or `config.toml` with environment variables, described after.
-
-### config.json, the agent CLI and the local page
-
-`/etc/shutup-and-run/config.json` (on Windows, inside the WSL distribution) holds every setting, tokens included, and nothing overrides it. The Windows install writes it. It is read and written by the CLI and by the local page, never by hand. The schema is [docs/schemas/worker-config.schema.json](docs/schemas/worker-config.schema.json); the keys are the ones in the table below, plus `token`, `poll_token`, `admin_user` and `admin_password`.
-
-```
-shutup-and-run config show                      # the whole file, secrets as ***
-shutup-and-run config set poll_url "https://queue.example/poll?user=ana" --apply
-shutup-and-run config get max_slots
-shutup-and-run config validate                  # exit 3 and the reason when invalid
-shutup-and-run config apply                     # restart on the file; containers are left alone
-shutup-and-run config reset                     # factory config, tokens kept
-shutup-and-run status                           # idle, active, draining, failed, stopped
-shutup-and-run doctor [--report]                # every failed line has a fix
-shutup-and-run pause | resume
-```
-
-All of them are non-interactive and take `--json`. Exit codes: `0` done, `1` failed or unhealthy, `2` wrong command line, `3` invalid config or value (nothing written). An invalid value is never saved, and a file damaged some other way does not stop the service: it runs on the copy from the last save, or on idle defaults, and says so. `doctor --report` prints a report with secrets masked and a link that opens a GitHub issue with it filled in. [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md) is the guide for an AI agent doing this on a client's PC.
-
-With `status_page = true` the page at `http://127.0.0.1:8787/` shows the status and, on a `config.json` machine, edits the config. It opens only on the machine itself. The poll URL, the interval, the slots, the machine name and the pause are edited directly. The allowed images, `poll_any_image`, the time limits, both tokens and the admin login ask for a user and password, `admin` / `admin` until `shutup-and-run config set admin_password NEW --apply`. That login keeps a curious person out and is not security. A link switches the page between English and Portuguese and the choice is remembered. Where the page is on, a pause ends when the service restarts. Why this replaced "no web UI" is in [docs/DECISIONS.md](docs/DECISIONS.md).
-
-The Linux installer still writes `config.toml`. A Linux machine uses `config.json` when that file exists and `SHUTUP_AND_RUN_CONFIG` does not name a TOML file; there is no converter.
-
-### config.toml and environment
-
-`/etc/shutup-and-run/config.toml`, or the file named by `SHUTUP_AND_RUN_CONFIG`. Environment variables override the file. An unknown key refuses to start. After a change: `sudo systemctl restart shutup-and-run`. Running jobs survive the restart.
-
-| toml | environment | meaning |
-| --- | --- | --- |
-| `listen` | `SHUTUP_AND_RUN_LISTEN` | `ip:port`. Default `127.0.0.1:8787`. The installer writes `0.0.0.0:8787`. |
-| `token` | `SHUTUP_AND_RUN_TOKEN` | Required. At least 16 characters. The installer keeps it in `/etc/shutup-and-run/env`. |
-| `max_slots` | `SHUTUP_AND_RUN_MAX_SLOTS` | Required. 1 to 256. The installer suggests one per CPU and 2 GiB. |
-| `allowlist` | `SHUTUP_AND_RUN_ALLOWLIST` | Required unless `poll_any_image` is set. Images that may run. Comma-separated in the environment. |
-| `default_timeout_secs` | `SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS` | Default 3600. |
-| `max_timeout_secs` | `SHUTUP_AND_RUN_MAX_TIMEOUT_SECS` | Default 21600. At most 7 days. |
-| `history_path` | `SHUTUP_AND_RUN_HISTORY_PATH` | SQLite file. Default `/var/lib/shutup-and-run/jobs.sqlite`. |
-| `history_days` | `SHUTUP_AND_RUN_HISTORY_DAYS` | Finished jobs older than this are deleted. Default 30. |
-| `log_lines` | `SHUTUP_AND_RUN_LOG_LINES` | Log lines kept per job. Default 200. |
-| `prune_interval_secs` | `SHUTUP_AND_RUN_PRUNE_INTERVAL_SECS` | Remove finished containers and unused images this often. Default 0, off. |
-| `auth_failures` | `SHUTUP_AND_RUN_AUTH_FAILURES` | Wrong tokens before a ban. Default 3. |
-| `ban_hours` | `SHUTUP_AND_RUN_BAN_HOURS` | Default 48. |
-| `tls_cert`, `tls_key` | `SHUTUP_AND_RUN_TLS_CERT`, `SHUTUP_AND_RUN_TLS_KEY` | PEM files. Required unless `http = true`. |
-| `http` | `SHUTUP_AND_RUN_HTTP` | `true` serves plaintext. For localhost only. |
-| `trust_x_forwarded_for` | `SHUTUP_AND_RUN_TRUST_X_FORWARDED_FOR` | Only behind a proxy you control. Default false. |
-| `status_page` | `SHUTUP_AND_RUN_STATUS_PAGE` | A status page at `/`, without the token, for a browser on the machine itself only. Default false; the Windows install turns it on. |
-| `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Optional. See [Pull](#pull). |
-| `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Default 15. |
-| (none) | `SHUTUP_AND_RUN_POLL_TOKEN` | Environment only. |
-| `poll_any_image` | `SHUTUP_AND_RUN_POLL_ANY_IMAGE` | A polled task may name any image. Default false. Needs `poll_url`. Lets `allowlist` be empty. |
-| `worker_name` | `SHUTUP_AND_RUN_WORKER_NAME` | Sent in the poll body. Default: the hostname. |
-| `worker_os` | `SHUTUP_AND_RUN_WORKER_OS` | Sent in the poll body. Default: the build OS. |
-| `reaper_interval_secs` | `SHUTUP_AND_RUN_REAPER_INTERVAL_SECS` | How often expired containers are killed. Default 2. |
-| `purge_interval_secs` | `SHUTUP_AND_RUN_PURGE_INTERVAL_SECS` | How often old history is deleted. Default 3600. |
-| `docker_config` | `SHUTUP_AND_RUN_DOCKER_CONFIG` | Path to Docker's `config.json`, for private images. |
-
-**Allowlist.** `ghcr.io/you/worker` allows any tag or digest of that repository and nothing else: not `ghcr.io/you/worker-evil`, not `ghcr.io/you/other`. An entry with a tag, such as `ghcr.io/you/worker:1.4`, allows exactly that string.
-
-**Private images.** `sudo docker login ghcr.io -u YOU` on the machine. The caller cannot supply registry credentials.
-
-**Logs.** `journalctl -u shutup-and-run -f`. The token and job environment are never logged.
-
-## Installer
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.sh | sudo SHUTUP_AND_RUN_ALLOWLIST=ghcr.io/you/worker bash
-```
+**Linux**, `scripts/install.sh`:
 
 | Variable | |
 | --- | --- |
@@ -404,33 +293,24 @@ curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/sc
 | `SHUTUP_AND_RUN_SHOW_TOKEN=1` | Print the token. |
 | `SHUTUP_AND_RUN_BIN=./shutup-and-run` | Install a binary you already have. No download, no checksum. |
 
-The download is checked against `SHA256SUMS` from the same release, and a mismatch stops the install. Running it again upgrades the binary and keeps the token, certificate, and config. `--uninstall` removes the service and the binary. `--uninstall --purge` also removes `/etc/shutup-and-run` and `/var/lib/shutup-and-run`.
+The download is checked against `SHA256SUMS` of the same release. Running it again upgrades the binary and keeps the token, certificate and config. `--uninstall` removes the service and the binary; `--uninstall --purge` also removes `/etc/shutup-and-run` and `/var/lib/shutup-and-run`. A container image, `ghcr.io/nailtongomes/shutup-and-run`, exists for people who run everything under Docker; it needs the host's Docker socket, which is root on the host. The systemd install is the supported path.
 
-A container image is also published at `ghcr.io/nailtongomes/shutup-and-run` for people who run everything under Docker. It needs the host Docker socket mounted, which is root on the host. The systemd install is the supported path.
+**Windows 11**, `scripts/install.ps1`, then `shutup-and-run wsl install`:
 
-### Windows 11
+| Command | |
+| --- | --- |
+| `wsl install [--poll-url URL] [--max-slots N] [--worker-name NAME] [--wsl-memory 4GB] [--wsl-processors 2]` | Install or upgrade. Keeps the config; changes only the options given. |
+| `wsl doctor`, `doctor` | Check everything, with a fix for each problem. |
+| `wsl limits [--apply]` | What WSL2 may take of the PC. |
+| `wsl start`, `wsl stop`, `wsl logs` | The logon task and the supervisor log. |
+| `wsl reset [--factory]` | Rebuild a broken distribution. |
+| `wsl uninstall [--purge]` | Remove the task and the distribution. |
 
-The release also ships `shutup-and-run-x86_64-pc-windows-msvc.exe`. It is a supervisor: it imports its own WSL2 distribution, installs Docker Engine and the Linux binary inside it, and keeps the service running there in pull mode. No Docker Desktop, no open port. Once WSL2 is enabled (`wsl --install --no-distribution` as administrator, then reboot):
-
-```powershell
-$env:SHUTUP_AND_RUN_POLL_TOKEN = "<token>"   # optional: without it the machine makes its own and waits for approval
-$env:SHUTUP_AND_RUN_POLL_URL = "https://orchestrator.example/poll"
-irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
-```
-
-`shutup-and-run wsl doctor` checks WSL, the distribution, Docker, runs one container, and checks the service. Leave the URL and the token out and run `shutup-and-run wsl install` to set a machine up idle, with only the smoke test. `wsl logs`, `wsl stop`, `wsl start`, `wsl uninstall`. Everything, including what a lent Windows machine gives up, is in [docs/WINDOWS.md](docs/WINDOWS.md). A step-by-step hand test is in [docs/TESTING.md](docs/TESTING.md).
-
-A PC that cannot run WSL2 cannot run the `.exe`. [`scripts/windows/sar-launcher.bat`](scripts/windows/sar-launcher.bat) is a fallback for that case: `cmd` downloads a Python script from a URL you set, caches it, and runs it. It does not use the allowlist, the slots, or the HTTP API, and it does not check a checksum. Use HTTPS and a host you control. Details: [docs/WINDOWS.md](docs/WINDOWS.md#when-the-exe-cannot-run).
+No Docker Desktop and no administrator, apart from enabling WSL2 once. The worker runs while the installing user is logged on. Everything else is in [docs/WINDOWS.md](docs/WINDOWS.md). A PC that cannot run WSL2 cannot run the `.exe`; the [shell fallback](docs/WINDOWS.md#when-the-exe-cannot-run) is a different, weaker thing.
 
 ## Testing
 
-`scripts/smoke.sh` checks a running instance through its API. It needs `curl` and `python3` where it runs, and one image on the instance's allowlist:
-
-- **Your own worker**, if it has `sh` and `sleep`. This is the best check, because it is what you will run.
-- **`ghcr.io/nailtongomes/shutup-and-run-smoke`**, the default. A small Python image built from `examples/smoke-image`. With no command it prints `python ok` and exits.
-- **`hello-world`**. It has no shell, so the five checks that need a job to stay up are skipped.
-
-On the machine, as root. `SMOKE_LOCAL=1` reads the URL, token and fingerprint from `/etc/shutup-and-run`:
+`scripts/smoke.sh` checks a running instance through its API, twelve scenarios, safe on a live machine. On the machine, as root:
 
 ```bash
 sudo SMOKE_LOCAL=1 SMOKE_IMAGE=ghcr.io/you/worker SMOKE_RESTART_CMD="systemctl restart shutup-and-run" bash scripts/smoke.sh
@@ -442,41 +322,30 @@ From another machine:
 SMOKE_URL=https://203.0.113.10:8787 SMOKE_TOKEN=... SMOKE_FINGERPRINT=AA:BB:... SMOKE_IMAGE=ghcr.io/you/worker bash scripts/smoke.sh
 ```
 
-One job with every field set, and nothing else:
+The image needs `sh` and `sleep`; the default is `ghcr.io/nailtongomes/shutup-and-run-smoke`, built from `examples/smoke-image`. A check that needs something you did not give is `SKIP`, with the reason. The header of the script lists every variable.
 
-```bash
-SMOKE_URL=... SMOKE_TOKEN=... SMOKE_IMAGE=ghcr.io/you/worker bash scripts/smoke.sh preflight
-```
-
-```text
-PASS: 1 health returns slot counts; 401 without a token
-PASS: 2 job accepted, running, exited 0, logs returned
-PASS: 3 3 slots filled, then 429, then 202 after one job ended
-PASS: 4 job past timeout_secs was killed, reason timeout_kill
-PASS: 5 image off the allowlist is 403 and nothing started
-PASS: 6 same job_key is 202 then 200 with the same id
-PASS: 7 drain is 503 for new jobs; undrain is 202 again
-PASS: 8 restart kept history, kept the running job, and freed its slot when it ended
-PASS: 9 three wrong tokens from 127.0.0.2 is 403 even with the right token; bans lift restores it
-PASS: 10 poll took one task, started exactly one container, then got empty answers
-PASS: 11 callback_url received the final job JSON once
-PASS: 12 preflight: one job end to end (env, cpu, memory, shm, job_key, callback), slot freed
-
-RESULT: 12 passed, 0 failed, 0 skipped
-```
-
-It is safe on a live machine. Its jobs only print and sleep, each with a `timeout_secs` of 120 at most. It never sends a wrong token from your address. A check that needs something you did not give is `SKIP`, with the reason. Two things a live machine will notice: check 3 fills every free slot for a few seconds, and check 7 drains for about a second. The header of the script lists every variable.
-
-`scripts/accept.sh` is the developer's test. It starts its own instance against a real Docker daemon. `SHUTUP_AND_RUN_SMOKE=1` runs `smoke.sh` on that instance afterwards. CI runs both on every push, and runs `smoke.sh` again against a service installed by `install.sh`.
+`scripts/accept.sh` is the developer's test: its own instance against a real Docker daemon, the per-job limits on the container included. CI runs it and `smoke.sh` on every push, a pull cycle against `tests/poll-mock`, and `smoke.sh` again against a service installed by `install.sh`. A hand test of a Windows PC and a Linux server, step by step, is [docs/TESTING.md](docs/TESTING.md).
 
 ## Limits
 
 - One process per Docker daemon. Two can exceed `max_slots`.
-- Stopping the service does not stop containers, and while it is stopped nothing enforces timeouts.
-- A timeout is SIGKILL. There is no grace period.
+- On Linux, stopping the service does not stop containers, and while it is stopped nothing enforces timeouts.
+- A timeout is SIGKILL, with no grace period.
 - `job_key` is per machine. Another machine does not know it.
 - No cancel call, no queue, no retry of a job that failed.
-- Windows runs the Linux service inside WSL2, pull mode only, while the installing user is logged on. Stopping it kills the containers inside the VM. A PC that cannot run WSL2 cannot run the `.exe`; the shell fallback is in [docs/WINDOWS.md](docs/WINDOWS.md#when-the-exe-cannot-run). macOS is planned: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md).
+- In pull mode the server is never told that a task was refused or dropped; the worker's own log is. See [the contract's limits](docs/INTEGRATION-CONTRACT.md#9-limits-of-the-current-contract).
+- Resource protection is admission control and container limits, not a guarantee. See [Protecting the PC](#protecting-the-pc).
+- Windows runs the Linux service inside WSL2, pull mode only, while the installing user is logged on. Stopping it, signing out or shutting down ends the containers. macOS is planned: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md).
+
+## Similar projects
+
+This one is a single process on a machine you already have, and your orchestrator chooses the machine.
+
+- **Nomad** schedules jobs across a cluster. Use it when one control plane should place the work.
+- **HTCondor** matchmakes high-throughput jobs across a pool.
+- **GitLab Runner** and the **GitHub Actions self-hosted runner** run their own CI systems' jobs.
+- **Tork** is a workflow engine with a coordinator, a queue and workers. Use it when you want that queue and retries.
+- **BOINC** is volunteer computing: strangers run a published workload. Here, your images run on machines you set up.
 
 ## Development
 
@@ -498,11 +367,13 @@ The static binary that releases ship:
 rustup target add x86_64-unknown-linux-musl && sudo apt-get install -y musl-tools build-essential && CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked --target x86_64-unknown-linux-musl
 ```
 
-A release is a `v*` tag pushed from `main`. It attaches the binary and `SHA256SUMS`, publishes the image, then runs the one-line install and the smoke test on a fresh runner.
+A release is a `v*` tag pushed from `main`. It attaches the Linux binary, the Windows `.exe` and `SHA256SUMS`, publishes the image, then runs the one-line install and the smoke test on a fresh runner.
 
 MIT license. More reading:
 
 - [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md): the contract for an orchestrator, with JSON Schemas in `docs/schemas`.
+- [docs/WINDOWS.md](docs/WINDOWS.md): the Windows worker, and sharing the PC.
+- [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md): for an AI agent setting up or repairing a worker.
 - [examples/n8n](examples/n8n/README.md): n8n as the orchestrator, and a smoke test.
 - [docs/RECIPES.md](docs/RECIPES.md): copy-and-paste answers for common cases.
 - [docs/CONVENTIONS.md](docs/CONVENTIONS.md): what the operator agrees to.

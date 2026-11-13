@@ -33,6 +33,11 @@ const ENV_KEYS: &[&str] = &[
     "SHUTUP_AND_RUN_POLL_ANY_IMAGE",
     "SHUTUP_AND_RUN_WORKER_NAME",
     "SHUTUP_AND_RUN_WORKER_OS",
+    "SHUTUP_AND_RUN_RESOURCE_PROFILE",
+    "SHUTUP_AND_RUN_MAX_JOB_CPUS",
+    "SHUTUP_AND_RUN_MAX_JOB_MEMORY",
+    "SHUTUP_AND_RUN_MIN_FREE_MEMORY",
+    "SHUTUP_AND_RUN_MIN_FREE_DISK",
 ];
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
@@ -86,6 +91,19 @@ pub struct Settings {
     /// Sent in the poll body. Default: the OS this binary was built for. The
     /// Windows supervisor sets `windows` for the binary it runs inside WSL.
     pub worker_os: String,
+    /// The `shared-pc` profile: the machine is someone's everyday computer,
+    /// so the four limits below have defaults. Off, they are unset and zero
+    /// unless the config names them.
+    pub shared_pc: bool,
+    /// The most CPU one job gets, and what a job that asks for none gets.
+    /// None: no limit.
+    pub max_job_cpus: Option<f64>,
+    /// The same for memory, in bytes.
+    pub max_job_memory: Option<u64>,
+    /// No new job starts with less memory available than this. Zero: off.
+    pub min_free_memory: u64,
+    /// The same for the disk Docker writes to.
+    pub min_free_disk: u64,
     /// The JSON file this config came from. None: config.toml and environment.
     pub config_json: Option<PathBuf>,
     /// The login for the dangerous fields on the local page. Not strong:
@@ -145,6 +163,11 @@ struct FileConfig {
     poll_any_image: Option<bool>,
     worker_name: Option<String>,
     worker_os: Option<String>,
+    resource_profile: Option<String>,
+    max_job_cpus: Option<String>,
+    max_job_memory: Option<String>,
+    min_free_memory: Option<String>,
+    min_free_disk: Option<String>,
     // config.json only. config.toml refuses these three.
     poll_token: Option<String>,
     admin_user: Option<String>,
@@ -412,6 +435,56 @@ impl Settings {
             Some(os) => validate_worker_field("worker_os", &os)?,
             None => std::env::consts::OS.to_string(),
         };
+        let shared_pc = match take_string(
+            env,
+            "SHUTUP_AND_RUN_RESOURCE_PROFILE",
+            file.resource_profile,
+        )
+        .as_deref()
+        {
+            Some(PROFILE_SHARED_PC) => true,
+            Some(PROFILE_NONE) => false,
+            Some(other) => {
+                return Err(ConfigError(format!(
+                    "resource_profile must be {PROFILE_SHARED_PC} or {PROFILE_NONE}, not {other:?}"
+                )))
+            }
+            // A Windows machine is a client's PC. A Linux one is the owner's
+            // server unless its config says otherwise.
+            None => worker_os == "windows",
+        };
+        let shared_memory = || crate::resources::shared_pc_memory(crate::resources::memory_total());
+        let max_job_cpus = match take_string(env, "SHUTUP_AND_RUN_MAX_JOB_CPUS", file.max_job_cpus)
+        {
+            Some(raw) => Some(parse_cpus(&raw)?),
+            None => shared_pc.then_some(crate::resources::SHARED_PC_CPUS),
+        };
+        let max_job_memory =
+            match take_string(env, "SHUTUP_AND_RUN_MAX_JOB_MEMORY", file.max_job_memory) {
+                Some(raw) => {
+                    let bytes = parse_size("max_job_memory", &raw)?;
+                    if bytes < MIN_JOB_MEMORY {
+                        return Err(ConfigError(
+                            "max_job_memory must be at least 6m, the least Docker gives a container"
+                                .into(),
+                        ));
+                    }
+                    Some(bytes)
+                }
+                None => shared_pc.then(shared_memory),
+            };
+        let min_free_memory =
+            match take_string(env, "SHUTUP_AND_RUN_MIN_FREE_MEMORY", file.min_free_memory) {
+                Some(raw) => parse_size("min_free_memory", &raw)?,
+                None if shared_pc => shared_memory(),
+                None => 0,
+            };
+        let min_free_disk =
+            match take_string(env, "SHUTUP_AND_RUN_MIN_FREE_DISK", file.min_free_disk) {
+                Some(raw) => parse_size("min_free_disk", &raw)?,
+                None if shared_pc => crate::resources::SHARED_PC_MIN_DISK,
+                None => 0,
+            };
         let poll_interval_secs = match take_u64(
             env,
             "SHUTUP_AND_RUN_POLL_INTERVAL_SECS",
@@ -477,6 +550,11 @@ impl Settings {
             poll_any_image,
             worker_name,
             worker_os,
+            shared_pc,
+            max_job_cpus,
+            max_job_memory,
+            min_free_memory,
+            min_free_disk,
             config_json: None,
             admin_user: DEFAULT_ADMIN.to_string(),
             admin_password: DEFAULT_ADMIN.to_string(),
@@ -495,6 +573,10 @@ const TOML_DEFAULT: &str = "/etc/shutup-and-run/config.toml";
 /// The login of the local page until `config set admin_password` changes it.
 pub const DEFAULT_ADMIN: &str = "admin";
 pub const MASK: &str = "***";
+pub const PROFILE_SHARED_PC: &str = "shared-pc";
+pub const PROFILE_NONE: &str = "none";
+/// Docker refuses a container with less.
+const MIN_JOB_MEMORY: u64 = 6 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -561,6 +643,11 @@ pub const KEYS: &[Key] = &[
     key("tls_key", Kind::Text, OnPage::No),
     key("status_page", Kind::Bool, OnPage::No),
     key("worker_os", Kind::Text, OnPage::No),
+    key("resource_profile", Kind::Text, OnPage::No),
+    key("max_job_cpus", Kind::Text, OnPage::No),
+    key("max_job_memory", Kind::Text, OnPage::No),
+    key("min_free_memory", Kind::Text, OnPage::No),
+    key("min_free_disk", Kind::Text, OnPage::No),
     key("history_path", Kind::Text, OnPage::No),
     key("history_days", Kind::Int, OnPage::No),
     key("docker_config", Kind::Text, OnPage::No),
@@ -773,6 +860,26 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp, path)
+}
+
+/// `1`, `0.5`, `2`: CPUs, as `docker run --cpus` counts them.
+fn parse_cpus(raw: &str) -> Result<f64, ConfigError> {
+    match raw.trim().parse::<f64>() {
+        Ok(cpus) if cpus.is_finite() && (0.01..=128.0).contains(&cpus) => Ok(cpus),
+        _ => Err(ConfigError(format!(
+            "max_job_cpus must be a number from 0.01 to 128, not {raw:?}"
+        ))),
+    }
+}
+
+/// `2g`, `512m`, or `0`.
+fn parse_size(key: &str, raw: &str) -> Result<u64, ConfigError> {
+    if raw.trim() == "0" {
+        return Ok(0);
+    }
+    crate::bytesize::parse_qty(raw)
+        .map(|bytes| bytes as u64)
+        .map_err(|err| ConfigError(format!("{key} must be a size like 2g or 512m: {err}")))
 }
 
 fn validate_admin(key: &str, value: &str) -> Result<String, ConfigError> {
@@ -1119,6 +1226,90 @@ mod tests {
         .unwrap();
         assert!(settings.allowlist.is_empty());
         assert!(settings.poll_any_image);
+    }
+
+    #[test]
+    fn the_shared_pc_profile_is_the_default_on_windows_and_each_figure_can_be_set() {
+        use crate::resources::{memory_total, shared_pc_memory, GIB};
+        let load = |extra: &str| Settings::from_toml_and_env(&base_toml(extra), &env(&[]));
+        // A Linux machine without the key is as it was before the profile existed.
+        let plain = load("").unwrap();
+        assert!(!plain.shared_pc);
+        assert_eq!((plain.max_job_cpus, plain.max_job_memory), (None, None));
+        assert_eq!((plain.min_free_memory, plain.min_free_disk), (0, 0));
+
+        // A Windows machine is a shared PC unless its config says otherwise.
+        let memory = shared_pc_memory(memory_total());
+        for extra in [
+            "worker_os = \"windows\"",
+            "resource_profile = \"shared-pc\"",
+        ] {
+            let shared = load(extra).unwrap();
+            assert!(shared.shared_pc, "{extra}");
+            assert_eq!(shared.max_job_cpus, Some(1.0));
+            assert_eq!(shared.max_job_memory, Some(memory));
+            assert_eq!(shared.min_free_memory, memory);
+            assert_eq!(shared.min_free_disk, 5 * GIB);
+        }
+        let opted_out = load("worker_os = \"windows\"\nresource_profile = \"none\"").unwrap();
+        assert!(!opted_out.shared_pc);
+        assert_eq!(opted_out.max_job_memory, None);
+
+        // Each figure on its own, under either profile; 0 turns a check off.
+        let set = load(
+            "resource_profile = \"shared-pc\"\nmax_job_cpus = \"0.5\"\nmax_job_memory = \"512m\"\nmin_free_memory = \"0\"\nmin_free_disk = \"1g\"",
+        )
+        .unwrap();
+        assert_eq!(set.max_job_cpus, Some(0.5));
+        assert_eq!(set.max_job_memory, Some(512 * 1024 * 1024));
+        assert_eq!((set.min_free_memory, set.min_free_disk), (0, GIB));
+        let only_one = load("max_job_memory = \"4g\"").unwrap();
+        assert_eq!(only_one.max_job_memory, Some(4 * GIB));
+        assert_eq!(only_one.max_job_cpus, None);
+        let from_env = Settings::from_toml_and_env(
+            &base_toml(""),
+            &env(&[("SHUTUP_AND_RUN_RESOURCE_PROFILE", "shared-pc")]),
+        )
+        .unwrap();
+        assert!(from_env.shared_pc);
+
+        for (bad, why) in [
+            ("resource_profile = \"gaming\"", "resource_profile must be"),
+            ("max_job_cpus = \"0\"", "max_job_cpus must be"),
+            ("max_job_cpus = \"200\"", "max_job_cpus must be"),
+            ("max_job_cpus = \"two\"", "max_job_cpus must be"),
+            ("max_job_memory = \"0\"", "at least 6m"),
+            ("max_job_memory = \"1m\"", "at least 6m"),
+            ("max_job_memory = \"lots\"", "max_job_memory must be a size"),
+            (
+                "min_free_memory = \"-1g\"",
+                "min_free_memory must be a size",
+            ),
+            ("min_free_disk = \"five\"", "min_free_disk must be a size"),
+        ] {
+            let refused = load(bad).unwrap_err().to_string();
+            assert!(refused.contains(why), "{bad}: {refused}");
+        }
+    }
+
+    /// A config.json written before these keys existed still loads, and on
+    /// Windows it gets the profile without being rewritten.
+    #[test]
+    fn a_config_json_from_before_the_profile_still_loads() {
+        let mut old = default_map();
+        old.insert("worker_os".into(), "windows".into());
+        old.insert("max_slots".into(), 2.into());
+        let settings = Settings::from_json_map(&old).unwrap();
+        assert!(settings.shared_pc);
+        assert_eq!(settings.max_slots, 2);
+        assert_eq!(settings.max_job_cpus, Some(1.0));
+        assert!(!Settings::from_json_map(&default_map()).unwrap().shared_pc);
+        // A factory reset drops the figures and keeps the machine's identity.
+        old.insert("max_job_memory".into(), "8g".into());
+        let reset = reset_map(Some(&old));
+        assert!(!reset.contains_key("max_job_memory"));
+        assert_eq!(reset["worker_os"], "windows");
+        assert!(Settings::from_json_map(&reset).unwrap().shared_pc);
     }
 
     #[test]

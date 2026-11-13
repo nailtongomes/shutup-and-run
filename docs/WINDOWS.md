@@ -51,7 +51,7 @@ shutup-and-run.exe wsl install --poll-url https://orchestrator.example/poll --ma
 | `--poll-interval-secs N` | Default 15. |
 | `--worker-name NAME` | What the poll body calls this machine. Default: the computer name. |
 | `--smoke-image IMAGE` | The image the doctor runs. Default `hello-world`. |
-| `--wsl-memory 4GB`, `--wsl-processors 2` | Written to `%UserProfile%\.wslconfig` when that file does not exist. It caps the whole WSL2 VM, which is the right place to cap what the lent machine gives up. |
+| `--wsl-memory 4GB`, `--wsl-processors 2` | The limits of the whole WSL2 VM. Default: 40% of the PC's RAM and half its processors. See [Sharing the PC](#sharing-the-pc). |
 | `--rootfs PATH`, `--bin PATH` | Skip the downloads. For an offline machine or a mirror. |
 | `--no-task` | Do not register the logon task. |
 
@@ -64,6 +64,54 @@ The poll token, given or made, is written to `/etc/shutup-and-run/config.json` i
 The task runs `shutup-and-run.exe wsl serve --background` when that user logs on. It may run on battery and has no time limit; the install changes those two task defaults with PowerShell and says so if it could not.
 
 **One instance.** A second `wsl serve` while one is running prints `another shutup-and-run is already running` and exits 1. The service inside the distribution does the same. The service is up while the user is logged on. A machine that nobody logs on to after a reboot runs nothing; that is the trade for not needing administrator rights or a stored password.
+
+## Sharing the PC
+
+The person who owns the PC is working on it. Their work comes first, and three layers keep the worker out of the way. All three are set by the install.
+
+| Layer | Default | Where |
+| --- | --- | --- |
+| The WSL2 VM | 40% of the PC's RAM, half its logical processors | `%UserProfile%\.wslconfig` |
+| Each job | 1 CPU, 2 GiB of memory, no swap beyond it; one job at a time | `config.json`: `max_job_cpus`, `max_job_memory`, `max_slots` |
+| Starting a job | not while the VM has under 2 GiB of memory or 5 GiB of disk free | `config.json`: `min_free_memory`, `min_free_disk` |
+
+The figures follow the PC:
+
+| PC | WSL2 VM | One job gets | A job starts with |
+| --- | --- | --- | --- |
+| 32 GiB, 16 processors | 13107 MB, 8 | 1 CPU, 2 GiB | 2 GiB free |
+| 16 GiB, 8 processors | 6553 MB, 4 | 1 CPU, 2 GiB | 2 GiB free |
+| 8 GiB, 4 processors | 3276 MB, 2 | 1 CPU, about 1.5 GiB | about 1.5 GiB free |
+| 4 GiB, 2 processors | 2048 MB, 1 | 1 CPU, about 1 GiB | about 1 GiB free |
+
+Below 4 GiB in the VM, the two memory figures are half of what the VM has, so a small PC is not asked for a 2 GiB job it cannot hold. A browser job on an 8 GiB PC is tight. Send such a machine lighter work.
+
+**`.wslconfig` belongs to the user and covers every WSL2 distribution**, Docker Desktop and a developer's own Ubuntu included. So the install is careful with it:
+
+- No file, and no other distribution on the PC: the install writes `[wsl2]`, `memory=` and `processors=`.
+- No file, but other distributions exist: nothing is written. The install says what it would set and how.
+- A file exists: it is never changed by the install. If it lets WSL2 take more than the budget, the install and the doctor say so.
+
+`shutup-and-run wsl limits` shows the PC, the budget and the file. `--apply` writes the two keys under `[wsl2]`, keeps every other line, and saves the old file as `.wslconfig.bak`. `--memory 4GB --processors 2` sets other figures. `--json` is for an agent; exit 1 means the file lets WSL2 take more than the budget.
+
+```powershell
+shutup-and-run wsl limits
+shutup-and-run wsl limits --apply
+```
+
+**A change to `.wslconfig` takes effect when WSL restarts**: at the next restart of the PC, or after `wsl --shutdown`. That command stops every WSL distribution of the user, so this program never runs it. Run it when no job and no other WSL work is open. Until then the doctor's `wsl-limits` line says `not in effect yet`.
+
+The per-job limits and the two free-space checks are in `config.json` and change like any other key. `resource_profile` is `shared-pc` on every Windows worker, also on one installed before 0.2.6; its config needs no change.
+
+```powershell
+shutup-and-run config set max_job_memory 1g --apply
+shutup-and-run config set min_free_disk 10g --apply
+shutup-and-run status --json     # "limits" and "waiting_for"
+```
+
+A job that asks for more `cpu` or `memory` than the machine's limit is refused, and the supervisor log says `poll task rejected`. While memory or disk is short the worker does not ask for work; `status` shows `waiting_for`, and it resumes by itself.
+
+**What this does not do.** It is not a guarantee that the PC stays responsive. The free-memory check sees the VM, not Windows: a PC whose Windows side is out of memory still looks fine from inside. It is taken when a job starts, not while it runs. Disk and network use of a job are not limited. Nothing watches the keyboard or the mouse, and a running job is never stopped to make room. The pause button on the local page is how the person at the PC says "not now".
 
 ## Check it
 
@@ -79,11 +127,13 @@ ok   container              hello-world ran: Hello from Docker!
 ok   binary                 /usr/local/bin/shutup-and-run
 ok   config                 /etc/shutup-and-run/config.json
 ok   service                answers on 127.0.0.1:8787: {"status":"ok","draining":false,...}
+ok   resources              profile shared-pc; per job: cpu 1, memory 2.0 GiB; a new job needs free memory 2.0 GiB, free disk 5.0 GiB; free now: memory 5.1 GiB, disk 230.4 GiB
 ok   task                   shutup-and-run is registered
-the Windows worker is ready
+ok   wsl-limits             this PC: 15.8 GiB, 8 processors; budget for WSL2: 6553MB, 4 processors; the VM now has 6.2 GiB, 4 processors
+the worker is ready
 ```
 
-The doctor stops at the first hard failure and exits 1. `service` and `task` are soft: they say the service is not running yet or the task was skipped, and do not fail the doctor. `wsl install` is stricter: when it registered the task, the service must answer or the install fails.
+The doctor stops at the first hard failure and exits 1. `service`, `task`, `resources` and `wsl-limits` are soft: they say the service is not running yet, the task was skipped, the machine is short of memory or disk, or `.wslconfig` lets WSL2 take more than the budget, and do not fail the doctor. `wsl install` is stricter: when it registered the task, the service must answer or the install fails.
 
 After the Windows-side checks, the doctor runs `shutup-and-run doctor` inside the distribution: the config file, the service (from its status file), a forgotten pause, bans, and whether the poll URL's host can be reached. It sends no token anywhere. Every failed line is followed by a `fix:` line, `--json` prints the same as one object, and `--report` adds a report without secrets and a link that opens a GitHub issue.
 
@@ -100,7 +150,8 @@ wsl -d shutup-and-run -u root -- sh -c 'curl -s -H "Authorization: Bearer $(shut
 | `shutup-and-run wsl logs` | The end of `%ProgramData%\shutup-and-run\supervisor.log`: the supervisor's lines and the service's own log. `--lines 500` for more. The file rotates once at 10 MiB. |
 | `shutup-and-run wsl stop` | Ends the task, stops the service, gives each running container SIGTERM and 10 seconds, then terminates the distribution. On a Linux server, stopping the service leaves containers alone; here the VM goes away with the service. |
 | `shutup-and-run wsl start` | Starts the task again. |
-| `shutup-and-run wsl uninstall` | Deletes the task and the distribution, with its images and job history. `--purge` also removes `%ProgramData%\shutup-and-run`. |
+| `shutup-and-run wsl uninstall` | Deletes the task and the distribution, with its images and job history. `--purge` also removes `%ProgramData%\shutup-and-run`. `%UserProfile%\.wslconfig` is left as it is: delete it, or its `memory=` and `processors=` lines, to give WSL2 back its defaults. |
+| `shutup-and-run wsl limits` | How much of the PC WSL2 may take. See [Sharing the PC](#sharing-the-pc). |
 | `wsl -d shutup-and-run -u root` | A root shell in the distribution. `docker ps`. |
 
 To change the config, use the CLI or the local page. Nothing is edited by hand, and nothing needs a re-install:
@@ -132,7 +183,7 @@ Jobs that are running when you re-install are ended: the distribution is restart
 Each poll is a `POST` with the token and this body:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.4", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.6", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
 ```
 
 `cpus` and `memory_bytes` are what the WSL2 VM has, which is what the machine lends. The body has no address, because the worker only knows the VM's private one and could claim any other. The server takes the public address from the connection.
@@ -208,11 +259,11 @@ Prefer the `.exe` whenever WSL2 works.
 
 ## Limits
 
-- Resource limits (`cpu`, `memory`, `shm`) apply inside the WSL2 VM. The VM itself takes up to half the machine's RAM unless `.wslconfig` says otherwise. Use `--wsl-memory` and `--wsl-processors` on a machine someone lends.
+- Resource limits (`cpu`, `memory`, `shm`) and the free-memory check apply inside the WSL2 VM. The VM itself takes up to half the machine's RAM unless `.wslconfig` says otherwise. See [Sharing the PC](#sharing-the-pc) for what is and is not protected.
 - The service runs only while the installing user is logged on. Lock the screen, do not sign out.
 - The `.exe` is not code signed. SmartScreen shows "Windows protected your PC" the first time; "More info", "Run anyway". The hash check in `install.ps1` is the integrity check.
 - `wsl --install --no-distribution` and the reboot need an administrator once. Nothing else does.
 - There is no script mode in the binary. A job of the service is a container. The `.bat` in [When the .exe cannot run](#when-the-exe-cannot-run) is a fallback for a PC that cannot run the `.exe`, and it is not that mode. [ROADMAP-windows-macos.md](ROADMAP-windows-macos.md) keeps the open questions.
 - Docker inside the distribution is started by systemd, which needs WSL 0.67.6 or newer. `wsl --update` brings an older one up to date.
-- Docker Desktop may be installed on the same PC. This worker has its own distribution, `shutup-and-run`, and always names it; it does not use or change `docker-desktop`, the default distribution, or Docker Desktop's engine. The one shared file is `%UserProfile%\.wslconfig`, which caps every WSL2 VM and is only written when it does not exist.
+- Docker Desktop may be installed on the same PC. This worker has its own distribution, `shutup-and-run`, and always names it; it does not use or change `docker-desktop`, the default distribution, or Docker Desktop's engine. The one shared file is `%UserProfile%\.wslconfig`, which caps every WSL2 VM. With Docker Desktop on the PC the install does not write it; `shutup-and-run wsl limits --apply` does, when the owner agrees.
 - A Windows machine without virtualization (some VMs, some corporate images) cannot run WSL2 and cannot run the `.exe`. That section is the other option.

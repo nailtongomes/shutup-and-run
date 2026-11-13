@@ -125,6 +125,8 @@ listen = "127.0.0.1:${PORT}"
 token = "${TOKEN}"
 max_slots = 2
 allowlist = ["alpine"]
+max_job_cpus = "1"
+max_job_memory = "256m"
 default_timeout_secs = 60
 max_timeout_secs = 120
 reaper_interval_secs = 1
@@ -301,6 +303,18 @@ post '{"image":"alpine","command":["sh","-c","echo shutup-and-run-log-marker; sl
 long_code=$CODE
 LONG=$(job_id || true)
 remember "$LONG"
+# A job that named no limits must carry the machine's: 1 CPU, 256m, no extra swap.
+limits=""
+for _ in $(seq 1 40); do
+  limits=$(docker inspect -f '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}' "shutup-and-run-$LONG" 2>/dev/null || true)
+  [[ -n "$limits" ]] && break
+  sleep 0.25
+done
+if [[ "$limits" == "1000000000 268435456 268435456" ]]; then
+  pass "default cpu and memory limits on the container"
+else
+  fail "default limits on the container (got '${limits}')"
+fi
 post '{"image":"alpine","command":["sh","-c","echo shutup-and-run-log-marker; sleep 180"],"job_key":"accept-key"}'
 replay_code=$CODE
 REPLAY=$(job_id || true)
@@ -365,6 +379,13 @@ if [[ "$callback_ok" == 1 ]]; then
   pass "callback delivered"
 else
   fail "callback delivered"
+fi
+
+post '{"image":"alpine","command":["true"],"memory":"1g"}'
+if [[ "$CODE" == 400 ]] && grep -q "above this machine's limit" "$BODY"; then
+  pass "a job above the machine's memory limit is refused"
+else
+  fail "a job above the limit (HTTP ${CODE})"
 fi
 
 post '{"image":"alpine","command":["sleep","300"],"timeout_secs":3,"job_key":"timeout-key"}'

@@ -697,7 +697,60 @@ pub struct Live {
     pub last: Option<JobRecord>,
     /// Why the last poll failed. None when it was answered or nothing is polled.
     pub poll_error: Option<String>,
+    /// Why no new job starts right now, though a slot is free: low memory
+    /// or disk. None when a job could start.
+    pub waiting_for: Option<String>,
+    pub limits: Limits,
     pub config_warning: Option<String>,
+}
+
+/// The resource limits in force, defaults filled in. No secret is in here.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Limits {
+    /// `shared-pc` or `none`.
+    pub profile: String,
+    /// Per job: the most it may ask for, and what it gets when it asks for
+    /// nothing. Null: no limit.
+    pub max_job_cpus: Option<f64>,
+    pub max_job_memory_bytes: Option<u64>,
+    /// Below these a new job waits. Zero: not checked.
+    pub min_free_memory_bytes: u64,
+    pub min_free_disk_bytes: u64,
+}
+
+impl Limits {
+    pub fn of(settings: &crate::config::Settings) -> Self {
+        Self {
+            profile: if settings.shared_pc {
+                crate::config::PROFILE_SHARED_PC
+            } else {
+                crate::config::PROFILE_NONE
+            }
+            .to_string(),
+            max_job_cpus: settings.max_job_cpus,
+            max_job_memory_bytes: settings.max_job_memory,
+            min_free_memory_bytes: settings.min_free_memory,
+            min_free_disk_bytes: settings.min_free_disk,
+        }
+    }
+
+    /// One line for the doctor and `status`.
+    pub fn line(&self) -> String {
+        use crate::resources::human;
+        let or_none = |text: Option<String>| text.unwrap_or_else(|| "no limit".to_string());
+        let or_off = |bytes: u64| match bytes {
+            0 => "not checked".to_string(),
+            bytes => human(bytes),
+        };
+        format!(
+            "profile {}; per job: cpu {}, memory {}; a new job needs free memory {}, free disk {}",
+            self.profile,
+            or_none(self.max_job_cpus.map(|c| c.to_string())),
+            or_none(self.max_job_memory_bytes.map(human)),
+            or_off(self.min_free_memory_bytes),
+            or_off(self.min_free_disk_bytes),
+        )
+    }
 }
 
 impl Live {
@@ -709,7 +762,7 @@ impl Live {
     /// so a heartbeat still rewrites the file on the interval.
     pub fn signature(&self) -> String {
         format!(
-            "{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}",
+            "{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{}",
             self.state(false),
             self.slots_used,
             self.slots_total,
@@ -717,7 +770,9 @@ impl Live {
             self.job_ids.join(","),
             self.last_job_at,
             self.last_error(false, None),
-            self.poll_error
+            self.poll_error,
+            // Not the text: its byte counts change every second.
+            self.waiting_for.is_some()
         )
     }
 
@@ -791,6 +846,8 @@ struct FileBody<'a> {
     last_job_at: Option<String>,
     last_error: Option<String>,
     poll_error: Option<String>,
+    waiting_for: Option<&'a str>,
+    limits: &'a Limits,
     config_warning: Option<String>,
     version: &'a str,
     pid: u32,
@@ -814,6 +871,8 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
         last_job_at: live.last_job_at.map(unix_to_iso),
         last_error: err,
         poll_error: live.poll_error.as_deref().map(one_line),
+        waiting_for: live.waiting_for.as_deref(),
+        limits: &live.limits,
         config_warning: live.config_warning.as_deref().map(one_line),
         version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
@@ -845,6 +904,8 @@ fn empty_live() -> Live {
         docker_error: None,
         last: None,
         poll_error: None,
+        waiting_for: None,
+        limits: Limits::default(),
         config_warning: None,
     }
 }
@@ -1295,10 +1356,36 @@ mod tests {
             docker_error: None,
             last: None,
             poll_error: None,
+            waiting_for: Some("low on memory: 512 MiB free, 2.0 GiB needed".into()),
+            limits: Limits {
+                profile: "shared-pc".into(),
+                max_job_cpus: Some(1.0),
+                max_job_memory_bytes: Some(2 << 30),
+                min_free_memory_bytes: 2 << 30,
+                min_free_disk_bytes: 0,
+            },
             config_warning: None,
         };
         let bytes = document(&live, 1_700_000_100, false, None);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["waiting_for"],
+            "low on memory: 512 MiB free, 2.0 GiB needed"
+        );
+        assert_eq!(
+            value["limits"],
+            serde_json::json!({
+                "profile": "shared-pc",
+                "max_job_cpus": 1.0,
+                "max_job_memory_bytes": 2147483648u64,
+                "min_free_memory_bytes": 2147483648u64,
+                "min_free_disk_bytes": 0,
+            })
+        );
+        assert_eq!(
+            live.limits.line(),
+            "profile shared-pc; per job: cpu 1, memory 2.0 GiB; a new job needs free memory 2.0 GiB, free disk not checked"
+        );
         assert_eq!(value["state"], "active");
         assert_eq!(value["slots_total"], 2);
         assert_eq!(value["slots_used"], 1);
