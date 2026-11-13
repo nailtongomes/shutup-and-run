@@ -202,6 +202,67 @@
         1120,
         160
       ]
+    },
+    {
+      "parameters": {
+        "amount": 20,
+        "unit": "seconds"
+      },
+      "id": "6b30d371-aa2e-5f0d-9f51-cef1c73f149c",
+      "name": "Wait 20 s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1340,
+        -160
+      ],
+      "webhookId": "3d98739f-9f03-5b28-8918-04b97407e0b2"
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Job').first().json.runner_url }}/v1/jobs/{{ $('Read the answer').first().json.job.id }}?logs=true",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $('Job').first().json.runner_token }}"
+            }
+          ]
+        },
+        "options": {
+          "allowUnauthorizedCerts": true,
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "467be0d9-93b3-58e7-aaae-e3455cd72afb",
+      "name": "GET /v1/jobs/{id}",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1560,
+        -160
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The same facts the callback carries, read on demand. Possible only where the\n// orchestrator can reach the runner: a Linux machine, not a Windows worker.\n// status: running | exited. reason: exited | timeout_kill | start_failed.\nconst r = $input.first().json;\nconst job = r.body ?? {};\nconst result = r.statusCode !== 200 ? 'unknown'\n  : job.status === 'running' ? 'running'\n  : job.reason === 'exited' && job.exit_code === 0 ? 'succeeded'\n  : 'failed';\nreturn [{ json: { result, exit_code: job.exit_code ?? null, reason: job.reason ?? null, logs: job.logs ?? null } }];\n"
+      },
+      "id": "29b6bb5b-a5ad-5965-815c-733ec24aab90",
+      "name": "Succeeded, failed or still running",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        -160
+      ]
     }
   ],
   "connections": {
@@ -268,6 +329,39 @@
         [
           {
             "node": "Refused: read statusCode and job.error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Accepted: wait for the callback": {
+      "main": [
+        [
+          {
+            "node": "Wait 20 s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 20 s": {
+      "main": [
+        [
+          {
+            "node": "GET /v1/jobs/{id}",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET /v1/jobs/{id}": {
+      "main": [
+        [
+          {
+            "node": "Succeeded, failed or still running",
             "type": "main",
             "index": 0
           }

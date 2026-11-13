@@ -1,0 +1,71 @@
+id: sar_e2e
+namespace: example.jobs
+
+description: >
+  The whole path against one Linux shutup-and-run machine: dispatch a
+  container job with a job_key, read its status, and end the execution as
+  succeeded or failed. The callback goes to the flow in
+  kestra-e2e-callback.yml. Needs the secret SHUTUP_AND_RUN_TOKEN and the
+  machine's address in `runner`. Written for Kestra 0.20 or newer.
+
+inputs:
+  - id: runner
+    type: STRING
+    defaults: https://203.0.113.10:8787
+  - id: image
+    type: STRING
+    defaults: ghcr.io/nailtongomes/shutup-and-run-smoke
+  - id: callback
+    type: STRING
+    defaults: https://kestra.example/api/v1/executions/webhook/example.jobs/sar_e2e_callback/REPLACE_WITH_WEBHOOK_KEY
+
+tasks:
+  # 1 and 2: dispatch, with the execution id as the job_key. A retry of this
+  # task returns the same job (200) and starts nothing.
+  - id: dispatch
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ inputs.runner }}/v1/jobs"
+    method: POST
+    contentType: application/json
+    timeout: PT20S
+    options:
+      ssl:
+        insecureTrustAllCertificates: true
+    headers:
+      Authorization: "Bearer {{ secret('SHUTUP_AND_RUN_TOKEN') }}"
+    body: |
+      {{ {
+        "image": inputs.image,
+        "job_key": execution.id,
+        "timeout_secs": 120,
+        "cpu": 1,
+        "memory": "512m",
+        "callback_url": inputs.callback
+      } }}
+
+  # 202 means accepted, not finished. The callback says when it ends; this
+  # flow also asks, to show how.
+  - id: wait
+    type: io.kestra.plugin.core.flow.Sleep
+    duration: PT20S
+
+  # 4: status, exit code, reason and the last log lines.
+  - id: status
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ inputs.runner }}/v1/jobs/{{ outputs.dispatch.body | jq('.id') | first }}?logs=true"
+    method: GET
+    options:
+      ssl:
+        insecureTrustAllCertificates: true
+    headers:
+      Authorization: "Bearer {{ secret('SHUTUP_AND_RUN_TOKEN') }}"
+
+  # 5: failed is start_failed, timeout_kill, or a non-zero exit code.
+  - id: failed
+    type: io.kestra.plugin.core.execution.Fail
+    runIf: "{{ (outputs.status.body | jq('.status') | first) == 'exited' and ((outputs.status.body | jq('.reason') | first) != 'exited' or (outputs.status.body | jq('.exit_code') | first) != 0) }}"
+    errorMessage: "the job failed: {{ outputs.status.body }}"
+
+  - id: succeeded
+    type: io.kestra.plugin.core.log.Log
+    message: "job {{ outputs.dispatch.body | jq('.id') | first }}: {{ outputs.status.body | jq('.status') | first }}"

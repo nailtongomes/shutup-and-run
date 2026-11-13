@@ -123,7 +123,7 @@ A `job_key` that is already queued is refused. A new attempt at the same work is
 
 ## 6. Push a job to a Linux runner
 
-`push-to-linux.json`: **Manual**, **Job**, **POST /v1/jobs**, **Read the answer**, **Outcome**.
+`push-to-linux.json`: **Manual**, **Job**, **POST /v1/jobs**, **Read the answer**, **Outcome**, and after an accepted job **Wait 20 s**, **GET /v1/jobs/{id}** and **Succeeded, failed or still running**.
 
 ```text
 202, 200          accepted: wait for the callback
@@ -133,6 +133,8 @@ no answer         ambiguous: send the same job_key to the same machine again fir
 ```
 
 The HTTP Request node has **Never Error** and **Full Response** on, so the status code is data to route on and not an exception, and **Retry on Fail**, which is safe only because the job has a `job_key`. **Ignore SSL Issues** is on because the runner's certificate is self-signed; to pin it instead, see [docs/RECIPES.md](../../docs/RECIPES.md).
+
+The three nodes after **Accepted** read the job's status on demand: `result` is `succeeded` (`reason` `exited`, `exit_code` 0), `failed`, or `running` when 20 seconds were not enough. That works because n8n can reach a Linux runner. A Windows worker cannot be asked; its callback is the only answer.
 
 The job's `callback_url` is the same `n3-callback` webhook, so a pushed job that is not in the queue is recorded by its `id` in `results`.
 
