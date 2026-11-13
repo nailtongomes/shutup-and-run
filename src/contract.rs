@@ -136,6 +136,7 @@ fn machine(slots: usize, extra: &str, env: &[(&str, &str)]) -> Machine {
         allowlist = ["alpine", "ghcr.io/you/worker", "ghcr.io/nailtongomes/shutup-and-run-smoke"]
         auth_failures = 30
         history_path = '{}'
+        resource_profile = "none"
         {extra}
         "#,
         dir.join("jobs.sqlite").display()
@@ -524,6 +525,10 @@ async fn push_refusals_have_the_documented_status_and_body() {
         ("memory", "min_free_memory = \"4000000g\""),
         ("disk", "min_free_disk = \"4000000g\""),
     ] {
+        // The readings come from /proc/meminfo and statvfs.
+        if !cfg!(target_os = "linux") {
+            continue;
+        }
         let m = machine(1, extra, &[]);
         let (status, body) = push(&m.app, held).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

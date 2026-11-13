@@ -1233,7 +1233,7 @@ mod tests {
         use crate::resources::{memory_total, shared_pc_memory, GIB};
         let load = |extra: &str| Settings::from_toml_and_env(&base_toml(extra), &env(&[]));
         // A Linux machine without the key is as it was before the profile existed.
-        let plain = load("").unwrap();
+        let plain = load("worker_os = \"linux\"").unwrap();
         assert!(!plain.shared_pc);
         assert_eq!((plain.max_job_cpus, plain.max_job_memory), (None, None));
         assert_eq!((plain.min_free_memory, plain.min_free_disk), (0, 0));
@@ -1263,7 +1263,7 @@ mod tests {
         assert_eq!(set.max_job_cpus, Some(0.5));
         assert_eq!(set.max_job_memory, Some(512 * 1024 * 1024));
         assert_eq!((set.min_free_memory, set.min_free_disk), (0, GIB));
-        let only_one = load("max_job_memory = \"4g\"").unwrap();
+        let only_one = load("worker_os = \"linux\"\nmax_job_memory = \"4g\"").unwrap();
         assert_eq!(only_one.max_job_memory, Some(4 * GIB));
         assert_eq!(only_one.max_job_cpus, None);
         let from_env = Settings::from_toml_and_env(
@@ -1303,7 +1303,9 @@ mod tests {
         assert!(settings.shared_pc);
         assert_eq!(settings.max_slots, 2);
         assert_eq!(settings.max_job_cpus, Some(1.0));
-        assert!(!Settings::from_json_map(&default_map()).unwrap().shared_pc);
+        let mut linux = default_map();
+        linux.insert("worker_os".into(), "linux".into());
+        assert!(!Settings::from_json_map(&linux).unwrap().shared_pc);
         // A factory reset drops the figures and keeps the machine's identity.
         old.insert("max_job_memory".into(), "8g".into());
         let reset = reset_map(Some(&old));

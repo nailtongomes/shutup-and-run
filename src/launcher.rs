@@ -841,6 +841,7 @@ mod tests {
                 max_timeout_secs = 120
                 history_path = '{}'
                 history_days = 30
+                resource_profile = "none"
                 "#,
                 dir.join("jobs.sqlite").display()
             ),
@@ -976,6 +977,8 @@ mod tests {
         );
     }
 
+    /// Linux only: the readings come from /proc/meminfo and statvfs.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_machine_short_of_memory_or_disk_takes_no_job() {
         // More than any machine has free, so the real reading is always short.

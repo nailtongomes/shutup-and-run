@@ -373,6 +373,7 @@ mod tests {
                 default_timeout_secs = 30
                 max_timeout_secs = 60
                 history_path = '{}'
+                resource_profile = "none"
                 {extra}
                 "#,
                 dir.join("jobs.sqlite").display()

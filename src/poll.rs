@@ -378,6 +378,7 @@ mod tests {
             default_timeout_secs = 30
             max_timeout_secs = 60
             history_path = '{}'
+            resource_profile = "none"
             {extra}
             "#,
             dir.join("jobs.sqlite").display()
@@ -817,6 +818,10 @@ mod tests {
             "min_free_memory = \"4000000g\"",
             "min_free_disk = \"4000000g\"",
         ] {
+            // The readings come from /proc/meminfo and statvfs.
+            if !cfg!(target_os = "linux") {
+                continue;
+            }
             let server = poll_server(StatusCode::OK, r#"{"image":"alpine"}"#).await;
             let (launcher, mock) =
                 launcher_for(1, &format!("poll_url = \"{}\"\n{extra}", server.url), &[]);
