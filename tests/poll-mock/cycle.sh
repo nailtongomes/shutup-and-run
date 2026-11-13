@@ -52,6 +52,9 @@ WORKER_PID=""
 cleanup() {
   if [[ -n "$WORKER_PID" ]]; then kill "$WORKER_PID" 2>/dev/null || true; fi
   if [[ -n "$MOCK_PID" ]]; then kill "$MOCK_PID" 2>/dev/null || true; fi
+  # The worker writes its last status.json as it stops. Removing the folder
+  # before it is gone loses that race and fails with "Directory not empty".
+  wait 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
