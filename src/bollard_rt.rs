@@ -496,3 +496,18 @@ fn is_status(err: &bollard::errors::Error, code: u16) -> bool {
 fn docker_err(err: bollard::errors::Error) -> RuntimeError {
     RuntimeError::new(err.to_string())
 }
+
+/// The local Docker socket. `DOCKER_HOST` may name another unix socket.
+pub fn connect_docker() -> Result<bollard::Docker, String> {
+    match std::env::var("DOCKER_HOST") {
+        Ok(host) if host.starts_with("unix://") => {
+            let path = host.trim_start_matches("unix://");
+            bollard::Docker::connect_with_socket(path, 120, bollard::API_DEFAULT_VERSION)
+                .map_err(|err| err.to_string())
+        }
+        Ok(host) => Err(format!(
+            "DOCKER_HOST={host} is not a local socket. shutup-and-run only talks to a unix socket."
+        )),
+        Err(_) => bollard::Docker::connect_with_socket_defaults().map_err(|err| err.to_string()),
+    }
+}

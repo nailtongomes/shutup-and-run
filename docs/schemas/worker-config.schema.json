@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/docs/schemas/worker-config.schema.json",
+  "title": "shutup-and-run worker config (config.json)",
+  "description": "The one config file of a worker: /etc/shutup-and-run/config.json (on Windows, inside the shutup-and-run WSL distribution). `shutup-and-run config` and the local page read and write it; nothing else holds config. The service applies more rules than a schema can say (for example default_timeout_secs <= max_timeout_secs); `shutup-and-run config validate` is the authority. Unknown keys are rejected.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "token",
+    "max_slots"
+  ],
+  "properties": {
+    "poll_url": {
+      "type": "string",
+      "description": "Where the worker asks for work, every poll_interval_secs. http or https, no credentials in it. It may carry a filter in the query, for example ?user=ana; that filter is not a secret. Unset: the worker polls nothing and is idle.",
+      "maxLength": 2048
+    },
+    "poll_interval_secs": {
+      "type": "integer",
+      "description": "Seconds between polls.",
+      "minimum": 1,
+      "maximum": 3600,
+      "default": 15
+    },
+    "max_slots": {
+      "type": "integer",
+      "description": "Containers at once.",
+      "minimum": 1,
+      "maximum": 256
+    },
+    "worker_name": {
+      "type": "string",
+      "description": "Sent in the poll body so one URL can serve many machines. Printable ASCII, no spaces or quotes. Default: the host name.",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "allowlist": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Image repositories this machine may run. `repo` allows repo:tag and repo@digest. May be empty only with poll_any_image."
+    },
+    "poll_any_image": {
+      "type": "boolean",
+      "description": "A task from poll_url may name any image. A pushed job never skips the allowlist. Needs poll_url.",
+      "default": false
+    },
+    "default_timeout_secs": {
+      "type": "integer",
+      "description": "Time limit of a job that names none.",
+      "minimum": 1,
+      "default": 3600
+    },
+    "max_timeout_secs": {
+      "type": "integer",
+      "description": "Longest time limit a job may ask for. At most 7 days.",
+      "minimum": 1,
+      "maximum": 604800,
+      "default": 21600
+    },
+    "token": {
+      "type": "string",
+      "description": "Bearer token of this machine's HTTP API. Secret: masked in `config show`, in the page and in reports.",
+      "minLength": 16
+    },
+    "poll_token": {
+      "type": "string",
+      "description": "Bearer token sent to poll_url: who this machine is to the queue. Secret. Changing it makes the machine a new one that the poll URL has to approve.",
+      "minLength": 16
+    },
+    "admin_user": {
+      "type": "string",
+      "description": "Login of the advanced settings on the local page.",
+      "minLength": 1,
+      "maxLength": 64,
+      "default": "admin"
+    },
+    "admin_password": {
+      "type": "string",
+      "description": "Password of that login. Not strong: it keeps a curious person out. Secret.",
+      "minLength": 1,
+      "maxLength": 64,
+      "default": "admin"
+    },
+    "listen": {
+      "type": "string",
+      "description": "Address and port of the API and the local page.",
+      "default": "127.0.0.1:8787"
+    },
+    "http": {
+      "type": "boolean",
+      "description": "Plain HTTP. For localhost or a private network. false needs tls_cert and tls_key.",
+      "default": false
+    },
+    "tls_cert": {
+      "type": "string",
+      "description": "PEM certificate file."
+    },
+    "tls_key": {
+      "type": "string",
+      "description": "PEM key file."
+    },
+    "status_page": {
+      "type": "boolean",
+      "description": "The local page at GET /, for a loopback peer only. Also: a pause does not outlive a restart.",
+      "default": false
+    },
+    "worker_os": {
+      "type": "string",
+      "description": "Sent in the poll body. `windows` inside the WSL distribution. Default: the OS of the binary.",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "history_path": {
+      "type": "string",
+      "description": "SQLite job history. status.json is written beside it.",
+      "default": "/var/lib/shutup-and-run/jobs.sqlite"
+    },
+    "history_days": {
+      "type": "integer",
+      "description": "Days a finished job stays in the history.",
+      "minimum": 0,
+      "maximum": 3650,
+      "default": 30
+    },
+    "docker_config": {
+      "type": "string",
+      "description": "Directory of a Docker config.json with registry credentials."
+    },
+    "log_lines": {
+      "type": "integer",
+      "description": "Lines of a container's log kept with its job.",
+      "minimum": 1,
+      "maximum": 5000,
+      "default": 200
+    },
+    "reaper_interval_secs": {
+      "type": "integer",
+      "description": "How often time limits are checked.",
+      "minimum": 1,
+      "maximum": 300,
+      "default": 2
+    },
+    "purge_interval_secs": {
+      "type": "integer",
+      "description": "How often old history is deleted.",
+      "minimum": 1,
+      "maximum": 86400,
+      "default": 3600
+    },
+    "prune_interval_secs": {
+      "type": "integer",
+      "description": "How often unused images are pruned. 0: never.",
+      "minimum": 0,
+      "maximum": 86400,
+      "default": 0
+    },
+    "auth_failures": {
+      "type": "integer",
+      "description": "Wrong tokens from one address before it is banned.",
+      "minimum": 1,
+      "maximum": 100,
+      "default": 3
+    },
+    "ban_hours": {
+      "type": "integer",
+      "description": "How long that ban lasts.",
+      "minimum": 1,
+      "maximum": 8760,
+      "default": 48
+    },
+    "trust_x_forwarded_for": {
+      "type": "boolean",
+      "description": "Take the caller's address from X-Forwarded-For. Only behind your own proxy.",
+      "default": false
+    }
+  }
+}

@@ -327,6 +327,32 @@ The whole contract for an orchestrator, push, poll, manifest and callback, with 
 
 ## Configuration
 
+A machine has one config source. Either `config.json`, described here first, or `config.toml` with environment variables, described after.
+
+### config.json, the agent CLI and the local page
+
+`/etc/shutup-and-run/config.json` (on Windows, inside the WSL distribution) holds every setting, tokens included, and nothing overrides it. The Windows install writes it. It is read and written by the CLI and by the local page, never by hand. The schema is [docs/schemas/worker-config.schema.json](docs/schemas/worker-config.schema.json); the keys are the ones in the table below, plus `token`, `poll_token`, `admin_user` and `admin_password`.
+
+```
+shutup-and-run config show                      # the whole file, secrets as ***
+shutup-and-run config set poll_url "https://queue.example/poll?user=ana" --apply
+shutup-and-run config get max_slots
+shutup-and-run config validate                  # exit 3 and the reason when invalid
+shutup-and-run config apply                     # restart on the file; containers are left alone
+shutup-and-run config reset                     # factory config, tokens kept
+shutup-and-run status                           # idle, active, draining, failed, stopped
+shutup-and-run doctor [--report]                # every failed line has a fix
+shutup-and-run pause | resume
+```
+
+All of them are non-interactive and take `--json`. Exit codes: `0` done, `1` failed or unhealthy, `2` wrong command line, `3` invalid config or value (nothing written). An invalid value is never saved, and a file damaged some other way does not stop the service: it runs on the copy from the last save, or on idle defaults, and says so. `doctor --report` prints a report with secrets masked and a link that opens a GitHub issue with it filled in. [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md) is the guide for an AI agent doing this on a client's PC.
+
+With `status_page = true` the page at `http://127.0.0.1:8787/` shows the status and, on a `config.json` machine, edits the config. It opens only on the machine itself. The poll URL, the interval, the slots, the machine name and the pause are edited directly. The allowed images, `poll_any_image`, the time limits, both tokens and the admin login ask for a user and password, `admin` / `admin` until `shutup-and-run config set admin_password NEW --apply`. That login keeps a curious person out and is not security. A link switches the page between English and Portuguese and the choice is remembered. Where the page is on, a pause ends when the service restarts. Why this replaced "no web UI" is in [docs/DECISIONS.md](docs/DECISIONS.md).
+
+The Linux installer still writes `config.toml`. A Linux machine uses `config.json` when that file exists and `SHUTUP_AND_RUN_CONFIG` does not name a TOML file; there is no converter.
+
+### config.toml and environment
+
 `/etc/shutup-and-run/config.toml`, or the file named by `SHUTUP_AND_RUN_CONFIG`. Environment variables override the file. An unknown key refuses to start. After a change: `sudo systemctl restart shutup-and-run`. Running jobs survive the restart.
 
 | toml | environment | meaning |

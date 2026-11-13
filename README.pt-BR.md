@@ -327,6 +327,32 @@ O contrato completo para um orquestrador (push, poll, manifesto e callback), com
 
 ## Configuração
 
+Uma máquina tem uma única fonte de configuração: o `config.json`, descrito primeiro, ou o `config.toml` com variáveis de ambiente, descrito depois.
+
+### config.json, o CLI para agentes e a página local
+
+`/etc/shutup-and-run/config.json` (no Windows, dentro da distribuição WSL) guarda toda a configuração, inclusive os tokens, e nada se sobrepõe a ele. A instalação no Windows grava esse arquivo. Quem lê e grava é o CLI e a página local, nunca a mão. O schema é [docs/schemas/worker-config.schema.json](docs/schemas/worker-config.schema.json); as chaves são as da tabela abaixo, mais `token`, `poll_token`, `admin_user` e `admin_password`.
+
+```
+shutup-and-run config show                      # o arquivo inteiro, segredos como ***
+shutup-and-run config set poll_url "https://fila.example/poll?user=ana" --apply
+shutup-and-run config get max_slots
+shutup-and-run config validate                  # sai com 3 e o motivo quando inválido
+shutup-and-run config apply                     # reinicia com o arquivo; os containers continuam
+shutup-and-run config reset                     # config de fábrica, tokens mantidos
+shutup-and-run status                           # idle, active, draining, failed, stopped
+shutup-and-run doctor [--report]                # cada linha com falha traz a correção
+shutup-and-run pause | resume
+```
+
+Nenhum deles pergunta nada e todos aceitam `--json`. Códigos de saída: `0` feito, `1` falhou ou não está saudável, `2` linha de comando errada, `3` config ou valor inválido (nada foi gravado). Um valor inválido nunca é salvo, e um arquivo danificado de outro jeito não impede o serviço de subir: ele roda com a cópia do último salvamento, ou com padrões ociosos, e avisa. `doctor --report` imprime um relatório com os segredos mascarados e um link que abre uma issue no GitHub já preenchida. [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md) é o guia para um agente de IA fazer isso no PC de um cliente.
+
+Com `status_page = true`, a página em `http://127.0.0.1:8787/` mostra o status e, numa máquina com `config.json`, edita a configuração. Ela só abre na própria máquina. A URL de poll, o intervalo, os slots, o nome da máquina e a pausa são editados direto. As imagens permitidas, `poll_any_image`, os tempos limite, os dois tokens e o login admin pedem usuário e senha, `admin` / `admin` até `shutup-and-run config set admin_password NOVA --apply`. Esse login afasta o curioso e não é segurança. Um link alterna a página entre inglês e português e a escolha fica guardada. Onde a página está ligada, a pausa termina quando o serviço reinicia. O motivo de isso ter substituído o "sem web UI" está em [docs/DECISIONS.md](docs/DECISIONS.md).
+
+O instalador do Linux ainda grava `config.toml`. Uma máquina Linux usa o `config.json` quando esse arquivo existe e `SHUTUP_AND_RUN_CONFIG` não aponta para um TOML; não há conversor.
+
+### config.toml e ambiente
+
 `/etc/shutup-and-run/config.toml`, ou o arquivo indicado em `SHUTUP_AND_RUN_CONFIG`. As variáveis de ambiente têm prioridade sobre o arquivo. Uma chave desconhecida impede a partida. Depois de alterar: `sudo systemctl restart shutup-and-run`. Os jobs em execução sobrevivem ao restart.
 
 | toml | ambiente | significado |

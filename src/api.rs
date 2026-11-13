@@ -838,7 +838,15 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&bytes);
-        assert!(html.contains("RODANDO / RUNNING"), "{html}");
+        assert!(html.contains("RUNNING"), "{html}");
+        // A config.toml machine has nothing to edit on the page.
+        assert!(!html.contains("/local/config"));
+        let response = app
+            .clone()
+            .oneshot(local("GET", "/local/config", LO, HOST, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(html.contains("0 / 1"));
         assert!(!html.contains(TOKEN));
 
@@ -921,5 +929,172 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The page of a config.json machine: language, the open form, and the
+    /// dangerous keys behind the admin login.
+    #[tokio::test]
+    async fn the_local_page_edits_config_json_and_locks_the_dangerous_keys() {
+        const LO: [u8; 4] = [127, 0, 0, 1];
+        const HOST: &str = "127.0.0.1:8787";
+        const ORIGIN: &str = "http://127.0.0.1:8787";
+        let dir = std::env::temp_dir().join(format!("shutup-and-run-page-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.json");
+        let mut map = crate::config::default_map();
+        map.insert(
+            "history_path".into(),
+            json!(dir.join("jobs.sqlite").display().to_string()),
+        );
+        map.insert("admin_password".into(), json!("open-sesame"));
+        crate::config::save_json(&path, &map).unwrap();
+        let cfg = Settings::load_json(&path);
+        assert_eq!(cfg.admin_user, "admin");
+        let runtime: Arc<dyn Runtime> = Arc::new(MockRuntime::new());
+        let launcher = Launcher::new(cfg, runtime).unwrap();
+        let app = router(launcher);
+
+        let send = |method: &'static str,
+                    uri: &'static str,
+                    headers: Vec<(&'static str, String)>,
+                    body: &'static str| {
+            let app = app.clone();
+            async move {
+                let mut builder = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("host", HOST)
+                    .header("content-type", "application/x-www-form-urlencoded");
+                for (name, value) in headers {
+                    builder = builder.header(name, value);
+                }
+                let request = stamp(builder.body(Body::from(body)).unwrap(), LO);
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let headers = response.headers().clone();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, headers, String::from_utf8_lossy(&bytes).to_string())
+            }
+        };
+        let basic = |pair: &str| {
+            use base64::Engine;
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(pair)
+            )
+        };
+
+        // Language: English by default, the button sets a cookie that lasts,
+        // and with the cookie the same page is in Portuguese only.
+        let (status, _, english) = send("GET", "/", vec![], "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(english.contains("Turn off?") && !english.contains("Pode desligar?"));
+        assert!(english.contains("href=\"/local/config\""));
+        let (status, headers, _) =
+            send("GET", "/local/lang?set=pt&to=/local/config", vec![], "").await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers["location"], "/local/config");
+        let cookie = headers["set-cookie"].to_str().unwrap().to_string();
+        assert!(cookie.starts_with("lang=pt;") && cookie.contains("Max-Age=315360000"));
+        let (_, headers, _) = send(
+            "GET",
+            "/local/lang?set=pt&to=https://evil.example/",
+            vec![],
+            "",
+        )
+        .await;
+        assert_eq!(headers["location"], "/");
+        let (_, _, portuguese) = send("GET", "/", vec![("cookie", "lang=pt".into())], "").await;
+        assert!(portuguese.contains("Pode desligar?") && !portuguese.contains("Turn off?"));
+
+        // The open form saves an everyday key with no login.
+        let (status, _, page) = send("GET", "/local/config", vec![], "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains("name=\"poll_url\"") && !page.contains("name=\"allowlist\""));
+        assert!(!page.contains("open-sesame"));
+        let (status, _, _) = send(
+            "POST",
+            "/local/config",
+            vec![("origin", ORIGIN.into())],
+            "poll_url=https%3A%2F%2Fjobs.example%2Fpoll%3Fuser%3Dana&max_slots=2",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let saved = crate::config::read_json(&path).unwrap();
+        assert_eq!(saved["poll_url"], "https://jobs.example/poll?user=ana");
+        assert_eq!(saved["max_slots"], 2);
+        // An invalid value comes back as the form with the reason.
+        let (status, _, page) = send(
+            "POST",
+            "/local/config",
+            vec![("origin", ORIGIN.into())],
+            "max_slots=0",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.contains("max_slots must be between 1 and 256"));
+        // Not from another site's form.
+        let (status, _, _) = send(
+            "POST",
+            "/local/config",
+            vec![("origin", "https://evil.example".into())],
+            "max_slots=9",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // A dangerous key through the open form is ignored.
+        let (status, _, _) = send(
+            "POST",
+            "/local/config",
+            vec![("origin", ORIGIN.into())],
+            "max_slots=2&allowlist=evil%2Fimage&poll_any_image=on",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let saved = crate::config::read_json(&path).unwrap();
+        assert_eq!(saved["allowlist"], json!(["hello-world"]));
+        assert!(saved.get("poll_any_image").is_none());
+
+        // The advanced page asks for the login: none, a wrong one, the default
+        // password that was changed. Reading and saving alike.
+        for auth in [None, Some(basic("admin:nope")), Some(basic("admin:admin"))] {
+            for (method, body) in [("GET", ""), ("POST", "allowlist=evil%2Fimage")] {
+                let mut headers = vec![("origin", ORIGIN.to_string())];
+                if let Some(auth) = &auth {
+                    headers.push(("authorization", auth.clone()));
+                }
+                let (status, headers, _) = send(method, "/local/advanced", headers, body).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {auth:?}");
+                assert!(headers["www-authenticate"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("Basic"));
+            }
+        }
+        assert_eq!(
+            crate::config::read_json(&path).unwrap()["allowlist"],
+            json!(["hello-world"])
+        );
+        let login = vec![
+            ("origin", ORIGIN.to_string()),
+            ("authorization", basic("admin:open-sesame")),
+        ];
+        let (status, _, page) = send("GET", "/local/advanced", login.clone(), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains("name=\"allowlist\"") && page.contains("name=\"admin_password\""));
+        let (status, _, _) = send(
+            "POST",
+            "/local/advanced",
+            login,
+            "allowlist=alpine%0D%0Aghcr.io%2Fo%2Fimg&token=&poll_token=&admin_user=admin&admin_password=",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let saved = crate::config::read_json(&path).unwrap();
+        assert_eq!(saved["allowlist"], json!(["alpine", "ghcr.io/o/img"]));
+        assert_eq!(saved["admin_password"], "open-sesame");
+        assert_eq!(saved["token"], map["token"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

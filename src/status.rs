@@ -1,23 +1,29 @@
-//! The local status page: `GET /` on the machine itself, off unless
+//! The local page: `GET /` on the machine itself, off unless
 //! `status_page = true`. It is for the person at the PC and for support
 //! asking them for a screenshot: is it running, is a job running, may the PC
-//! be turned off. It shows no token, no env and no logs.
+//! be turned off. On a machine whose config is config.json it also edits
+//! that file: the everyday keys directly, the dangerous ones behind the
+//! admin login. It shows no token, no env and no logs.
 //!
 //! It is the one thing on the port without the bearer token, so it answers
 //! only a loopback peer that also names a loopback host. Anything else is a
 //! 404, and never an authentication failure: a browser must not get the
 //! machine's own address banned.
 
+use crate::config::{self, JsonMap, Kind, OnPage};
 use crate::launcher::Launcher;
 use crate::store::JobRecord;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Form, Query, State};
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::middleware::{from_fn, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use base64::Engine;
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,6 +35,9 @@ pub fn router(launcher: Arc<Launcher>) -> Router {
         .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
         .route("/local/pause", post(pause))
         .route("/local/resume", post(resume))
+        .route("/local/lang", get(set_lang))
+        .route("/local/config", get(config_page).post(config_save))
+        .route("/local/advanced", get(advanced_page).post(advanced_save))
         .layer(from_fn(local_only))
         .with_state(launcher)
 }
@@ -89,7 +98,76 @@ fn set_draining(launcher: &Launcher, draining: bool) -> Response {
     }
 }
 
-async fn page(State(launcher): State<Arc<Launcher>>) -> Response {
+// ---------------------------------------------------------------------------
+// Language. One at a time on the screen, never both.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lang {
+    En,
+    Pt,
+}
+
+impl Lang {
+    fn t(self, en: &'static str, pt: &'static str) -> &'static str {
+        match self {
+            Lang::En => en,
+            Lang::Pt => pt,
+        }
+    }
+}
+
+/// The cookie the language button sets, kept by the browser for ten years.
+/// Without it, the browser's own language decides.
+pub(crate) fn lang_of(headers: &HeaderMap) -> Lang {
+    let text = |name| {
+        headers
+            .get(name)
+            .and_then(|v: &header::HeaderValue| v.to_str().ok())
+    };
+    let cookie = text(header::COOKIE).and_then(|cookies| {
+        cookies
+            .split(';')
+            .filter_map(|pair| pair.trim().strip_prefix("lang="))
+            .next()
+    });
+    match cookie {
+        Some("pt") => Lang::Pt,
+        Some("en") => Lang::En,
+        _ if text(header::ACCEPT_LANGUAGE)
+            .is_some_and(|accept| accept.trim_start().to_ascii_lowercase().starts_with("pt")) =>
+        {
+            Lang::Pt
+        }
+        _ => Lang::En,
+    }
+}
+
+async fn set_lang(Query(query): Query<HashMap<String, String>>) -> Response {
+    let lang = if query.get("set").map(String::as_str) == Some("pt") {
+        "pt"
+    } else {
+        "en"
+    };
+    // Only back to one of this page's own paths.
+    let to = query
+        .get("to")
+        .map(String::as_str)
+        .filter(|to| matches!(*to, "/local/config" | "/local/advanced"))
+        .unwrap_or("/");
+    (
+        [(
+            header::SET_COOKIE,
+            format!("lang={lang}; Path=/; Max-Age=315360000; SameSite=Lax"),
+        )],
+        Redirect::to(to),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// The status page
+
+async fn page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Response {
     let settings = launcher.settings();
     let live = launcher.live_status().await;
     let now = SystemTime::now()
@@ -97,17 +175,27 @@ async fn page(State(launcher): State<Arc<Launcher>>) -> Response {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let view = View {
+        lang: lang_of(&headers),
         worker: &settings.worker_name,
         os: &settings.worker_os,
         slots: live.slots_for_page(),
         draining: live.draining,
         last: live.last.as_ref(),
         now,
+        polls: settings.poll_url.is_some(),
+        poll_error: live.poll_error.as_deref(),
+        warning: live.config_warning.as_deref(),
+        editable: settings.config_json.is_some(),
     };
-    ([(header::CACHE_CONTROL, "no-store")], Html(render(&view))).into_response()
+    html(StatusCode::OK, render(&view))
+}
+
+fn html(status: StatusCode, body: String) -> Response {
+    (status, [(header::CACHE_CONTROL, "no-store")], Html(body)).into_response()
 }
 
 pub(crate) struct View<'a> {
+    pub lang: Lang,
     pub worker: &'a str,
     pub os: &'a str,
     /// Used and total. None when Docker did not answer.
@@ -115,26 +203,61 @@ pub(crate) struct View<'a> {
     pub draining: bool,
     pub last: Option<&'a JobRecord>,
     pub now: i64,
+    pub polls: bool,
+    pub poll_error: Option<&'a str>,
+    pub warning: Option<&'a str>,
+    /// The config is config.json, so the page can edit it.
+    pub editable: bool,
+}
+
+/// Everything around a page's body: one language, and a link to the other.
+fn shell(lang: Lang, here: &str, refresh: Option<(u32, &str)>, body: &str) -> String {
+    let refresh = refresh
+        .map(|(secs, url)| format!("<meta http-equiv=\"refresh\" content=\"{secs};url={url}\">"))
+        .unwrap_or_default();
+    let (other, other_name) = match lang {
+        Lang::En => ("pt", "Português"),
+        Lang::Pt => ("en", "English"),
+    };
+    format!(
+        "<!doctype html><html lang=\"{code}\"><head><meta charset=\"utf-8\">{refresh}\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>shutup-and-run</title>\
+         <style>body{{font:16px/1.5 system-ui,sans-serif;max-width:44em;margin:2em auto;padding:0 1em}}\
+         h1{{font-size:1.1em}}h2{{font-size:1em;margin-top:2em}}\
+         .state{{font-size:1.6em;font-weight:700}}.bad{{color:#b00020}}.top{{float:right}}\
+         td{{padding:.2em 1em .2em 0;vertical-align:top}}button{{font:inherit;padding:.4em 1em}}\
+         label{{display:block;margin:.8em 0 .2em}}input[type=text],input[type=number],input[type=password],textarea\
+         {{font:inherit;width:100%;box-sizing:border-box;padding:.3em}}code{{word-break:break-all}}</style>\
+         </head><body><p class=\"top\"><a href=\"/local/lang?set={other}&amp;to={here}\">{other_name}</a></p>\
+         <h1>shutup-and-run {version}</h1>{body}</body></html>",
+        code = lang.t("en", "pt-BR"),
+        version = env!("CARGO_PKG_VERSION"),
+    )
 }
 
 pub(crate) fn render(view: &View) -> String {
+    let lang = view.lang;
     let (state, color) = match worker_state(
         view.slots.is_none(),
         view.draining,
         view.slots.map(|(used, _)| used).unwrap_or(0),
         false,
     ) {
-        "failed" => ("DOCKER PAROU / DOCKER IS DOWN", "#b00020"),
-        "draining" => ("PAUSADO / PAUSED", "#8a6d00"),
-        _ => ("RODANDO / RUNNING", "#0a7a2f"),
+        "failed" => (lang.t("DOCKER IS DOWN", "DOCKER PAROU"), "#b00020"),
+        "draining" => (lang.t("PAUSED", "PAUSADO"), "#8a6d00"),
+        _ => (lang.t("RUNNING", "RODANDO"), "#0a7a2f"),
     };
     let (slots, off) = match view.slots {
         Some((used, total)) => (
             format!("{used} / {total}"),
             if used == 0 {
-                "SIM, pode desligar o PC. / YES, the PC can be turned off."
+                lang.t("YES, the PC can be turned off.", "SIM, pode desligar o PC.")
             } else {
-                "NAO agora: ha tarefa rodando. / NOT now: a job is running."
+                lang.t(
+                    "NOT now: a job is running.",
+                    "NÃO agora: há tarefa rodando.",
+                )
             },
         ),
         None => ("?".to_string(), "?"),
@@ -153,36 +276,384 @@ pub(crate) fn render(view: &View) -> String {
                 .unwrap_or_default(),
             ago(view.now.saturating_sub(job.started_at)),
         ),
-        None => "nenhum ainda / none yet".to_string(),
+        None => lang.t("none yet", "nenhuma ainda").to_string(),
+    };
+    let queue = match (view.polls, view.poll_error) {
+        (false, _) => lang
+            .t(
+                "no poll URL: nothing to do",
+                "sem URL de poll: nada a fazer",
+            )
+            .to_string(),
+        (true, None) => lang.t("answering", "respondendo").to_string(),
+        (true, Some(error)) => format!("<span class=\"bad\">{}</span>", escape(error)),
     };
     let (action, label) = if view.draining {
-        ("/local/resume", "Voltar a aceitar tarefas / Resume")
+        (
+            "/local/resume",
+            lang.t("Resume taking jobs", "Voltar a aceitar tarefas"),
+        )
     } else {
-        ("/local/pause", "Pausar: nao pegar novas tarefas / Pause")
+        (
+            "/local/pause",
+            lang.t("Pause: take no new jobs", "Pausar: não pegar novas tarefas"),
+        )
     };
-    format!(
-        "<!doctype html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\">\
-         <meta http-equiv=\"refresh\" content=\"10\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>shutup-and-run</title>\
-         <style>body{{font:16px/1.5 system-ui,sans-serif;max-width:40em;margin:2em auto;padding:0 1em}}\
-         h1{{font-size:1.1em}}.state{{font-size:1.6em;font-weight:700;color:{color}}}\
-         td{{padding:.2em 1em .2em 0;vertical-align:top}}button{{font:inherit;padding:.4em 1em}}</style>\
-         </head><body><h1>shutup-and-run {version}</h1>\
-         <p class=\"state\">{state}</p>\
+    let warning = view
+        .warning
+        .map(|w| format!("<p class=\"bad\">{}</p>", escape(w)))
+        .unwrap_or_default();
+    let settings = if view.editable {
+        format!(
+            "<p><a href=\"/local/config\">{}</a></p>",
+            lang.t("Settings", "Configuração")
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "<p class=\"state\" style=\"color:{color}\">{state}</p>{warning}\
          <table>\
-         <tr><td>Pode desligar? / Turn off?</td><td><b>{off}</b></td></tr>\
-         <tr><td>Tarefas agora / Jobs now</td><td>{slots}</td></tr>\
-         <tr><td>Ultima tarefa / Last job</td><td>{last}</td></tr>\
-         <tr><td>Maquina / Machine</td><td>{worker} ({os})</td></tr>\
+         <tr><td>{t_off}</td><td><b>{off}</b></td></tr>\
+         <tr><td>{t_jobs}</td><td>{slots}</td></tr>\
+         <tr><td>{t_last}</td><td>{last}</td></tr>\
+         <tr><td>{t_queue}</td><td>{queue}</td></tr>\
+         <tr><td>{t_machine}</td><td>{worker} ({os})</td></tr>\
          </table>\
          <form method=\"post\" action=\"{action}\"><p><button>{label}</button></p></form>\
-         <p><small>Esta pagina so abre neste computador e se atualiza a cada 10 s. / \
-         This page opens only on this computer and reloads every 10 s.</small></p>\
-         </body></html>",
-        version = env!("CARGO_PKG_VERSION"),
+         {settings}<p><small>{note}</small></p>",
+        t_off = lang.t("Turn off?", "Pode desligar?"),
+        t_jobs = lang.t("Jobs now", "Tarefas agora"),
+        t_last = lang.t("Last job", "Última tarefa"),
+        t_queue = lang.t("Job queue", "Fila de tarefas"),
+        t_machine = lang.t("Machine", "Máquina"),
         worker = escape(view.worker),
         os = escape(view.os),
+        note = lang.t(
+            "This page opens only on this computer and reloads every 10 s. A pause ends when the PC restarts.",
+            "Esta página só abre neste computador e se atualiza a cada 10 s. A pausa termina quando o PC reinicia.",
+        ),
+    );
+    shell(lang, "/", Some((10, "/")), &body)
+}
+
+// ---------------------------------------------------------------------------
+// The config editor. config.json is the source; these pages read it and
+// write it through the same validation as the CLI.
+
+fn label(name: &str, lang: Lang) -> &'static str {
+    match name {
+        "poll_url" => lang.t(
+            "Poll URL (with its ?user= filter)",
+            "URL de poll (com o filtro ?user=)",
+        ),
+        "poll_interval_secs" => lang.t("Poll interval, seconds", "Intervalo de poll, segundos"),
+        "max_slots" => lang.t("Containers at once", "Containers ao mesmo tempo"),
+        "worker_name" => lang.t("Machine name", "Nome da máquina"),
+        "allowlist" => lang.t(
+            "Allowed images, one per line",
+            "Imagens permitidas, uma por linha",
+        ),
+        "poll_any_image" => lang.t(
+            "Run any image the poll URL sends",
+            "Rodar qualquer imagem que a URL de poll mandar",
+        ),
+        "default_timeout_secs" => lang.t(
+            "Job time limit, seconds",
+            "Tempo limite da tarefa, segundos",
+        ),
+        "max_timeout_secs" => lang.t(
+            "Longest time limit a job may ask for, seconds",
+            "Maior tempo limite que uma tarefa pode pedir, segundos",
+        ),
+        "token" => lang.t("API token (blank keeps it)", "Token da API (vazio mantém)"),
+        "poll_token" => lang.t(
+            "Poll token: who this machine is to the poll URL (blank keeps it)",
+            "Token de poll: quem esta máquina é para a URL de poll (vazio mantém)",
+        ),
+        "admin_user" => lang.t("Admin user", "Usuário admin"),
+        "admin_password" => lang.t(
+            "Admin password (blank keeps it)",
+            "Senha admin (vazio mantém)",
+        ),
+        _ => "",
+    }
+}
+
+/// The form for the keys of one group, filled from the file.
+fn form(map: &JsonMap, group: OnPage, action: &str, lang: Lang) -> String {
+    let mut fields = String::new();
+    for key in config::KEYS.iter().filter(|k| k.page == group) {
+        let name = key.name;
+        let text = label(name, lang);
+        let value = map.get(name);
+        fields.push_str(&match key.kind {
+            Kind::Bool => format!(
+                "<label><input type=\"checkbox\" name=\"{name}\"{}> {text}</label>",
+                if value.and_then(|v| v.as_bool()).unwrap_or(false) {
+                    " checked"
+                } else {
+                    ""
+                }
+            ),
+            Kind::List => format!(
+                "<label for=\"{name}\">{text}</label><textarea id=\"{name}\" name=\"{name}\" rows=\"4\">{}</textarea>",
+                escape(
+                    &value
+                        .and_then(|v| v.as_array())
+                        .map(|list| list
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"))
+                        .unwrap_or_default()
+                )
+            ),
+            _ if key.secret => format!(
+                "<label for=\"{name}\">{text}</label><input type=\"password\" id=\"{name}\" name=\"{name}\" autocomplete=\"new-password\">"
+            ),
+            kind => format!(
+                "<label for=\"{name}\">{text}</label><input type=\"{}\" id=\"{name}\" name=\"{name}\" value=\"{}\">",
+                if kind == Kind::Int { "number" } else { "text" },
+                escape(&match value {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(other) => other.to_string(),
+                    None => String::new(),
+                })
+            ),
+        });
+    }
+    format!(
+        "<form method=\"post\" action=\"{action}\">{fields}<p><button>{}</button></p></form>",
+        lang.t("Save and apply", "Salvar e aplicar")
+    )
+}
+
+fn editor(path: &Path, group: OnPage, lang: Lang, error: Option<&str>) -> String {
+    let (here, title, other) = match group {
+        OnPage::Locked => (
+            "/local/advanced",
+            lang.t("Advanced settings", "Configuração avançada"),
+            format!(
+                "<a href=\"/local/config\">{}</a>",
+                lang.t("Everyday settings", "Configuração do dia a dia")
+            ),
+        ),
+        _ => (
+            "/local/config",
+            lang.t("Settings", "Configuração"),
+            format!(
+                "<a href=\"/local/advanced\">{}</a>",
+                lang.t(
+                    "Advanced settings (asks for the admin user and password)",
+                    "Configuração avançada (pede o usuário e a senha admin)"
+                )
+            ),
+        ),
+    };
+    let error = error
+        .map(|e| {
+            format!(
+                "<p class=\"bad\"><b>{}</b> {}</p>",
+                lang.t("Not saved.", "Não foi salvo."),
+                escape(e)
+            )
+        })
+        .unwrap_or_default();
+    let body = match config::read_json(path) {
+        Ok(map) => {
+            let rows: String = config::masked(&map)
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "<tr><td>{}</td><td><code>{}</code></td></tr>",
+                        escape(k),
+                        escape(&v.to_string())
+                    )
+                })
+                .collect();
+            format!(
+                "{}<h2>{}</h2><table>{rows}</table><p><small>{}</small></p>",
+                form(&map, group, here, lang),
+                lang.t("The whole config file", "O arquivo de configuração inteiro"),
+                lang.t(
+                    "Saving restarts the service; running jobs are not stopped. An empty field goes back to its default. The other keys change with <code>shutup-and-run config set KEY VALUE</code>.",
+                    "Salvar reinicia o serviço; as tarefas em execução não param. Campo vazio volta ao padrão. As outras chaves mudam com <code>shutup-and-run config set CHAVE VALOR</code>.",
+                ),
+            )
+        }
+        Err(err) => format!(
+            "<p class=\"bad\">{}</p><p>{}</p>",
+            escape(&err.0),
+            lang.t(
+                "Repair it with <code>shutup-and-run config reset</code>.",
+                "Conserte com <code>shutup-and-run config reset</code>.",
+            )
+        ),
+    };
+    shell(
+        lang,
+        here,
+        None,
+        &format!(
+            "<h2>{title}</h2>{error}{body}<p><a href=\"/\">{}</a> &middot; {other}</p>",
+            lang.t("Back to status", "Voltar ao status")
+        ),
+    )
+}
+
+/// Put one group's form fields into the file. Only that group's keys are
+/// read from the form, so the open form cannot carry a dangerous key.
+pub(crate) fn save_fields(
+    path: &Path,
+    group: OnPage,
+    form: &HashMap<String, String>,
+) -> Result<(), String> {
+    let mut map = config::read_json(path).map_err(|e| e.0)?;
+    for key in config::KEYS.iter().filter(|k| k.page == group) {
+        let raw = form.get(key.name).map(|v| v.trim());
+        match (key.kind, raw) {
+            (Kind::Bool, raw) => {
+                map.insert(key.name.to_string(), serde_json::Value::Bool(raw.is_some()));
+            }
+            (_, None) => {}
+            (Kind::List, Some(raw)) => {
+                map.insert(
+                    key.name.to_string(),
+                    config::parse_value(key, raw).map_err(|e| e.0)?,
+                );
+            }
+            // Blank keeps a secret, and returns any other key to its default.
+            (_, Some("")) if key.secret => {}
+            (_, Some("")) => {
+                map.remove(key.name);
+            }
+            (_, Some(raw)) => {
+                map.insert(
+                    key.name.to_string(),
+                    config::parse_value(key, raw).map_err(|e| e.0)?,
+                );
+            }
+        }
+    }
+    config::save_json(path, &map).map_err(|e| e.0)
+}
+
+/// `Authorization: Basic` against the admin user and password. It keeps a
+/// curious person out of the dangerous keys. It is not strong and is not
+/// meant to be: the person at the machine can read the file.
+fn admin(headers: &HeaderMap, launcher: &Launcher) -> bool {
+    let settings = launcher.settings();
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .and_then(|b64| {
+            base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .ok()
+        })
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .is_some_and(|pair| pair == format!("{}:{}", settings.admin_user, settings.admin_password))
+}
+
+fn ask_login() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            header::WWW_AUTHENTICATE,
+            "Basic realm=\"shutup-and-run advanced settings\", charset=\"UTF-8\"",
+        )],
+        "admin user and password needed",
+    )
+        .into_response()
+}
+
+fn not_editable(lang: Lang) -> Response {
+    html(
+        StatusCode::NOT_FOUND,
+        shell(
+            lang,
+            "/",
+            None,
+            lang.t(
+                "<p>This machine is set up with config.toml. The page edits config.json only.</p>",
+                "<p>Esta máquina usa config.toml. A página só edita o config.json.</p>",
+            ),
+        ),
+    )
+}
+
+async fn config_page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Response {
+    edit_page(&launcher, &headers, OnPage::Open)
+}
+
+async fn advanced_page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Response {
+    edit_page(&launcher, &headers, OnPage::Locked)
+}
+
+fn edit_page(launcher: &Launcher, headers: &HeaderMap, group: OnPage) -> Response {
+    let lang = lang_of(headers);
+    let Some(path) = &launcher.settings().config_json else {
+        return not_editable(lang);
+    };
+    if group == OnPage::Locked && !admin(headers, launcher) {
+        return ask_login();
+    }
+    html(StatusCode::OK, editor(path, group, lang, None))
+}
+
+async fn config_save(
+    State(launcher): State<Arc<Launcher>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    save_page(&launcher, &headers, OnPage::Open, &form)
+}
+
+async fn advanced_save(
+    State(launcher): State<Arc<Launcher>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    save_page(&launcher, &headers, OnPage::Locked, &form)
+}
+
+fn save_page(
+    launcher: &Launcher,
+    headers: &HeaderMap,
+    group: OnPage,
+    form: &HashMap<String, String>,
+) -> Response {
+    let lang = lang_of(headers);
+    let Some(path) = &launcher.settings().config_json else {
+        return not_editable(lang);
+    };
+    if group == OnPage::Locked && !admin(headers, launcher) {
+        return ask_login();
+    }
+    if let Err(error) = save_fields(path, group, form) {
+        return html(
+            StatusCode::BAD_REQUEST,
+            editor(path, group, lang, Some(&error)),
+        );
+    }
+    // Answer first, then restart: the page below reloads into the new service.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        request_restart();
+    });
+    html(
+        StatusCode::OK,
+        shell(
+            lang,
+            "/",
+            Some((4, "/")),
+            lang.t(
+                "<p class=\"state\">Saved.</p><p>The service is restarting on the new settings. This page goes back to the status in a few seconds.</p>",
+                "<p class=\"state\">Salvo.</p><p>O serviço está reiniciando com a nova configuração. Esta página volta ao status em alguns segundos.</p>",
+            ),
+        ),
     )
 }
 
@@ -224,6 +695,9 @@ pub struct Live {
     pub last_job_error: Option<String>,
     pub docker_error: Option<String>,
     pub last: Option<JobRecord>,
+    /// Why the last poll failed. None when it was answered or nothing is polled.
+    pub poll_error: Option<String>,
+    pub config_warning: Option<String>,
 }
 
 impl Live {
@@ -235,14 +709,15 @@ impl Live {
     /// so a heartbeat still rewrites the file on the interval.
     pub fn signature(&self) -> String {
         format!(
-            "{}|{:?}|{:?}|{}|{}|{:?}|{:?}",
+            "{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}",
             self.state(false),
             self.slots_used,
             self.slots_total,
             self.draining,
             self.job_ids.join(","),
             self.last_job_at,
-            self.last_error(false, None)
+            self.last_error(false, None),
+            self.poll_error
         )
     }
 
@@ -315,8 +790,13 @@ struct FileBody<'a> {
     job_ids: &'a [String],
     last_job_at: Option<String>,
     last_error: Option<String>,
+    poll_error: Option<String>,
+    config_warning: Option<String>,
     version: &'a str,
     pid: u32,
+    /// When this process started. It changes when the service restarts on a
+    /// new config, which keeps the pid.
+    started_at: String,
     updated_at: String,
 }
 
@@ -333,8 +813,11 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
         job_ids: &live.job_ids,
         last_job_at: live.last_job_at.map(unix_to_iso),
         last_error: err,
+        poll_error: live.poll_error.as_deref().map(one_line),
+        config_warning: live.config_warning.as_deref().map(one_line),
         version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
+        started_at: unix_to_iso(*STARTED.get_or_init(self::now_unix)),
         updated_at: unix_to_iso(now_unix),
     };
     let mut bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
@@ -361,8 +844,29 @@ fn empty_live() -> Live {
         last_job_error: None,
         docker_error: None,
         last: None,
+        poll_error: None,
+        config_warning: None,
     }
 }
+
+static RESTART: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static WANT_RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stop serving and start again on the config file. `main` does the restart.
+pub fn request_restart() {
+    WANT_RESTART.store(true, std::sync::atomic::Ordering::SeqCst);
+    RESTART.notify_one();
+}
+
+pub async fn restart_requested() {
+    RESTART.notified().await;
+}
+
+pub fn restart_wanted() -> bool {
+    WANT_RESTART.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+static STARTED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
 
 pub fn now_unix() -> i64 {
     SystemTime::now()
@@ -588,75 +1092,189 @@ fn publish(path: &std::path::Path, live: &Live, stopped: bool, failed: Option<&s
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_page_says_the_state_and_whether_the_pc_can_be_turned_off() {
-        let idle = render(&View {
+    fn view(lang: Lang, slots: Option<(usize, usize)>, draining: bool) -> View<'static> {
+        View {
+            lang,
             worker: "DESK<07>",
             os: "windows",
-            slots: Some((0, 2)),
-            draining: false,
+            slots,
+            draining,
             last: None,
             now: 1_700_000_000,
-        });
-        assert!(idle.contains("RODANDO / RUNNING"));
+            polls: true,
+            poll_error: None,
+            warning: None,
+            editable: true,
+        }
+    }
+
+    #[test]
+    fn the_page_says_the_state_and_whether_the_pc_can_be_turned_off() {
+        let idle = render(&view(Lang::Pt, Some((0, 2)), false));
+        assert!(idle.contains("RODANDO"));
         assert!(idle.contains("SIM, pode desligar"));
         assert!(idle.contains("0 / 2"));
         assert!(idle.contains("DESK&lt;07&gt; (windows)"));
         assert!(idle.contains(env!("CARGO_PKG_VERSION")));
         assert!(idle.contains("action=\"/local/pause\""));
+        assert!(idle.contains("href=\"/local/config\""));
 
-        let busy = render(&View {
-            worker: "d",
-            os: "linux",
-            slots: Some((1, 2)),
-            draining: true,
-            last: None,
-            now: 0,
-        });
-        assert!(busy.contains("PAUSADO / PAUSED"));
-        assert!(busy.contains("NAO agora"));
+        let busy = render(&view(Lang::Pt, Some((1, 2)), true));
+        assert!(busy.contains("PAUSADO"));
+        assert!(busy.contains("NÃO agora"));
         assert!(busy.contains("action=\"/local/resume\""));
 
-        let down = render(&View {
-            worker: "d",
-            os: "linux",
-            slots: None,
-            draining: false,
-            last: None,
-            now: 0,
-        });
-        assert!(down.contains("DOCKER PAROU"));
+        let down = render(&view(Lang::En, None, false));
+        assert!(down.contains("DOCKER IS DOWN"));
+        let mut refused = view(Lang::En, Some((0, 1)), false);
+        refused.poll_error = Some("poll returned 403: the poll URL has not approved this machine");
+        refused.warning = Some("config.json is not usable");
+        refused.editable = false;
+        let refused = render(&refused);
+        assert!(refused.contains("has not approved this machine"));
+        assert!(refused.contains("config.json is not usable"));
+        assert!(!refused.contains("/local/config"));
         assert_eq!(ago(90), "90 s");
         assert_eq!(ago(600), "10 min");
         assert_eq!(ago(7200), "2 h");
     }
 
+    /// One language on the screen at a time, and a link to the other.
     #[test]
-    fn the_file_uses_the_same_state_as_the_page() {
-        assert_eq!(worker_state(false, false, 0, false), "idle");
-        assert_eq!(worker_state(false, false, 2, false), "active");
-        assert_eq!(worker_state(false, true, 2, false), "draining");
-        assert_eq!(worker_state(true, false, 0, false), "failed");
-        assert_eq!(worker_state(false, false, 1, true), "stopped");
+    fn each_page_is_in_one_language_only() {
+        let english = [
+            "RUNNING",
+            "Turn off?",
+            "Jobs now",
+            "Last job",
+            "Machine",
+            "Pause: take no new jobs",
+            "Settings",
+            "This page opens only",
+        ];
+        let portuguese = [
+            "RODANDO",
+            "Pode desligar?",
+            "Tarefas agora",
+            "Última tarefa",
+            "Máquina",
+            "Pausar: não pegar",
+            "Configuração",
+            "Esta página só abre",
+        ];
+        let en = render(&view(Lang::En, Some((0, 2)), false));
+        let pt = render(&view(Lang::Pt, Some((0, 2)), false));
+        for text in english {
+            assert!(en.contains(text), "missing in EN: {text}");
+            assert!(!pt.contains(text), "English on the PT page: {text}");
+        }
+        for text in portuguese {
+            assert!(pt.contains(text), "missing in PT: {text}");
+            assert!(!en.contains(text), "Portuguese on the EN page: {text}");
+        }
+        assert!(en.contains("<html lang=\"en\">") && en.contains("set=pt&amp;to=/\">Português<"));
+        assert!(pt.contains("<html lang=\"pt-BR\">") && pt.contains("set=en&amp;to=/\">English<"));
 
-        let idle = render(&View {
-            worker: "d",
-            os: "linux",
-            slots: Some((0, 2)),
-            draining: false,
-            last: None,
-            now: 0,
-        });
-        assert!(idle.contains("RODANDO / RUNNING"));
-        let down = render(&View {
-            worker: "d",
-            os: "linux",
-            slots: None,
-            draining: false,
-            last: None,
-            now: 0,
-        });
-        assert!(down.contains("DOCKER PAROU"));
+        // The cookie the button sets wins over the browser's language.
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, value.parse().unwrap());
+            }
+            map
+        };
+        assert_eq!(lang_of(&headers(&[])), Lang::En);
+        assert_eq!(
+            lang_of(&headers(&[("accept-language", "pt-BR,pt;q=0.9")])),
+            Lang::Pt
+        );
+        assert_eq!(
+            lang_of(&headers(&[("accept-language", "en-US,pt;q=0.5")])),
+            Lang::En
+        );
+        assert_eq!(
+            lang_of(&headers(&[
+                ("accept-language", "pt-BR"),
+                ("cookie", "a=b; lang=en")
+            ])),
+            Lang::En
+        );
+        assert_eq!(lang_of(&headers(&[("cookie", "lang=pt")])), Lang::Pt);
+    }
+
+    #[test]
+    fn a_form_changes_only_the_keys_of_its_own_group() {
+        let dir = std::env::temp_dir().join(format!("sar-page-form-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.json");
+        let mut map = config::default_map();
+        map.insert("poll_token".into(), serde_json::json!("p".repeat(32)));
+        config::save_json(&path, &map).unwrap();
+        let form = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+
+        // The open form: the everyday keys. A dangerous key in it is ignored.
+        save_fields(
+            &path,
+            OnPage::Open,
+            &form(&[
+                ("poll_url", "https://jobs.example/poll?user=ana"),
+                ("max_slots", "2"),
+                ("poll_interval_secs", ""),
+                ("allowlist", "evil/image"),
+                ("token", "t".repeat(32).as_str()),
+            ]),
+        )
+        .unwrap();
+        let saved = config::read_json(&path).unwrap();
+        assert_eq!(saved["poll_url"], "https://jobs.example/poll?user=ana");
+        assert_eq!(saved["max_slots"], 2);
+        assert_eq!(saved["allowlist"], map["allowlist"]);
+        assert_eq!(saved["token"], map["token"]);
+
+        // An invalid value is refused whole and the file stays.
+        let error = save_fields(&path, OnPage::Open, &form(&[("max_slots", "0")])).unwrap_err();
+        assert!(error.contains("max_slots"), "{error}");
+        assert_eq!(config::read_json(&path).unwrap(), saved);
+
+        // The locked form: a blank secret keeps it, an unticked box is false.
+        save_fields(
+            &path,
+            OnPage::Locked,
+            &form(&[
+                ("allowlist", "alpine\nghcr.io/o/img"),
+                ("token", ""),
+                ("poll_token", ""),
+                ("admin_user", "boss"),
+                ("admin_password", "s3cret"),
+                ("default_timeout_secs", ""),
+                ("max_timeout_secs", ""),
+            ]),
+        )
+        .unwrap();
+        let locked = config::read_json(&path).unwrap();
+        assert_eq!(
+            locked["allowlist"],
+            serde_json::json!(["alpine", "ghcr.io/o/img"])
+        );
+        assert_eq!(locked["token"], map["token"]);
+        assert_eq!(locked["poll_token"], map["poll_token"]);
+        assert_eq!(locked["poll_any_image"], false);
+        assert_eq!(locked["admin_user"], "boss");
+        assert_eq!(locked["poll_url"], saved["poll_url"]);
+
+        // The editor shows the file with every secret masked.
+        let page = editor(&path, OnPage::Locked, Lang::En, Some("bad <value>"));
+        assert!(page.contains("bad &lt;value&gt;"));
+        assert!(page.contains("name=\"admin_password\""));
+        for secret in ["s3cret", &"p".repeat(32), map["token"].as_str().unwrap()] {
+            assert!(!page.contains(secret), "{secret} is on the page");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -676,6 +1294,8 @@ mod tests {
             last_job_error: None,
             docker_error: None,
             last: None,
+            poll_error: None,
+            config_warning: None,
         };
         let bytes = document(&live, 1_700_000_100, false, None);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

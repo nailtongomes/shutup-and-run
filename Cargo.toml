@@ -1,6 +1,6 @@
 [package]
 name = "shutup-and-run"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Start allowlisted containers on one machine, up to a fixed number of slots."
 license = "MIT"
@@ -26,6 +26,9 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 http-body-util = "0.1"

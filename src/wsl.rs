@@ -11,6 +11,8 @@
 //! config files are pure and tested on any platform. The commands that need
 //! Windows say so when `wsl.exe` is not found.
 
+use crate::cli::{check, report, soft, Check};
+use crate::config::JsonMap;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -31,7 +33,12 @@ const RELEASE_URL: &str = "https://github.com/nailtongomes/shutup-and-run/releas
 
 const INNER_BIN: &str = "/usr/local/bin/shutup-and-run";
 const INNER_SERVE: &str = "/usr/local/bin/shutup-and-run-serve";
-const INNER_CONFIG: &str = "/etc/shutup-and-run/config.toml";
+const INNER_CONFIG: &str = "/etc/shutup-and-run/config.json";
+/// What installs up to 0.2.4 wrote. Read once, to carry the settings over.
+const OLD_CONFIG: &str = "/etc/shutup-and-run/config.toml";
+const INNER_STATUS: &str = "/var/lib/shutup-and-run/status.json";
+const HOST_BACKUP: &str = "config.backup.json";
+const SHORTCUT_FILE: &str = "shutup-and-run.url";
 const INNER_ENV: &str = "/etc/shutup-and-run/env";
 const INNER_LISTEN: &str = "127.0.0.1:8787";
 
@@ -102,26 +109,6 @@ pub(crate) fn stop_service_script(process: &str) -> String {
     )
 }
 
-/// The doctor's question to the service: does it answer, with the token in
-/// the env file? It prints the body and exits 0 on a 200. On a 401 or 403 it
-/// prints the code and exits 3 at once: the service is up and was started
-/// with another token, so asking again would only count failures until the
-/// machine's own address is banned. Anything else (nothing listening yet,
-/// Docker still starting) is asked again, once a second, `wait_secs` times.
-///
-/// No double quotes in the script: the token is hex, so it needs none, and
-/// one fewer quoting layer between here and sh is one fewer surprise.
-pub(crate) fn health_script(env_file: &str, listen: &str, wait_secs: u32) -> String {
-    format!(
-        ". {env_file} && i=0; while :; do \
-         out=$(curl -s -m 5 -w ' %{{http_code}}' --oauth2-bearer $SHUTUP_AND_RUN_TOKEN http://{listen}/health); \
-         code=${{out##* }}; \
-         case $code in 200) echo ${{out% *}}; exit 0;; 401|403) echo $code; exit 3;; esac; \
-         i=$((i + 1)); [ $i -ge {wait_secs} ] && exit 1; sleep 1; done"
-    )
-}
-
-const HEALTH_REFUSED: i32 = 3;
 const FAIL_LINES: usize = 20;
 const SERVICE_WAIT_SECS: u32 = 20;
 /// After an install the service must answer, so it gets longer than a doctor
@@ -145,17 +132,23 @@ fn err(msg: impl Into<String>) -> WslError {
 
 pub fn usage() -> &'static str {
     "\
-shutup-and-run wsl doctor [--smoke-image IMAGE]
-    check WSL2, the shutup-and-run distribution, Docker inside it, and run
-    one container as a smoke test. Exit 1 when something is missing.
+shutup-and-run wsl doctor [--smoke-image IMAGE] [--json] [--report]
+    check WSL2, the shutup-and-run distribution, Docker inside it, run one
+    container as a smoke test, then the config, the service, a forgotten
+    pause, bans and the poll URL. Every failed line has a `fix:`. --report
+    adds a report without secrets and a link that opens a GitHub issue.
+    Exit 1 when something is wrong. `shutup-and-run doctor` is the same.
 
 shutup-and-run wsl install [--poll-url URL] [options]
-    create the distribution, install Docker and the Linux binary in it, write a
-    pull-only config, register the logon task, and run the doctor.
-    Without --poll-url the worker is installed idle: only the doctor's smoke
-    test runs. SHUTUP_AND_RUN_POLL_TOKEN is the token the poll URL knows this
-    machine by. Unset, the machine keeps the one it has or makes its own, and
-    the poll URL decides whether to serve it.
+    create the distribution, install Docker and the Linux binary in it, write
+    config.json, register the logon task, put a shortcut to the local page on
+    the desktop, and run the doctor. Safe to run again: a re-install keeps
+    the config the machine has and changes only the options given here.
+    Without a poll URL the worker is idle: only the doctor's smoke test runs.
+    SHUTUP_AND_RUN_POLL_TOKEN is the token the poll URL knows this machine
+    by. Unset, the machine keeps the one it has or makes its own, and the
+    poll URL decides whether to serve it.
+    Afterwards the config changes with `shutup-and-run config set`, not here.
       --max-slots N              containers at once (default 1)
       --poll-interval-secs N     default 15
       --worker-name NAME         default: the computer name
@@ -165,6 +158,13 @@ shutup-and-run wsl install [--poll-url URL] [options]
       --wsl-memory SIZE          write memory=SIZE to %UserProfile%\\.wslconfig
       --wsl-processors N         write processors=N to %UserProfile%\\.wslconfig
       --no-task                  do not register the scheduled task
+
+shutup-and-run wsl reset [--factory] [install options]
+    factory reset for a machine that broke: delete the distribution with its
+    containers, images and job history, and install it again. The config
+    (poll URL, slots, this machine's poll token) is kept. --factory forgets
+    it too: the machine comes back idle, with a new poll token that the poll
+    URL has to approve again.
 
 shutup-and-run wsl serve [--background]
     run the service inside the distribution and restart it if it exits.
@@ -196,6 +196,7 @@ pub async fn cli(args: &[String]) -> ExitCode {
     let result = match sub {
         "doctor" => doctor_cli(rest),
         "install" => install_cli(rest).await,
+        "reset" => reset_cli(rest).await,
         "serve" => serve_cli(rest),
         "start" => start_cli(),
         "stop" => stop_cli(),
@@ -599,9 +600,6 @@ pub(crate) fn render_serve_script() -> String {
     format!(
         "#!/bin/sh\n\
          # Started by shutup-and-run.exe wsl serve. Keeps the distribution up while it runs.\n\
-         set -a\n\
-         . {INNER_ENV}\n\
-         set +a\n\
          i=0\n\
          until docker info >/dev/null 2>&1; do\n\
          \x20 [ \"$i\" -eq 0 ] && systemctl start docker >/dev/null 2>&1\n\
@@ -613,74 +611,82 @@ pub(crate) fn render_serve_script() -> String {
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InnerConfig {
-    /// None: nothing to poll. The service idles and only the doctor runs a container.
+/// What `wsl install` was asked for. None leaves the config as it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct InstallOptions {
     pub poll_url: Option<String>,
-    pub smoke_image: String,
-    pub poll_interval_secs: u64,
-    pub max_slots: u64,
-    pub worker_name: String,
+    pub poll_interval_secs: Option<u64>,
+    pub max_slots: Option<u64>,
+    pub worker_name: Option<String>,
+    pub poll_token: Option<String>,
 }
 
-/// The pull-only config. No allowlist: the poll URL decides the image, which
-/// is what `poll_any_image` means. The listener stays on localhost inside the
-/// distribution, for the doctor and for `GET /v1/jobs/{id}` from a shell.
+/// config.json for this machine: the config it already has, or the factory
+/// one, with the options of this install on top. The listener stays on
+/// localhost inside the distribution, for the local page.
 ///
-/// Without a poll URL nothing is polled and `poll_any_image` cannot be set, so
-/// the allowlist holds the smoke image, because the service wants one entry.
-pub(crate) fn render_config(c: &InnerConfig) -> String {
-    let work = match &c.poll_url {
-        Some(url) => format!(
-            "allowlist = []\n\
-             poll_url = {}\n\
-             poll_interval_secs = {}\n\
-             poll_any_image = true\n",
-            toml_string(url),
-            c.poll_interval_secs,
-        ),
-        None => format!("allowlist = [{}]\n", toml_string(&c.smoke_image)),
+/// A poll URL given here turns `poll_any_image` on unless the config already
+/// says otherwise: the poll URL decides the image. The factory allowlist is
+/// the smoke image, because the service wants one entry.
+pub(crate) fn install_config(
+    old: Option<&JsonMap>,
+    options: &InstallOptions,
+    computer: &str,
+    smoke_image: &str,
+) -> JsonMap {
+    use serde_json::{json, Value};
+    let mut map = old.cloned().unwrap_or_default();
+    let mut default = |key: &str, value: Value| {
+        map.entry(key.to_string()).or_insert(value);
     };
-    format!(
-        "# Written by shutup-and-run.exe wsl install. Edit and restart the task.\n\
-         listen = \"{INNER_LISTEN}\"\n\
-         http = true\n\
-         max_slots = {}\n\
-         {work}\
-         worker_name = {}\n\
-         worker_os = \"windows\"\n\
-         status_page = true\n\
-         history_path = \"/var/lib/shutup-and-run/jobs.sqlite\"\n",
-        c.max_slots,
-        toml_string(&c.worker_name),
-    )
+    default("listen", json!(INNER_LISTEN));
+    default("max_slots", json!(1));
+    default("allowlist", json!([smoke_image]));
+    default("worker_name", json!(computer));
+    default("history_path", json!("/var/lib/shutup-and-run/jobs.sqlite"));
+    default("token", json!(crate::launcher::random_id()));
+    map.insert("http".into(), json!(true));
+    map.insert("status_page".into(), json!(true));
+    map.insert("worker_os".into(), json!("windows"));
+    if let Some(n) = options.max_slots {
+        map.insert("max_slots".into(), json!(n));
+    }
+    if let Some(n) = options.poll_interval_secs {
+        map.insert("poll_interval_secs".into(), json!(n));
+    }
+    if let Some(name) = &options.worker_name {
+        map.insert("worker_name".into(), json!(name));
+    }
+    if let Some(url) = &options.poll_url {
+        map.insert("poll_url".into(), json!(url));
+        map.entry("poll_any_image".to_string())
+            .or_insert(json!(true));
+    }
+    if let Some(token) = &options.poll_token {
+        map.insert("poll_token".into(), json!(token));
+    }
+    map
 }
 
-fn toml_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
+/// The settings of an install up to 0.2.4, which kept them in config.toml
+/// and the tokens in an env file. The keys have the same names.
+pub(crate) fn config_from_toml(text: &str, poll_token: Option<String>) -> Option<JsonMap> {
+    let value: toml::Value = toml::from_str(text).ok()?;
+    let mut map = match serde_json::to_value(value).ok()? {
+        serde_json::Value::Object(map) => map,
+        _ => return None,
+    };
+    if let Some(token) = poll_token {
+        map.insert("poll_token".into(), serde_json::Value::String(token));
     }
-    out.push('"');
-    out
+    Some(map)
 }
 
-/// `/etc/shutup-and-run/env`, mode 600. Both tokens live only here.
-pub(crate) fn render_env(api_token: &str, poll_token: Option<&str>) -> String {
-    let mut text = format!("SHUTUP_AND_RUN_TOKEN={api_token}\n");
-    if let Some(poll_token) = poll_token {
-        text.push_str(&format!("SHUTUP_AND_RUN_POLL_TOKEN={poll_token}\n"));
-    }
-    text
+/// The desktop shortcut: a link the person clicks to see whether the PC is
+/// in use. A wildcard listen address is opened as localhost.
+pub(crate) fn shortcut_text(listen: &str) -> String {
+    let port = listen.rsplit(':').next().unwrap_or("8787");
+    format!("[InternetShortcut]\r\nURL=http://127.0.0.1:{port}/\r\n")
 }
 
 /// `%UserProfile%\.wslconfig` is per user and global to WSL2, so it is written
@@ -895,88 +901,63 @@ async fn obtain_musl(client: &reqwest::Client, flags: &Flags) -> WslResult<PathB
 // ---------------------------------------------------------------------------
 // doctor
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Check {
-    pub name: &'static str,
-    pub ok: bool,
-    /// A failed check that does not fail the doctor: the service is simply
-    /// not running yet, or the task was not registered on purpose.
-    pub soft: bool,
-    pub detail: String,
-}
-
-fn check(name: &'static str, ok: bool, detail: impl Into<String>) -> Check {
-    Check {
-        name,
-        ok,
-        soft: false,
-        detail: detail.into(),
-    }
-}
-
-fn soft(name: &'static str, ok: bool, detail: impl Into<String>) -> Check {
-    Check {
-        name,
-        ok,
-        soft: true,
-        detail: detail.into(),
-    }
-}
-
-pub(crate) fn report(checks: &[Check]) -> (String, bool) {
-    let mut text = String::new();
-    let mut healthy = true;
-    for c in checks {
-        let mark = if c.ok {
-            "ok  "
-        } else if c.soft {
-            "--  "
-        } else {
-            healthy = false;
-            "FAIL"
-        };
-        text.push_str(&format!("{mark} {:<22} {}\n", c.name, c.detail));
-    }
-    (text, healthy)
-}
-
 fn doctor_cli(args: &[String]) -> WslResult<ExitCode> {
-    let flags = parse_flags(args, &["--smoke-image"], &[])?;
+    let flags = parse_flags(args, &["--smoke-image"], &["--json", "--report"])?;
     let image = flags.get("--smoke-image").unwrap_or(DEFAULT_SMOKE_IMAGE);
-    let checks = doctor(image, SERVICE_WAIT_SECS)?;
-    let (text, healthy) = report(&checks);
-    print!("{text}");
-    if healthy {
-        println!("the Windows worker is ready");
-        Ok(ExitCode::SUCCESS)
+    let (checks, inner) = doctor(image, SERVICE_WAIT_SECS)?;
+    // The inner doctor masked its own secrets; the lines added here have none.
+    let out = crate::cli::doctor_out(
+        "windows (WSL2)",
+        &checks,
+        inner
+            .as_ref()
+            .map(|v| &v["config"])
+            .filter(|v| !v.is_null()),
+        inner
+            .as_ref()
+            .map(|v| &v["status"])
+            .filter(|v| !v.is_null()),
+        &[],
+        flags.has("--report"),
+    );
+    if flags.has("--json") {
+        println!("{}", out.json);
     } else {
-        println!("something is missing. `shutup-and-run wsl install` sets up what FAIL names.");
-        Ok(ExitCode::from(1))
+        println!("{}", out.text);
     }
+    Ok(ExitCode::from(out.code))
 }
 
 /// Each check needs the one before it. The first failure stops the list,
 /// so a machine without WSL gets one line, not a page of errors.
-fn doctor(smoke_image: &str, service_wait_secs: u32) -> WslResult<Vec<Check>> {
+///
+/// The second value is what the doctor inside the distribution answered:
+/// its checks are already in the list, and its masked config and status go
+/// into the report.
+fn doctor(
+    smoke_image: &str,
+    service_wait_secs: u32,
+) -> WslResult<(Vec<Check>, Option<serde_json::Value>)> {
     let mut checks = Vec::new();
+    const INSTALL: &str = "`shutup-and-run wsl install` (safe to run again; it keeps the config)";
+    const RESET: &str = "`shutup-and-run wsl reset` rebuilds the distribution and keeps the config";
 
     let status = match wsl_status() {
         Ok(out) => out,
         Err(e) => {
-            checks.push(check("wsl", false, e.to_string()));
-            return Ok(checks);
+            checks.push(
+                check("wsl", false, e.to_string())
+                    .fix("run `wsl --install --no-distribution` as administrator and reboot"),
+            );
+            return Ok((checks, None));
         }
     };
     if !status.ok() {
-        checks.push(check(
-            "wsl",
-            false,
-            format!(
-                "{}. Run `wsl --install --no-distribution` as administrator and reboot.",
-                status.one_line()
-            ),
-        ));
-        return Ok(checks);
+        checks.push(
+            check("wsl", false, status.one_line())
+                .fix("run `wsl --install --no-distribution` as administrator and reboot"),
+        );
+        return Ok((checks, None));
     }
     checks.push(check("wsl", true, status.one_line()));
 
@@ -987,20 +968,21 @@ fn doctor(smoke_image: &str, service_wait_secs: u32) -> WslResult<Vec<Check>> {
             format!("{DISTRO} ({})", d.state),
         )),
         Some(d) => {
-            checks.push(check(
-                "distribution",
-                false,
-                format!("{DISTRO} is WSL version {}; it must be 2", d.version),
-            ));
-            return Ok(checks);
+            checks.push(
+                check(
+                    "distribution",
+                    false,
+                    format!("{DISTRO} is WSL version {}; it must be 2", d.version),
+                )
+                .fix(RESET),
+            );
+            return Ok((checks, None));
         }
         None => {
-            checks.push(check(
-                "distribution",
-                false,
-                format!("{DISTRO} is not registered"),
-            ));
-            return Ok(checks);
+            checks.push(
+                check("distribution", false, format!("{DISTRO} is not registered")).fix(INSTALL),
+            );
+            return Ok((checks, None));
         }
     }
 
@@ -1012,8 +994,10 @@ fn doctor(smoke_image: &str, service_wait_secs: u32) -> WslResult<Vec<Check>> {
         DISTRO_START,
     )?;
     if !docker.ok() {
-        checks.push(check("docker", false, docker.one_line()));
-        return Ok(checks);
+        checks.push(check("docker", false, docker.one_line()).fix(format!(
+            "`shutup-and-run wsl stop`, then `shutup-and-run wsl start`. Still failing: {RESET}"
+        )));
+        return Ok((checks, None));
     }
     checks.push(check(
         "docker",
@@ -1040,50 +1024,64 @@ fn doctor(smoke_image: &str, service_wait_secs: u32) -> WslResult<Vec<Check>> {
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    checks.push(check(
-        "container",
-        smoke.ok(),
-        if smoke.ok() {
-            format!("{smoke_image} ran: {first}")
-        } else {
-            format!("{smoke_image}: {}", smoke.one_line())
-        },
-    ));
+    checks.push(
+        check(
+            "container",
+            smoke.ok(),
+            if smoke.ok() {
+                format!("{smoke_image} ran: {first}")
+            } else {
+                format!("{smoke_image}: {}", smoke.one_line())
+            },
+        )
+        .fix(
+            "the image could not be pulled or run: check the internet connection of this PC \
+         (a restricted network may block the registry), then run the doctor again",
+        ),
+    );
 
     let bin = in_distro(&[INNER_BIN, "--help"], None, DISTRO_START)?;
-    checks.push(check(
-        "binary",
-        bin.ok(),
-        if bin.ok() {
-            INNER_BIN.to_string()
-        } else {
-            format!("{INNER_BIN}: {}", bin.one_line())
-        },
-    ));
-
-    let config = sh_in_distro(
-        &format!("test -s {INNER_CONFIG} && test -s {INNER_ENV} && test -x {INNER_SERVE}"),
-        None,
-        DISTRO_START,
-    )?;
-    checks.push(check(
-        "config",
-        config.ok(),
-        if config.ok() {
-            INNER_CONFIG.to_string()
-        } else {
-            format!("{INNER_CONFIG}, {INNER_ENV} or {INNER_SERVE} is missing")
-        },
-    ));
+    checks.push(
+        check(
+            "binary",
+            bin.ok(),
+            if bin.ok() {
+                INNER_BIN.to_string()
+            } else {
+                format!("{INNER_BIN}: {}", bin.one_line())
+            },
+        )
+        .fix(INSTALL),
+    );
 
     // Right after an install the task has just started and the service is
-    // still waiting for dockerd, so the port gets some seconds to answer.
-    let health = sh_in_distro(
-        &health_script(INNER_ENV, INNER_LISTEN, service_wait_secs),
+    // still waiting for dockerd, so its first status file gets some seconds.
+    let _ = sh_in_distro(
+        &format!(
+            "i=0; until [ -s {INNER_STATUS} ]; do i=$((i + 1)); [ $i -ge {service_wait_secs} ] && break; sleep 1; done"
+        ),
         None,
         DISTRO_START,
-    )?;
-    checks.push(service_check(health.status, &health.text()));
+    );
+    // The rest is the same doctor a Linux machine runs, inside the distribution.
+    let inner = in_distro(&[INNER_BIN, "doctor", "--json"], None, DISTRO_START)?;
+    let inner: Option<serde_json::Value> = serde_json::from_str(inner.text().trim()).ok();
+    match &inner {
+        Some(answer) => checks.extend(
+            crate::cli::checks_from_json(&answer["checks"])
+                .into_iter()
+                // Docker was checked above, from the outside.
+                .filter(|c| c.name != "docker"),
+        ),
+        None => checks.push(
+            check(
+                "config",
+                false,
+                "the binary in the distribution has no doctor",
+            )
+            .fix(INSTALL),
+        ),
+    }
 
     let task = run("schtasks.exe", &["/Query", "/TN", TASK_NAME], None, SHORT);
     checks.push(match task {
@@ -1091,50 +1089,13 @@ fn doctor(smoke_image: &str, service_wait_secs: u32) -> WslResult<Vec<Check>> {
         Ok(_) => soft(
             "task",
             false,
-            format!("{TASK_NAME} is not registered (--no-task?)"),
-        ),
+            format!("{TASK_NAME} is not registered, so the worker does not start at logon"),
+        )
+        .fix("`shutup-and-run wsl task register`"),
         Err(e) => soft("task", false, e.to_string()),
     });
 
-    Ok(checks)
-}
-
-/// What the health script's exit says. Soft either way: the doctor reports,
-/// and `wsl install` is what insists on a service that answers.
-pub(crate) fn service_check(status: Option<i32>, output: &str) -> Check {
-    let line = output
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    match status {
-        Some(0) => soft(
-            "service",
-            true,
-            format!("answers on {INNER_LISTEN}: {line}"),
-        ),
-        Some(HEALTH_REFUSED) if line == "403" => soft(
-            "service",
-            false,
-            format!(
-                "answers on {INNER_LISTEN} but this machine's own address is banned there (403). \
-                 Run `shutup-and-run wsl install` again with the same options; it lifts that ban."
-            ),
-        ),
-        Some(HEALTH_REFUSED) => soft(
-            "service",
-            false,
-            format!(
-                "answers on {INNER_LISTEN} but refuses the token in {INNER_ENV} ({line}): it was \
-                 started with an older config. Run `shutup-and-run wsl stop`, then `shutup-and-run wsl start`."
-            ),
-        ),
-        _ => soft(
-            "service",
-            false,
-            "not running (start it with `shutup-and-run wsl start`)",
-        ),
-    }
+    Ok((checks, inner))
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,13 +1129,20 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     let given_token = std::env::var("SHUTUP_AND_RUN_POLL_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());
-    let max_slots = parse_count(&flags, "--max-slots", 1, 1..=256)?;
-    let poll_interval_secs = parse_count(&flags, "--poll-interval-secs", 15, 1..=3600)?;
-    let worker_name = flags
-        .get("--worker-name")
-        .map(str::to_string)
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .unwrap_or_else(|| "windows-worker".to_string());
+    let count = |key: &str, range| {
+        flags
+            .get(key)
+            .map(|_| parse_count(&flags, key, 1, range))
+            .transpose()
+    };
+    let mut options = InstallOptions {
+        poll_url: poll_url.clone(),
+        max_slots: count("--max-slots", 1..=256)?,
+        poll_interval_secs: count("--poll-interval-secs", 1..=3600)?,
+        worker_name: flags.get("--worker-name").map(str::to_string),
+        poll_token: given_token.clone(),
+    };
+    let computer = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-worker".to_string());
     let smoke_image = flags.get("--smoke-image").unwrap_or(DEFAULT_SMOKE_IMAGE);
     let wsl_memory = flags
         .get("--wsl-memory")
@@ -1186,20 +1154,7 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
         .transpose()?;
 
     // The same checks the service applies, before anything is downloaded.
-    let inner = InnerConfig {
-        poll_url: poll_url.clone(),
-        smoke_image: smoke_image.to_string(),
-        poll_interval_secs,
-        max_slots,
-        worker_name: worker_name.clone(),
-    };
-    let api_token = crate::launcher::random_id();
-    let probe = render_config(&inner);
-    let mut probe_env = HashMap::from([("SHUTUP_AND_RUN_TOKEN".to_string(), api_token.clone())]);
-    if let Some(token) = &given_token {
-        probe_env.insert("SHUTUP_AND_RUN_POLL_TOKEN".to_string(), token.clone());
-    }
-    crate::config::Settings::from_toml_and_env(&probe, &probe_env)
+    crate::config::Settings::from_json_map(&install_config(None, &options, &computer, smoke_image))
         .map_err(|e| err(format!("the config these options make is invalid: {e}")))?;
 
     let data = data_dir();
@@ -1302,44 +1257,70 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     }
     println!("    {INNER_BIN}");
 
-    println!("[6/8] config, env and the serve script");
+    println!("[6/8] config.json and the serve script");
     // Step 3 terminated the distribution, so a service from an earlier
-    // install should be gone. Make sure, before the files it read change: a
-    // survivor would keep the old config, and the new token would be sent to
-    // it and counted as a wrong one.
+    // install should be gone. Make sure, before the file it read changes: a
+    // survivor would keep running on the old config.
     let stop = stop_service_script(SERVICE_PROCESS);
     let out = sh_in_distro(&stop, None, DISTRO_START)?;
     if !out.ok() {
         return Err(step_failed("stopping the previous service", &stop, &out));
     }
-    let mut enrolling = false;
-    let poll_token = match (&poll_url, given_token) {
-        (None, _) => None,
-        (Some(_), Some(token)) => Some(token),
-        (Some(_), None) => match existing_poll_token() {
-            Some(token) => {
-                println!("    kept this machine's poll token");
-                Some(token)
-            }
-            None => {
-                enrolling = true;
-                println!("    made a poll token for this machine");
-                Some(format!(
-                    "{}{}",
-                    crate::launcher::random_id(),
-                    crate::launcher::random_id()
-                ))
-            }
-        },
+    // The config this machine already has: config.json in the distribution,
+    // else the settings of an install up to 0.2.4, else the copy kept on the
+    // Windows side, which is what survives a `wsl reset`.
+    let usable = |map: &JsonMap| crate::config::Settings::from_json_map(map).is_ok();
+    let old = inner_text(INNER_CONFIG)
+        .and_then(|text| crate::config::parse_json(&text).ok())
+        .or_else(|| config_from_toml(&inner_text(OLD_CONFIG)?, existing_poll_token()))
+        .or_else(host_backup);
+    let has_poll_token = |map: Option<&JsonMap>| {
+        map.and_then(|m| m.get("poll_token"))
+            .and_then(|t| t.as_str())
+            .is_some_and(is_token)
     };
-    put_file(INNER_CONFIG, "644", render_config(&inner).into_bytes())?;
+    let mut config = install_config(old.as_ref(), &options, &computer, smoke_image);
+    if old.is_some() && usable(&config) {
+        println!("    kept the config this machine had");
+    } else {
+        if old.is_some() {
+            println!(
+                "    the config this machine had is not usable; starting from the factory one"
+            );
+        }
+        config = install_config(None, &options, &computer, smoke_image);
+    }
+    let mut enrolling = false;
+    if config.contains_key("poll_url") && !has_poll_token(Some(&config)) {
+        enrolling = true;
+        println!("    made a poll token for this machine");
+        options.poll_token = Some(format!(
+            "{}{}",
+            crate::launcher::random_id(),
+            crate::launcher::random_id()
+        ));
+        config = install_config(Some(&config), &options, &computer, smoke_image);
+    }
+    crate::config::Settings::from_json_map(&config)
+        .map_err(|e| err(format!("the config is invalid: {e}")))?;
+    let text = crate::config::to_text(&config);
+    put_file(INNER_CONFIG, "600", text.clone().into_bytes())?;
     put_file(
-        INNER_ENV,
+        &format!("{INNER_CONFIG}.bak"),
         "600",
-        render_env(&api_token, poll_token.as_deref()).into_bytes(),
+        text.clone().into_bytes(),
     )?;
     put_file(INNER_SERVE, "755", render_serve_script().into_bytes())?;
-    println!("    {INNER_CONFIG}, {INNER_ENV} (600), {INNER_SERVE}");
+    // config.json is now the one source: the files of an older install go,
+    // and so does the status the old service left, so the doctor below sees
+    // only what the new service writes.
+    let _ = sh_in_distro(
+        &format!("rm -f {OLD_CONFIG} {INNER_ENV} {INNER_STATUS}"),
+        None,
+        SHORT,
+    );
+    save_host_backup(&text);
+    println!("    {INNER_CONFIG} (600), {INNER_SERVE}");
     // An earlier install may have banned this machine's own address by
     // sending a new token to an old service, and a ban outlives a restart.
     // This is `bans lift` as root inside the distribution, where the listener
@@ -1385,19 +1366,26 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
         println!("    registered and started");
         std::thread::sleep(Duration::from_secs(5));
     }
+    let listen = config["listen"]
+        .as_str()
+        .unwrap_or(INNER_LISTEN)
+        .to_string();
+    match write_shortcut(&listen) {
+        Ok(path) => println!("    shortcut to the local page: {}", path.display()),
+        Err(e) => println!("    no desktop shortcut ({e}); the page is http://{listen}/"),
+    }
 
     println!("[8/8] doctor");
-    let checks = doctor(smoke_image, INSTALL_SERVICE_WAIT_SECS)?;
+    let (checks, _) = doctor(smoke_image, INSTALL_SERVICE_WAIT_SECS)?;
     let (text, healthy) = report(&checks);
     print!("{text}");
     if !healthy {
         return Err(err(
-            "the doctor found a problem. Fix it and run `shutup-and-run wsl doctor`.",
+            "the doctor found a problem. Run the `fix:` lines, then `shutup-and-run doctor`.",
         ));
     }
-    // The API token is new with every install, so a service that answers it
-    // was started after step 6 and read this install's config. Anything else
-    // is not an install that worked.
+    // Step 6 removed the old status file, so a service the doctor saw
+    // running was started after it and read this install's config.
     if !flags.has("--no-task") && !service_answers(&checks) {
         return Err(err(
             "the service is not running with the config this install wrote. \
@@ -1405,10 +1393,12 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
         ));
     }
     println!();
-    match &poll_url {
+    let slots = &config["max_slots"];
+    let name = config["worker_name"].as_str().unwrap_or("?");
+    match config.get("poll_url").and_then(|u| u.as_str()) {
         Some(url) => {
             println!(
-                "done. The worker polls {} as {worker_name} with {max_slots} slot(s).",
+                "done. The worker polls {} as {name} with {slots} slot(s).",
                 host_of(url)
             );
             if enrolling {
@@ -1418,9 +1408,10 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
             }
         }
         None => println!(
-            "done. No poll URL: the worker is installed and idle. Run install again with --poll-url to give it work."
+            "done. No poll URL: the worker is idle. Give it one with\n    shutup-and-run config set poll_url URL --apply"
         ),
     }
+    println!("page: http://{listen}/   config: shutup-and-run config show");
     println!("logs: shutup-and-run wsl logs");
     Ok(ExitCode::SUCCESS)
 }
@@ -1478,6 +1469,161 @@ fn existing_poll_token() -> Option<String> {
     let out = sh_in_distro(&script, None, SHORT).ok()?;
     let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
     is_token(&token).then_some(token)
+}
+
+/// A file inside the distribution, when it is there and has text.
+fn inner_text(path: &str) -> Option<String> {
+    let out = in_distro(&["cat", path], None, SHORT).ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    (out.ok() && !text.trim().is_empty()).then_some(text)
+}
+
+/// A copy of config.json beside the Windows-side data. The distribution can
+/// be lost (a power cut, a full disk); this is what `wsl reset` and the next
+/// install put back, so the machine keeps its poll URL and its poll token.
+fn save_host_backup(text: &str) {
+    let _ = crate::status::write_atomic(&data_dir().join(HOST_BACKUP), text.as_bytes());
+}
+
+fn host_backup() -> Option<JsonMap> {
+    let text = std::fs::read_to_string(data_dir().join(HOST_BACKUP)).ok()?;
+    crate::config::parse_json(&text).ok()
+}
+
+/// Copy the distribution's config.json to the Windows side, when it is valid.
+fn refresh_host_backup() -> Option<JsonMap> {
+    let text = inner_text(INNER_CONFIG)?;
+    let map = crate::config::parse_json(&text).ok()?;
+    crate::config::Settings::from_json_map(&map).ok()?;
+    save_host_backup(&text);
+    Some(map)
+}
+
+fn desktop_dir() -> WslResult<PathBuf> {
+    let out = run(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Environment]::GetFolderPath('Desktop')",
+        ],
+        None,
+        SHORT,
+    )?;
+    let dir = out.text().trim().to_string();
+    if !out.ok() || dir.is_empty() {
+        return Err(err("the desktop folder was not found"));
+    }
+    Ok(PathBuf::from(dir))
+}
+
+fn write_shortcut(listen: &str) -> WslResult<PathBuf> {
+    let path = desktop_dir()?.join(SHORTCUT_FILE);
+    std::fs::write(&path, shortcut_text(listen))
+        .map_err(|e| err(format!("{}: {e}", path.display())))?;
+    Ok(path)
+}
+
+fn remove_shortcut() {
+    if let Ok(dir) = desktop_dir() {
+        let _ = std::fs::remove_file(dir.join(SHORTCUT_FILE));
+    }
+}
+
+/// `config`, `pause`, `resume` and `bans` run inside the distribution, where
+/// the file, the job history and the service are. Output and exit code are
+/// the inner command's own.
+pub fn forward(args: &[String]) -> ExitCode {
+    let as_json = args.iter().any(|a| a == "--json");
+    let wants_help = args.iter().any(|a| a == "--help" || a == "-h");
+    let fail = |msg: String| {
+        if as_json {
+            println!("{}", serde_json::json!({"ok": false, "error": msg}));
+        } else {
+            eprintln!("shutup-and-run: {msg}");
+        }
+        ExitCode::from(1)
+    };
+    if wants_help {
+        println!("{}", crate::cli::usage());
+        return ExitCode::SUCCESS;
+    }
+    match our_distro() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return fail(format!(
+                "the worker is not installed on this PC ({DISTRO} is not a WSL distribution). \
+                 Run `shutup-and-run wsl install`."
+            ))
+        }
+        Err(e) => return fail(e.to_string()),
+    }
+    let mut inner: Vec<&str> = vec![INNER_BIN];
+    inner.extend(args.iter().map(String::as_str));
+    let out = match in_distro(&inner, None, DISTRO_START) {
+        Ok(out) => out,
+        Err(e) => return fail(e.to_string()),
+    };
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    if out.ok() && args.first().map(String::as_str) == Some("config") {
+        let changes = args
+            .iter()
+            .any(|a| matches!(a.as_str(), "set" | "unset" | "apply" | "reset"));
+        if args.iter().any(|a| a == "reset") {
+            // The factory config of a Linux machine says linux.
+            let _ = in_distro(
+                &[
+                    INNER_BIN,
+                    "config",
+                    "set",
+                    "worker_os",
+                    "windows",
+                    "--apply",
+                ],
+                None,
+                DISTRO_START,
+            );
+        }
+        if changes {
+            if let Some(map) = refresh_host_backup() {
+                if let Some(listen) = map.get("listen").and_then(|l| l.as_str()) {
+                    let _ = write_shortcut(listen);
+                }
+            }
+        }
+    }
+    ExitCode::from(out.status.unwrap_or(1).clamp(0, 255) as u8)
+}
+
+/// `wsl reset`: the distribution is deleted and installed again. The config
+/// comes back from the Windows-side copy, unless `--factory` forgets it.
+async fn reset_cli(args: &[String]) -> WslResult<ExitCode> {
+    let factory = args.iter().any(|a| a == "--factory");
+    let rest: Vec<String> = args.iter().filter(|a| *a != "--factory").cloned().collect();
+    if factory {
+        let _ = std::fs::remove_file(data_dir().join(HOST_BACKUP));
+        println!("reset: forgetting the config (--factory)");
+    } else if our_distro()?.is_some() && refresh_host_backup().is_some() {
+        println!("reset: kept a copy of the config");
+    } else if host_backup().is_some() {
+        println!("reset: the distribution's config is unreadable; using the last copy kept");
+    } else {
+        println!("reset: no config to keep; the worker comes back with the factory one");
+    }
+    remove_task();
+    if our_distro()?.is_some() {
+        let _ = sh_in_distro(&graceful_stop_script(10), None, DISTRO_START);
+        let _ = run("wsl.exe", &["--terminate", DISTRO], None, SHORT);
+        let out = run("wsl.exe", &["--unregister", DISTRO], None, APT)?;
+        if !out.ok() {
+            return Err(step_failed("wsl --unregister", "wsl --unregister", &out));
+        }
+        println!("reset: deleted {DISTRO}; installing it again");
+    }
+    mark_stopped();
+    install_cli(&rest).await
 }
 
 /// What a token we wrote looks like. Anything else in that file is not reused.
@@ -1630,6 +1776,9 @@ fn serve_cli(args: &[String]) -> WslResult<ExitCode> {
     let mut wait = RESTART_MIN;
     loop {
         let started = Instant::now();
+        // What the page changed since the last start is copied to the
+        // Windows side here, for a reset to put back.
+        let _ = refresh_host_backup();
         let reason = match run_service(&log) {
             Ok(code) => {
                 log.line(&format!("service exited with {code:?}"));
@@ -1889,6 +2038,7 @@ pub(crate) fn tail(text: &str, lines: usize) -> Vec<&str> {
 fn uninstall_cli(args: &[String]) -> WslResult<ExitCode> {
     let flags = parse_flags(args, &[], &["--purge"])?;
     remove_task();
+    remove_shortcut();
     if our_distro()?.is_some() {
         let _ = run("wsl.exe", &["--terminate", DISTRO], None, SHORT);
         let out = run("wsl.exe", &["--unregister", DISTRO], None, APT)?;
@@ -1911,7 +2061,10 @@ fn uninstall_cli(args: &[String]) -> WslResult<ExitCode> {
             ),
         }
     } else {
-        println!("kept {} (pass --purge to delete it)", data_dir().display());
+        println!(
+            "kept {} with a copy of the config, which the next install uses (pass --purge to delete it)",
+            data_dir().display()
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1919,7 +2072,6 @@ fn uninstall_cli(args: &[String]) -> WslResult<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -2001,28 +2153,23 @@ mod tests {
     }
 
     #[test]
-    fn rendered_config_is_one_the_service_accepts() {
-        let text = render_config(&InnerConfig {
-            poll_url: Some("https://orchestrator.example/poll?x=\"1\"".into()),
-            smoke_image: "hello-world".into(),
-            poll_interval_secs: 20,
-            max_slots: 2,
-            worker_name: "DESK-07".into(),
-        });
-        let env = HashMap::from([
-            ("SHUTUP_AND_RUN_TOKEN".to_string(), "a".repeat(32)),
-            ("SHUTUP_AND_RUN_POLL_TOKEN".to_string(), "b".repeat(32)),
-        ]);
-        let settings = crate::config::Settings::from_toml_and_env(&text, &env).unwrap();
+    fn the_install_config_is_one_the_service_accepts() {
+        let options = InstallOptions {
+            poll_url: Some("https://orchestrator.example/poll?user=ana".into()),
+            poll_interval_secs: Some(20),
+            max_slots: Some(2),
+            worker_name: None,
+            poll_token: Some("b".repeat(32)),
+        };
+        let map = install_config(None, &options, "DESK-07", "hello-world");
+        let settings = crate::config::Settings::from_json_map(&map).unwrap();
         assert!(settings.http_plain);
         assert_eq!(settings.listen.to_string(), INNER_LISTEN);
-        assert!(settings.listen.ip().is_loopback());
         assert_eq!(settings.max_slots, 2);
-        assert!(settings.allowlist.is_empty());
         assert!(settings.poll_any_image);
         assert_eq!(
             settings.poll_url.as_deref(),
-            Some("https://orchestrator.example/poll?x=\"1\"")
+            Some("https://orchestrator.example/poll?user=ana")
         );
         assert_eq!(settings.poll_interval, Duration::from_secs(20));
         assert_eq!(settings.worker_name, "DESK-07");
@@ -2030,39 +2177,86 @@ mod tests {
         assert!(settings.poll_token.is_some());
         assert!(settings.status_page);
 
-        // Without the poll token in the env the service refuses, and so does install.
-        let no_poll_token = HashMap::from([("SHUTUP_AND_RUN_TOKEN".to_string(), "a".repeat(32))]);
-        let settings = crate::config::Settings::from_toml_and_env(&text, &no_poll_token).unwrap();
-        assert!(settings.poll_token.is_none());
-
-        assert_eq!(toml_string("a\"b\\c\n"), "\"a\\\"b\\\\c\\n\"");
+        // No poll URL: idle, and the smoke image is the one allowed image.
+        let idle = install_config(None, &InstallOptions::default(), "DESK-07", "hello-world");
+        let settings = crate::config::Settings::from_json_map(&idle).unwrap();
+        assert!(settings.poll_url.is_none() && !settings.poll_any_image);
+        assert_eq!(settings.allowlist, vec!["hello-world".to_string()]);
+        assert!(settings.listen.ip().is_loopback());
     }
 
     #[test]
-    fn without_a_poll_url_the_config_is_idle_and_still_accepted() {
-        let text = render_config(&InnerConfig {
-            poll_url: None,
-            smoke_image: "hello-world".into(),
-            poll_interval_secs: 15,
-            max_slots: 1,
-            worker_name: "DESK-07".into(),
-        });
-        let env = HashMap::from([("SHUTUP_AND_RUN_TOKEN".to_string(), "a".repeat(32))]);
-        let settings = crate::config::Settings::from_toml_and_env(&text, &env).unwrap();
-        assert!(settings.poll_url.is_none());
-        assert!(!settings.poll_any_image);
-        assert_eq!(settings.allowlist, vec!["hello-world".to_string()]);
-        assert!(settings.listen.ip().is_loopback());
-        assert_eq!(render_env("api", None), "SHUTUP_AND_RUN_TOKEN=api\n");
+    fn a_reinstall_keeps_the_config_and_changes_only_what_was_asked() {
+        let first = install_config(
+            None,
+            &InstallOptions {
+                poll_url: Some("https://jobs.example/poll?user=ana".into()),
+                max_slots: Some(3),
+                poll_token: Some("b".repeat(32)),
+                ..InstallOptions::default()
+            },
+            "DESK-07",
+            "hello-world",
+        );
+        // The person changed two things on the page since.
+        let mut edited = first.clone();
+        edited.insert("poll_any_image".into(), serde_json::json!(false));
+        edited.insert("admin_password".into(), serde_json::json!("changed"));
+
+        let again = install_config(
+            Some(&edited),
+            &InstallOptions::default(),
+            "OTHER",
+            "hello-world",
+        );
+        assert_eq!(again, edited, "an install with no options changes nothing");
+
+        let moved = install_config(
+            Some(&edited),
+            &InstallOptions {
+                poll_url: Some("https://jobs.example/poll?user=bia".into()),
+                ..InstallOptions::default()
+            },
+            "OTHER",
+            "hello-world",
+        );
+        assert_eq!(moved["poll_url"], "https://jobs.example/poll?user=bia");
+        assert_eq!(moved["poll_any_image"], false);
+        assert_eq!(moved["max_slots"], 3);
+        assert_eq!(moved["token"], first["token"]);
+        assert_eq!(moved["poll_token"], first["poll_token"]);
+        assert_eq!(moved["worker_name"], "DESK-07");
+
+        // What 0.2.4 wrote, carried over with the token from its env file.
+        let old = "listen = \"127.0.0.1:8787\"\nhttp = true\nmax_slots = 2\nallowlist = []\n\
+                   poll_url = \"https://jobs.example/poll\"\npoll_interval_secs = 15\n\
+                   poll_any_image = true\nworker_name = \"DESK-07\"\nworker_os = \"windows\"\n\
+                   status_page = true\nhistory_path = \"/var/lib/shutup-and-run/jobs.sqlite\"\n";
+        let carried = config_from_toml(old, Some("c".repeat(32))).unwrap();
+        let map = install_config(
+            Some(&carried),
+            &InstallOptions::default(),
+            "X",
+            "hello-world",
+        );
+        let settings = crate::config::Settings::from_json_map(&map).unwrap();
+        assert_eq!(
+            settings.poll_url.as_deref(),
+            Some("https://jobs.example/poll")
+        );
+        assert_eq!(settings.max_slots, 2);
+        assert_eq!(settings.poll_token.unwrap().as_str(), "c".repeat(32));
+        assert!(config_from_toml("not = [toml", None).is_none());
+
+        assert_eq!(
+            shortcut_text("127.0.0.1:8788"),
+            "[InternetShortcut]\r\nURL=http://127.0.0.1:8788/\r\n"
+        );
+        assert!(shortcut_text("0.0.0.0:8787").contains("http://127.0.0.1:8787/"));
     }
 
     #[test]
     fn env_wsl_conf_and_serve_script_have_the_expected_shape() {
-        let env = render_env("api-token-value-ok", Some("poll-token-value-ok"));
-        assert_eq!(
-            env,
-            "SHUTUP_AND_RUN_TOKEN=api-token-value-ok\nSHUTUP_AND_RUN_POLL_TOKEN=poll-token-value-ok\n"
-        );
         let conf = render_wsl_conf();
         assert!(conf.contains("[automount]\nenabled = false"));
         assert!(conf.contains("[interop]\nenabled = false"));
@@ -2074,7 +2268,7 @@ mod tests {
         let script = render_serve_script();
         assert!(script.contains("systemctl start docker"));
         assert!(script.starts_with("#!/bin/sh\n"));
-        assert!(script.contains(". /etc/shutup-and-run/env"));
+        assert!(!script.contains("/etc/shutup-and-run/env"));
         assert!(script.ends_with("exec /usr/local/bin/shutup-and-run serve\n"));
         assert_eq!(
             render_wslconfig(Some("4GB"), Some(2)),
@@ -2203,7 +2397,7 @@ mod tests {
         // and exits 1. On Windows with WSL this test still passes when the
         // distribution is absent, because the second check fails instead.
         if cfg!(not(windows)) {
-            let checks = doctor(DEFAULT_SMOKE_IMAGE, 1).unwrap();
+            let (checks, _) = doctor(DEFAULT_SMOKE_IMAGE, 1).unwrap();
             assert_eq!(checks.len(), 1);
             assert!(!checks[0].ok);
             assert!(checks[0].detail.contains("wsl.exe"), "{}", checks[0].detail);
@@ -2253,20 +2447,11 @@ mod tests {
             ]
         );
 
-        let up = service_check(Some(0), "{\"status\":\"ok\"}\n");
-        assert!(up.ok && up.detail.contains("{\"status\":\"ok\"}"));
-        let stale = service_check(Some(HEALTH_REFUSED), "401\n");
-        assert!(!stale.ok && stale.soft);
-        assert!(stale.detail.contains("older config"), "{}", stale.detail);
-        let banned = service_check(Some(HEALTH_REFUSED), "403\n");
-        assert!(banned.detail.contains("banned"), "{}", banned.detail);
-        let down = service_check(Some(1), "");
-        assert!(down.detail.starts_with("not running"));
-        assert!(service_check(None, "").detail.starts_with("not running"));
-
-        // The doctor stays healthy on a stale service; the install does not.
-        assert!(report(std::slice::from_ref(&stale)).1);
-        assert!(!service_answers(&[check("wsl", true, ""), stale]));
+        // The install insists on a service the doctor saw running.
+        let up = check("service", true, "running (idle)");
+        let down = check("service", false, "not running").fix("`shutup-and-run wsl start`");
+        assert_eq!(down.fix, "`shutup-and-run wsl start`");
+        assert!(!service_answers(&[check("wsl", true, ""), down]));
         assert!(service_answers(&[check("wsl", true, ""), up]));
     }
 
@@ -2313,82 +2498,6 @@ mod tests {
         assert!(out.ok());
         let _ = reaper.join();
         assert!(!Path::new("/proc").join(pid).exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The second defect: a new token sent to a service started with the old
-    /// one. The doctor used to ask 20 times; three refusals ban the address,
-    /// here 127.0.0.1, for 48 hours. It now stops at the first refusal, and
-    /// the service's own rule for everyone else is untouched.
-    #[tokio::test]
-    async fn a_wrong_token_from_the_doctor_is_one_failure_and_never_a_ban() {
-        use crate::launcher::Launcher;
-        use crate::mock::MockRuntime;
-        use crate::runtime::Runtime;
-        use std::net::SocketAddr;
-
-        if !cfg!(unix) || run("curl", &["--version"], None, SHORT).is_err() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("sar-wsl-health-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let old_token = "a".repeat(32);
-        let settings = crate::config::Settings::from_toml_and_env(
-            &format!(
-                "max_slots = 1\nallowlist = [\"alpine\"]\nhttp = true\nhistory_path = '{}'\n",
-                dir.join("jobs.sqlite").display()
-            ),
-            &HashMap::from([("SHUTUP_AND_RUN_TOKEN".to_string(), old_token.clone())]),
-        )
-        .unwrap();
-        // The defaults a Windows worker runs with.
-        assert_eq!(settings.auth_failures, 3);
-        assert_eq!(settings.ban_secs, 48 * 3600);
-        let runtime: Arc<dyn Runtime> = Arc::new(MockRuntime::new());
-        let launcher = Launcher::new(settings, runtime).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let listen = listener.local_addr().unwrap().to_string();
-        let app = crate::api::router(launcher.clone())
-            .into_make_service_with_connect_info::<SocketAddr>();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let probe = |token: String| {
-            let env = dir.join("env");
-            let listen = listen.clone();
-            async move {
-                std::fs::write(&env, render_env(&token, None)).unwrap();
-                let script = health_script(&env.display().to_string(), &listen, 20);
-                tokio::task::spawn_blocking(move || run("sh", &["-c", &script], None, SHORT))
-                    .await
-                    .unwrap()
-                    .unwrap()
-            }
-        };
-
-        // The env file of a new install, the service of the old one.
-        let out = probe("b".repeat(32)).await;
-        assert_eq!(out.status, Some(HEALTH_REFUSED), "{}", out.tail(5));
-        assert_eq!(out.text().trim(), "401");
-        assert!(launcher.list_bans().unwrap().is_empty());
-
-        // Not banned: the right token is served, and that clears the count.
-        let out = probe(old_token.clone()).await;
-        assert_eq!(out.status, Some(0), "{}", out.tail(5));
-        assert!(out.text().contains("\"slots_total\":1"), "{}", out.text());
-        assert!(service_check(out.status, &out.text()).ok);
-
-        // The rule itself did not move: three wrong tokens still ban, also
-        // from this machine, and a banned address is told so in one answer.
-        for _ in 0..3 {
-            assert_eq!(probe("c".repeat(32)).await.status, Some(HEALTH_REFUSED));
-        }
-        assert_eq!(launcher.list_bans().unwrap().len(), 1);
-        let out = probe(old_token).await;
-        assert_eq!(out.status, Some(HEALTH_REFUSED));
-        assert_eq!(out.text().trim(), "403");
-        // What `wsl install` runs inside the distribution after writing the env.
-        assert!(launcher.lift_ban("127.0.0.1").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

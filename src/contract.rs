@@ -46,6 +46,10 @@ const SCHEMAS: &[(&str, &str)] = &[
         "job-result.schema.json",
         include_str!("../docs/schemas/job-result.schema.json"),
     ),
+    (
+        "worker-config.schema.json",
+        include_str!("../docs/schemas/worker-config.schema.json"),
+    ),
 ];
 
 macro_rules! example {
@@ -1008,5 +1012,59 @@ async fn the_existing_surface_did_not_move() {
     for uri in ["/v1/register", "/v1/workers", "/v2/jobs"] {
         let (status, _) = call(&m.app, "POST", uri, Some(TOKEN), b"{}".to_vec()).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+/// config.json: the schema lists exactly the keys the service knows, and
+/// what the service writes and accepts validates against it.
+#[test]
+fn the_config_schema_matches_the_keys_and_the_validation() {
+    use crate::config::{self, Settings};
+    let validator = schema("worker-config.schema.json");
+    let (name, text) = SCHEMAS.last().unwrap();
+    let published = parse(text, name);
+    let mut in_schema: Vec<&str> = published["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let mut in_code: Vec<&str> = config::KEYS.iter().map(|k| k.name).collect();
+    in_schema.sort_unstable();
+    in_code.sort_unstable();
+    assert_eq!(in_schema, in_code);
+
+    let (name, text) = example!("worker-config.json");
+    let example = parse(text, name);
+    assert_valid(&validator, &example, name);
+    Settings::from_json_map(example.as_object().unwrap()).unwrap();
+
+    let defaults = Value::Object(config::default_map());
+    assert_valid(&validator, &defaults, "the factory defaults");
+
+    // Refused by the schema and by the service alike.
+    for (key, bad) in [
+        ("max_slots", json!(0)),
+        ("max_slots", json!("2")),
+        ("poll_interval_secs", json!(0)),
+        ("token", json!("short")),
+        ("allowlist", json!("alpine")),
+        ("no_such_key", json!(true)),
+    ] {
+        let mut map = config::default_map();
+        map.insert(key.to_string(), bad.clone());
+        assert!(
+            !validator.is_valid(&Value::Object(map.clone())),
+            "schema accepts {key}={bad}"
+        );
+        let refused = Settings::from_json_map(&map).unwrap_err().to_string();
+        assert!(!refused.is_empty(), "{key}={bad}");
+    }
+    // Required keys.
+    for key in ["token", "max_slots"] {
+        let mut map = config::default_map();
+        map.remove(key);
+        assert!(!validator.is_valid(&Value::Object(map.clone())), "{key}");
+        assert!(Settings::from_json_map(&map).is_err(), "{key}");
     }
 }

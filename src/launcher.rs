@@ -77,6 +77,9 @@ pub struct Launcher {
     /// slot. This set is memory only: after a restart such a row has no
     /// container and reconcile closes it.
     starting: Mutex<HashSet<String>>,
+    /// Why the last poll failed, for status.json and the doctor. None after
+    /// a poll that was answered.
+    poll_error: std::sync::Mutex<Option<String>>,
 }
 
 impl Launcher {
@@ -98,6 +101,7 @@ impl Launcher {
             slots: Mutex::new(()),
             timeouts: Mutex::new(HashSet::new()),
             starting: Mutex::new(HashSet::new()),
+            poll_error: std::sync::Mutex::new(None),
         }))
     }
 
@@ -162,6 +166,10 @@ impl Launcher {
         })
     }
 
+    pub fn set_poll_error(&self, error: Option<String>) {
+        *self.poll_error.lock().expect("poll error") = error;
+    }
+
     pub fn last_job(&self) -> Result<Option<JobRecord>, LaunchError> {
         self.store.last_job().map_err(store_err)
     }
@@ -191,6 +199,8 @@ impl Launcher {
             last_job_error,
             docker_error,
             last,
+            poll_error: self.poll_error.lock().expect("poll error").clone(),
+            config_warning: self.settings.config_warning.clone(),
         }
     }
 

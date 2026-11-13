@@ -86,6 +86,15 @@ pub struct Settings {
     /// Sent in the poll body. Default: the OS this binary was built for. The
     /// Windows supervisor sets `windows` for the binary it runs inside WSL.
     pub worker_os: String,
+    /// The JSON file this config came from. None: config.toml and environment.
+    pub config_json: Option<PathBuf>,
+    /// The login for the dangerous fields on the local page. Not strong:
+    /// it keeps a curious person out, like a BIOS password.
+    pub admin_user: String,
+    pub admin_password: String,
+    /// Set when the JSON file was unusable and an older copy or the built-in
+    /// defaults are running instead. The page, status.json and the doctor show it.
+    pub config_warning: Option<String>,
 }
 
 /// Outbound poll secret. Debug output is redacted.
@@ -136,13 +145,69 @@ struct FileConfig {
     poll_any_image: Option<bool>,
     worker_name: Option<String>,
     worker_os: Option<String>,
+    // config.json only. config.toml refuses these three.
+    poll_token: Option<String>,
+    admin_user: Option<String>,
+    admin_password: Option<String>,
 }
 
 impl Settings {
     pub fn load() -> Result<Self, ConfigError> {
         let env = process_env();
+        if let Some(path) = json_path(&env) {
+            return Ok(Self::load_json(&path));
+        }
         let toml_text = read_config_file(&env)?;
         Self::from_toml_and_env(&toml_text, &env)
+    }
+
+    /// config.json never stops the service. An unusable file falls back to
+    /// the copy written by the last save, then to the built-in defaults, and
+    /// the warning says which.
+    pub fn load_json(path: &Path) -> Self {
+        let problem = match read_json(path).and_then(|map| Self::from_json_map(&map)) {
+            Ok(mut settings) => {
+                settings.config_json = Some(path.to_path_buf());
+                return settings;
+            }
+            Err(err) => err.0,
+        };
+        let (mut settings, running) =
+            match read_json(&backup_path(path)).and_then(|map| Self::from_json_map(&map)) {
+                Ok(settings) => (settings, "the copy from the last save"),
+                Err(_) => (
+                    Self::from_json_map(&default_map())
+                        .expect("the built-in defaults are a valid config"),
+                    "the built-in defaults (idle)",
+                ),
+            };
+        settings.config_json = Some(path.to_path_buf());
+        settings.config_warning = Some(format!(
+            "{} is not usable ({problem}); running on {running}",
+            path.display()
+        ));
+        settings
+    }
+
+    /// The whole of config.json. The same rules as config.toml, with no
+    /// environment on top: the file is the one source.
+    pub fn from_json_map(map: &JsonMap) -> Result<Self, ConfigError> {
+        let file: FileConfig = serde_json::from_value(serde_json::Value::Object(map.clone()))
+            .map_err(|err| ConfigError(format!("config.json: {err}")))?;
+        let mut env = HashMap::new();
+        if let Some(token) = file.poll_token.clone().filter(|t| !t.is_empty()) {
+            env.insert("SHUTUP_AND_RUN_POLL_TOKEN".to_string(), token);
+        }
+        let admin_user = file.admin_user.clone();
+        let admin_password = file.admin_password.clone();
+        let mut settings = Self::build(file, &env)?;
+        if let Some(user) = admin_user {
+            settings.admin_user = validate_admin("admin_user", &user)?;
+        }
+        if let Some(password) = admin_password {
+            settings.admin_password = validate_admin("admin_password", &password)?;
+        }
+        Ok(settings)
     }
 
     /// Only the SQLite path, for `shutup-and-run bans`. That command runs from
@@ -150,6 +215,9 @@ impl Settings {
     /// so it must not need the rest of the settings.
     pub fn history_path() -> Result<PathBuf, ConfigError> {
         let env = process_env();
+        if let Some(path) = json_path(&env) {
+            return Ok(Self::load_json(&path).history_path);
+        }
         let toml_text = read_config_file(&env)?;
         Self::history_path_from(&toml_text, &env)
     }
@@ -178,7 +246,17 @@ impl Settings {
         } else {
             toml::from_str(toml_text).map_err(|err| ConfigError(format!("config.toml: {err}")))?
         };
+        if file.poll_token.is_some() || file.admin_user.is_some() || file.admin_password.is_some() {
+            return Err(ConfigError(
+                "config.toml: poll_token, admin_user and admin_password are config.json keys. \
+                 The poll token of a config.toml machine is SHUTUP_AND_RUN_POLL_TOKEN."
+                    .into(),
+            ));
+        }
+        Self::build(file, env)
+    }
 
+    fn build(file: FileConfig, env: &HashMap<String, String>) -> Result<Self, ConfigError> {
         let listen = take_string(env, "SHUTUP_AND_RUN_LISTEN", file.listen)
             .unwrap_or_else(|| DEFAULT_LISTEN.to_string());
         let listen: SocketAddr = listen
@@ -399,8 +477,311 @@ impl Settings {
             poll_any_image,
             worker_name,
             worker_os,
+            config_json: None,
+            admin_user: DEFAULT_ADMIN.to_string(),
+            admin_password: DEFAULT_ADMIN.to_string(),
+            config_warning: None,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// config.json: one local file that the CLI and the local page read and write.
+
+pub type JsonMap = serde_json::Map<String, serde_json::Value>;
+
+pub const JSON_DEFAULT: &str = "/etc/shutup-and-run/config.json";
+const TOML_DEFAULT: &str = "/etc/shutup-and-run/config.toml";
+/// The login of the local page until `config set admin_password` changes it.
+pub const DEFAULT_ADMIN: &str = "admin";
+pub const MASK: &str = "***";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Text,
+    Int,
+    Bool,
+    List,
+}
+
+/// Where a key can be edited besides the CLI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnPage {
+    /// On the local page, by whoever is at the machine.
+    Open,
+    /// On the local page, behind the admin login.
+    Locked,
+    /// CLI only.
+    No,
+}
+
+pub struct Key {
+    pub name: &'static str,
+    pub kind: Kind,
+    pub secret: bool,
+    pub page: OnPage,
+}
+
+const fn key(name: &'static str, kind: Kind, page: OnPage) -> Key {
+    Key {
+        name,
+        kind,
+        secret: false,
+        page,
+    }
+}
+
+const fn secret(name: &'static str) -> Key {
+    Key {
+        name,
+        kind: Kind::Text,
+        secret: true,
+        page: OnPage::Locked,
+    }
+}
+
+/// Every key of config.json. `docs/schemas/worker-config.schema.json` lists
+/// the same names; a test keeps the two equal.
+pub const KEYS: &[Key] = &[
+    key("poll_url", Kind::Text, OnPage::Open),
+    key("poll_interval_secs", Kind::Int, OnPage::Open),
+    key("max_slots", Kind::Int, OnPage::Open),
+    key("worker_name", Kind::Text, OnPage::Open),
+    key("allowlist", Kind::List, OnPage::Locked),
+    key("poll_any_image", Kind::Bool, OnPage::Locked),
+    key("default_timeout_secs", Kind::Int, OnPage::Locked),
+    key("max_timeout_secs", Kind::Int, OnPage::Locked),
+    secret("token"),
+    secret("poll_token"),
+    key("admin_user", Kind::Text, OnPage::Locked),
+    secret("admin_password"),
+    key("listen", Kind::Text, OnPage::No),
+    key("http", Kind::Bool, OnPage::No),
+    key("tls_cert", Kind::Text, OnPage::No),
+    key("tls_key", Kind::Text, OnPage::No),
+    key("status_page", Kind::Bool, OnPage::No),
+    key("worker_os", Kind::Text, OnPage::No),
+    key("history_path", Kind::Text, OnPage::No),
+    key("history_days", Kind::Int, OnPage::No),
+    key("docker_config", Kind::Text, OnPage::No),
+    key("log_lines", Kind::Int, OnPage::No),
+    key("reaper_interval_secs", Kind::Int, OnPage::No),
+    key("purge_interval_secs", Kind::Int, OnPage::No),
+    key("prune_interval_secs", Kind::Int, OnPage::No),
+    key("auth_failures", Kind::Int, OnPage::No),
+    key("ban_hours", Kind::Int, OnPage::No),
+    key("trust_x_forwarded_for", Kind::Bool, OnPage::No),
+];
+
+pub fn find_key(name: &str) -> Result<&'static Key, ConfigError> {
+    KEYS.iter().find(|k| k.name == name).ok_or_else(|| {
+        let names: Vec<&str> = KEYS.iter().map(|k| k.name).collect();
+        ConfigError(format!(
+            "{name} is not a config key. The keys are: {}",
+            names.join(", ")
+        ))
+    })
+}
+
+/// Text from a command line or a form field, as the JSON value of that key.
+pub fn parse_value(key: &Key, raw: &str) -> Result<serde_json::Value, ConfigError> {
+    use serde_json::Value;
+    let raw = raw.trim();
+    match key.kind {
+        Kind::Text => Ok(Value::String(raw.to_string())),
+        Kind::Int => raw
+            .parse::<u64>()
+            .map(Value::from)
+            .map_err(|_| ConfigError(format!("{} must be a whole number, not {raw:?}", key.name))),
+        Kind::Bool => match raw.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(Value::Bool(true)),
+            "false" | "0" | "no" | "off" => Ok(Value::Bool(false)),
+            _ => Err(ConfigError(format!(
+                "{} must be true or false, not {raw:?}",
+                key.name
+            ))),
+        },
+        Kind::List => {
+            if raw.starts_with('[') {
+                let list: Vec<String> = serde_json::from_str(raw).map_err(|_| {
+                    ConfigError(format!("{} must be a JSON list of strings", key.name))
+                })?;
+                return Ok(Value::from(list));
+            }
+            Ok(Value::from(
+                raw.split([',', '\n'])
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<String>>(),
+            ))
+        }
+    }
+}
+
+/// The map with every secret that is set replaced by `***`.
+pub fn masked(map: &JsonMap) -> JsonMap {
+    let mut out = map.clone();
+    for key in KEYS.iter().filter(|k| k.secret) {
+        if let Some(value) = out.get_mut(key.name) {
+            *value = serde_json::Value::String(MASK.to_string());
+        }
+    }
+    out
+}
+
+/// The secrets a report must not carry, longest first so one is not left
+/// half masked inside another.
+pub fn secret_values(map: &JsonMap) -> Vec<String> {
+    let mut values: Vec<String> = KEYS
+        .iter()
+        .filter(|k| k.secret)
+        .filter_map(|k| map.get(k.name).and_then(|v| v.as_str()))
+        .filter(|v| v.len() >= 4)
+        .map(str::to_string)
+        .collect();
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    values
+}
+
+/// What a machine with no config runs: one slot, nothing to poll, the local
+/// page on, and a token of its own.
+pub fn default_map() -> JsonMap {
+    let value = serde_json::json!({
+        "listen": DEFAULT_LISTEN,
+        "http": true,
+        "status_page": true,
+        "max_slots": 1,
+        "allowlist": ["hello-world"],
+        "token": crate::launcher::random_id(),
+    });
+    match value {
+        serde_json::Value::Object(map) => map,
+        _ => JsonMap::new(),
+    }
+}
+
+/// A factory reset: the defaults, keeping what says which machine this is
+/// and where it listens, when the old file can still be read.
+pub fn reset_map(old: Option<&JsonMap>) -> JsonMap {
+    let mut map = default_map();
+    if let Some(old) = old {
+        for name in [
+            "token",
+            "poll_token",
+            "worker_name",
+            "worker_os",
+            "listen",
+            "http",
+            "tls_cert",
+            "tls_key",
+            "status_page",
+            "history_path",
+        ] {
+            if let Some(value) = old.get(name) {
+                map.insert(name.to_string(), value.clone());
+            }
+        }
+    }
+    if Settings::from_json_map(&map).is_err() {
+        return default_map();
+    }
+    map
+}
+
+/// The JSON file the service reads, or None on a machine set up with
+/// config.toml and environment. `SHUTUP_AND_RUN_CONFIG` names either kind;
+/// without it, config.json wins when it exists.
+pub fn json_path(env: &HashMap<String, String>) -> Option<PathBuf> {
+    match env.get("SHUTUP_AND_RUN_CONFIG") {
+        Some(path) => path.ends_with(".json").then(|| PathBuf::from(path)),
+        None => Path::new(JSON_DEFAULT)
+            .exists()
+            .then(|| PathBuf::from(JSON_DEFAULT)),
+    }
+}
+
+/// The JSON file the `config` commands work on. A machine with no config
+/// file at all gets config.json; one with a config.toml is left alone.
+pub fn json_path_for_cli() -> Result<PathBuf, ConfigError> {
+    let env = process_env();
+    if let Some(path) = json_path(&env) {
+        return Ok(path);
+    }
+    if env.contains_key("SHUTUP_AND_RUN_CONFIG") || Path::new(TOML_DEFAULT).exists() {
+        return Err(ConfigError(
+            "this machine is set up with config.toml and environment variables. \
+             The config commands and the page editor work on config.json; see docs/FOR-AGENTS.md."
+                .into(),
+        ));
+    }
+    Ok(PathBuf::from(JSON_DEFAULT))
+}
+
+pub fn backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+pub fn read_json(path: &Path) -> Result<JsonMap, ConfigError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| ConfigError(format!("could not read {}: {err}", path.display())))?;
+    parse_json(&text)
+}
+
+pub fn parse_json(text: &str) -> Result<JsonMap, ConfigError> {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        Ok(_) => Err(ConfigError("config.json must be a JSON object".into())),
+        Err(err) => Err(ConfigError(format!("config.json is not JSON: {err}"))),
+    }
+}
+
+pub fn to_text(map: &JsonMap) -> String {
+    let mut text = serde_json::to_string_pretty(map).unwrap_or_else(|_| "{}".to_string());
+    text.push('\n');
+    text
+}
+
+/// Validate, then replace the file and its backup copy. Nothing invalid is
+/// ever written, so the file on disk always starts the service.
+pub fn save_json(path: &Path, map: &JsonMap) -> Result<(), ConfigError> {
+    Settings::from_json_map(map)?;
+    let text = to_text(map);
+    for target in [path.to_path_buf(), backup_path(path)] {
+        write_private(&target, text.as_bytes())
+            .map_err(|err| ConfigError(format!("could not write {}: {err}", target.display())))?;
+    }
+    Ok(())
+}
+
+/// Mode 600, written beside the target and renamed over it.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+}
+
+fn validate_admin(key: &str, value: &str) -> Result<String, ConfigError> {
+    if value.is_empty() || value.len() > 64 || value.chars().any(|c| c.is_control() || c == ':') {
+        return Err(ConfigError(format!(
+            "{key} must be 1 to 64 characters with no colon"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 fn process_env() -> HashMap<String, String> {
