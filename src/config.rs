@@ -104,6 +104,16 @@ pub struct Settings {
     pub min_free_memory: u64,
     /// The same for the disk Docker writes to.
     pub min_free_disk: u64,
+    /// Certificate passthrough: every container of this machine gets the
+    /// owner's PKCS#12 file and its password. Off unless the owner turned it
+    /// on and accepted that in the config.
+    pub certificate_enabled: bool,
+    /// The file name the certificate was imported from. For display only.
+    pub certificate_name: Option<String>,
+    /// Where the imported certificate and its password are kept, mode 600.
+    pub certificate_dir: PathBuf,
+    /// Where each job's own read-only copies live while it runs.
+    pub secrets_dir: PathBuf,
     /// The JSON file this config came from. None: config.toml and environment.
     pub config_json: Option<PathBuf>,
     /// The login for the dangerous fields on the local page. Not strong:
@@ -168,6 +178,9 @@ struct FileConfig {
     max_job_memory: Option<String>,
     min_free_memory: Option<String>,
     min_free_disk: Option<String>,
+    certificate_enabled: Option<bool>,
+    certificate_consent: Option<bool>,
+    certificate_name: Option<String>,
     // config.json only. config.toml refuses these three.
     poll_token: Option<String>,
     admin_user: Option<String>,
@@ -191,6 +204,7 @@ impl Settings {
         let problem = match read_json(path).and_then(|map| Self::from_json_map(&map)) {
             Ok(mut settings) => {
                 settings.config_json = Some(path.to_path_buf());
+                settings.certificate_dir = certificate_dir_for(path);
                 return settings;
             }
             Err(err) => err.0,
@@ -205,6 +219,7 @@ impl Settings {
                 ),
             };
         settings.config_json = Some(path.to_path_buf());
+        settings.certificate_dir = certificate_dir_for(path);
         settings.config_warning = Some(format!(
             "{} is not usable ({problem}); running on {running}",
             path.display()
@@ -485,6 +500,19 @@ impl Settings {
                 None if shared_pc => crate::resources::SHARED_PC_MIN_DISK,
                 None => 0,
             };
+        let certificate_enabled = file.certificate_enabled.unwrap_or(false);
+        if certificate_enabled && !file.certificate_consent.unwrap_or(false) {
+            return Err(ConfigError(
+                "certificate_enabled needs certificate_consent = true: every container this \
+                 machine runs would get the certificate and its password. Turn it on with \
+                 `shutup-and-run certificate set`, which asks for that consent."
+                    .into(),
+            ));
+        }
+        let certificate_name = file
+            .certificate_name
+            .map(|name| validate_worker_field("certificate_name", &name.replace(' ', "_")))
+            .transpose()?;
         let poll_interval_secs = match take_u64(
             env,
             "SHUTUP_AND_RUN_POLL_INTERVAL_SECS",
@@ -522,6 +550,10 @@ impl Settings {
             None
         };
 
+        let history_dir = Path::new(&history_path)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         Ok(Settings {
             listen,
             max_slots,
@@ -530,7 +562,7 @@ impl Settings {
             max_timeout_secs,
             reaper_interval: Duration::from_secs(reaper),
             docker_config,
-            history_path: PathBuf::from(history_path),
+            history_path: PathBuf::from(&history_path),
             history_days,
             purge_interval: Duration::from_secs(purge),
             log_lines: log_lines as usize,
@@ -555,6 +587,10 @@ impl Settings {
             max_job_memory,
             min_free_memory,
             min_free_disk,
+            certificate_enabled,
+            certificate_name,
+            certificate_dir: PathBuf::from(CERTIFICATE_DIR),
+            secrets_dir: default_secrets_dir(&history_dir),
             config_json: None,
             admin_user: DEFAULT_ADMIN.to_string(),
             admin_password: DEFAULT_ADMIN.to_string(),
@@ -573,6 +609,19 @@ const TOML_DEFAULT: &str = "/etc/shutup-and-run/config.toml";
 /// The login of the local page until `config set admin_password` changes it.
 pub const DEFAULT_ADMIN: &str = "admin";
 pub const MASK: &str = "***";
+/// The imported certificate lives beside the config, never in it.
+pub const CERTIFICATE_DIR: &str = "/etc/shutup-and-run/certificate";
+
+/// `/run` is memory on a systemd machine and in WSL, so a job's copy of the
+/// password does not reach the disk. Elsewhere it goes beside the history.
+fn default_secrets_dir(history_dir: &Path) -> PathBuf {
+    if Path::new("/run").is_dir() {
+        PathBuf::from("/run/shutup-and-run/jobs")
+    } else {
+        history_dir.join("job-secrets")
+    }
+}
+
 pub const PROFILE_SHARED_PC: &str = "shared-pc";
 pub const PROFILE_NONE: &str = "none";
 /// Docker refuses a container with less.
@@ -648,6 +697,9 @@ pub const KEYS: &[Key] = &[
     key("max_job_memory", Kind::Text, OnPage::No),
     key("min_free_memory", Kind::Text, OnPage::No),
     key("min_free_disk", Kind::Text, OnPage::No),
+    key("certificate_enabled", Kind::Bool, OnPage::No),
+    key("certificate_consent", Kind::Bool, OnPage::No),
+    key("certificate_name", Kind::Text, OnPage::No),
     key("history_path", Kind::Text, OnPage::No),
     key("history_days", Kind::Int, OnPage::No),
     key("docker_config", Kind::Text, OnPage::No),
@@ -805,6 +857,15 @@ pub fn json_path_for_cli() -> Result<PathBuf, ConfigError> {
     Ok(PathBuf::from(JSON_DEFAULT))
 }
 
+/// `certificate/` beside the config file.
+pub fn certificate_dir_for(config: &Path) -> PathBuf {
+    config
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .join("certificate")
+}
+
 pub fn backup_path(path: &Path) -> PathBuf {
     path.with_extension("json.bak")
 }
@@ -842,7 +903,7 @@ pub fn save_json(path: &Path, map: &JsonMap) -> Result<(), ConfigError> {
 }
 
 /// Mode 600, written beside the target and renamed over it.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;

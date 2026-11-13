@@ -24,6 +24,11 @@ async fn main() -> ExitCode {
             Some("config" | "bans" | "pause" | "resume") => {
                 return shutup_and_run::wsl::forward(&args)
             }
+            // These need a file or a result to cross between Windows and
+            // the distribution, so the supervisor carries it.
+            Some("job" | "demo" | "certificate") => {
+                return shutup_and_run::wsl::forward_with_files(&args)
+            }
             Some("doctor") => {
                 let mut wsl = vec!["doctor".to_string()];
                 wsl.extend_from_slice(rest);
@@ -37,6 +42,13 @@ async fn main() -> ExitCode {
             usage();
             ExitCode::SUCCESS
         }
+        Some("version" | "--version" | "-V") => shutup_and_run::devx::version_cli(rest),
+        Some("config") if rest.first().map(String::as_str) == Some("check") => {
+            shutup_and_run::devx::config_check_cli(&rest[1..]).await
+        }
+        Some("job") => shutup_and_run::devx::job_cli(rest),
+        Some("demo") => shutup_and_run::devx::demo_cli(rest).await,
+        Some("certificate") => shutup_and_run::devx::certificate_cli(rest),
         Some("bans") => bans_cli(rest),
         Some("config") => shutup_and_run::cli::config_cli(rest),
         Some("status") => shutup_and_run::cli::status_cli(rest),
@@ -70,6 +82,15 @@ shutup-and-run doctor [--report]
 shutup-and-run pause | resume
     for an agent or a script: no questions, --json, stable exit codes.
     `shutup-and-run config --help` documents all of them.
+
+shutup-and-run version
+shutup-and-run config check
+shutup-and-run job validate FILE
+shutup-and-run demo [sign]
+shutup-and-run certificate status|validate|set|disable
+    first run, and for an agent: the build, a preflight that changes nothing,
+    a dry run of a task, a self-contained demo, and the optional certificate
+    passthrough. `shutup-and-run demo --help` documents all of them.
 
 shutup-and-run bans
     list IPs banned for authentication failures

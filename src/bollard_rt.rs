@@ -151,6 +151,7 @@ impl Runtime for BollardRuntime {
                 // job must page. No restart policy: a failed container stays stopped.
                 memory_swap: spec.memory_bytes,
                 shm_size: spec.shm_bytes,
+                binds: (!spec.binds.is_empty()).then(|| spec.binds.clone()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -192,6 +193,22 @@ impl Runtime for BollardRuntime {
         {
             Ok(info) => Ok(map_state(info.state)),
             Err(err) if is_status(&err, 404) => Ok(Inspected::NotFound),
+            Err(err) => Err(docker_err(err)),
+        }
+    }
+
+    async fn applied(&self, id: &str) -> Result<Option<crate::runtime::Applied>, RuntimeError> {
+        match self
+            .docker
+            .inspect_container(&container_ref(id), None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) => Ok(info.host_config.map(|host| crate::runtime::Applied {
+                nano_cpus: host.nano_cpus.unwrap_or(0),
+                memory_bytes: host.memory.unwrap_or(0),
+                memory_swap: host.memory_swap.unwrap_or(0),
+            })),
+            Err(err) if is_status(&err, 404) => Ok(None),
             Err(err) => Err(docker_err(err)),
         }
     }

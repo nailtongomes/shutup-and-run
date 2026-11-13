@@ -16,6 +16,7 @@ struct Inner {
     specs: Vec<StartSpec>,
     fail_list: bool,
     fail_start: bool,
+    exit_on_start: Option<i64>,
 }
 
 pub struct MockRuntime {
@@ -44,6 +45,7 @@ impl MockRuntime {
                 specs: Vec::new(),
                 fail_list: false,
                 fail_start: false,
+                exit_on_start: None,
             }),
         }
     }
@@ -79,6 +81,12 @@ impl MockRuntime {
 
     pub async fn fail_lists(&self, yes: bool) {
         self.inner.lock().await.fail_list = yes;
+    }
+
+    /// Every container started from now on has already exited with `code`,
+    /// like `hello-world`, instead of running until it is killed.
+    pub async fn exit_on_start(&self, code: Option<i64>) {
+        self.inner.lock().await.exit_on_start = code;
     }
 
     pub async fn fail_start(&self, yes: bool) {
@@ -117,10 +125,34 @@ impl Runtime for MockRuntime {
         inner.starts += 1;
         inner.specs.push(spec.clone());
         let id = id.to_string();
-        inner.running.insert(id.clone(), spec.deadline_unix);
+        match inner.exit_on_start {
+            Some(code) => {
+                inner.stopped.insert(id.clone(), code);
+            }
+            None => {
+                inner.running.insert(id.clone(), spec.deadline_unix);
+            }
+        }
         inner.logs.insert(id.clone(), format!("log {id}\n"));
         inner.image_of.insert(id, spec.image.clone());
         Ok(())
+    }
+
+    async fn applied(&self, id: &str) -> Result<Option<crate::runtime::Applied>, RuntimeError> {
+        let inner = self.inner.lock().await;
+        if !inner.running.contains_key(id) && !inner.stopped.contains_key(id) {
+            return Ok(None);
+        }
+        Ok(inner
+            .specs
+            .iter()
+            .rev()
+            .find(|spec| inner.image_of.get(id) == Some(&spec.image))
+            .map(|spec| crate::runtime::Applied {
+                nano_cpus: spec.nano_cpus.unwrap_or(0),
+                memory_bytes: spec.memory_bytes.unwrap_or(0),
+                memory_swap: spec.memory_bytes.unwrap_or(0),
+            }))
     }
 
     async fn inspect(&self, id: &str) -> Result<Inspected, RuntimeError> {

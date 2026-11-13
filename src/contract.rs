@@ -1056,6 +1056,79 @@ async fn the_existing_surface_did_not_move() {
     }
 }
 
+/// `job validate` and a push give the same verdict on every documented
+/// request and on the bodies the API refuses, and validating stores nothing.
+#[tokio::test]
+async fn job_validate_agrees_with_a_push_and_changes_nothing() {
+    use crate::launcher::JobSource;
+    let mut bodies: Vec<String> = vec![
+        example!("job-request.minimal.json").1.to_string(),
+        example!("job-request.full.json").1.to_string(),
+    ];
+    for bad in [
+        r#"{"image":"alpine","volumes":["/:/host"]}"#,
+        r#"{"image":"alpine","privileged":true}"#,
+        r#"{"image":"alpine","binds":["/etc:/etc"]}"#,
+        r#"{"env":{}}"#,
+        r#"{"image":"docker.io/evil/image"}"#,
+        r#"{"image":"alpine","timeout_secs":0}"#,
+        r#"{"image":"alpine","timeout_secs":999999999}"#,
+        r#"{"image":"alpine","cpu":2}"#,
+        r#"{"image":"alpine","memory":"64g"}"#,
+        r#"{"image":"alpine","job_key":"has space"}"#,
+        r#"{"image":"alpine","callback_url":"ftp://x"}"#,
+        r#"{"image":"alpine","env":{"1BAD":"x"}}"#,
+        "not json",
+        r#"{"image":"alpine","cpu":0.5,"memory":"256m","job_key":"ok-1"}"#,
+    ] {
+        bodies.push(bad.to_string());
+    }
+    for body in bodies {
+        // A fresh machine each time, so a job_key or a full slot does not decide.
+        let m = machine(1, "max_job_cpus = \"1\"\nmax_job_memory = \"2g\"", &[]);
+        let verdict =
+            crate::devx::job_validate(body.as_bytes(), m.launcher.settings(), JobSource::Push);
+        assert_eq!(m.launcher.counts().unwrap().started, 0, "{body}");
+        assert_eq!(m.mock.pulls().await.len(), 0, "{body}");
+        assert_eq!(m.launcher.slots().await.unwrap().used, 0, "{body}");
+        let (status, answer) = push(&m.app, &body).await;
+        m.launcher.settled().await;
+        assert_eq!(
+            verdict.code == 0,
+            status == StatusCode::ACCEPTED,
+            "{body}: validate says {} and the API says {status}",
+            verdict.json
+        );
+        match status {
+            StatusCode::ACCEPTED => {
+                assert_eq!(verdict.json["code"], "JOB_VALID");
+                assert_eq!(verdict.json["runtime"]["checked"], false);
+            }
+            StatusCode::FORBIDDEN => assert_eq!(verdict.json["code"], "JOB_IMAGE_NOT_ALLOWED"),
+            _ => {
+                assert_eq!(verdict.code, crate::cli::EXIT_INVALID);
+                // The same words the API uses.
+                assert_eq!(verdict.json["error"], answer["error"], "{body}");
+            }
+        }
+    }
+    // A polled task is held to what a polled task is held to.
+    let m = machine(
+        1,
+        "poll_url = \"http://127.0.0.1:9/p\"\npoll_any_image = true",
+        &[],
+    );
+    let other = br#"{"image":"docker.io/other/image"}"#;
+    assert_eq!(
+        crate::devx::job_validate(other, m.launcher.settings(), JobSource::Poll).code,
+        0
+    );
+    assert_ne!(
+        crate::devx::job_validate(other, m.launcher.settings(), JobSource::Push).code,
+        0
+    );
+}
+
 /// config.json: the schema lists exactly the keys the service knows, and
 /// what the service writes and accepts validates against it.
 #[test]
@@ -1091,6 +1164,9 @@ fn the_config_schema_matches_the_keys_and_the_validation() {
         ("token", json!("short")),
         ("allowlist", json!("alpine")),
         ("no_such_key", json!(true)),
+        ("certificate_enabled", json!("yes")),
+        ("certificate_enabled", json!(true)),
+        ("certificate_name", json!(7)),
         ("resource_profile", json!("gaming-pc")),
         ("max_job_cpus", json!(1)),
         ("max_job_cpus", json!("many")),

@@ -140,6 +140,20 @@
       "pattern": "^(0|[0-9]+(\\.[0-9]+)?\\s*([kKmMgG]([iI]?[bB])?|[bB])?)$",
       "description": "No new job starts while the disk Docker writes to has less than this free. \"0\" turns the check off."
     },
+    "certificate_enabled": {
+      "type": "boolean",
+      "default": false,
+      "description": "Certificate passthrough. When true, EVERY container this machine starts can read the owner's PKCS#12 certificate at /run/shutup-and-run/certificate/client.pfx and its password at /run/shutup-and-run/secrets/certificate-password, read-only. There is no per-image list. Needs certificate_consent. Set by `shutup-and-run certificate set` or the local page, not by hand. The certificate and the password are not in this file: they are kept beside it, mode 600, and never sent to the poll URL."
+    },
+    "certificate_consent": {
+      "type": "boolean",
+      "description": "The owner of the machine accepted that every job can copy the certificate's private key. A local decision: no job, poll answer or API call can set it."
+    },
+    "certificate_name": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "The file name the certificate was imported from, for display. Not a path."
+    },
     "history_path": {
       "type": "string",
       "description": "SQLite job history. status.json is written beside it.",
@@ -203,5 +217,25 @@
       "description": "Take the caller's address from X-Forwarded-For. Only behind your own proxy.",
       "default": false
     }
+  },
+  "if": {
+    "properties": {
+      "certificate_enabled": {
+        "const": true
+      }
+    },
+    "required": [
+      "certificate_enabled"
+    ]
+  },
+  "then": {
+    "properties": {
+      "certificate_consent": {
+        "const": true
+      }
+    },
+    "required": [
+      "certificate_consent"
+    ]
   }
 }

@@ -38,6 +38,10 @@ pub fn router(launcher: Arc<Launcher>) -> Router {
         .route("/local/lang", get(set_lang))
         .route("/local/config", get(config_page).post(config_save))
         .route("/local/advanced", get(advanced_page).post(advanced_save))
+        .route(
+            "/local/certificate",
+            get(certificate_page).post(certificate_save),
+        )
         .layer(from_fn(local_only))
         .with_state(launcher)
 }
@@ -472,8 +476,19 @@ fn editor(path: &Path, group: OnPage, lang: Lang, error: Option<&str>) -> String
                     )
                 })
                 .collect();
+            let more = if group == OnPage::Locked {
+                format!(
+                    "<p><a href=\"/local/certificate\">{}</a></p>",
+                    lang.t(
+                        "Certificate (advanced, optional)",
+                        "Certificado (avançado, opcional)"
+                    )
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{}<h2>{}</h2><table>{rows}</table><p><small>{}</small></p>",
+                "{}{more}<h2>{}</h2><table>{rows}</table><p><small>{}</small></p>",
                 form(&map, group, here, lang),
                 lang.t("The whole config file", "O arquivo de configuração inteiro"),
                 lang.t(
@@ -655,6 +670,248 @@ fn save_page(
             ),
         ),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Certificate passthrough. Behind the admin login, like the other dangerous
+// settings, and like them only on the machine itself.
+
+fn risk(lang: Lang) -> &'static str {
+    lang.t(
+        crate::devx::RISK,
+        "Quando ativado, todo container executado por este worker pode acessar o certificado \
+         configurado e a senha dele. A montagem somente leitura protege o arquivo original \
+         contra alteração, mas não impede copiar, exportar ou usar a chave privada. Ative este \
+         recurso apenas se você confia em toda carga de trabalho que pode rodar nesta máquina.",
+    )
+}
+
+/// The certificate section. `note` is the answer to the last button.
+pub(crate) fn certificate_view(path: &Path, lang: Lang, note: Option<(bool, &str)>) -> String {
+    let status = crate::devx::certificate_status(path);
+    let enabled = status["enabled"] == true;
+    let imported = status["imported"] == true;
+    let state = match (enabled, imported) {
+        (true, _) => lang.t(
+            "ON: every container gets the certificate and its password.",
+            "ATIVADO: todo container recebe o certificado e a senha.",
+        ),
+        (false, true) => lang.t(
+            "Off. A certificate is imported and is not given to containers.",
+            "Desativado. Há um certificado importado, que não é entregue aos containers.",
+        ),
+        (false, false) => lang.t("Off. No certificate.", "Desativado. Sem certificado."),
+    };
+    let note = note
+        .map(|(ok, text)| {
+            format!(
+                "<pre{}>{}</pre>",
+                if ok { "" } else { " class=\"bad\"" },
+                escape(text)
+            )
+        })
+        .unwrap_or_default();
+    let name = status["name"]
+        .as_str()
+        .map(|n| format!(" (<code>{}</code>)", escape(n)))
+        .unwrap_or_default();
+    let body = format!(
+        "<h2>{title}</h2>{note}<p><b>{state}</b>{name}</p><p class=\"bad\">{risk}</p>\
+         <form method=\"post\" action=\"/local/certificate\" id=\"cert\">\
+         <label for=\"file\">{t_file}</label><input type=\"file\" id=\"file\" accept=\".pfx,.p12\">\
+         <input type=\"hidden\" name=\"pfx_base64\" id=\"pfx_base64\">\
+         <input type=\"hidden\" name=\"file_name\" id=\"file_name\">\
+         <label for=\"password\">{t_password}</label>\
+         <input type=\"password\" id=\"password\" name=\"password\" autocomplete=\"new-password\">\
+         <label><input type=\"checkbox\" name=\"confirm\"> {t_confirm}</label>\
+         <p><button name=\"action\" value=\"save\">{t_save}</button></p>\
+         <p><button name=\"action\" value=\"validate\">{t_validate}</button> \
+         <button name=\"action\" value=\"sign\">{t_sign}</button></p>\
+         <p><button name=\"action\" value=\"disable\">{t_disable}</button> \
+         <button name=\"action\" value=\"forget\">{t_forget}</button></p></form>\
+         <script>document.getElementById('file').addEventListener('change',function(){{\
+         var f=this.files[0];if(!f)return;var r=new FileReader();r.onload=function(){{\
+         document.getElementById('pfx_base64').value=r.result.split(',')[1]||'';\
+         document.getElementById('file_name').value=f.name}};r.readAsDataURL(f)}});</script>\
+         <p><small>{t_where} <code>{cert}</code>, <code>{pw}</code>. {t_note}</small></p>\
+         <p><a href=\"/local/advanced\">{t_back}</a> &middot; <a href=\"/\">{t_status}</a></p>",
+        title = lang.t("Certificate (advanced, optional)", "Certificado (avançado, opcional)"),
+        risk = risk(lang),
+        t_file = lang.t(
+            "Certificate file (.pfx or .p12). It is copied into the worker; the original is only read.",
+            "Arquivo do certificado (.pfx ou .p12). Ele é copiado para o worker; o original é só lido.",
+        ),
+        t_password = lang.t(
+            "Certificate password. It is never shown again.",
+            "Senha do certificado. Ela nunca é mostrada de novo.",
+        ),
+        t_confirm = lang.t(
+            "I have read the warning above and I trust every job this machine may run.",
+            "Li o aviso acima e confio em toda tarefa que esta máquina pode rodar.",
+        ),
+        t_save = lang.t("Enable certificate passthrough", "Ativar o repasse do certificado"),
+        t_validate = lang.t("Validate certificate", "Validar o certificado"),
+        t_sign = lang.t("Test PDF signing", "Testar assinatura de PDF"),
+        t_disable = lang.t("Disable certificate passthrough", "Desativar o repasse do certificado"),
+        t_forget = lang.t("Disable and delete the certificate", "Desativar e apagar o certificado"),
+        t_where = lang.t("A container finds them at", "O container os encontra em"),
+        cert = crate::certificate::CONTAINER_CERT,
+        pw = crate::certificate::CONTAINER_PASSWORD,
+        t_note = lang.t(
+            "Enabling or disabling restarts the service; running jobs keep what they had. The signing test takes a while the first time, because it pulls an image.",
+            "Ativar ou desativar reinicia o serviço; as tarefas em execução ficam com o que tinham. O teste de assinatura demora na primeira vez, porque baixa uma imagem.",
+        ),
+        t_back = lang.t("Advanced settings", "Configuração avançada"),
+        t_status = lang.t("Back to status", "Voltar ao status"),
+    );
+    shell(lang, "/local/certificate", None, &body)
+}
+
+async fn certificate_page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Response {
+    let lang = lang_of(&headers);
+    let Some(path) = &launcher.settings().config_json else {
+        return not_editable(lang);
+    };
+    if !admin(&headers, &launcher) {
+        return ask_login();
+    }
+    html(StatusCode::OK, certificate_view(path, lang, None))
+}
+
+/// What one button of the certificate form did. Restart: the config changed.
+pub(crate) enum CertificateDone {
+    Restart,
+    Note(bool, String),
+}
+
+/// The buttons that need no container. `sign` is handled by the caller.
+pub(crate) fn certificate_action(
+    path: &Path,
+    form: &HashMap<String, String>,
+    lang: Lang,
+) -> CertificateDone {
+    let dir = config::certificate_dir_for(path);
+    let field = |name: &str| form.get(name).map(String::as_str).unwrap_or("");
+    match field("action") {
+        "validate" => {
+            let found = crate::certificate::validate_imported(&dir);
+            CertificateDone::Note(
+                found.ok,
+                format!(
+                    "{}: {}{}",
+                    found.code,
+                    found.detail,
+                    found
+                        .not_after
+                        .as_deref()
+                        .map(|until| format!(" (valid until {until})"))
+                        .unwrap_or_default()
+                ),
+            )
+        }
+        "disable" | "forget" => {
+            match crate::devx::certificate_disable(path, field("action") == "forget") {
+                Ok(()) => CertificateDone::Restart,
+                Err(err) => CertificateDone::Note(false, err),
+            }
+        }
+        "save" => {
+            if !form.contains_key("confirm") {
+                return CertificateDone::Note(
+                    false,
+                    lang.t(
+                        "Not enabled: tick the box to confirm you have read the warning.",
+                        "Não ativado: marque a caixa para confirmar que leu o aviso.",
+                    )
+                    .to_string(),
+                );
+            }
+            // No new file: the one already imported, with the password typed.
+            let pfx = if field("pfx_base64").is_empty() {
+                std::fs::read(crate::certificate::pfx_path(&dir)).map_err(|_| {
+                    lang.t(
+                        "Choose a certificate file.",
+                        "Escolha um arquivo de certificado.",
+                    )
+                    .to_string()
+                })
+            } else {
+                base64::engine::general_purpose::STANDARD
+                    .decode(field("pfx_base64").trim())
+                    .map_err(|_| "the file did not arrive whole".to_string())
+            };
+            let name = match field("file_name") {
+                "" => "certificate",
+                name => name,
+            };
+            match pfx.and_then(|pfx| {
+                crate::devx::certificate_set(path, name, &pfx, field("password"), true)
+                    .map_err(|out| out.text)
+            }) {
+                Ok(_) => CertificateDone::Restart,
+                Err(err) => CertificateDone::Note(false, err),
+            }
+        }
+        _ => CertificateDone::Note(false, "unknown action".to_string()),
+    }
+}
+
+async fn certificate_save(
+    State(launcher): State<Arc<Launcher>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let lang = lang_of(&headers);
+    let Some(path) = &launcher.settings().config_json else {
+        return not_editable(lang);
+    };
+    if !admin(&headers, &launcher) {
+        return ask_login();
+    }
+    let done = if form.get("action").map(String::as_str) == Some("sign") {
+        let out = crate::devx::demo_sign(
+            launcher.settings().clone(),
+            None,
+            crate::devx::SignOptions {
+                configured: true,
+                image: crate::devx::SIGN_IMAGE,
+                out: None,
+                inline: false,
+            },
+        )
+        .await;
+        CertificateDone::Note(out.code == 0, out.text)
+    } else {
+        certificate_action(path, &form, lang)
+    };
+    match done {
+        CertificateDone::Note(ok, text) => html(
+            if ok {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            certificate_view(path, lang, Some((ok, &text))),
+        ),
+        CertificateDone::Restart => {
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                request_restart();
+            });
+            html(
+                StatusCode::OK,
+                shell(
+                    lang,
+                    "/",
+                    Some((4, "/local/certificate")),
+                    lang.t(
+                        "<p class=\"state\">Saved.</p><p>The service is restarting. Running jobs keep what they had; the next ones get the new setting.</p>",
+                        "<p class=\"state\">Salvo.</p><p>O serviço está reiniciando. As tarefas em execução ficam com o que tinham; as próximas recebem a nova configuração.</p>",
+                    ),
+                ),
+            )
+        }
+    }
 }
 
 fn ago(secs: i64) -> String {

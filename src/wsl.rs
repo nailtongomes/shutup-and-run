@@ -62,7 +62,7 @@ const DOCKER_STEPS: &[(&str, &str)] = &[
     ),
     (
         "apt-get install docker.io",
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io curl ca-certificates",
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io curl ca-certificates openssl",
     ),
     (
         "creating the config and data directories",
@@ -982,6 +982,7 @@ pub(crate) fn wsl_limits_check(limits: &WslLimits, vm: Option<(u64, u64)>) -> Ch
             false,
             format!(".wslconfig: {}. {host}{now}", limits.problems.join("; ")),
         )
+        .coded("WSL_LIMITS_ABOVE_BUDGET")
         .fix(format!("{LIMITS_APPLY}. Then {WSL_RESTART}"));
     }
     // The file is right. Is the VM still running on what it had before?
@@ -993,6 +994,7 @@ pub(crate) fn wsl_limits_check(limits: &WslLimits, vm: Option<(u64, u64)>) -> Ch
                 false,
                 format!(".wslconfig is within the budget, but not in effect yet. {host}{now}"),
             )
+            .coded("WSL_LIMITS_NOT_IN_EFFECT")
             .fix(WSL_RESTART);
         }
     }
@@ -1274,6 +1276,7 @@ fn doctor_cli(args: &[String]) -> WslResult<ExitCode> {
             .map(|v| &v["status"])
             .filter(|v| !v.is_null()),
         &[],
+        &recent_log_problems(),
         flags.has("--report"),
     );
     if flags.has("--json") {
@@ -1303,6 +1306,7 @@ fn doctor(
         Err(e) => {
             checks.push(
                 check("wsl", false, e.to_string())
+                    .coded("WSL_UNAVAILABLE")
                     .fix("run `wsl --install --no-distribution` as administrator and reboot"),
             );
             return Ok((checks, None));
@@ -1311,6 +1315,7 @@ fn doctor(
     if !status.ok() {
         checks.push(
             check("wsl", false, status.one_line())
+                .coded("WSL_UNAVAILABLE")
                 .fix("run `wsl --install --no-distribution` as administrator and reboot"),
         );
         return Ok((checks, None));
@@ -1336,7 +1341,9 @@ fn doctor(
         }
         None => {
             checks.push(
-                check("distribution", false, format!("{DISTRO} is not registered")).fix(INSTALL),
+                check("distribution", false, format!("{DISTRO} is not registered"))
+                    .coded("DISTRIBUTION_MISSING")
+                    .fix(INSTALL),
             );
             return Ok((checks, None));
         }
@@ -1350,9 +1357,13 @@ fn doctor(
         DISTRO_START,
     )?;
     if !docker.ok() {
-        checks.push(check("docker", false, docker.one_line()).fix(format!(
+        checks.push(
+            check("docker", false, docker.one_line())
+                .coded("DOCKER_UNAVAILABLE")
+                .fix(format!(
             "`shutup-and-run wsl stop`, then `shutup-and-run wsl start`. Still failing: {RESET}"
-        )));
+        )),
+        );
         return Ok((checks, None));
     }
     checks.push(check(
@@ -1447,6 +1458,7 @@ fn doctor(
             false,
             format!("{TASK_NAME} is not registered, so the worker does not start at logon"),
         )
+        .coded("TASK_NOT_REGISTERED")
         .fix("`shutup-and-run wsl task register`"),
         Err(e) => soft("task", false, e.to_string()),
     });
@@ -1989,6 +2001,172 @@ pub fn forward(args: &[String]) -> ExitCode {
     ExitCode::from(out.status.unwrap_or(1).clamp(0, 255) as u8)
 }
 
+/// `job validate FILE`, `demo sign` and `certificate set --file` on Windows.
+/// The service is inside the distribution, which mounts no Windows drive, so
+/// a file named on the Windows side is read here and handed over on stdin,
+/// and the signed PDF of the demo is written here from the answer.
+pub fn forward_with_files(args: &[String]) -> ExitCode {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let as_json = args.iter().any(|a| a == "--json");
+    let fail = |msg: String| {
+        if as_json {
+            println!("{}", serde_json::json!({"ok": false, "error": msg}));
+        } else {
+            eprintln!("shutup-and-run: {msg}");
+        }
+        ExitCode::from(1)
+    };
+    let value_of = |flag: &str| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|at| args.get(at + 1))
+            .cloned()
+    };
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut inner: Vec<String> = vec![INNER_BIN.to_string()];
+    let mut stdin = None;
+    let mut pdf_out = None;
+    match words[..] {
+        ["job", "validate", file, ..] if file != "-" && !file.starts_with("--") => {
+            match std::fs::read(file) {
+                Ok(bytes) => stdin = Some(bytes),
+                Err(e) => return fail(format!("{file}: {e}")),
+            }
+            inner.extend(args.iter().map(|a| {
+                if a == file {
+                    "-".to_string()
+                } else {
+                    a.clone()
+                }
+            }));
+        }
+        ["demo", "sign", ..] if !args.iter().any(|a| a == "--help" || a == "-h") => {
+            pdf_out =
+                Some(PathBuf::from(value_of("--out").unwrap_or_else(|| {
+                    "shutup-and-run-demo-signed.pdf".to_string()
+                })));
+            let mut skip = false;
+            for arg in args {
+                if std::mem::take(&mut skip) {
+                    continue;
+                }
+                match arg.as_str() {
+                    "--out" => skip = true,
+                    "--json" | "--inline" => {}
+                    _ => inner.push(arg.clone()),
+                }
+            }
+            inner.extend(["--json".to_string(), "--inline".to_string()]);
+        }
+        ["certificate", "set", ..] if value_of("--file").is_some() => {
+            let file = value_of("--file").unwrap_or_default();
+            let pfx = match std::fs::read(&file) {
+                Ok(bytes) => bytes,
+                Err(e) => return fail(format!("{file}: {e}")),
+            };
+            let password = if args.iter().any(|a| a == "--password-stdin") {
+                let mut line = String::new();
+                if let Err(e) = std::io::stdin().read_line(&mut line) {
+                    return fail(format!("could not read the password from stdin: {e}"));
+                }
+                line.trim_end_matches(['\n', '\r']).to_string()
+            } else {
+                match std::env::var("SHUTUP_AND_RUN_CERT_PASSWORD") {
+                    Ok(password) => password,
+                    Err(_) => return fail(
+                        "the certificate password is not given: set SHUTUP_AND_RUN_CERT_PASSWORD, \
+                             or pass --password-stdin and write it on stdin"
+                            .to_string(),
+                    ),
+                }
+            };
+            let name = Path::new(&file)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            stdin = Some(
+                serde_json::json!({"name": name, "pfx_base64": b64.encode(pfx), "password": password})
+                    .to_string()
+                    .into_bytes(),
+            );
+            let mut skip = false;
+            for arg in args {
+                if std::mem::take(&mut skip) {
+                    continue;
+                }
+                match arg.as_str() {
+                    "--file" => skip = true,
+                    "--password-stdin" => {}
+                    _ => inner.push(arg.clone()),
+                }
+            }
+            inner.push("--stdin-json".to_string());
+        }
+        _ => inner.extend(args.iter().cloned()),
+    }
+    match our_distro() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return fail(format!(
+                "the worker is not installed on this PC ({DISTRO} is not a WSL distribution). \
+                 Run `shutup-and-run wsl install`."
+            ))
+        }
+        Err(e) => return fail(e.to_string()),
+    }
+    let inner: Vec<&str> = inner.iter().map(String::as_str).collect();
+    // A demo pulls an image the first time.
+    let out = match in_distro(&inner, stdin, APT) {
+        Ok(out) => out,
+        Err(e) => return fail(e.to_string()),
+    };
+    let code = ExitCode::from(out.status.unwrap_or(1).clamp(0, 255) as u8);
+    let Some(pdf_out) = pdf_out else {
+        print!("{}", String::from_utf8_lossy(&out.stdout));
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        if out.ok() && words.first() == Some(&"certificate") {
+            let _ = refresh_host_backup();
+        }
+        return code;
+    };
+    // The signed PDF comes back inside the JSON and is written on this side.
+    let Ok(mut answer) = serde_json::from_str::<serde_json::Value>(out.text().trim()) else {
+        print!("{}", String::from_utf8_lossy(&out.stdout));
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        return code;
+    };
+    let pdf = answer
+        .as_object_mut()
+        .and_then(|o| o.remove("signed_pdf_base64"))
+        .and_then(|v| v.as_str().and_then(|s| b64.decode(s).ok()));
+    let mut wrote = String::new();
+    if let Some(pdf) = pdf {
+        match std::fs::write(&pdf_out, pdf) {
+            Ok(()) => {
+                answer["output"] = serde_json::json!(pdf_out);
+                wrote = format!("wrote {}\n", pdf_out.display());
+            }
+            Err(e) => wrote = format!("could not write {}: {e}\n", pdf_out.display()),
+        }
+    }
+    if as_json {
+        println!("{answer}");
+    } else {
+        let checks = crate::cli::checks_from_json(&answer["checks"]);
+        print!("{}{wrote}", report(&checks).0);
+        println!(
+            "{}",
+            if answer["ok"] == true {
+                "signing demo passed"
+            } else {
+                "signing demo failed: run the `fix:` under each FAIL"
+            }
+        );
+    }
+    code
+}
+
 /// `wsl reset`: the distribution is deleted and installed again. The config
 /// comes back from the Windows-side copy, unless `--factory` forgets it.
 async fn reset_cli(args: &[String]) -> WslResult<ExitCode> {
@@ -2421,6 +2599,24 @@ fn logs_cli(args: &[String]) -> WslResult<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The last warnings and errors of the supervisor log, for the report. The
+/// log never holds a token or a job's env, and the report is scrubbed again.
+fn recent_log_problems() -> Vec<String> {
+    let text = std::fs::read_to_string(log_path()).unwrap_or_default();
+    problems_in(&text, 400, 12)
+}
+
+pub(crate) fn problems_in(text: &str, window: usize, keep: usize) -> Vec<String> {
+    let found: Vec<&str> = tail(text, window)
+        .into_iter()
+        .filter(|line| line.contains("WARN") || line.contains("ERROR") || line.contains("failed"))
+        .collect();
+    found[found.len().saturating_sub(keep)..]
+        .iter()
+        .map(|line| line.chars().take(300).collect())
+        .collect()
+}
+
 pub(crate) fn tail(text: &str, lines: usize) -> Vec<&str> {
     let all: Vec<&str> = text.lines().collect();
     let start = all.len().saturating_sub(lines);
@@ -2772,6 +2968,21 @@ mod tests {
         assert!(asked.within());
         // A PC whose RAM cannot be read is treated as 8 GiB.
         assert_eq!(wsl_limits(None, 4, None, none).budget, (3276, 2));
+    }
+
+    #[test]
+    fn the_report_takes_the_last_problems_of_the_log() {
+        let log =
+            "a INFO up\nb WARN poll: refused\nc INFO ok\nd ERROR docker\ne the service failed\n";
+        assert_eq!(
+            problems_in(log, 400, 2),
+            vec!["d ERROR docker", "e the service failed"]
+        );
+        assert!(problems_in("INFO fine\n", 400, 12).is_empty());
+        assert_eq!(
+            problems_in(&format!("WARN {}", "x".repeat(900)), 5, 5)[0].len(),
+            300
+        );
     }
 
     #[test]
