@@ -219,7 +219,7 @@ shutup-and-run status
 shutup-and-run doctor
 ```
 
-`config`, `pause`, `resume` and `bans` run inside the distribution; the `.exe` forwards them. The page is `http://127.0.0.1:8787/`, and the install puts a `shutup-and-run` shortcut to it on the desktop. [FOR-AGENTS.md](FOR-AGENTS.md) lists the known problems and their fixes.
+`config`, `jobs`, `pause`, `resume` and `bans` run inside the distribution; the `.exe` forwards them. The page is `http://127.0.0.1:8787/`, and the install puts a `shutup-and-run` shortcut to it on the desktop. [FOR-AGENTS.md](FOR-AGENTS.md) lists the known problems and their fixes.
 
 When the machine itself broke (a power cut, a damaged distribution), `shutup-and-run wsl reset` deletes the distribution and installs it again, keeping the config and the machine's poll token. `--factory` forgets those too.
 
@@ -239,7 +239,7 @@ Jobs that are running when you re-install are ended: the distribution is restart
 Each poll is a `POST` with the token and this body:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.8", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.9", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
 ```
 
 `cpus` and `memory_bytes` are what the WSL2 VM has, which is what the machine lends. The body has no address, because the worker only knows the VM's private one and could claim any other. The server takes the public address from the connection.

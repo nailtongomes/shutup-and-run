@@ -17,11 +17,19 @@ const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let rest = args.get(1..).unwrap_or(&[]);
+    // The language of the hints: `language` in config.json, when it is here.
+    // On Windows the file is inside the distribution, and the supervisor
+    // reads the copy it keeps on the host.
+    if cfg!(windows) {
+        shutup_and_run::wsl::load_language();
+    } else if !matches!(args.first().map(String::as_str), None | Some("serve")) {
+        shutup_and_run::hints::load_language();
+    }
     // On Windows the config, the job history and the service are inside the
     // distribution, so these run there. `status` reads the host's copy.
     if cfg!(windows) {
         match args.first().map(String::as_str) {
-            Some("config" | "bans" | "pause" | "resume") => {
+            Some("config" | "bans" | "pause" | "resume" | "jobs") => {
                 return shutup_and_run::wsl::forward(&args)
             }
             // These need a file or a result to cross between Windows and
@@ -52,6 +60,7 @@ async fn main() -> ExitCode {
         Some("bans") => bans_cli(rest),
         Some("config") => shutup_and_run::cli::config_cli(rest),
         Some("status") => shutup_and_run::cli::status_cli(rest),
+        Some("jobs") => shutup_and_run::jobs::jobs_cli(rest),
         Some("doctor") => shutup_and_run::cli::doctor_cli(rest).await,
         Some("pause") => shutup_and_run::cli::pause_cli(true, rest),
         Some("resume") => shutup_and_run::cli::pause_cli(false, rest),
@@ -80,6 +89,7 @@ shutup-and-run config show|get|set|unset|validate|apply|reset|keys
 shutup-and-run status
 shutup-and-run doctor [--report]
 shutup-and-run pause | resume
+shutup-and-run jobs [--limit N]
     for an agent or a script: no questions, --json, stable exit codes.
     `shutup-and-run config --help` documents all of them.
 

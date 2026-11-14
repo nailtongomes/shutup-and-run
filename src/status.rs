@@ -473,6 +473,11 @@ fn form(map: &JsonMap, group: OnPage, action: &str, lang: Lang) -> String {
                     String::new()
                 },
                 escape(&match value {
+                    // The query pairs the machine with a person: masked.
+                    // Saving it back unchanged keeps the URL (save_fields).
+                    Some(serde_json::Value::String(s)) if name == "poll_url" => {
+                        config::mask_query(s)
+                    }
                     Some(serde_json::Value::String(s)) => s.clone(),
                     Some(other) => other.to_string(),
                     None => String::new(),
@@ -591,6 +596,15 @@ pub(crate) fn save_fields(
                     config::parse_value(key, raw).map_err(|e| e.0)?,
                 );
             }
+            // The poll URL is shown with its query masked. Sent back as it
+            // was shown, it stays as it is.
+            (_, Some(raw))
+                if key.name == "poll_url"
+                    && map
+                        .get("poll_url")
+                        .and_then(|v| v.as_str())
+                        .map(config::mask_query)
+                        == Some(raw.to_string()) => {}
             // Blank keeps a secret, and returns any other key to its default.
             (_, Some("")) if key.secret => {}
             (_, Some("")) => {

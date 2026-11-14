@@ -238,6 +238,36 @@ impl Store {
         Ok(n)
     }
 
+    /// The jobs that started last, newest first.
+    pub fn recent(&self, limit: usize) -> Result<Vec<JobRecord>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs
+                 FROM jobs ORDER BY started_at DESC, rowid DESC LIMIT ?1",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([limit as i64], map_job)
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)?;
+        Ok(rows)
+    }
+
+    /// The ceiling of the history: finished rows beyond the newest `keep`
+    /// go, whatever `history_days` says. Running rows stay.
+    pub fn purge_beyond(&self, keep: usize) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute(
+            "DELETE FROM jobs WHERE ended_at IS NOT NULL AND id NOT IN (
+                 SELECT id FROM jobs WHERE ended_at IS NOT NULL
+                 ORDER BY started_at DESC, rowid DESC LIMIT ?1)",
+            [keep as i64],
+        )
+        .map_err(sql)
+    }
+
     pub fn counts(&self) -> Result<JobCounts, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         let started: i64 = conn

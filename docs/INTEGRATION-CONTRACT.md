@@ -1,6 +1,6 @@
 # Integration contract
 
-What an orchestrator (n8n, Kestra, your own API) needs in order to give work to a shutup-and-run machine and learn how it ended, without reading the Rust source. It describes what the runner does today, release 0.2.8. Where the behavior is awkward it is written down as it is, under [Limits](#9-limits-of-the-current-contract), and not as it might be wished.
+What an orchestrator (n8n, Kestra, your own API) needs in order to give work to a shutup-and-run machine and learn how it ended, without reading the Rust source. It describes what the runner does today, release 0.2.9. Where the behavior is awkward it is written down as it is, under [Limits](#9-limits-of-the-current-contract), and not as it might be wished.
 
 Machine-readable, JSON Schema Draft 2020-12:
 
@@ -277,11 +277,13 @@ Content-Type: application/json
 | `arch` | string | `x86_64`, `aarch64`. |
 | `version` | string | The runner's version, such as `0.2.4`. |
 | `max_slots` | integer, 1 to 256 | Containers the machine runs at once. |
-| `free_slots` | integer, 1 to `max_slots` | Free when the poll was sent. Never `0`: a full machine does not poll. Neither does one that is short of memory or disk. |
+| `free_slots` | integer, 1 to `max_slots` | Free when the poll was sent. Never `0` in a poll for work: a full machine does not poll. Neither does one that is short of memory or disk. `0` only in the [probe](#the-probe-of-config-check). |
 | `cpus` | integer or `null` | What the process sees. On Windows that is the WSL2 VM. |
 | `memory_bytes` | integer or `null` | Same. |
 
-All eight keys are always present. There is no address, token, config or job history in the body, and there will not be: read the machine's address from the connection.
+All eight keys are always present. There is no address, token, config or job history in the body, and there will not be: read the machine's address from the connection. Behind proxies, prefer `CF-Connecting-IP` (set by Cloudflare), then `X-Real-IP`, then the first entry of `X-Forwarded-For`, and trust each only when your own edge sets it.
+
+**The query is pairing, not approval.** The poll URL in a machine's config may carry a query, for example `https://api.example/poll?cpf=00000000000` or `?email=...&chave=...`, set with `config set poll_url`, `wsl install --poll-url` or the local page. The worker sends the URL as it is, query included, on every poll. Use it to pair or filter: which person, account or queue this machine belongs to. It proves nothing, because the person at the machine typed it. Approval stays with the token: a known `cpf` on an unknown or unapproved token still gets `403`, `401` or `204`, never a task. The worker treats the values as private: they print as `***` in `config show`, `doctor --report`, the page, `status` and the logs (`config get poll_url --reveal` shows them).
 
 **Authentication.** `Authorization: Bearer <poll-token>` is sent when the machine has `SHUTUP_AND_RUN_POLL_TOKEN` (at least 16 characters, no whitespace). Without it there is no `Authorization` header at all. The token is the machine's identity. `worker` is a name the machine chose for itself and proves nothing.
 
@@ -293,6 +295,10 @@ All eight keys are always present. There is no address, token, config or job his
 - Limit how many pending records one address can create. Anyone who knows the URL can make them.
 
 There is no register call. Enrollment is this: the first poll with a new token.
+
+#### The probe of `config check`
+
+`shutup-and-run config check` asks the poll URL once, to tell a wrong path from a poll endpoint. That request is the poll body with `free_slots: 0` and **no `Authorization` header**. Answer it like any request without a token: `401`, `403` or `204`. Never with a task; the worker would not run it. A `404`, `405` or `5xx` is reported to the person as `POLL_HTTP_ERROR`, and `429` as `POLL_RATE_LIMITED`. The probe does not create a pending machine: it has no token.
 
 ### The answers
 
@@ -338,9 +344,10 @@ A `200` body that is none of the forms above (not JSON, an array, a task with an
 
 | | |
 | --- | --- |
-| Interval | `poll_interval_secs`, default 30, 30 to 3600. Counted from the end of one poll to the start of the next. A worker of 0.2.8 or newer never polls more often than every 30 seconds, whatever its config says: plan for at most one task per machine per 30 seconds, and two polls a minute per machine. Older workers could be set as low as 1. Rate limiting is still the server's job. |
+| Interval | `poll_interval_secs`, default 30, 30 to 3600. Counted from the end of one poll to the start of the next. A worker of 0.2.8 or newer never polls more often than every 30 seconds, whatever its config says: an idle machine sends at most two polls a minute. From 0.2.9 a machine also polls right after each job ends, so the rate of polls of a busy machine is the rate at which you hand it tasks: answer `204` to slow it to the interval, or `429` to make it back off. Older workers could be set as low as 1. Rate limiting is still the server's job. |
 | When no poll is sent | While every slot is busy, and while the machine is draining (paused from its status page, or by `POST /v1/drain`). The server sees silence, the same as from a machine that is off. |
 | After a task was launched | The next poll is one interval later, if a slot is still free. A machine with 4 slots fills them in four polls. |
+| After a job ends (0.2.9) | The worker polls at once, about one second after a container that ran has exited, when a slot is free and the machine is not paused or short of memory or disk. It does not wait for the interval, so a queue drains one task after another. That poll is an ordinary one: `204` (or any "nothing to do") is followed by the whole interval again, so an empty queue is never asked in a loop. A job whose container never started (the image could not be pulled) does not trigger it. While the worker is backing off after an error, `429` included, the end of a job does not shorten the wait. |
 | Request timeout | 10 seconds for the whole exchange, body included. A slow answer is an error. |
 | Errors | Connection failure, timeout, an answer over 64 KiB, or a status that is not `200` or `204`. The wait doubles after each one, up to 300 seconds (or the interval, when that is longer), and returns to the interval after the next answer that is not an error. There is no jitter. |
 | Dropped task | Not an error: no backoff. |

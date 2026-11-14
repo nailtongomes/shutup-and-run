@@ -8,9 +8,9 @@ Uma VPS Linux (sua, confiável) e um PC com Windows 11 (tratado como PC de clien
 
 As instalações de uma linha baixam da última release do GitHub.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a versão do `Cargo.toml` (`v0.2.8` quando isto foi escrito) ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a versão do `Cargo.toml` (`v0.2.9` quando isto foi escrito) ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
-Se não estiver lá, crie a tag no `main`: `git tag v0.2.8 && git push origin v0.2.8` (a tag tem que ser a versão do `Cargo.toml`, porque o `.exe` baixa o binário Linux da própria versão), e espere o workflow `release`.
+Se não estiver lá, crie a tag no `main`: `git tag v0.2.9 && git push origin v0.2.9` (a tag tem que ser a versão do `Cargo.toml`, porque o `.exe` baixa o binário Linux da própria versão), e espere o workflow `release`.
 
 ## 1. VPS Linux: push
 
@@ -111,7 +111,7 @@ Aprove a máquina, na VPS, na pasta onde o mock roda, com a linha que o mock imp
 echo <hash> >> approved.txt
 ```
 
-- [ ] Em até cinco minutos (o worker espaça as consultas enquanto é recusado) o mock imprime `TASK mock-...-1` e depois `ok   1/3 ... reason=exited exit=0`, três vezes, a cada 30 segundos, e então um `SUMMARY` com `ok 3`. Depois disso responde `204`.
+- [ ] Em até cinco minutos (o worker espaça as consultas enquanto é recusado) o mock imprime `TASK mock-...-1` e depois `ok   1/3 ... reason=exited exit=0`, três vezes, com poucos segundos entre elas e não 30 (0.2.9: o worker pergunta de novo assim que uma tarefa termina), e então um `SUMMARY` com `ok 3`. Depois disso responde `204`, e os polls voltam a um a cada 30 segundos.
 - [ ] `shutup-and-run wsl logs` mostra `poll started a job` três vezes.
 
 Instale de novo, mudando uma opção:
@@ -127,6 +127,15 @@ shutup-and-run wsl install --poll-url http://IP_DO_SEU_VPS:8080/poll --max-slots
 Abra um segundo PowerShell, rode `shutup-and-run wsl stop` e depois `shutup-and-run wsl serve`, e deixe aberto. No primeiro, instale de novo com o mesmo comando.
 
 - [ ] Ou a instalação termina e o segundo terminal volta ao prompt, ou ela para antes do passo 3 com `a shutup-and-run wsl serve is still running`. Ela nunca imprime `done` com o serviço antigo ainda rodando. Anote qual dos dois aconteceu.
+
+### 0.2.9: dicas, jobs, query de pareamento
+
+- [ ] `shutup-and-run jobs` lista as três tarefas, a mais nova primeiro, cada uma `ok`, `exit 0`, com duração. `shutup-and-run jobs --limit 1 --json` tem uma entrada com `id`, `image`, `started_at`, `ended_at`, `duration_secs`, `exit_code`, `status`, `failure`, e mais nada.
+- [ ] `shutup-and-run pause`, depois `shutup-and-run doctor --json`: a linha `paused` tem `"code":"WORKER_PAUSED"` e um `"hint"` que cita `shutup-and-run resume`. `shutup-and-run config set language pt`, o doctor de novo: a dica vem em português. `shutup-and-run resume`.
+- [ ] `shutup-and-run config set max_slots 0 --json` sai com 3, `"code":"INVALID_VALUE"` e um `"hint"`.
+- [ ] `shutup-and-run config set poll_url "http://IP_DA_SUA_VPS:8080/poll?cpf=00000000000&email=nobody@example.com" --apply`. O mock continua respondendo. `shutup-and-run config show`, `shutup-and-run doctor --report` e a Configuração da página mostram `?cpf=***&email=***`; nenhum mostra `00000000000`. `shutup-and-run config get poll_url --reveal` mostra a URL inteira. Salvar o formulário da página sem mexer mantém a URL.
+- [ ] `shutup-and-run config set poll_url "http://IP_DA_SUA_VPS:8080/nope" --json`, depois `shutup-and-run config check --json`: a linha `poll` é `POLL_HTTP_ERROR` com `HTTP 404`, não `POLL_OK`. Volte a URL certa com `--apply`.
+- [ ] `shutup-and-run wsl install --poll-interval-secs 5` sai com 3 (`$LASTEXITCODE`), diz `at least 30`, e não muda nada.
 
 O mesmo cadastro, fila e callback contra o n8n, sem o mock: [examples/n8n/README.md](../examples/n8n/README.md#7-smoke-test).
 

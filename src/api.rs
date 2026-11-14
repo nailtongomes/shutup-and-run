@@ -957,6 +957,9 @@ mod tests {
             json!(dir.join("jobs.sqlite").display().to_string()),
         );
         map.insert("admin_password".into(), json!("open-sesame"));
+        // The fixture is a Linux server on every platform: on Windows the
+        // default profile is shared-pc.
+        map.insert("worker_os".into(), json!("linux"));
         crate::config::save_json(&path, &map).unwrap();
         let cfg = Settings::load_json(&path);
         assert_eq!(cfg.admin_user, "admin");
@@ -1033,6 +1036,21 @@ mod tests {
         let saved = crate::config::read_json(&path).unwrap();
         assert_eq!(saved["poll_url"], "https://jobs.example/poll?user=ana");
         assert_eq!(saved["max_slots"], 2);
+        // The page shows the URL with the values of its query masked, in the
+        // form and in the table, and saving the form as shown keeps the URL.
+        let (_, _, page) = send("GET", "/local/config", vec![], "").await;
+        assert!(page.contains("value=\"https://jobs.example/poll?user=***\""));
+        assert!(!page.contains("user=ana"));
+        let (status, _, _) = send(
+            "POST",
+            "/local/config",
+            vec![("origin", ORIGIN.into())],
+            "poll_url=https%3A%2F%2Fjobs.example%2Fpoll%3Fuser%3D***&max_slots=2",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let saved = crate::config::read_json(&path).unwrap();
+        assert_eq!(saved["poll_url"], "https://jobs.example/poll?user=ana");
         // An invalid value comes back as the form with the reason.
         let (status, _, page) = send(
             "POST",

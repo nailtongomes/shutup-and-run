@@ -63,6 +63,9 @@ pub enum LaunchError {
     Unavailable(String),
 }
 
+/// The most finished jobs the history keeps, whatever `history_days` is.
+pub const MAX_HISTORY_ROWS: usize = 500;
+
 pub struct Launcher {
     settings: Settings,
     runtime: Arc<dyn Runtime>,
@@ -83,6 +86,9 @@ pub struct Launcher {
     /// Why the last poll failed, for status.json and the doctor. None after
     /// a poll that was answered.
     poll_error: std::sync::Mutex<Option<String>>,
+    /// Told when a job that ran has ended, so the poller can ask for the
+    /// next one without waiting for its interval.
+    job_ended: tokio::sync::Notify,
 }
 
 impl Launcher {
@@ -105,6 +111,7 @@ impl Launcher {
             timeouts: Mutex::new(HashSet::new()),
             starting: Mutex::new(HashSet::new()),
             poll_error: std::sync::Mutex::new(None),
+            job_ended: tokio::sync::Notify::new(),
         }))
     }
 
@@ -182,6 +189,11 @@ impl Launcher {
         }
         let path = crate::resources::disk_path(&self.settings.history_path);
         crate::resources::shortage(crate::resources::read(&path), memory, disk)
+    }
+
+    /// Resolves when a job that ran has ended since the last call.
+    pub async fn job_ended(&self) {
+        self.job_ended.notified().await
     }
 
     pub fn set_poll_error(&self, error: Option<String>) {
@@ -445,6 +457,9 @@ impl Launcher {
                 self.timeouts.lock().await.remove(id);
                 let _ = self.runtime.remove(id).await;
                 self.fire_callback(&job);
+                // A job that never started does not wake the poller: a task
+                // whose image cannot be pulled must not be asked for in a loop.
+                self.job_ended.notify_one();
             }
             Ok(None) => {
                 let _ = self.runtime.remove(id).await;
@@ -484,6 +499,11 @@ impl Launcher {
                 .purge_finished_before(cutoff)
                 .map_err(store_err)?
         };
+        let removed = removed
+            + self
+                .store
+                .purge_beyond(MAX_HISTORY_ROWS)
+                .map_err(store_err)?;
         if removed > 0 {
             tracing::info!(removed, "purged old jobs");
         }

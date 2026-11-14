@@ -14,6 +14,8 @@ use std::time::Duration;
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKOFF_CAP: Duration = Duration::from_secs(300);
 const MAX_POLL_BODY: usize = 64 * 1024;
+/// The least time between two polls, whatever woke the poller.
+const REPOLL_GAP: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PollOutcome {
@@ -63,20 +65,40 @@ pub fn spawn_poller(launcher: Arc<Launcher>) {
         // Upgrade if many machines poll one URL and you need to spread them out.
         let mut wait = interval;
         loop {
-            match poll_once(&launcher, &client).await {
+            let failed = match poll_once(&launcher, &client).await {
                 Ok(_) => {
                     launcher.set_poll_error(None);
-                    wait = interval;
+                    false
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "poll");
                     launcher.set_poll_error(Some(err.to_string()));
-                    wait = next_wait(wait, interval, true);
+                    true
                 }
-            }
-            tokio::time::sleep(wait).await;
+            };
+            wait = next_wait(wait, interval, failed);
+            rest(&launcher, wait, failed).await;
         }
     });
+}
+
+/// The pause between two polls: `wait`, cut short when a job ends, since
+/// that is when a slot is free and the queue may have the next task. Every
+/// poll that follows is an ordinary one: an empty answer (204) is followed
+/// by the whole interval again, so this cannot spin. After a failed poll
+/// (429 included) nothing cuts the backoff short.
+pub(crate) async fn rest(launcher: &Launcher, wait: Duration, failed: bool) {
+    if failed {
+        tokio::time::sleep(wait).await;
+        return;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(wait) => {}
+        _ = launcher.job_ended() => {
+            tracing::debug!("a job ended: polling now");
+            tokio::time::sleep(REPOLL_GAP.min(wait)).await;
+        }
+    }
 }
 
 pub(crate) fn client() -> Result<reqwest::Client, String> {
@@ -130,10 +152,12 @@ pub(crate) async fn poll_once(
     if let Some(token) = settings.poll_token.as_ref() {
         request = request.bearer_auth(token.as_str());
     }
+    // The error is kept in status.json and the log: without the URL, whose
+    // query pairs the machine with a person.
     let response = request
         .send()
         .await
-        .map_err(|err| PollError(err.to_string()))?;
+        .map_err(|err| PollError(err.without_url().to_string()))?;
     let status = response.status();
     if status == reqwest::StatusCode::NO_CONTENT {
         tracing::debug!("poll: nothing to do");
@@ -204,7 +228,7 @@ async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, PollErr
                 body.extend_from_slice(&chunk);
             }
             Ok(None) => return Ok(body),
-            Err(err) => return Err(PollError(err.to_string())),
+            Err(err) => return Err(PollError(err.without_url().to_string())),
         }
     }
 }
@@ -789,6 +813,93 @@ mod tests {
             next_wait(Duration::from_secs(3600), Duration::from_secs(3600), true),
             Duration::from_secs(3600)
         );
+    }
+
+    /// Re-poll: the end of a job is followed by a poll at once; an empty
+    /// answer is followed by the whole interval, so nothing spins; and a
+    /// failed poll (429 included) keeps its backoff whatever ends meanwhile.
+    #[tokio::test]
+    async fn a_job_that_ends_is_followed_by_a_poll_at_once_and_an_empty_answer_by_the_interval() {
+        let server = poll_server(StatusCode::NO_CONTENT, "").await;
+        let (launcher, _mock) = launcher_for(
+            3,
+            &format!("poll_url = \"{}\"\npoll_interval_secs = 600", server.url),
+            &[],
+        );
+        let start = |launcher: Arc<Launcher>| async move {
+            let task = launch_request_from_value(serde_json::json!({"image": "alpine"})).unwrap();
+            match launcher.launch_from(task, JobSource::Push).await.unwrap() {
+                LaunchOutcome::Created(job) => job.id,
+                LaunchOutcome::Existing(job) => job.id,
+            }
+        };
+        let first = start(launcher.clone()).await;
+        let hits = || server.hits.load(Ordering::Relaxed);
+        let reaches = |n: u64| {
+            let hits = server.hits.clone();
+            async move {
+                for _ in 0..100 {
+                    if hits.load(Ordering::Relaxed) >= n {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                false
+            }
+        };
+
+        spawn_poller(launcher.clone());
+        assert!(reaches(1).await, "the first poll");
+        // Idle: the next poll is an interval away.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(hits(), 1);
+
+        launcher.on_exit(&first, 0).await;
+        assert!(reaches(2).await, "a poll right after the job ended");
+        // That poll was answered 204: back to the interval, no loop.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(hits(), 2);
+
+        // After a failed poll the backoff is not cut short by a job ending.
+        // On a launcher of its own: the poller above would take the wake-up.
+        let (launcher, _mock) = launcher_for(3, "", &[]);
+        let second = start(launcher.clone()).await;
+        launcher.on_exit(&second, 0).await;
+        let backoff = rest(&launcher, Duration::from_secs(30), true);
+        assert!(tokio::time::timeout(Duration::from_millis(400), backoff)
+            .await
+            .is_err());
+        // The same wait after a poll that was answered ends early.
+        let answered = rest(&launcher, Duration::from_secs(30), false);
+        assert!(tokio::time::timeout(Duration::from_secs(5), answered)
+            .await
+            .is_ok());
+
+        // 429 is a failed poll: the caller backs off.
+        let busy = poll_server(StatusCode::TOO_MANY_REQUESTS, "").await;
+        let (launcher, _mock) = launcher_for(1, &format!("poll_url = \"{}\"", busy.url), &[]);
+        let err = poll_once(&launcher, &client().unwrap()).await.unwrap_err();
+        assert!(err.to_string().contains("429"));
+    }
+
+    /// The query of the poll URL pairs the machine with a person. It reaches
+    /// the server, and it is not in the error that status.json and the log keep.
+    #[tokio::test]
+    async fn the_query_of_the_poll_url_is_sent_and_is_not_in_a_poll_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let (launcher, _mock) = launcher_for(
+            1,
+            &format!("poll_url = \"http://127.0.0.1:{port}/poll?cpf=00000000000&email=nobody%40example.com\""),
+            &[],
+        );
+        let err = poll_once(&launcher, &client().unwrap()).await.unwrap_err();
+        let said = err.to_string();
+        assert!(!said.is_empty());
+        for private in ["00000000000", "nobody", "cpf=", "/poll"] {
+            assert!(!said.contains(private), "{private} in {said}");
+        }
     }
 
     #[tokio::test]

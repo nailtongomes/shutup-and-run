@@ -201,9 +201,10 @@ shutup-and-run config reset                     # config de fábrica; tokens, no
 shutup-and-run status                           # idle, active, draining, failed, stopped
 shutup-and-run doctor [--report]                # toda linha com falha tem um fix
 shutup-and-run pause | resume
+shutup-and-run jobs [--limit N]                 # as últimas tarefas: status, exit code, duração, motivo da falha
 ```
 
-Todos são não interativos e aceitam `--json`. Códigos de saída: `0` feito, `1` falhou ou não está saudável, `2` linha de comando errada, `3` configuração ou valor inválido (nada foi gravado). Um valor inválido nunca é salvo, e um arquivo danificado de outro jeito não derruba o serviço: ele roda com a cópia do último salvamento, ou com os padrões ociosos, e avisa.
+Todos são não interativos e aceitam `--json`. Toda falha, e toda linha do doctor que não está ok, traz um `hint` com o próximo passo, em inglês ou português (`config set language pt`). Os valores da query da poll URL aparecem como `***` (`config get poll_url --reveal` mostra). Códigos de saída: `0` feito, `1` falhou ou não está saudável, `2` linha de comando errada, `3` configuração ou valor inválido (nada foi gravado). Um valor inválido nunca é salvo, e um arquivo danificado de outro jeito não derruba o serviço: ele roda com a cópia do último salvamento, ou com os padrões ociosos, e avisa.
 
 **`config.toml` mais ambiente** é o que o instalador do Linux ainda escreve: `/etc/shutup-and-run/config.toml`, ou o arquivo indicado por `SHUTUP_AND_RUN_CONFIG`. Variáveis de ambiente sobrepõem o arquivo. Depois de mudar: `sudo systemctl restart shutup-and-run`; os jobs em execução sobrevivem. Numa máquina assim `shutup-and-run config` recusa e explica; `status`, `doctor`, `pause`, `resume` e `bans` funcionam. Uma máquina Linux usa `config.json` quando esse arquivo existe e `SHUTUP_AND_RUN_CONFIG` não aponta para um TOML. Não há conversor.
 
@@ -314,7 +315,7 @@ Só `image` é obrigatório. Campos desconhecidos são recusados. `job_key` torn
 **Pull.** Com `poll_url` definida, a máquina faz POST nela a cada `poll_interval_secs` (30 segundos, e nunca menos), só quando tem um slot livre, não está pausada e não está com pouca memória ou disco:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.8", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.9", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 A resposta é nada (`204`), uma tarefa, `{"task": {...}}`, ou `{"manifest_url": "https://..."}`, que é buscado uma vez e precisa ser uma tarefa. `401` ou `403` quer dizer "ainda não aprovada": o worker não inicia nada e continua perguntando, espaçando até cinco minutos. O servidor decide quais máquinas recebem trabalho; o token do worker é a identidade dele.

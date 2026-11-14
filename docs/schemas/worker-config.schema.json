@@ -12,7 +12,7 @@
   "properties": {
     "poll_url": {
       "type": "string",
-      "description": "Where the worker asks for work, every poll_interval_secs. http or https, no credentials in it. It may carry a filter in the query, for example ?user=ana; that filter is not a secret. Unset: the worker polls nothing and is idle.",
+      "description": "Where the worker asks for work, every poll_interval_secs. http or https, no credentials in it. It may carry a query that pairs the machine with a person, for example ?cpf=...&email=...; that query is a filter, not what approves the machine (the poll token is), and its values print as *** in config show, the doctor, the page and the logs. Unset: the worker polls nothing and is idle.",
       "maxLength": 2048
     },
     "poll_interval_secs": {
@@ -68,6 +68,12 @@
       "type": "string",
       "description": "Bearer token sent to poll_url: who this machine is to the queue. Secret. Changing it makes the machine a new one that the poll URL has to approve.",
       "minLength": 16
+    },
+    "language": {
+      "type": "string",
+      "description": "Language of the hints the CLI prints with every error and warning: en or pt.",
+      "enum": ["en", "pt"],
+      "default": "en"
     },
     "admin_user": {
       "type": "string",

@@ -31,7 +31,8 @@ Exit codes: 0 done; 1 failed, or the doctor found a problem; 2 wrong command
 line; 3 invalid config or value, and nothing was written.
 
 shutup-and-run config show [--reveal]
-    the whole config file. Secrets print as *** unless --reveal.
+    the whole config file. Secrets, and the values of the poll URL's query,
+    print as *** unless --reveal.
 shutup-and-run config get KEY [--reveal]
     one value. Prints nothing when the key is not set.
 shutup-and-run config set KEY VALUE [--apply]
@@ -63,6 +64,21 @@ shutup-and-run doctor [--report]
     that opens a new GitHub issue with it filled in. Exit 1 when unhealthy.
 shutup-and-run pause | resume
     stop or start taking new work. Running containers are left alone.
+shutup-and-run jobs [--limit N]
+    the last N jobs, newest first (default 20): id, image, start, end,
+    duration, exit code, status (running, ok, failed, timeout, killed) and
+    why it failed. Never a job's env, command, payload or logs.
+
+Every failure, and every doctor or check line that is not ok, carries a
+`hint`: the next step, short, with the command when there is one. In JSON it
+is the `hint` field beside `code`. Its language is the config key `language`:
+    shutup-and-run config set language pt
+(en is the default). docs/FOR-AGENTS.md lists every code with its hint.
+
+The poll URL may carry a query that pairs this machine with a person
+(?cpf=...&email=...). It is only a filter: the poll token is what the server
+approves. Its values print as *** everywhere; `config get poll_url --reveal`
+shows them.
 
 Resource limits, for a machine someone is working on:
     shutup-and-run config set resource_profile shared-pc --apply
@@ -114,7 +130,8 @@ impl Out {
     }
 }
 
-pub(crate) fn emit(out: Out, as_json: bool) -> ExitCode {
+pub(crate) fn emit(mut out: Out, as_json: bool) -> ExitCode {
+    crate::hints::attach(&mut out.json, out.code);
     if as_json {
         println!("{}", out.json);
     } else if out.code == 0 {
@@ -123,8 +140,19 @@ pub(crate) fn emit(out: Out, as_json: bool) -> ExitCode {
         }
     } else {
         eprintln!("shutup-and-run: {}", out.text);
+        if let Some(hint) = out.json["hint"].as_str() {
+            eprintln!("hint: {hint}");
+        }
     }
     ExitCode::from(out.code)
+}
+
+/// The JSON of a failure that has only a message, for the places that print
+/// one without an `Out`.
+pub fn failure_json(code: &str, error: &str) -> Value {
+    let mut value = json!({"ok": false, "code": code, "error": error});
+    crate::hints::attach(&mut value, EXIT_FAILED);
+    value
 }
 
 /// Splits `--json`, `--reveal`, `--apply`, `--report` and `--help` from the rest.
@@ -622,6 +650,9 @@ pub struct Check {
     /// A stable identifier of what was found, for a program: `DOCKER_UNAVAILABLE`.
     /// Empty means the default, the name and the outcome: `DOCKER_OK`.
     pub code: String,
+    /// The next step, already in a language: set only on a check read back
+    /// from another process. Empty means the catalogue's hint for the code.
+    pub hint: String,
 }
 
 pub fn check(name: &str, ok: bool, detail: impl Into<String>) -> Check {
@@ -632,6 +663,7 @@ pub fn check(name: &str, ok: bool, detail: impl Into<String>) -> Check {
         detail: detail.into(),
         fix: String::new(),
         code: String::new(),
+        hint: String::new(),
     }
 }
 
@@ -673,6 +705,17 @@ impl Check {
         format!("{name}_{outcome}")
     }
 
+    /// The next step in the configured language. Empty when the check is ok.
+    pub fn hint(&self) -> String {
+        if self.ok {
+            String::new()
+        } else if !self.hint.is_empty() {
+            self.hint.clone()
+        } else {
+            crate::hints::hint(&self.code()).to_string()
+        }
+    }
+
     fn mark(&self) -> &'static str {
         if self.ok {
             "ok"
@@ -700,6 +743,9 @@ pub fn report(checks: &[Check]) -> (String, bool) {
         if !c.fix.is_empty() {
             text.push_str(&format!("     {:<22} fix: {}\n", "", c.fix));
         }
+        if !c.ok {
+            text.push_str(&format!("     {:<22} hint: {}\n", "", c.hint()));
+        }
     }
     (text, healthy)
 }
@@ -714,6 +760,7 @@ pub fn checks_json(checks: &[Check]) -> Value {
                 "status": c.mark(),
                 "detail": c.detail,
                 "fix": if c.fix.is_empty() { Value::Null } else { Value::String(c.fix.clone()) },
+                "hint": if c.ok { Value::Null } else { Value::String(c.hint()) },
             })
         })
         .collect()
@@ -731,6 +778,7 @@ pub fn checks_from_json(value: &Value) -> Vec<Check> {
                     detail: c["detail"].as_str().unwrap_or("").to_string(),
                     fix: c["fix"].as_str().unwrap_or("").to_string(),
                     code: c["code"].as_str().unwrap_or("").to_string(),
+                    hint: c["hint"].as_str().unwrap_or("").to_string(),
                 })
                 .collect()
         })
@@ -915,6 +963,8 @@ pub async fn doctor_cli(args: &[String]) -> ExitCode {
         &[],
         parsed.report,
     );
+    let mut out = out;
+    crate::hints::attach(&mut out.json, out.code);
     // The doctor's text goes to stdout even when unhealthy: it is the answer.
     if parsed.json {
         println!("{}", out.json);
@@ -1124,10 +1174,12 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
         ),
         Some(url) => {
             let reach = reach(url).await;
+            // The query pairs the machine with a person: never printed.
+            let url = &config::mask_query(url);
             let poll_error = fresh.and_then(|s| s["poll_error"].as_str());
             checks.push(match (reach, poll_error) {
                 (Err(err), _) => check("poll", false, format!("cannot reach {url}: {err}")).coded("POLL_UNREACHABLE").fix(
-                    "check the URL (`shutup-and-run config get poll_url`), the internet and DNS. \
+                    "check the URL (`shutup-and-run config get poll_url --reveal`), the internet and DNS. \
                      On Windows, when the URL is on this PC or this LAN, the Windows firewall \
                      blocks WSL on a Public network: see docs/FOR-AGENTS.md",
                 ),
@@ -1141,9 +1193,12 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
                     "approve worker {} at the poll URL; nothing to do on this machine",
                     settings.worker_name
                 )),
-                (Ok(()), Some(err)) => check("poll", false, format!("{url}: {err}")).coded("POLL_ERROR").fix(
-                    "check the URL and its ?user= filter with `shutup-and-run config get poll_url`",
-                ),
+                (Ok(()), Some(err)) => match http_status_in(err) {
+                    Some(status) => poll_answer_check(url, status, false),
+                    None => check("poll", false, format!("{url}: {err}")).coded("POLL_ERROR").fix(
+                        "check the URL and its query with `shutup-and-run config get poll_url --reveal`",
+                    ),
+                },
                 (Ok(()), None) => check("poll", true, format!("{url} is reachable")),
             });
         }
@@ -1238,6 +1293,67 @@ pub fn resources_check(
 
 /// Can a TCP connection be opened to the poll URL's host? Nothing is sent,
 /// so the poll URL sees no request and enrolls nobody.
+/// The status in the service's own "poll returned 404 Not Found".
+pub fn http_status_in(poll_error: &str) -> Option<u16> {
+    poll_error
+        .strip_prefix("poll returned ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// What an HTTP status of the poll URL means. `url` is already masked.
+/// `probe` is the config check's own request, which carries no token, so
+/// 401 and 403 are the right answer to it; from the service they mean the
+/// machine is not approved, which the doctor says before it gets here.
+pub fn poll_answer_check(url: &str, status: u16, probe: bool) -> Check {
+    let line = |ok: bool, detail: String| {
+        if probe {
+            // The service out there, not the config in here: a warning.
+            soft("poll", ok, detail)
+        } else {
+            check("poll", ok, detail)
+        }
+    };
+    match status {
+        200..=299 => check("poll", true, format!("{url} answers (HTTP {status})")),
+        401 | 403 if probe => check(
+            "poll",
+            true,
+            format!("{url} answers and asks for the token (HTTP {status})"),
+        ),
+        429 => soft(
+            "poll",
+            false,
+            format!("{url} answered HTTP 429: it asks this machine to slow down"),
+        )
+        .coded("POLL_RATE_LIMITED")
+        .fix("wait: the worker backs off by itself, up to 5 minutes between polls"),
+        _ => line(
+            false,
+            format!("{url} answered HTTP {status}: that is not a poll endpoint, or it is failing"),
+        )
+        .coded("POLL_HTTP_ERROR")
+        .fix("check the path and the query of the URL with `shutup-and-run config get poll_url --reveal`; \
+              set it again with `shutup-and-run config set poll_url URL --apply`"),
+    }
+}
+
+/// One request to the poll URL that cannot take a task away: no token, and
+/// `free_slots` 0. A poll endpoint answers 401, 403 or 204; a wrong path
+/// answers 404. Returns the HTTP status.
+pub(crate) async fn probe(settings: &Settings, url: &str) -> Result<u16, String> {
+    let response = crate::poll::client()?
+        .post(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&crate::poll::poll_body(settings, 0))
+        .send()
+        .await
+        .map_err(|err| err.without_url().to_string())?;
+    Ok(response.status().as_u16())
+}
+
 pub(crate) async fn reach(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
     let host = parsed.host_str().ok_or("no host in the URL")?.to_string();
@@ -1278,7 +1394,11 @@ mod tests {
         assert_eq!(out.json["ok"], true);
         assert!(path.exists() && config::backup_path(&path).exists());
 
+        // The query pairs the machine with a person: masked unless asked.
         let got = config_command(&path, &["get", "poll_url"], false);
+        assert_eq!(got.text, "https://jobs.example/poll?user=***");
+        assert_eq!(got.json["value"], "https://jobs.example/poll?user=***");
+        let got = config_command(&path, &["get", "poll_url"], true);
         assert_eq!(got.text, "https://jobs.example/poll?user=ana");
         assert_eq!(got.json["value"], "https://jobs.example/poll?user=ana");
 
@@ -1402,7 +1522,11 @@ mod tests {
             ("token", "api-token-0123456789abcdef"),
             ("poll_token", "poll-token-0123456789abcdef"),
             ("admin_password", "hunter2-secret"),
-            ("poll_url", "https://jobs.example/poll?user=ana"),
+            // Obviously made up: a pairing query with a tax id, an e-mail and a key.
+            (
+                "poll_url",
+                "https://jobs.example/poll?cpf=00000000000&email=nobody%40example.com&chave=FAKE-PAIRING-KEY",
+            ),
         ] {
             assert_eq!(
                 config_command(&path, &["set", key, value], false).code,
@@ -1413,10 +1537,17 @@ mod tests {
         let map = config::read_json(&path).unwrap();
         let secrets = config::secret_values(&map);
         let masked = Value::Object(config::masked(&map));
-        // A check that quotes a secret by accident is scrubbed as well.
+        // A check that quotes a secret, or the poll URL, by accident is
+        // scrubbed as well.
         let checks = vec![
             check("docker", true, "answers"),
-            check("poll", false, "poll-token-0123456789abcdef was refused").fix("approve it"),
+            check(
+                "poll",
+                false,
+                "poll-token-0123456789abcdef was refused at \
+                 https://jobs.example/poll?cpf=00000000000&email=nobody@example.com",
+            )
+            .fix("approve it"),
         ];
         let out = doctor_out(
             "linux x86_64",
@@ -1440,8 +1571,27 @@ mod tests {
                 "{secret} leaked in the URL"
             );
         }
-        // The poll URL and its filter are not a secret.
-        assert!(out.json["report"].as_str().unwrap().contains("?user=ana"));
+        // The poll URL is in the report, and the values of its query are not:
+        // they pair the machine with a person.
+        let report = out.json["report"].as_str().unwrap();
+        assert!(report.contains("https://jobs.example/poll?cpf=***&email=***&chave=***"));
+        for private in ["00000000000", "nobody", "example.com", "FAKE-PAIRING-KEY"] {
+            assert!(!everything.contains(private), "{private} leaked");
+        }
+        // `config show` masks the same way, and --reveal is the way to read it.
+        let shown = config_command(&path, &["show"], false);
+        assert_eq!(
+            shown.json["config"]["poll_url"],
+            "https://jobs.example/poll?cpf=***&email=***&chave=***"
+        );
+        assert!(!shown.text.contains("00000000000") && !shown.text.contains("nobody"));
+        let revealed = config_command(&path, &["show"], true);
+        assert!(revealed.text.contains("cpf=00000000000"));
+        // The service still polls the whole URL.
+        assert_eq!(
+            Settings::load_json(&path).poll_url.as_deref(),
+            Some("https://jobs.example/poll?cpf=00000000000&email=nobody%40example.com&chave=FAKE-PAIRING-KEY")
+        );
         let url = out.json["issue_url"].as_str().unwrap();
         assert!(url.starts_with(
             "https://github.com/nailtongomes/shutup-and-run/issues/new?template=worker-problem.md&title=doctor%3A%20poll%20failed&body="
@@ -1478,6 +1628,8 @@ mod tests {
         let path = temp("poll-min");
         let set = |words: &[&str]| config_command(&path, words, false);
         assert_eq!(set(&["set", "max_slots", "1"]).code, 0);
+        // A Linux server on every platform: Windows defaults to shared-pc.
+        assert_eq!(set(&["set", "worker_os", "linux"]).code, 0);
         let before = std::fs::read_to_string(&path).unwrap();
         for low in ["1", "2", "29"] {
             let out = set(&["set", "poll_interval_secs", low]);
@@ -1521,6 +1673,44 @@ mod tests {
         assert!(
             poll_interval_check(&Settings::from_json_map(&config::default_map()).unwrap())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn the_language_of_the_hints_is_a_config_key_and_every_failure_has_a_hint() {
+        use crate::hints::{hint_in, Lang};
+        let path = temp("language");
+        let set = |words: &[&str]| config_command(&path, words, false);
+        assert_eq!(set(&["set", "language", "pt"]).code, 0);
+        assert_eq!(Settings::load_json(&path).language, "pt");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let refused = set(&["set", "language", "fr"]);
+        assert_eq!(refused.code, EXIT_INVALID);
+        assert!(refused.json["error"].as_str().unwrap().contains("en or pt"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(set(&["unset", "language"]).code, 0);
+        assert_eq!(Settings::load_json(&path).language, "en");
+
+        // Each kind of CLI failure leaves with a code and a hint.
+        for (mut out, code) in [
+            (set(&["set", "max_slots", "0"]), "INVALID_VALUE"),
+            (set(&["set", "no_such_key", "1"]), "USAGE"),
+            (set(&["frobnicate"]), "USAGE"),
+            (status_out(&path.with_file_name("status.json"), 0), "FAILED"),
+        ] {
+            assert_ne!(out.code, 0);
+            crate::hints::attach(&mut out.json, out.code);
+            assert_eq!(out.json["code"], code);
+            assert_eq!(out.json["hint"], hint_in(code, Lang::En));
+        }
+        // The doctor's text carries the hint under the line that failed.
+        let checks = [soft("paused", false, "the worker is paused").coded("WORKER_PAUSED")];
+        assert!(report(&checks)
+            .0
+            .contains("hint: Run `shutup-and-run resume`."));
+        assert_eq!(
+            hint_in("WORKER_PAUSED", Lang::Pt),
+            "Rode `shutup-and-run resume`."
         );
     }
 
@@ -1647,7 +1837,20 @@ mod tests {
         assert_eq!(
             json[1],
             json!({"name": "docker", "code": "DOCKER_UNAVAILABLE", "status": "fail",
-                   "detail": "no socket", "fix": "start it"})
+                   "detail": "no socket", "fix": "start it",
+                   "hint": crate::hints::hint_in("DOCKER_UNAVAILABLE", crate::hints::Lang::En)})
+        );
+        // A line that is fine has no hint; one that is not always has one.
+        assert!(json[0]["hint"].is_null());
+        for line in json.as_array().unwrap() {
+            assert_eq!(line["hint"].is_string(), line["status"] != "ok", "{line}");
+        }
+        // A hint that came from another process, in its language, is kept.
+        let mut inner = json.clone();
+        inner[1]["hint"] = "Inicie o Docker.".into();
+        assert_eq!(
+            checks_json(&checks_from_json(&inner))[1]["hint"],
+            "Inicie o Docker."
         );
         // The Windows doctor carries the inner doctor's codes through.
         let back = checks_from_json(&json);

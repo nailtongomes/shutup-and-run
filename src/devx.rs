@@ -34,8 +34,10 @@ shutup-and-run version [--json]
 shutup-and-run config check [--json]
     a preflight that changes nothing: the config, Docker, the folders the
     service writes to, the resource limits, the allowlist, the certificate
-    when passthrough is on, and whether the poll URL's host can be reached
-    (8 s at most). Exit 3 when the config itself is invalid, 1 when
+    when passthrough is on, and the poll URL: its host must answer and the
+    path must be a poll endpoint (one request with no token and no free
+    slot, which takes no task; a 404 is reported, not called reachable).
+    Exit 3 when the config itself is invalid, 1 when
     something around it is wrong, 0 otherwise.
 
 shutup-and-run job validate FILE [--poll] [--json]
@@ -153,7 +155,8 @@ fn checks_out(checks: &[Check], extra: Value, good: &str, bad: &str) -> Out {
 }
 
 /// Checks print on stdout whatever the outcome: they are the answer.
-fn emit_checks(out: Out, as_json: bool) -> ExitCode {
+fn emit_checks(mut out: Out, as_json: bool) -> ExitCode {
+    crate::hints::attach(&mut out.json, out.code);
     println!(
         "{}",
         if as_json {
@@ -269,6 +272,31 @@ pub fn allowlist_check(settings: &Settings) -> Check {
     }
 }
 
+/// The poll URL, asked once without a token and with no free slot: is the
+/// host there, and is the path a poll endpoint? A 404 is not "reachable".
+pub async fn poll_check(settings: &Settings) -> Check {
+    let Some(url) = &settings.poll_url else {
+        return soft("poll", false, "no poll URL: the worker would be idle")
+            .coded("POLL_URL_UNSET")
+            .fix("`shutup-and-run config set poll_url URL --apply`");
+    };
+    // The query pairs the machine with a person: never printed.
+    let shown = crate::config::mask_query(url);
+    let unreachable = |err: String| {
+        // The service out there, not the config in here: a warning.
+        soft("poll", false, format!("cannot reach {shown}: {err}"))
+            .coded("POLL_UNREACHABLE")
+            .fix("the URL is well formed, and its host did not answer: check the network and DNS, or the URL with `shutup-and-run config get poll_url --reveal`")
+    };
+    if let Err(err) = crate::cli::reach(url).await {
+        return unreachable(err);
+    }
+    match crate::cli::probe(settings, url).await {
+        Ok(status) => crate::cli::poll_answer_check(&shown, status, true),
+        Err(err) => unreachable(err),
+    }
+}
+
 pub async fn config_check() -> Out {
     let (found, settings) = crate::cli::base_checks().await;
     let mut checks = found.checks;
@@ -282,18 +310,7 @@ pub async fn config_check() -> Out {
         ));
         checks.push(allowlist_check(settings));
         checks.extend(crate::cli::certificate_check(settings));
-        checks.push(match &settings.poll_url {
-            None => soft("poll", false, "no poll URL: the worker would be idle")
-                .coded("POLL_URL_UNSET")
-                .fix("`shutup-and-run config set poll_url URL --apply`"),
-            // The service out there, not the config in here: a warning.
-            Some(url) => match crate::cli::reach(url).await {
-                Ok(()) => check("poll", true, format!("{url} is reachable")),
-                Err(err) => soft("poll", false, format!("cannot reach {url}: {err}"))
-                    .coded("POLL_UNREACHABLE")
-                    .fix("the URL is well formed, and its host did not answer: check the network and DNS, or the URL with `shutup-and-run config get poll_url`"),
-            },
-        });
+        checks.push(poll_check(settings).await);
     }
     let checks: Vec<Check> = checks
         .into_iter()
@@ -1571,6 +1588,73 @@ mod tests {
         }
         assert_eq!(allowlist_check(&cfg).code(), "ALLOWLIST_OK");
         assert!(crate::cli::certificate_check(&cfg).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A poll URL whose host answers and whose path is wrong is not "ok".
+    /// The probe carries no token and offers no slot.
+    #[tokio::test]
+    async fn the_preflight_reads_the_http_status_of_the_poll_url() {
+        use axum::http::{HeaderMap, StatusCode};
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<(bool, serde_json::Value)>>> = Arc::default();
+        let record = seen.clone();
+        let poll = move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+            let record = record.clone();
+            async move {
+                let with_token = headers.contains_key("authorization");
+                record.lock().unwrap().push((with_token, body));
+                StatusCode::UNAUTHORIZED
+            }
+        };
+        let app = axum::Router::new()
+            .route("/poll", axum::routing::post(poll))
+            .route(
+                "/busy",
+                axum::routing::post(|| async { StatusCode::TOO_MANY_REQUESTS }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = temp("poll-status");
+        let at = |path: &str| {
+            let mut cfg = settings(&dir, "");
+            cfg.poll_url = Some(format!("{base}{path}"));
+            cfg.poll_token = settings(&dir, "").poll_token;
+            cfg
+        };
+        let found = poll_check(&at("/poll?cpf=00000000000")).await;
+        assert!(found.ok, "{found:?}");
+        assert_eq!(found.code(), "POLL_OK");
+        assert!(found.detail.contains("cpf=***") && !found.detail.contains("00000000000"));
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(!seen[0].0, "the probe sent a token");
+        assert_eq!(seen[0].1["free_slots"], 0);
+
+        let wrong = poll_check(&at("/no-such-path?cpf=00000000000")).await;
+        assert!(!wrong.ok);
+        assert_eq!(wrong.code(), "POLL_HTTP_ERROR");
+        assert!(wrong.detail.contains("HTTP 404") && !wrong.detail.contains("00000000000"));
+        assert!(!wrong.fix.is_empty() && !wrong.hint().is_empty());
+
+        assert_eq!(poll_check(&at("/busy")).await.code(), "POLL_RATE_LIMITED");
+        let mut none = settings(&dir, "");
+        none.poll_url = None;
+        assert_eq!(poll_check(&none).await.code(), "POLL_URL_UNSET");
+
+        // The doctor reads the same from what the service said.
+        assert_eq!(
+            crate::cli::http_status_in("poll returned 404 Not Found"),
+            Some(404)
+        );
+        assert_eq!(crate::cli::http_status_in("error sending request"), None);
+        let said = crate::cli::poll_answer_check("https://jobs.example/poll", 404, false);
+        assert_eq!(
+            (said.code().as_str(), said.soft),
+            ("POLL_HTTP_ERROR", false)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

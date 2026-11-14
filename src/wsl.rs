@@ -230,6 +230,7 @@ pub async fn cli(args: &[String]) -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("shutup-and-run wsl: {e}");
+            eprintln!("hint: {}", crate::hints::hint("FAILED"));
             ExitCode::from(1)
         }
     }
@@ -1291,6 +1292,8 @@ fn doctor_cli(args: &[String]) -> WslResult<ExitCode> {
         &recent_log_problems(),
         flags.has("--report"),
     );
+    let mut out = out;
+    crate::hints::attach(&mut out.json, out.code);
     if flags.has("--json") {
         println!("{}", out.json);
     } else {
@@ -1490,6 +1493,22 @@ fn doctor(
 // ---------------------------------------------------------------------------
 // install
 
+/// `--poll-interval-secs`: a number from the minimum to an hour. `Err` is
+/// an invalid value, which is exit 3.
+pub(crate) fn install_interval(raw: Option<&str>) -> Result<Option<u64>, String> {
+    let min = crate::config::MIN_POLL_INTERVAL_SECS;
+    match raw {
+        None => Ok(None),
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(n) if (min..=3600).contains(&n) => Ok(Some(n)),
+            _ => Err(format!(
+                "--poll-interval-secs must be at least {min} (and at most 3600), not {raw}: \
+                 nothing was installed or changed"
+            )),
+        },
+    }
+}
+
 async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     let flags = parse_flags(
         args,
@@ -1524,13 +1543,20 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
             .map(|_| parse_count(&flags, key, 1, range))
             .transpose()
     };
+    // The same answer as `config set poll_interval_secs`: exit 3, and
+    // nothing is installed or changed.
+    let poll_interval_secs = match install_interval(flags.get("--poll-interval-secs")) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("shutup-and-run wsl: {msg}");
+            eprintln!("hint: {}", crate::hints::hint("POLL_INTERVAL_TOO_LOW"));
+            return Ok(ExitCode::from(crate::cli::EXIT_INVALID));
+        }
+    };
     let mut options = InstallOptions {
         poll_url: poll_url.clone(),
         max_slots: count("--max-slots", 1..=256)?,
-        poll_interval_secs: count(
-            "--poll-interval-secs",
-            crate::config::MIN_POLL_INTERVAL_SECS..=3600,
-        )?,
+        poll_interval_secs,
         worker_name: flags.get("--worker-name").map(str::to_string),
         poll_token: given_token.clone(),
     };
@@ -1945,6 +1971,16 @@ fn host_backup() -> Option<JsonMap> {
     crate::config::parse_json(&text).ok()
 }
 
+/// The language of the hints, from the host's copy of the config.
+pub fn load_language() {
+    if let Some(language) = host_backup().and_then(|map| {
+        map.get("language")
+            .and_then(|v| v.as_str().map(String::from))
+    }) {
+        crate::hints::set_language(&language);
+    }
+}
+
 /// Copy the distribution's config.json to the Windows side, when it is valid.
 fn refresh_host_backup() -> Option<JsonMap> {
     let text = inner_text(INNER_CONFIG)?;
@@ -2007,7 +2043,12 @@ pub fn forward(args: &[String]) -> ExitCode {
     let wants_help = args.iter().any(|a| a == "--help" || a == "-h");
     let fail = |msg: String| {
         if as_json {
-            println!("{}", serde_json::json!({"ok": false, "error": msg}));
+            let code = if msg.contains("is not installed") {
+                "NOT_INSTALLED"
+            } else {
+                "FAILED"
+            };
+            println!("{}", crate::cli::failure_json(code, &msg));
         } else {
             eprintln!("shutup-and-run: {msg}");
         }
@@ -2075,7 +2116,12 @@ pub fn forward_with_files(args: &[String]) -> ExitCode {
     let as_json = args.iter().any(|a| a == "--json");
     let fail = |msg: String| {
         if as_json {
-            println!("{}", serde_json::json!({"ok": false, "error": msg}));
+            let code = if msg.contains("is not installed") {
+                "NOT_INSTALLED"
+            } else {
+                "FAILED"
+            };
+            println!("{}", crate::cli::failure_json(code, &msg));
         } else {
             eprintln!("shutup-and-run: {msg}");
         }
@@ -2897,8 +2943,61 @@ mod tests {
             Some("https://jobs.example/poll")
         );
         assert_eq!(settings.max_slots, 2);
-        assert_eq!(settings.poll_token.unwrap().as_str(), "c".repeat(32));
+        assert_eq!(
+            settings.poll_token.as_ref().unwrap().as_str(),
+            "c".repeat(32)
+        );
         assert!(config_from_toml("not = [toml", None).is_none());
+
+        // Migration of an old config whose interval is under the minimum (the
+        // 15 above): as it was left on the disk it still loads, polls every
+        // 30 s and says so; the install then writes 30 and the warning ends.
+        let mut left = carried.clone();
+        left.insert("token".into(), map["token"].clone());
+        left.insert("allowlist".into(), map["allowlist"].clone());
+        let as_left = crate::config::Settings::from_json_map(&left).unwrap();
+        assert_eq!(as_left.poll_interval, Duration::from_secs(30));
+        assert_eq!(as_left.poll_interval_raised_from, Some(15));
+        let note = crate::cli::poll_interval_note(&as_left).unwrap();
+        assert!(note.contains("15") && note.contains("polls every 30 s"));
+        assert_eq!(map["poll_interval_secs"], 30);
+        assert_eq!(settings.poll_interval, Duration::from_secs(30));
+        assert_eq!(settings.poll_interval_raised_from, None);
+        assert!(crate::cli::poll_interval_note(&settings).is_none());
+
+        // `wsl install --poll-interval-secs 5` is an invalid value (exit 3),
+        // like `config set poll_interval_secs 5`.
+        assert_eq!(install_interval(None), Ok(None));
+        assert_eq!(install_interval(Some("30")), Ok(Some(30)));
+        assert_eq!(install_interval(Some("3600")), Ok(Some(3600)));
+        for bad in ["5", "29", "0", "3601", "soon", ""] {
+            let said = install_interval(Some(bad)).unwrap_err();
+            assert!(said.contains("at least 30"), "{bad}: {said}");
+        }
+
+        // A pairing query in the poll URL goes into the config whole.
+        let paired = install_config(
+            None,
+            &InstallOptions {
+                poll_url: Some(
+                    "https://jobs.example/poll?cpf=00000000000&email=nobody%40example.com".into(),
+                ),
+                ..InstallOptions::default()
+            },
+            "X",
+            "hello-world",
+        );
+        assert_eq!(
+            crate::config::Settings::from_json_map(&paired)
+                .unwrap()
+                .poll_url
+                .as_deref(),
+            Some("https://jobs.example/poll?cpf=00000000000&email=nobody%40example.com")
+        );
+        assert_eq!(
+            crate::config::masked(&paired)["poll_url"],
+            "https://jobs.example/poll?cpf=***&email=***"
+        );
 
         assert_eq!(
             shortcut_text("127.0.0.1:8788"),

@@ -38,7 +38,11 @@ jobs:
           # A typo must not install anything.
           .\target\release\shutup-and-run.exe wsl install --pol-url https://x/poll
           if ($LASTEXITCODE -ne 1) { throw "wsl install with a bad flag exited $LASTEXITCODE, expected 1" }
-          # Both commands above are meant to exit 1, and the step would end
+          # An interval under the minimum is an invalid value: exit 3, like
+          # `config set poll_interval_secs 5`, and nothing is installed.
+          .\target\release\shutup-and-run.exe wsl install --poll-interval-secs 5
+          if ($LASTEXITCODE -ne 3) { throw "wsl install --poll-interval-secs 5 exited $LASTEXITCODE, expected 3" }
+          # The commands above are meant to exit 1 and 3, and the step would end
           # with the last exit code.
           exit 0
       # The runner has the Visual C++ Redistributable, so an .exe that needs
