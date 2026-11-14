@@ -7,7 +7,7 @@
     "hello-world"
   ],
   "poll_url": "https://queue.example/poll?user=ana",
-  "poll_interval_secs": 15,
+  "poll_interval_secs": 30,
   "poll_any_image": true,
   "worker_name": "DESK-07",
   "worker_os": "windows",

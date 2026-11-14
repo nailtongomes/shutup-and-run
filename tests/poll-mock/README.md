@@ -31,7 +31,7 @@ On Windows, allow Python through the firewall when asked (private network), and 
 Point the worker at it:
 
 ```powershell
-shutup-and-run wsl install --poll-url http://192.168.0.50:8080/poll --max-slots 2 --poll-interval-secs 2
+shutup-and-run wsl install --poll-url http://192.168.0.50:8080/poll --max-slots 2 --poll-interval-secs 30
 ```
 
 The mock prints `WORKER` (who asked, with its CPUs and RAM), `TASK`, `FILE`, then `ok` or `FAIL` per job and a `SUMMARY`, and exits. `C:\ProgramData\shutup-and-run\status.json` says `active` while a job runs and `idle` after; `http://127.0.0.1:8787/` shows the same.

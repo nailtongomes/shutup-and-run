@@ -40,7 +40,7 @@ shutup-and-run config set poll_url "https://QUEUE/poll?user=NAME" --apply --json
 shutup-and-run config get poll_url
 ```
 
-`--apply` restarts the service on the new file and waits until it is back. Running containers are not stopped. Other everyday keys: `max_slots`, `poll_interval_secs`, `worker_name`. An invalid value exits 3 with the reason and leaves the file as it was.
+`--apply` restarts the service on the new file and waits until it is back. Running containers are not stopped. Other everyday keys: `max_slots`, `poll_interval_secs`, `worker_name`. `poll_interval_secs` is 30 by default and cannot be set lower: 1 to 29 exits 3 and nothing is written. An invalid value exits 3 with the reason and leaves the file as it was.
 
 ## Quick start: prove the machine works
 
@@ -68,6 +68,7 @@ Each prints `ok`, a top-level `code`, and `checks[]` with `name`, `code`, `statu
 | `STORAGE_NOT_WRITABLE` | The service cannot write its history folder | Run as root; fix the folder's owner |
 | `LOW_MEMORY`, `LOW_DISK` | No new job starts until it clears | Wait, free disk, or lower `min_free_*` |
 | `SLOTS_EXCEED_MEMORY` | `max_slots` times `max_job_memory` does not fit | The `config set max_slots` in `fix` |
+| `POLL_INTERVAL_RAISED` | The config asks for a poll interval under 30 s, from an older release. The worker runs, on 30 | `shutup-and-run config set poll_interval_secs 30 --apply` |
 | `POLL_URL_UNSET` | No poll URL: the worker is idle | `config set poll_url URL --apply` |
 | `POLL_UNREACHABLE` | The poll URL's host did not answer. The network or the server, not the config | Check the network, DNS, the URL |
 | `POLL_NOT_APPROVED` | The server has not approved this machine | Nothing here: the owner approves it |
@@ -117,6 +118,7 @@ Where the service sees under 4 GiB of memory, the two memory defaults are half o
 Inspect what is in force, and whether the worker is waiting for memory or disk:
 
 ```
+shutup-and-run config show --json   # "effective": the limits and the poll interval that run, defaults filled in
 shutup-and-run status --json     # "limits": {...}, "waiting_for": null or "low on memory: ..."
 shutup-and-run doctor --json     # the "resources" check; on Windows also "wsl-limits"
 ```
@@ -164,6 +166,7 @@ Run `shutup-and-run doctor` first. Every failed line has a `fix:`. The cases bel
 | `service` not running (Windows) | The logon task is not running | `shutup-and-run wsl start`. `task` warns if the task is missing: `shutup-and-run wsl task register`. |
 | `config` fails, or `config-in-use` warns | The file was damaged; the service is running on an older copy or on defaults | `shutup-and-run config validate` shows why. `shutup-and-run config reset` writes the factory config (tokens kept), then set the poll URL again. |
 | `docker` or `distribution` fails, or anything odd after a power cut | The WSL distribution is damaged | `shutup-and-run wsl reset` deletes and rebuilds it and keeps the config. `--factory` forgets the config too; the machine then needs approval again. |
+| `wsl install` printed `note: the install is complete` about the poll URL | The poll URL did not answer during the install. The install itself succeeded (exit 0) | Nothing on the PC. Check the URL with `shutup-and-run config get poll_url`; `shutup-and-run doctor` later. |
 | Re-install | | Run `shutup-and-run wsl install` again with no options. It keeps the config. |
 | Factory reset | | Config only: `shutup-and-run config reset` (tokens, name and listen address kept; resource limits back to the profile's defaults). The whole Windows worker: `shutup-and-run wsl reset --factory`. |
 | `container` fails | The smoke image could not be pulled | A restricted network blocks the registry. Try another network, then the doctor again. |

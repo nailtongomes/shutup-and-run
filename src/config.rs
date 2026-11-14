@@ -48,7 +48,11 @@ const DEFAULT_HISTORY: &str = "/var/lib/shutup-and-run/jobs.sqlite";
 const DEFAULT_HISTORY_DAYS: u64 = 30;
 const DEFAULT_PURGE: u64 = 3600;
 const DEFAULT_LOG_LINES: u64 = 200;
-const DEFAULT_POLL_INTERVAL: u64 = 15;
+/// The least a machine waits between two polls, and the default. One number
+/// for the service, the CLI, the page and the installers: a poll URL serves
+/// many machines, and a machine set to a second or two is a flood.
+pub const MIN_POLL_INTERVAL_SECS: u64 = 30;
+const DEFAULT_POLL_INTERVAL: u64 = MIN_POLL_INTERVAL_SECS;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -82,6 +86,9 @@ pub struct Settings {
     /// Unset means push only. The process does not call out.
     pub poll_url: Option<String>,
     pub poll_interval: Duration,
+    /// The interval the config asked for, when it was under the minimum and
+    /// the minimum is what runs. An old config must still start the worker.
+    pub poll_interval_raised_from: Option<u64>,
     /// Bearer token for `poll_url`. Environment only, so it cannot be committed in TOML.
     pub poll_token: Option<PollToken>,
     /// A task from `poll_url` skips the allowlist. Push jobs never do. Needs `poll_url`.
@@ -520,14 +527,19 @@ impl Settings {
         )? {
             Some(value) => {
                 if !(1..=3600).contains(&value) {
-                    return Err(ConfigError(
-                        "poll_interval_secs must be between 1 and 3600".into(),
-                    ));
+                    return Err(ConfigError(format!(
+                        "poll_interval_secs must be between {MIN_POLL_INTERVAL_SECS} and 3600"
+                    )));
                 }
                 value
             }
             None => DEFAULT_POLL_INTERVAL,
         };
+        // Loading never refuses a value that used to be allowed: the worker
+        // runs on the minimum and says so. Writing one is refused, in save_json.
+        let poll_interval_raised_from =
+            (poll_interval_secs < MIN_POLL_INTERVAL_SECS).then_some(poll_interval_secs);
+        let poll_interval_secs = poll_interval_secs.max(MIN_POLL_INTERVAL_SECS);
         // The token is not a TOML field. deny_unknown_fields rejects `poll_token` in the file.
         // When poll_url is unset the variable is ignored, so a stray value does not change startup.
         let poll_token = if poll_url.is_some() {
@@ -578,6 +590,7 @@ impl Settings {
             token: TokenChecker::new(&token),
             poll_url,
             poll_interval: Duration::from_secs(poll_interval_secs),
+            poll_interval_raised_from,
             poll_token,
             poll_any_image,
             worker_name,
@@ -692,11 +705,11 @@ pub const KEYS: &[Key] = &[
     key("tls_key", Kind::Text, OnPage::No),
     key("status_page", Kind::Bool, OnPage::No),
     key("worker_os", Kind::Text, OnPage::No),
-    key("resource_profile", Kind::Text, OnPage::No),
-    key("max_job_cpus", Kind::Text, OnPage::No),
-    key("max_job_memory", Kind::Text, OnPage::No),
-    key("min_free_memory", Kind::Text, OnPage::No),
-    key("min_free_disk", Kind::Text, OnPage::No),
+    key("resource_profile", Kind::Text, OnPage::Locked),
+    key("max_job_cpus", Kind::Text, OnPage::Locked),
+    key("max_job_memory", Kind::Text, OnPage::Locked),
+    key("min_free_memory", Kind::Text, OnPage::Locked),
+    key("min_free_disk", Kind::Text, OnPage::Locked),
     key("certificate_enabled", Kind::Bool, OnPage::No),
     key("certificate_consent", Kind::Bool, OnPage::No),
     key("certificate_name", Kind::Text, OnPage::No),
@@ -893,6 +906,7 @@ pub fn to_text(map: &JsonMap) -> String {
 /// Validate, then replace the file and its backup copy. Nothing invalid is
 /// ever written, so the file on disk always starts the service.
 pub fn save_json(path: &Path, map: &JsonMap) -> Result<(), ConfigError> {
+    let map = &with_poll_minimum(map, read_json(path).ok().as_ref())?;
     Settings::from_json_map(map)?;
     let text = to_text(map);
     for target in [path.to_path_buf(), backup_path(path)] {
@@ -900,6 +914,35 @@ pub fn save_json(path: &Path, map: &JsonMap) -> Result<(), ConfigError> {
             .map_err(|err| ConfigError(format!("could not write {}: {err}", target.display())))?;
     }
     Ok(())
+}
+
+/// The poll interval rule for a write. A value under the minimum is refused.
+/// The one exception is the value the file already had, from a release that
+/// allowed it: that is raised to the minimum in this write, so that an old
+/// install is not locked out of changing its other keys.
+pub fn with_poll_minimum(map: &JsonMap, on_disk: Option<&JsonMap>) -> Result<JsonMap, ConfigError> {
+    const KEY: &str = "poll_interval_secs";
+    let mut map = map.clone();
+    let Some(value) = map.get(KEY).and_then(|v| v.as_u64()) else {
+        return Ok(map);
+    };
+    if (1..MIN_POLL_INTERVAL_SECS).contains(&value) {
+        if on_disk
+            .and_then(|old| old.get(KEY))
+            .and_then(|v| v.as_u64())
+            != Some(value)
+        {
+            return Err(ConfigError(format!(
+                "poll_interval_secs must be at least {MIN_POLL_INTERVAL_SECS} (and at most 3600), not {value}: \
+                 a poll URL serves many machines"
+            )));
+        }
+        map.insert(
+            KEY.to_string(),
+            serde_json::Value::from(MIN_POLL_INTERVAL_SECS),
+        );
+    }
+    Ok(map)
 }
 
 /// Mode 600, written beside the target and renamed over it.
@@ -1197,7 +1240,8 @@ mod tests {
         let settings = Settings::from_toml_and_env(&base_toml(""), &HashMap::new()).unwrap();
         assert!(settings.poll_url.is_none());
         assert!(settings.poll_token.is_none());
-        assert_eq!(settings.poll_interval, Duration::from_secs(15));
+        assert_eq!(settings.poll_interval, Duration::from_secs(30));
+        assert_eq!(settings.poll_interval_raised_from, None);
 
         let settings = Settings::from_toml_and_env(
             &base_toml(""),
@@ -1208,7 +1252,7 @@ mod tests {
         assert!(settings.poll_token.is_none());
 
         let settings = Settings::from_toml_and_env(
-            &base_toml("poll_url = \"https://jobs.example/poll\"\npoll_interval_secs = 5"),
+            &base_toml("poll_url = \"https://jobs.example/poll\"\npoll_interval_secs = 45"),
             &env(&[
                 ("SHUTUP_AND_RUN_POLL_URL", "http://127.0.0.1:9/poll"),
                 ("SHUTUP_AND_RUN_POLL_TOKEN", "poll-token-value-ok"),
@@ -1219,7 +1263,7 @@ mod tests {
             settings.poll_url.as_deref(),
             Some("http://127.0.0.1:9/poll")
         );
-        assert_eq!(settings.poll_interval, Duration::from_secs(5));
+        assert_eq!(settings.poll_interval, Duration::from_secs(45));
         assert_eq!(
             settings.poll_token.as_ref().map(PollToken::as_str),
             Some("poll-token-value-ok")
@@ -1373,6 +1417,86 @@ mod tests {
         assert!(!reset.contains_key("max_job_memory"));
         assert_eq!(reset["worker_os"], "windows");
         assert!(Settings::from_json_map(&reset).unwrap().shared_pc);
+    }
+
+    #[test]
+    fn the_poll_interval_has_one_minimum_old_configs_still_load_and_new_ones_are_refused() {
+        assert_eq!(MIN_POLL_INTERVAL_SECS, 30);
+        assert_eq!(DEFAULT_POLL_INTERVAL, MIN_POLL_INTERVAL_SECS);
+        // An installed config from a release that allowed 2 s: the worker
+        // starts, runs on the minimum, and remembers what was asked.
+        for (text, env_pairs) in [
+            ("poll_interval_secs = 2", vec![]),
+            ("", vec![("SHUTUP_AND_RUN_POLL_INTERVAL_SECS", "2")]),
+        ] {
+            let old = Settings::from_toml_and_env(&base_toml(text), &env(&env_pairs)).unwrap();
+            assert_eq!(old.poll_interval, Duration::from_secs(30));
+            assert_eq!(old.poll_interval_raised_from, Some(2));
+        }
+        let mut map = default_map();
+        map.insert("poll_interval_secs".into(), 2.into());
+        let old = Settings::from_json_map(&map).unwrap();
+        assert_eq!(
+            (old.poll_interval.as_secs(), old.poll_interval_raised_from),
+            (30, Some(2))
+        );
+        // At and above the minimum nothing is raised. Zero and too long stay invalid.
+        for ok in [30u64, 31, 3600] {
+            map.insert("poll_interval_secs".into(), ok.into());
+            let s = Settings::from_json_map(&map).unwrap();
+            assert_eq!(
+                (s.poll_interval.as_secs(), s.poll_interval_raised_from),
+                (ok, None)
+            );
+        }
+        for bad in [0u64, 3601] {
+            map.insert("poll_interval_secs".into(), bad.into());
+            assert!(Settings::from_json_map(&map)
+                .unwrap_err()
+                .to_string()
+                .contains("between 30 and 3600"));
+        }
+
+        // Writing: a new value under the minimum is refused and the file stays.
+        let dir = std::env::temp_dir().join(format!("sar-poll-min-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.json");
+        let mut fresh = default_map();
+        save_json(&path, &fresh).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        for low in [1u64, 2, 29] {
+            fresh.insert("poll_interval_secs".into(), low.into());
+            let refused = save_json(&path, &fresh).unwrap_err().to_string();
+            assert!(refused.contains("at least 30") && refused.contains(&low.to_string()));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+        fresh.insert("poll_interval_secs".into(), 30.into());
+        save_json(&path, &fresh).unwrap();
+
+        // An old file that already holds 2 is not locked: the next write of
+        // any key carries the interval up to the minimum, once.
+        let mut old = default_map();
+        old.insert("poll_interval_secs".into(), 2.into());
+        std::fs::write(&path, to_text(&old)).unwrap();
+        assert_eq!(
+            Settings::load_json(&path).poll_interval_raised_from,
+            Some(2)
+        );
+        assert!(Settings::load_json(&path).config_warning.is_none());
+        old.insert("max_slots".into(), 2.into());
+        save_json(&path, &old).unwrap();
+        let saved = read_json(&path).unwrap();
+        assert_eq!(
+            (
+                saved["poll_interval_secs"].as_u64(),
+                saved["max_slots"].as_u64()
+            ),
+            (Some(30), Some(2))
+        );
+        // But not to another value under it.
+        old.insert("poll_interval_secs".into(), 5.into());
+        assert!(save_json(&path, &old).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

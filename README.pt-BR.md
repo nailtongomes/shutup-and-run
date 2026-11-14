@@ -143,12 +143,13 @@ Com `status_page = true` (a instalação no Windows liga; a do Linux não), o se
 | --- | --- | --- |
 | `/` | Rodando, pausado ou Docker parado. Se o PC pode ser desligado. Tarefas agora, a última tarefa, se a fila responde, o nome da máquina. Um botão para pausar ou voltar a aceitar tarefas. Recarrega a cada 10 segundos | nenhum |
 | Configuração (`/local/config`) | URL de poll, intervalo de poll, tarefas ao mesmo tempo, nome da máquina | nenhum |
-| Configuração avançada (`/local/advanced`) | Imagens permitidas, qualquer imagem, limites de tempo, os dois tokens, o login de admin | `admin` / `admin` até ser trocado |
+| Configuração avançada (`/local/advanced`) | Imagens permitidas, qualquer imagem, limites de tempo, os limites de recursos, os dois tokens, o login de admin | `admin` / `admin` até ser trocado |
 | Certificado (`/local/certificate`) | [Repasse de certificado](#repasse-de-certificado-opcional), opcional: importar um `.pfx` e a senha, validar, testar assinatura de PDF, desligar. A senha nunca é mostrada | o mesmo login, e uma confirmação |
 
 - A página edita o mesmo `config.json` que o CLI, pela mesma validação. Uma mudança salva reinicia o serviço com o arquivo novo; os containers em execução não são tocados. Um valor inválido é recusado e nada é gravado.
 - Troque a senha de admin com `shutup-and-run config set admin_password "NOVA" --apply`.
-- Os limites de recursos e as demais chaves são só pelo CLI. `shutup-and-run config keys` diz onde cada chave pode ser editada.
+- Os limites de recursos (`resource_profile`, `max_job_cpus`, `max_job_memory`, `min_free_memory`, `min_free_disk`) ficam em Configuração avançada. Campo vazio usa o padrão do perfil, mostrado em cinza. `shutup-and-run config show` imprime os mesmos valores em "in force", e em `effective` com `--json`.
+- As demais chaves são só pelo CLI. `shutup-and-run config keys` diz onde cada chave pode ser editada.
 - Ela fica em inglês ou em português, um idioma por vez; um link troca e a escolha é lembrada.
 
 A segurança da página, sem rodeios. Ela não pede token, então só responde a uma conexão de loopback que nomeia um host de loopback, e só aceita um formulário da própria origem. Nunca mostra token, env de job nem logs. O login de admin afasta um curioso e **não** é uma barreira de segurança: quem usa o PC consegue ler o arquivo de configuração. Nada nela é acessível pela rede, e ela não foi feita para ficar atrás de um proxy. Numa máquina configurada com `config.toml` a página só mostra o status.
@@ -222,7 +223,7 @@ As chaves são as mesmas nos dois. Chave desconhecida é recusada.
 | `default_timeout_secs` | `SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS` | Padrão 3600. |
 | `max_timeout_secs` | `SHUTUP_AND_RUN_MAX_TIMEOUT_SECS` | Padrão 21600. No máximo 7 dias. |
 | `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Opcional. Liga o modo pull. |
-| `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Padrão 15. |
+| `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Segundos entre polls. Padrão 30, mínimo 30, no máximo 3600. Um valor menor é recusado (saída 3). Um que ficou numa config de versão antiga ainda carrega e roda como 30, com aviso no `doctor`. |
 | `poll_token` (só JSON) | `SHUTUP_AND_RUN_POLL_TOKEN` | Quem esta máquina é para a URL de poll. Não é chave do TOML. |
 | `poll_any_image` | `SHUTUP_AND_RUN_POLL_ANY_IMAGE` | Uma tarefa de poll pode indicar qualquer imagem. Precisa de `poll_url`. Permite `allowlist` vazia. Nunca vale para um push. |
 | `worker_name`, `worker_os` | `SHUTUP_AND_RUN_WORKER_NAME`, `_WORKER_OS` | Vão no corpo do poll. Padrões: o hostname, o SO do binário. |
@@ -310,10 +311,10 @@ Uma tarefa, o mesmo JSON num push, numa resposta de poll e num manifesto:
 
 Só `image` é obrigatório. Campos desconhecidos são recusados. `job_key` torna um retry seguro naquela máquina: a mesma chave devolve o mesmo job e não inicia nada. `reason` no resultado é `exited`, `timeout_kill` ou `start_failed`. Não existe chamada de cancelamento.
 
-**Pull.** Com `poll_url` definida, a máquina faz POST nela a cada `poll_interval_secs`, só quando tem um slot livre, não está pausada e não está com pouca memória ou disco:
+**Pull.** Com `poll_url` definida, a máquina faz POST nela a cada `poll_interval_secs` (30 segundos, e nunca menos), só quando tem um slot livre, não está pausada e não está com pouca memória ou disco:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.7", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.8", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 A resposta é nada (`204`), uma tarefa, `{"task": {...}}`, ou `{"manifest_url": "https://..."}`, que é buscado uma vez e precisa ser uma tarefa. `401` ou `403` quer dizer "ainda não aprovada": o worker não inicia nada e continua perguntando, espaçando até cinco minutos. O servidor decide quais máquinas recebem trabalho; o token do worker é a identidade dele.

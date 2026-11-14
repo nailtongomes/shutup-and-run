@@ -1,6 +1,6 @@
 # Integration contract
 
-What an orchestrator (n8n, Kestra, your own API) needs in order to give work to a shutup-and-run machine and learn how it ended, without reading the Rust source. It describes what the runner does today, release 0.2.7. Where the behavior is awkward it is written down as it is, under [Limits](#9-limits-of-the-current-contract), and not as it might be wished.
+What an orchestrator (n8n, Kestra, your own API) needs in order to give work to a shutup-and-run machine and learn how it ended, without reading the Rust source. It describes what the runner does today, release 0.2.8. Where the behavior is awkward it is written down as it is, under [Limits](#9-limits-of-the-current-contract), and not as it might be wished.
 
 Machine-readable, JSON Schema Draft 2020-12:
 
@@ -338,7 +338,7 @@ A `200` body that is none of the forms above (not JSON, an array, a task with an
 
 | | |
 | --- | --- |
-| Interval | `poll_interval_secs`, default 15, 1 to 3600. Counted from the end of one poll to the start of the next. |
+| Interval | `poll_interval_secs`, default 30, 30 to 3600. Counted from the end of one poll to the start of the next. A worker of 0.2.8 or newer never polls more often than every 30 seconds, whatever its config says: plan for at most one task per machine per 30 seconds, and two polls a minute per machine. Older workers could be set as low as 1. Rate limiting is still the server's job. |
 | When no poll is sent | While every slot is busy, and while the machine is draining (paused from its status page, or by `POST /v1/drain`). The server sees silence, the same as from a machine that is off. |
 | After a task was launched | The next poll is one interval later, if a slot is still free. A machine with 4 slots fills them in four polls. |
 | Request timeout | 10 seconds for the whole exchange, body included. A slow answer is an error. |

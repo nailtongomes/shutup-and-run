@@ -562,7 +562,7 @@ if wants 10 && needs_shell 10 poll; then
   else
     wait_used "$USED0" 60
     : >"$TMP/polls"
-    printf '{"task":{"image":"%s","command":["sleep","10"],"timeout_secs":60,"job_key":"%s-poll"}}' "$IMAGE" "$RUN" >"$TMP/poll.task.new"
+    printf '{"task":{"image":"%s","command":["sleep","100"],"timeout_secs":120,"job_key":"%s-poll"}}' "$IMAGE" "$RUN" >"$TMP/poll.task.new"
     mv "$TMP/poll.task.new" "$TMP/poll.task"
     served=0
     deadline=$((SECONDS + POLL_WAIT))
@@ -578,12 +578,14 @@ if wants 10 && needs_shell 10 poll; then
       done
     fi
     # The same key again must be the job the poll started, not a new one.
-    sh_job "sleep 10" 60 "\"job_key\":\"${RUN}-poll\""
+    sh_job "sleep 100" 120 "\"job_key\":\"${RUN}-poll\""
     replay=$CODE
     poll_id=$ID
     # Two more polls must come back empty and leave the count alone.
     : >"$TMP/polls"
-    deadline=$((SECONDS + 30))
+    # A worker polls every 30 seconds at the fastest, so two polls take a
+    # minute. The job sleeps for longer than that, to still hold its slot.
+    deadline=$((SECONDS + 100))
     while ((SECONDS < deadline)); do
       [[ "$(grep -c '^empty$' "$TMP/polls")" -ge 2 ]] && break
       sleep 0.5
@@ -596,7 +598,7 @@ if wants 10 && needs_shell 10 poll; then
     else
       fail "10 poll (task served ${served}, container started ${started}, same key ${replay}, empty polls ${empties}, slots_used ${after:-?}, expected $((USED0 + 1)))"
     fi
-    [[ -n "$poll_id" ]] && wait_exit "$poll_id" 60
+    [[ -n "$poll_id" ]] && wait_exit "$poll_id" 130
   fi
 fi
 

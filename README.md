@@ -143,12 +143,13 @@ With `status_page = true` (the Windows install turns it on; a Linux install does
 | --- | --- | --- |
 | `/` | Running, paused or Docker down. Whether the PC can be turned off. Jobs now, the last job, whether the queue answers, the machine's name. A button to pause or resume taking jobs. Reloads every 10 seconds | none |
 | Settings (`/local/config`) | Poll URL, poll interval, jobs at once, machine name | none |
-| Advanced settings (`/local/advanced`) | Allowed images, any-image, time limits, both tokens, the admin login | `admin` / `admin` until changed |
+| Advanced settings (`/local/advanced`) | Allowed images, any-image, time limits, the resource limits, both tokens, the admin login | `admin` / `admin` until changed |
 | Certificate (`/local/certificate`) | Optional [certificate passthrough](#certificate-passthrough-optional): import a `.pfx` and its password, validate it, test PDF signing, turn it off. The password is never shown | the same login, and a confirmation |
 
 - The page edits the same `config.json` as the CLI, through the same validation. A saved change restarts the service on the new file; running containers are left alone. An invalid value is refused and nothing is written.
 - Change the admin password with `shutup-and-run config set admin_password "NEW" --apply`.
-- The resource limits and the other keys are CLI only. `shutup-and-run config keys` says where each key can be edited.
+- The resource limits (`resource_profile`, `max_job_cpus`, `max_job_memory`, `min_free_memory`, `min_free_disk`) are under Advanced settings. A field left empty uses the profile's default, shown in grey. `shutup-and-run config show` prints the same values under "in force", and in `effective` with `--json`.
+- The remaining keys are CLI only. `shutup-and-run config keys` says where each key can be edited.
 - It is in English or Portuguese, one at a time; a link switches and the choice is remembered.
 
 Security of the page, plainly. It needs no token, so it answers only a loopback connection that names a loopback host, and accepts a form only from its own origin. It never shows a token, a job's env or logs. The admin login keeps a curious person out and is **not** a security boundary: whoever uses the PC can read the config file. Nothing on it is reachable from the network, and it is not meant to be put behind a proxy. On a machine set up with `config.toml` the page shows status only.
@@ -222,7 +223,7 @@ The keys are the same in both. An unknown key is refused.
 | `default_timeout_secs` | `SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS` | Default 3600. |
 | `max_timeout_secs` | `SHUTUP_AND_RUN_MAX_TIMEOUT_SECS` | Default 21600. At most 7 days. |
 | `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Optional. Turns pull mode on. |
-| `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Default 15. |
+| `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Seconds between polls. Default 30, minimum 30, at most 3600. A lower value is refused (exit 3). One left in a config by an older release still loads and runs as 30, with a warning in `doctor`. |
 | `poll_token` (JSON only) | `SHUTUP_AND_RUN_POLL_TOKEN` | Who this machine is to the poll URL. Not a TOML key. |
 | `poll_any_image` | `SHUTUP_AND_RUN_POLL_ANY_IMAGE` | A polled task may name any image. Needs `poll_url`. Lets `allowlist` be empty. Never applies to a push. |
 | `worker_name`, `worker_os` | `SHUTUP_AND_RUN_WORKER_NAME`, `_WORKER_OS` | Sent in the poll body. Defaults: the hostname, the build OS. |
@@ -310,10 +311,10 @@ A task, the same JSON on a push, in a poll answer, and in a manifest:
 
 Only `image` is required. Unknown fields are refused. `job_key` makes a retry safe on that one machine: the same key returns the same job and starts nothing. `reason` in the result is `exited`, `timeout_kill` or `start_failed`. There is no cancel call.
 
-**Pull.** With `poll_url` set, the machine POSTs to it every `poll_interval_secs`, only when it has a free slot, is not paused and is not short of memory or disk:
+**Pull.** With `poll_url` set, the machine POSTs to it every `poll_interval_secs` (30 seconds, and never less), only when it has a free slot, is not paused and is not short of memory or disk:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.7", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.8", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 The answer is nothing (`204`), a task, `{"task": {...}}`, or `{"manifest_url": "https://..."}`, which is fetched once and must be a task. `401` or `403` means "not approved yet": the worker starts nothing and keeps asking, backing off to five minutes. The server decides which machines get work; the worker's token is its identity.

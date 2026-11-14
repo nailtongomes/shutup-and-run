@@ -78,7 +78,7 @@ Pull, all optional:
 | toml | environment | notes |
 | --- | --- | --- |
 | `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Unset: no outbound poll. `http` or `https`, no userinfo. |
-| `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Default 15. Range 1 to 3600. Ignored for behavior when `poll_url` is unset, but an out-of-range value still fails startup. |
+| `poll_interval_secs` | `SHUTUP_AND_RUN_POLL_INTERVAL_SECS` | Default 30. Range 30 to 3600; 1 to 29 in an old config runs as 30 with a warning. Ignored for behavior when `poll_url` is unset, but an out-of-range value still fails startup. |
 | (not a toml key) | `SHUTUP_AND_RUN_POLL_TOKEN` | Sent as `Authorization: Bearer` only when `poll_url` is set. A `poll_token` key in the file is an unknown field and startup fails. When `poll_url` is unset the variable is ignored. |
 | `poll_any_image` | `SHUTUP_AND_RUN_POLL_ANY_IMAGE` | Default false. A polled task skips the allowlist; a push never does. Needs `poll_url`. Lets `allowlist` be empty. |
 | `worker_name`, `worker_os` | `SHUTUP_AND_RUN_WORKER_NAME`, `SHUTUP_AND_RUN_WORKER_OS` | In the poll body. Defaults: the hostname, the build OS. Printable ASCII, no spaces, at most 64 characters. |
@@ -137,7 +137,7 @@ Run the service: `shutup-and-run` or `shutup-and-run serve`. Config errors print
 
 `release.yml` runs on `v*` tags. Permissions: `contents: write`. It attaches `shutup-and-run-x86_64-unknown-linux-musl` and `SHA256SUMS` to the GitHub release. `scripts/install.sh` downloads that asset from `releases/latest` and refuses to install it when the hash does not match `SHA256SUMS`. `SHUTUP_AND_RUN_BIN` skips the download. A second job, `install`, waits for the assets, runs the README one-liner on a fresh runner, checks that the installed binary matches `SHA256SUMS`, and runs `smoke.sh`.
 
-To cut a release: merge to `main`, then `git tag vX.Y.Z && git push origin vX.Y.Z` from `main`, because the one-liner fetches `install.sh` from `main`. `Cargo.toml` must say the version of the tag (now `0.2.7`), because the Windows `.exe` downloads the Linux binary of its own version. `install.sh` and `install.ps1` download `releases/latest`. The tags and GitHub releases before v0.2.3 were removed.
+To cut a release: merge to `main`, then `git tag vX.Y.Z && git push origin vX.Y.Z` from `main`, because the one-liner fetches `install.sh` from `main`. `Cargo.toml` must say the version of the tag (now `0.2.8`), because the Windows `.exe` downloads the Linux binary of its own version. `install.sh` and `install.ps1` download `releases/latest`. The tags and GitHub releases before v0.2.3 were removed.
 
 The workflows do not set `id-token` or a cloud deploy role. They use `GITHUB_TOKEN`.
 

@@ -519,7 +519,7 @@ if [[ "${SHUTUP_AND_RUN_SMOKE:-}" == 1 ]]; then
   sed -i 's/^history_days = 0$/history_days = 30/' "$WORK/config.toml"
   cat >>"$WORK/config.toml" <<EOF
 poll_url = "http://127.0.0.1:18790/poll"
-poll_interval_secs = 2
+poll_interval_secs = 30
 EOF
   bash "$WORK/restart.sh"
   wait_ready

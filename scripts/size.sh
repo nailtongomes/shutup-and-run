@@ -127,7 +127,7 @@ start_launcher() {
     export RUST_LOG=warn
     if [[ -n "$poll_url" ]]; then
       export SHUTUP_AND_RUN_POLL_URL="$poll_url"
-      export SHUTUP_AND_RUN_POLL_INTERVAL_SECS=1
+      export SHUTUP_AND_RUN_POLL_INTERVAL_SECS=30
       export SHUTUP_AND_RUN_POLL_TOKEN="$POLL_TOKEN"
     fi
     exec "$BIN"

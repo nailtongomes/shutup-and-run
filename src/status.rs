@@ -351,7 +351,30 @@ fn label(name: &str, lang: Lang) -> &'static str {
             "Poll URL (with its ?user= filter)",
             "URL de poll (com o filtro ?user=)",
         ),
-        "poll_interval_secs" => lang.t("Poll interval, seconds", "Intervalo de poll, segundos"),
+        "poll_interval_secs" => lang.t(
+            "Poll interval, seconds (30 or more)",
+            "Intervalo de poll, segundos (30 ou mais)",
+        ),
+        "resource_profile" => lang.t(
+            "Resource profile: shared-pc or none",
+            "Perfil de recursos: shared-pc ou none",
+        ),
+        "max_job_cpus" => lang.t(
+            "Most CPUs one job gets (blank: the profile's default, shown in grey)",
+            "Máximo de CPUs por tarefa (vazio: o padrão do perfil, em cinza)",
+        ),
+        "max_job_memory" => lang.t(
+            "Most memory one job gets, like 2g or 512m",
+            "Máximo de memória por tarefa, como 2g ou 512m",
+        ),
+        "min_free_memory" => lang.t(
+            "Free memory a new job needs, like 2g (0: not checked)",
+            "Memória livre que uma tarefa nova exige, como 2g (0: não confere)",
+        ),
+        "min_free_disk" => lang.t(
+            "Free disk a new job needs, like 5g (0: not checked)",
+            "Disco livre que uma tarefa nova exige, como 5g (0: não confere)",
+        ),
         "max_slots" => lang.t("Containers at once", "Containers ao mesmo tempo"),
         "worker_name" => lang.t("Machine name", "Nome da máquina"),
         "allowlist" => lang.t(
@@ -385,8 +408,32 @@ fn label(name: &str, lang: Lang) -> &'static str {
 }
 
 /// The form for the keys of one group, filled from the file.
+/// What runs for a key the file does not set, as the grey text of its field.
+pub(crate) fn in_force(name: &str, settings: &config::Settings) -> String {
+    let size = |bytes: u64| match bytes {
+        0 => "0".to_string(),
+        bytes => format!("{}m", bytes / (1024 * 1024)),
+    };
+    match name {
+        "poll_interval_secs" => settings.poll_interval.as_secs().to_string(),
+        "resource_profile" => Limits::of(settings).profile,
+        "max_job_cpus" => settings
+            .max_job_cpus
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        "max_job_memory" => settings
+            .max_job_memory
+            .map(size)
+            .unwrap_or_else(|| "-".to_string()),
+        "min_free_memory" => size(settings.min_free_memory),
+        "min_free_disk" => size(settings.min_free_disk),
+        _ => String::new(),
+    }
+}
+
 fn form(map: &JsonMap, group: OnPage, action: &str, lang: Lang) -> String {
     let mut fields = String::new();
+    let running = config::Settings::from_json_map(map).ok();
     for key in config::KEYS.iter().filter(|k| k.page == group) {
         let name = key.name;
         let text = label(name, lang);
@@ -417,8 +464,14 @@ fn form(map: &JsonMap, group: OnPage, action: &str, lang: Lang) -> String {
                 "<label for=\"{name}\">{text}</label><input type=\"password\" id=\"{name}\" name=\"{name}\" autocomplete=\"new-password\">"
             ),
             kind => format!(
-                "<label for=\"{name}\">{text}</label><input type=\"{}\" id=\"{name}\" name=\"{name}\" value=\"{}\">",
+                "<label for=\"{name}\">{text}</label><input type=\"{}\" id=\"{name}\" name=\"{name}\" placeholder=\"{}\"{} value=\"{}\">",
                 if kind == Kind::Int { "number" } else { "text" },
+                escape(&running.as_ref().map(|s| in_force(name, s)).unwrap_or_default()),
+                if name == "poll_interval_secs" {
+                    format!(" min=\"{}\" max=\"3600\"", config::MIN_POLL_INTERVAL_SECS)
+                } else {
+                    String::new()
+                },
                 escape(&match value {
                     Some(serde_json::Value::String(s)) => s.clone(),
                     Some(other) => other.to_string(),
