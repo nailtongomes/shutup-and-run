@@ -119,6 +119,7 @@ O trabalho interativo do cliente tem prioridade sobre a vazão de jobs. Num PC c
 | Cada job | 1 CPU, 2 GiB de memória, sem swap além disso | `max_job_cpus`, `max_job_memory` |
 | Jobs ao mesmo tempo | 1 | `max_slots` |
 | Iniciar um job | só com 2 GiB de memória e 5 GiB de disco livres | `min_free_memory`, `min_free_disk` |
+| Iniciar um job (Windows, opcional) | só depois de o PC ficar N segundos sem uso; desligado por padrão | `min_idle_secs` |
 
 - Quem aplica os limites é o Docker (`NanoCpus`, `Memory`, `MemorySwap`), num job de push e num de pull. Tarefa que não informa `cpu` ou `memory` recebe o limite da máquina; a que informa menos recebe o que pediu; a que informa mais é recusada, com o limite na resposta.
 - Enquanto faltar memória ou disco, um push recebe `503` `insufficient resources` e um worker em pull simplesmente não pede trabalho, então nenhuma tarefa é retirada da fila e depois descartada. Ele volta sozinho. O `status` mostra `waiting_for`.
@@ -221,6 +222,7 @@ As chaves são as mesmas nos dois. Chave desconhecida é recusada.
 | `max_job_memory` | `SHUTUP_AND_RUN_MAX_JOB_MEMORY` | O mesmo para memória: `"2g"`, `"512m"`. |
 | `min_free_memory` | `SHUTUP_AND_RUN_MIN_FREE_MEMORY` | Nenhum job novo abaixo dessa memória disponível. `"0"`: não confere. |
 | `min_free_disk` | `SHUTUP_AND_RUN_MIN_FREE_DISK` | O mesmo para o disco em que o Docker grava. |
+| `min_idle_secs` | `SHUTUP_AND_RUN_MIN_IDLE_SECS` | Só Windows: um job novo espera até o PC ficar estes segundos sem uso. `0` (o padrão): desligado. |
 | `default_timeout_secs` | `SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS` | Padrão 3600. |
 | `max_timeout_secs` | `SHUTUP_AND_RUN_MAX_TIMEOUT_SECS` | Padrão 21600. No máximo 7 dias. |
 | `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Opcional. Liga o modo pull. |
@@ -310,7 +312,7 @@ Uma tarefa, o mesmo JSON num push, numa resposta de poll e num manifesto:
 }
 ```
 
-Só `image` é obrigatório. Campos desconhecidos são recusados. `job_key` torna um retry seguro naquela máquina: a mesma chave devolve o mesmo job e não inicia nada. `reason` no resultado é `exited`, `timeout_kill` ou `start_failed`. Não existe chamada de cancelamento.
+Só `image` é obrigatório. Campos desconhecidos são recusados. `job_key` torna um retry seguro naquela máquina: a mesma chave devolve o mesmo job e não inicia nada. `reason` no resultado é `exited`, `timeout_kill`, `start_failed` ou `interrupted` (a máquina, o WSL, o Docker ou o worker parou com o job em andamento; ele não roda de novo). Não existe chamada de cancelamento.
 
 **Pull.** Com `poll_url` definida, a máquina faz POST nela a cada `poll_interval_secs` (30 segundos, e nunca menos), só quando tem um slot livre, não está pausada e não está com pouca memória ou disco:
 
@@ -322,7 +324,7 @@ A resposta é nada (`204`), uma tarefa, `{"task": {...}}`, ou `{"manifest_url": 
 
 Limites de cada campo, todos os códigos de status, o callback, idempotência, e o que não é garantido: [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md).
 
-**`status.json`** tem os mesmos fatos da página local, para um script que não deve chamar HTTP: `state` (`idle`, `active`, `draining`, `failed`, `stopped`), `slots_total`, `slots_used`, `job_ids`, `last_job_at`, `last_error`, `poll_error`, `waiting_for`, `limits`, `config_warning`, `version`, `pid`, `started_at`, `updated_at`. Linux: ao lado do arquivo de histórico, `/var/lib/shutup-and-run/status.json`, só root. Windows: `C:\ProgramData\shutup-and-run\status.json`, legível pelo usuário. Se `updated_at` tem mais de 60 segundos, o worker morreu. `shutup-and-run status --json` lê para você.
+**`status.json`** tem os mesmos fatos da página local, para um script que não deve chamar HTTP: `state` (`idle`, `active`, `draining`, `failed`, `stopped`), `slots_total`, `slots_used`, `job_ids`, `last_job_at`, `last_error`, `poll_error`, `waiting_for`, `callbacks` (jobs interrompidos, callbacks pendentes e desistidos), `limits`, `config_warning`, `version`, `pid`, `started_at`, `updated_at`. Linux: ao lado do arquivo de histórico, `/var/lib/shutup-and-run/status.json`, só root. Windows: `C:\ProgramData\shutup-and-run\status.json`, legível pelo usuário. Se `updated_at` tem mais de 60 segundos, o worker morreu. `shutup-and-run status --json` lê para você.
 
 ## Segurança
 

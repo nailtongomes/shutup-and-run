@@ -199,6 +199,14 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
                 "needed_bytes": shortage.needed_bytes,
             })),
         ),
+        Err(LaunchError::UserActive(active)) => error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "user active",
+            Some(json!({
+                "idle_secs": active.idle_secs,
+                "needed_secs": active.needed_secs,
+            })),
+        ),
         Err(LaunchError::Unavailable(msg)) => error_body(StatusCode::BAD_GATEWAY, &msg, None),
     }
 }

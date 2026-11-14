@@ -139,8 +139,9 @@ pub(crate) async fn poll_once(
     }
     // Do not ask for a task the machine could not start: a task that was
     // handed out and then refused here is lost to the server.
-    if let Some(shortage) = launcher.shortage() {
-        tracing::debug!(%shortage, "poll skipped");
+    // The same for a PC whose owner is using it (`min_idle_secs`).
+    if let Some(why) = launcher.waiting_for() {
+        tracing::debug!(%why, "poll skipped");
         return Ok(PollOutcome::Idle);
     }
 

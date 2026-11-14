@@ -271,6 +271,10 @@ async fn serve() -> ExitCode {
     if let Some(warning) = &launcher.settings().config_warning {
         tracing::warn!("{warning}");
     }
+    // On Windows the supervisor writes the PC's idle time to stdin.
+    if launcher.settings().worker_os == "windows" {
+        shutup_and_run::host::spawn_reader();
+    }
     launcher.reconcile().await;
     let pending = launcher.clone();
     let status_file = shutup_and_run::status::spawn(launcher.clone());

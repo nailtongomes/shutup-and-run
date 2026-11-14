@@ -93,6 +93,7 @@ The JSON also carries `fix`. It is the same sentence under the name 0.2.8 used; 
 | `RESOURCES_WARNING` | The worker waits until memory and disk are free again. Close heavy programs or free disk space. | O worker espera até haver memória e disco livres. Feche programas pesados ou libere espaço em disco. |
 | `LOW_MEMORY` | It clears when programs close or a job ends. To ask for less: `shutup-and-run config set min_free_memory 1g --apply`. On Windows, `shutup-and-run wsl limits` shows what WSL2 has. | Passa quando programas fecham ou uma tarefa termina. Para exigir menos: `shutup-and-run config set min_free_memory 1g --apply`. No Windows, `shutup-and-run wsl limits` mostra quanto o WSL2 tem. |
 | `LOW_DISK` | Free disk space: `docker image prune -af` (Windows: `wsl -d shutup-and-run -u root docker image prune -af`). To ask for less: `shutup-and-run config set min_free_disk 2g --apply`. | Libere espaço em disco: `docker image prune -af` (Windows: `wsl -d shutup-and-run -u root docker image prune -af`). Para exigir menos: `shutup-and-run config set min_free_disk 2g --apply`. |
+| `USER_ACTIVE` | The PC is in use and `min_idle_secs` makes jobs wait; it clears by itself. To start jobs at any time: `shutup-and-run config set min_idle_secs 0 --apply`. | O PC está em uso e `min_idle_secs` faz as tarefas esperarem; passa sozinho. Para começar tarefas a qualquer hora: `shutup-and-run config set min_idle_secs 0 --apply`. |
 | `WORKER_BUSY` | Every slot is in use. Wait for the running job (`shutup-and-run jobs`) and try again. | Todos os slots estão em uso. Aguarde a tarefa em execução (`shutup-and-run jobs`) e tente de novo. |
 | `SLOTS_EXCEED_MEMORY` | Run `shutup-and-run config set max_slots {} --apply`, or lower `max_job_memory`. | Rode `shutup-and-run config set max_slots {} --apply`, ou reduza `max_job_memory`. |
 | `POLL_URL_UNSET` | Run `shutup-and-run config set poll_url URL --apply` with the URL the service gave you. | Rode `shutup-and-run config set poll_url URL --apply` com a URL que o serviço informou. |
@@ -177,6 +178,7 @@ shutup-and-run config set resource_profile shared-pc --apply
 | `max_job_memory` | `2g` | The same for memory. No swap beyond it. |
 | `min_free_memory` | `2g` | No new job starts with less memory available. `0`: not checked. |
 | `min_free_disk` | `5g` | The same for the disk Docker writes to. |
+| `min_idle_secs` | `0` | Windows only: a new job waits until the PC was not used for this many seconds. `0`: off. A running job is never stopped for it. |
 
 Where the service sees under 4 GiB of memory, the two memory defaults are half of what it sees. Change one figure with `config set KEY VALUE --apply`; go back to the default with `config unset KEY --apply`. `resource_profile none` removes the defaults, and the four keys still work one by one.
 
@@ -219,7 +221,7 @@ shutup-and-run jobs --json       # the last 20 jobs and how each ended
 ]}
 ```
 
-`status` is `running`, `ok` (exit 0), `failed` (another exit code, or the container never started), `timeout` (it ran past its time limit) or `killed` (exit 137: out of memory, or stopped). `failure` says why in one sentence, and is null for `ok` and `running`. The history keeps the last 500 finished jobs at most, for `history_days`. It never holds or prints a job's env, command, payload or logs. The result of a job is not here either: the container sends it to the service itself.
+`status` is `running`, `ok` (exit 0), `failed` (another exit code, or the container never started), `timeout` (it ran past its time limit), `killed` (exit 137: out of memory, or stopped) or `interrupted` (the PC, WSL or Docker stopped under it, or the worker was not running when it ended; it is not run again, the service that sent it decides). `failure` says why in one sentence, and is null for `ok` and `running`. The history keeps the last 500 finished jobs at most, for `history_days`. It never holds or prints a job's env, command, payload or logs. The result of a job is not here either: the container sends it to the service itself.
 
 Healthy is: `status` exits 0, `doctor` exits 0, and `poll_error` is null. A new machine shows `poll` as `warn` with "has not approved this machine" until the owner approves it at the poll URL. That is expected, and nothing on the machine fixes it.
 

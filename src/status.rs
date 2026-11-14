@@ -193,6 +193,9 @@ async fn page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Resp
         poll_error: live.poll_error.as_deref(),
         warning: live.config_warning.as_deref(),
         editable: settings.config_json.is_some(),
+        computer: Some(&live.computer),
+        limits: Some(&live.limits),
+        waiting_for: live.waiting_for.as_deref(),
     };
     html(StatusCode::OK, render(&view))
 }
@@ -215,6 +218,10 @@ pub(crate) struct View<'a> {
     pub warning: Option<&'a str>,
     /// The config is config.json, so the page can edit it.
     pub editable: bool,
+    /// The "Computer resources" section. None leaves it out.
+    pub computer: Option<&'a Computer>,
+    pub limits: Option<&'a Limits>,
+    pub waiting_for: Option<&'a str>,
 }
 
 /// Everything around a page's body: one language, and a link to the other.
@@ -328,7 +335,8 @@ pub(crate) fn render(view: &View) -> String {
          <tr><td>{t_machine}</td><td>{worker} ({os})</td></tr>\
          </table>\
          <form method=\"post\" action=\"{action}\"><p><button>{label}</button></p></form>\
-         {settings}<p><small>{note}</small></p>",
+         {settings}{computer}<p><small>{note}</small></p>",
+        computer = computer_section(view),
         t_off = lang.t("Turn off?", "Pode desligar?"),
         t_jobs = lang.t("Jobs now", "Tarefas agora"),
         t_last = lang.t("Last job", "Última tarefa"),
@@ -342,6 +350,176 @@ pub(crate) fn render(view: &View) -> String {
         ),
     );
     shell(lang, "/", Some((10, "/")), &body)
+}
+
+/// "Computer resources": what the machine has, what a job may take, and
+/// whether a new job could start. Readings only: a figure that was not read
+/// is left out or shown as not reported, never guessed.
+fn computer_section(view: &View) -> String {
+    use crate::resources::human;
+    let (Some(computer), Some(limits)) = (view.computer, view.limits) else {
+        return String::new();
+    };
+    let lang = view.lang;
+    let windows = view.os == "windows";
+    let mut rows: Vec<(&str, String)> = Vec::new();
+    rows.push((
+        lang.t("Operating system", "Sistema operacional"),
+        if windows {
+            lang.t(
+                "Windows (jobs run inside WSL2)",
+                "Windows (as tarefas rodam dentro do WSL2)",
+            )
+            .to_string()
+        } else {
+            escape(view.os)
+        },
+    ));
+    let machine = |cpus: Option<u64>, total: Option<u64>, available: Option<u64>| {
+        let mut parts = Vec::new();
+        if let Some(cpus) = cpus {
+            parts.push(format!("{cpus} {}", lang.t("processors", "processadores")));
+        }
+        if let Some(total) = total {
+            parts.push(format!(
+                "{} {}",
+                human(total),
+                lang.t("of memory", "de memória")
+            ));
+        }
+        if let Some(available) = available {
+            parts.push(format!(
+                "{} {}",
+                human(available),
+                lang.t("available", "disponível")
+            ));
+        }
+        if parts.is_empty() {
+            lang.t("not reported", "não informado").to_string()
+        } else {
+            parts.join(", ")
+        }
+    };
+    let inner = machine(
+        computer.cpus,
+        computer.memory_total,
+        computer.memory_available,
+    );
+    if windows {
+        let host = computer.host.unwrap_or_default();
+        rows.push((
+            lang.t("This PC (Windows)", "Este PC (Windows)"),
+            machine(host.cpus, host.memory_total, host.memory_available),
+        ));
+        rows.push((
+            lang.t(
+                "WSL2 (its limit, and what is free)",
+                "WSL2 (o limite dele, e o que está livre)",
+            ),
+            inner,
+        ));
+    } else {
+        rows.push((lang.t("This machine", "Esta máquina"), inner));
+    }
+    let no_limit = lang.t("no limit", "sem limite");
+    rows.push((
+        lang.t("Limit of each job", "Limite de cada tarefa"),
+        format!(
+            "CPU: {}, {}: {}",
+            limits
+                .max_job_cpus
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| no_limit.to_string()),
+            lang.t("memory", "memória"),
+            limits
+                .max_job_memory_bytes
+                .map(human)
+                .unwrap_or_else(|| no_limit.to_string()),
+        ),
+    ));
+    rows.push((
+        lang.t("Jobs running / at most", "Tarefas rodando / máximo"),
+        match view.slots {
+            Some((used, total)) => format!("{used} / {total}"),
+            None => "?".to_string(),
+        },
+    ));
+    if windows {
+        let idle = match computer.host.and_then(|host| host.idle_secs) {
+            Some(secs) => ago(secs as i64),
+            None => lang.t("not reported", "não informado").to_string(),
+        };
+        let rule = match computer.min_idle_secs {
+            0 => lang
+                .t("jobs start at any time", "tarefas começam a qualquer hora")
+                .to_string(),
+            secs => format!(
+                "{} {}",
+                lang.t("a job starts after", "uma tarefa começa depois de"),
+                ago(secs as i64)
+            ),
+        };
+        rows.push((
+            lang.t("PC without use for", "PC sem uso há"),
+            format!("{idle} ({rule})"),
+        ));
+    }
+    let admission = match (view.slots, view.draining, view.waiting_for) {
+        (None, _, _) => lang
+            .t("no: Docker is down", "não: o Docker parou")
+            .to_string(),
+        (_, true, _) => lang.t("no: paused", "não: pausado").to_string(),
+        (Some((used, total)), _, _) if used >= total => lang
+            .t(
+                "no: busy, every slot is taken",
+                "não: ocupado, todas as vagas em uso",
+            )
+            .to_string(),
+        (_, _, Some(_)) if computer.user_active => lang
+            .t("waiting: the PC is in use", "esperando: o PC está em uso")
+            .to_string(),
+        (_, _, Some(why)) => format!(
+            "{}: {}",
+            lang.t(
+                "waiting, not enough resources",
+                "esperando, recursos insuficientes"
+            ),
+            escape(why)
+        ),
+        _ => lang.t("yes", "sim").to_string(),
+    };
+    rows.push((
+        lang.t("Can a new job start?", "Pode começar tarefa nova?"),
+        admission,
+    ));
+    let delivery = computer.delivery;
+    rows.push((
+        lang.t("Interrupted jobs", "Tarefas interrompidas"),
+        format!(
+            "{} ({} {})",
+            delivery.interrupted,
+            delivery.interrupted_unnotified,
+            lang.t("not notified", "sem aviso entregue")
+        ),
+    ));
+    rows.push((
+        lang.t("Callback delivery", "Entrega de callbacks"),
+        format!(
+            "{} {}, {} {}",
+            delivery.pending,
+            lang.t("waiting for a new try", "aguardando nova tentativa"),
+            delivery.failed,
+            lang.t("given up", "desistidos")
+        ),
+    ));
+    let rows: String = rows
+        .iter()
+        .map(|(name, value)| format!("<tr><td>{name}</td><td>{value}</td></tr>"))
+        .collect();
+    format!(
+        "<h2>{}</h2><table>{rows}</table>",
+        lang.t("Computer resources", "Recursos do computador")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +555,10 @@ fn label(name: &str, lang: Lang) -> &'static str {
         "min_free_disk" => lang.t(
             "Free disk a new job needs, like 5g (0: not checked)",
             "Disco livre que uma tarefa nova exige, como 5g (0: não confere)",
+        ),
+        "min_idle_secs" => lang.t(
+            "Windows: start a job only after the PC was not used for this many seconds (0: any time)",
+            "Windows: só começar uma tarefa depois de o PC ficar sem uso por estes segundos (0: a qualquer hora)",
         ),
         "max_slots" => lang.t("Containers at once", "Containers ao mesmo tempo"),
         "worker_name" => lang.t("Machine name", "Nome da máquina"),
@@ -1031,6 +1213,37 @@ pub struct Live {
     pub waiting_for: Option<String>,
     pub limits: Limits,
     pub config_warning: Option<String>,
+    pub computer: Computer,
+}
+
+/// Readings for the page's "Computer resources". On Windows `host` is the
+/// PC, from the supervisor, and the rest is the WSL2 VM the service runs in.
+#[derive(Clone, Debug, Default)]
+pub struct Computer {
+    pub host: Option<crate::host::Feed>,
+    pub cpus: Option<u64>,
+    pub memory_total: Option<u64>,
+    pub memory_available: Option<u64>,
+    pub min_idle_secs: u64,
+    /// `waiting_for` is the idle wait, not memory or disk.
+    pub user_active: bool,
+    pub delivery: crate::store::Delivery,
+}
+
+impl Computer {
+    pub fn read(launcher: &Launcher) -> Self {
+        Self {
+            host: crate::host::current(),
+            cpus: std::thread::available_parallelism()
+                .ok()
+                .map(|n| n.get() as u64),
+            memory_total: crate::resources::memory_total(),
+            memory_available: crate::resources::memory_available(),
+            min_idle_secs: launcher.settings().min_idle_secs,
+            user_active: launcher.shortage().is_none() && launcher.user_active().is_some(),
+            delivery: launcher.delivery(),
+        }
+    }
 }
 
 /// The resource limits in force, defaults filled in. No secret is in here.
@@ -1091,7 +1304,7 @@ impl Live {
     /// so a heartbeat still rewrites the file on the interval.
     pub fn signature(&self) -> String {
         format!(
-            "{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{}",
+            "{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{}|{:?}",
             self.state(false),
             self.slots_used,
             self.slots_total,
@@ -1101,7 +1314,8 @@ impl Live {
             self.last_error(false, None),
             self.poll_error,
             // Not the text: its byte counts change every second.
-            self.waiting_for.is_some()
+            self.waiting_for.is_some(),
+            self.computer.delivery
         )
     }
 
@@ -1181,6 +1395,8 @@ struct FileBody<'a> {
     /// `task`, `nothing`, `task_rejected`, `not_approved` or `error`.
     last_poll_status: Option<&'a str>,
     waiting_for: Option<&'a str>,
+    /// Interrupted jobs and callbacks not answered, over the history.
+    callbacks: &'a crate::store::Delivery,
     limits: &'a Limits,
     config_warning: Option<String>,
     version: &'a str,
@@ -1208,6 +1424,7 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
         last_poll_at: live.last_poll.map(|(at, _)| unix_to_iso(at)),
         last_poll_status: live.last_poll.map(|(_, status)| status),
         waiting_for: live.waiting_for.as_deref(),
+        callbacks: &live.computer.delivery,
         limits: &live.limits,
         config_warning: live.config_warning.as_deref().map(one_line),
         version: env!("CARGO_PKG_VERSION"),
@@ -1244,6 +1461,7 @@ fn empty_live() -> Live {
         waiting_for: None,
         limits: Limits::default(),
         config_warning: None,
+        computer: Computer::default(),
     }
 }
 
@@ -1503,6 +1721,9 @@ mod tests {
             poll_error: None,
             warning: None,
             editable: true,
+            computer: None,
+            limits: None,
+            waiting_for: None,
         }
     }
 
@@ -1538,6 +1759,86 @@ mod tests {
     }
 
     /// One language on the screen at a time, and a link to the other.
+    #[test]
+    fn the_page_shows_the_computer_and_only_what_was_read() {
+        use crate::host::Feed;
+        const GIB: u64 = 1 << 30;
+        let limits = Limits {
+            profile: "shared-pc".into(),
+            max_job_cpus: Some(1.0),
+            max_job_memory_bytes: Some(2 * GIB),
+            min_free_memory_bytes: 2 * GIB,
+            min_free_disk_bytes: 0,
+        };
+        let mut computer = Computer {
+            host: Some(Feed {
+                idle_secs: Some(90),
+                memory_total: Some(12 * GIB),
+                memory_available: Some(5 * GIB),
+                cpus: Some(8),
+            }),
+            cpus: Some(4),
+            memory_total: Some(4 * GIB),
+            memory_available: Some(3 * GIB),
+            min_idle_secs: 300,
+            user_active: true,
+            delivery: crate::store::Delivery {
+                interrupted: 2,
+                interrupted_unnotified: 1,
+                pending: 1,
+                failed: 3,
+            },
+        };
+        let mut v = view(Lang::Pt, Some((0, 1)), false);
+        v.limits = Some(&limits);
+        v.waiting_for = Some("the PC is in use: idle for 90s, 300s needed");
+        v.computer = Some(&computer);
+        let page = render(&v);
+        for text in [
+            "<h2>Recursos do computador</h2>",
+            "Windows (as tarefas rodam dentro do WSL2)",
+            // The PC and the VM are two lines with their own numbers.
+            "<td>Este PC (Windows)</td><td>8 processadores, 12.0 GiB de memória, 5.0 GiB disponível</td>",
+            "<td>WSL2 (o limite dele, e o que está livre)</td><td>4 processadores, 4.0 GiB de memória, 3.0 GiB disponível</td>",
+            "<td>Limite de cada tarefa</td><td>CPU: 1, memória: 2.0 GiB</td>",
+            "<td>Tarefas rodando / máximo</td><td>0 / 1</td>",
+            "<td>PC sem uso há</td><td>90 s (uma tarefa começa depois de 5 min)</td>",
+            "esperando: o PC está em uso",
+            "<td>Tarefas interrompidas</td><td>2 (1 sem aviso entregue)</td>",
+            "<td>Entrega de callbacks</td><td>1 aguardando nova tentativa, 3 desistidos</td>",
+        ] {
+            assert!(page.contains(text), "{text}\n{page}");
+        }
+        assert!(!page.contains("Computer resources"));
+
+        // No supervisor feed: said so, not guessed. Short of memory is its
+        // own answer, and a full or paused worker comes first.
+        computer.host = None;
+        computer.user_active = false;
+        let mut v = view(Lang::En, Some((0, 1)), false);
+        v.limits = Some(&limits);
+        v.computer = Some(&computer);
+        v.waiting_for = Some("low on memory: 512 MiB free, 2.0 GiB needed");
+        let page = render(&v);
+        assert!(page.contains("<td>This PC (Windows)</td><td>not reported</td>"));
+        assert!(page.contains("<td>PC without use for</td><td>not reported ("));
+        assert!(page.contains("waiting, not enough resources: low on memory"));
+        v.waiting_for = None;
+        assert!(render(&v).contains("<td>Can a new job start?</td><td>yes</td>"));
+        v.slots = Some((1, 1));
+        assert!(render(&v).contains("no: busy"));
+        v.draining = true;
+        assert!(render(&v).contains("no: paused"));
+        // A Linux machine has one line for itself and no idle row.
+        let mut v = view(Lang::En, Some((0, 1)), false);
+        v.os = "linux";
+        v.limits = Some(&limits);
+        v.computer = Some(&computer);
+        let page = render(&v);
+        assert!(page.contains("<td>This machine</td><td>4 processors"));
+        assert!(!page.contains("WSL2") && !page.contains("without use"));
+    }
+
     #[test]
     fn each_page_is_in_one_language_only() {
         let english = [
@@ -1711,6 +2012,7 @@ mod tests {
                 min_free_disk_bytes: 0,
             },
             config_warning: None,
+            computer: Computer::default(),
         };
         let bytes = document(&live, 1_700_000_100, false, None);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

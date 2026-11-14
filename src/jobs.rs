@@ -4,7 +4,7 @@
 
 use crate::cli::{emit, Out, EXIT_FAILED, EXIT_USAGE};
 use crate::store::{JobRecord, Store};
-use crate::{REASON_LAUNCHER, REASON_START_FAILED, REASON_TIMEOUT};
+use crate::{REASON_INTERRUPTED, REASON_LAUNCHER, REASON_START_FAILED, REASON_TIMEOUT};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::ExitCode;
@@ -17,18 +17,20 @@ pub fn usage() -> &'static str {
 shutup-and-run jobs [--limit N] [--json]
     the last N jobs of this machine, newest first (default 20, at most 200):
     id, image, start, end, duration, exit code, status and, when it did not
-    end well, why. Status is running, ok, failed, timeout or killed. The
+    end well, why. Status is running, ok, failed, timeout, killed or
+    interrupted (the PC, WSL or Docker stopped under the job). The
     history holds at most the last 500 finished jobs, and never a job's env,
     command, payload or logs."
 }
 
-/// `running`, `ok`, `failed`, `timeout` or `killed`.
+/// `running`, `ok`, `failed`, `timeout`, `killed` or `interrupted`.
 pub fn status_of(job: &JobRecord) -> &'static str {
     match (job.ended_at, job.reason.as_deref(), job.exit_code) {
         (None, _, _) => "running",
         (_, Some(REASON_TIMEOUT), _) => "timeout",
         (_, Some(REASON_LAUNCHER), _) => "killed",
         (_, Some(REASON_START_FAILED), _) => "failed",
+        (_, Some(REASON_INTERRUPTED), _) => "interrupted",
         // SIGKILL from outside: the kernel out of memory, or `docker kill`.
         (_, _, Some(137)) => "killed",
         (_, _, Some(0)) => "ok",
@@ -41,6 +43,10 @@ pub fn status_of(job: &JobRecord) -> &'static str {
 pub fn failure_of(job: &JobRecord) -> Option<String> {
     match status_of(job) {
         "timeout" => Some("ran past its time limit and was stopped".into()),
+        "interrupted" => Some(
+            "the PC, WSL or Docker stopped while it ran, or the worker was not running when it ended"
+                .into(),
+        ),
         "killed" if job.reason.as_deref() == Some(REASON_LAUNCHER) => {
             Some("stopped by the worker".into())
         }
