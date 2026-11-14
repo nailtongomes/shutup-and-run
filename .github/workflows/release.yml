@@ -1,21 +1,66 @@
-# On tag v*, attach the musl binary, the Windows .exe and one SHA256SUMS
-# that lists both to the GitHub release. install.sh downloads the musl asset
-# from releases/latest and checks SHA256SUMS. install.ps1 does the same for
-# the .exe, and the .exe then fetches the musl asset of its own version for
-# the WSL distribution. A later job runs the README one-liner on a fresh
-# runner and smokes the service it installed. Tag from main: the one-liners
-# fetch install.sh and install.ps1 from main.
+# A release is cut when `main` gets a version in Cargo.toml that has no tag
+# yet: this workflow builds the musl binary and the Windows .exe, creates the
+# tag v<version> on that commit and the GitHub release with both files and
+# one SHA256SUMS that lists them. Nobody pushes a tag by hand. A push to main
+# that does not change the version does nothing. Pushing a tag v* still
+# works, and "Run workflow" on main retries a release that failed.
+#
+# install.sh downloads the musl asset from releases/latest and checks
+# SHA256SUMS. install.ps1 does the same for the .exe, and the .exe then
+# fetches the musl asset of its own version for the WSL distribution. A later
+# job runs the README one-liner on a fresh runner and smokes the service it
+# installed. The one-liners fetch install.sh and install.ps1 from main.
 name: release
 
 on:
   push:
+    branches: [main]
+    paths: [Cargo.toml]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  # Which version this commit is, and whether it still has to be released.
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.read.outputs.tag }}
+      release: ${{ steps.read.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          tag="v${version}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF_TYPE}" == tag && "${GITHUB_REF_NAME}" != "${tag}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} is not the version in Cargo.toml (${version})" >&2
+            exit 1
+          fi
+          # Released already: the release exists with its checksums.
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json assets \
+               --jq '.assets[].name' 2>/dev/null | grep -qx SHA256SUMS; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "${tag} is already released: nothing to do"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "releasing ${tag}"
+          fi
+
   musl:
+    needs: version
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +80,8 @@ jobs:
           path: target/x86_64-unknown-linux-musl/release/shutup-and-run
 
   windows:
+    needs: version
+    if: needs.version.outputs.release == 'true'
     runs-on: windows-latest
     permissions:
       contents: read
@@ -49,7 +96,7 @@ jobs:
           path: target/release/shutup-and-run.exe
 
   publish:
-    needs: [musl, windows]
+    needs: [version, musl, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -68,15 +115,18 @@ jobs:
           # Hash from inside dist so each line names the asset, not dist/<asset>.
           (cd dist && sha256sum shutup-and-run-x86_64-unknown-linux-musl shutup-and-run-x86_64-pc-windows-msvc.exe > SHA256SUMS)
           cat dist/SHA256SUMS
+      # Creates the tag on this commit when it does not exist yet.
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: |
             dist/shutup-and-run-x86_64-unknown-linux-musl
             dist/shutup-and-run-x86_64-pc-windows-msvc.exe
             dist/SHA256SUMS
 
   install:
-    needs: publish
+    needs: [version, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -87,8 +137,10 @@ jobs:
       - name: the README one-liner
         run: curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.sh | sudo bash
       - name: installed binary is this release's asset
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
-          curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/SHA256SUMS" -o SHA256SUMS
+          curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/SHA256SUMS" -o SHA256SUMS
           test "$(awk '{ print $1; exit }' SHA256SUMS)" = "$(sha256sum /usr/local/bin/shutup-and-run | awk '{ print $1 }')"
       - name: smoke the installed service
         timeout-minutes: 15

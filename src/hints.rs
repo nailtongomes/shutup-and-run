@@ -67,21 +67,21 @@ pub const CATALOG: &[(&str, &str, &str)] = &[
     ("DOCKER_UNAVAILABLE", "Start Docker. Windows: `shutup-and-run wsl stop` then `shutup-and-run wsl start`. Linux: `sudo systemctl start docker`.", "Inicie o Docker. Windows: `shutup-and-run wsl stop` e depois `shutup-and-run wsl start`. Linux: `sudo systemctl start docker`."),
     ("DOCKER_FAILED", "Windows: `shutup-and-run wsl stop` then `shutup-and-run wsl start`; still failing, `shutup-and-run wsl reset`.", "Windows: `shutup-and-run wsl stop` e depois `shutup-and-run wsl start`; se continuar, `shutup-and-run wsl reset`."),
     ("SERVICE_PORT_IN_USE", "Pick another port: `shutup-and-run config set listen 127.0.0.1:8788`, then start the service again.", "Escolha outra porta: `shutup-and-run config set listen 127.0.0.1:8788` e inicie o serviço de novo."),
-    ("SERVICE_FAILED", "Fix the docker line first, then start the service: Windows `shutup-and-run wsl start`, Linux `sudo systemctl restart shutup-and-run`.", "Corrija primeiro a linha do docker e inicie o serviço: Windows `shutup-and-run wsl start`, Linux `sudo systemctl restart shutup-and-run`."),
+    ("SERVICE_FAILED", "Follow the docker line first if it failed, then start the service: Windows `shutup-and-run wsl start`, Linux `sudo systemctl restart shutup-and-run`.", "Siga primeiro a linha do docker, se ela falhou, e inicie o serviço: Windows `shutup-and-run wsl start`, Linux `sudo systemctl restart shutup-and-run`."),
     ("SERVICE_NOT_RUNNING", "Start the service: Windows `shutup-and-run wsl start`, Linux `sudo systemctl restart shutup-and-run`.", "Inicie o serviço: Windows `shutup-and-run wsl start`, Linux `sudo systemctl restart shutup-and-run`."),
     ("WORKER_PAUSED", "Run `shutup-and-run resume`.", "Rode `shutup-and-run resume`."),
-    ("LOCAL_ADDRESS_BANNED", "Run `shutup-and-run bans lift 127.0.0.1`, then check the token of whoever calls this machine.", "Rode `shutup-and-run bans lift 127.0.0.1` e confira o token de quem chama esta máquina."),
+    ("LOCAL_ADDRESS_BANNED", "Run `shutup-and-run bans lift {}`, then check the token of whoever calls this machine.", "Rode `shutup-and-run bans lift {}` e confira o token de quem chama esta máquina."),
     ("ADDRESS_BANNED", "Only if one of the addresses is yours: `shutup-and-run bans lift IP`.", "Só se um dos endereços for seu: `shutup-and-run bans lift IP`."),
     ("RESOURCES_FAILED", "Free memory or disk on this machine, or lower the need: `shutup-and-run config set max_slots 1 --apply`.", "Libere memória ou disco nesta máquina, ou reduza a exigência: `shutup-and-run config set max_slots 1 --apply`."),
     ("RESOURCES_WARNING", "The worker waits until memory and disk are free again. Close heavy programs or free disk space.", "O worker espera até haver memória e disco livres. Feche programas pesados ou libere espaço em disco."),
-    ("LOW_MEMORY", "Close heavy programs on this machine, then try again; or lower the floor: `shutup-and-run config set min_free_memory 1g --apply`.", "Feche programas pesados nesta máquina e tente de novo; ou reduza o mínimo: `shutup-and-run config set min_free_memory 1g --apply`."),
-    ("LOW_DISK", "Free disk space: `docker image prune -af` (on Windows inside the distribution: `wsl -d shutup-and-run -u root docker image prune -af`).", "Libere espaço em disco: `docker image prune -af` (no Windows, dentro da distribuição: `wsl -d shutup-and-run -u root docker image prune -af`)."),
+    ("LOW_MEMORY", "It clears when programs close or a job ends. To ask for less: `shutup-and-run config set min_free_memory 1g --apply`. On Windows, `shutup-and-run wsl limits` shows what WSL2 has.", "Passa quando programas fecham ou uma tarefa termina. Para exigir menos: `shutup-and-run config set min_free_memory 1g --apply`. No Windows, `shutup-and-run wsl limits` mostra quanto o WSL2 tem."),
+    ("LOW_DISK", "Free disk space: `docker image prune -af` (Windows: `wsl -d shutup-and-run -u root docker image prune -af`). To ask for less: `shutup-and-run config set min_free_disk 2g --apply`.", "Libere espaço em disco: `docker image prune -af` (Windows: `wsl -d shutup-and-run -u root docker image prune -af`). Para exigir menos: `shutup-and-run config set min_free_disk 2g --apply`."),
     ("WORKER_BUSY", "Every slot is in use. Wait for the running job (`shutup-and-run jobs`) and try again.", "Todos os slots estão em uso. Aguarde a tarefa em execução (`shutup-and-run jobs`) e tente de novo."),
-    ("SLOTS_EXCEED_MEMORY", "Run `shutup-and-run config set max_slots 1 --apply`, or lower `max_job_memory`.", "Rode `shutup-and-run config set max_slots 1 --apply`, ou reduza `max_job_memory`."),
+    ("SLOTS_EXCEED_MEMORY", "Run `shutup-and-run config set max_slots {} --apply`, or lower `max_job_memory`.", "Rode `shutup-and-run config set max_slots {} --apply`, ou reduza `max_job_memory`."),
     // The poll URL.
     ("POLL_URL_UNSET", "Run `shutup-and-run config set poll_url URL --apply` with the URL the service gave you.", "Rode `shutup-and-run config set poll_url URL --apply` com a URL que o serviço informou."),
-    ("POLL_UNREACHABLE", "Check the internet and the address: `shutup-and-run config get poll_url --reveal`. Then `shutup-and-run doctor` again.", "Confira a internet e o endereço: `shutup-and-run config get poll_url --reveal`. Depois rode `shutup-and-run doctor` de novo."),
-    ("POLL_NOT_APPROVED", "Nothing to do on this machine: ask the service to approve this worker. It keeps asking by itself.", "Nada a fazer nesta máquina: peça ao serviço para aprovar este worker. Ele continua tentando sozinho."),
+    ("POLL_UNREACHABLE", "Check the internet and the address: `shutup-and-run config get poll_url --reveal`. On Windows, a URL on this PC or LAN is blocked by the firewall on a Public network (docs/FOR-AGENTS.md).", "Confira a internet e o endereço: `shutup-and-run config get poll_url --reveal`. No Windows, uma URL neste PC ou na rede local é bloqueada pelo firewall em rede Pública (docs/FOR-AGENTS.md)."),
+    ("POLL_NOT_APPROVED", "Nothing to do on this machine: ask the service to approve worker {}. It keeps asking by itself.", "Nada a fazer nesta máquina: peça ao serviço para aprovar o worker {}. Ele continua tentando sozinho."),
     ("POLL_HTTP_ERROR", "The poll URL answered with an error. Check the path and the query: `shutup-and-run config get poll_url --reveal`; fix with `shutup-and-run config set poll_url URL --apply`.", "A poll URL respondeu com erro. Confira o caminho e os parâmetros: `shutup-and-run config get poll_url --reveal`; corrija com `shutup-and-run config set poll_url URL --apply`."),
     ("POLL_RATE_LIMITED", "The poll URL asked this machine to slow down (429). Wait: the worker backs off by itself.", "A poll URL pediu para esta máquina ir mais devagar (429). Aguarde: o worker reduz o ritmo sozinho."),
     ("POLL_ERROR", "Check the URL and its query with `shutup-and-run config get poll_url --reveal`, then `shutup-and-run status`.", "Confira a URL e seus parâmetros com `shutup-and-run config get poll_url --reveal` e depois `shutup-and-run status`."),
@@ -90,19 +90,19 @@ pub const CATALOG: &[(&str, &str, &str)] = &[
     ("JOB_INVALID_FIELD", "Fix the field named in the error; docs/INTEGRATION-CONTRACT.md lists the fields of a job.", "Corrija o campo citado no erro; docs/INTEGRATION-CONTRACT.md lista os campos de uma tarefa."),
     ("JOB_IMAGE_NOT_ALLOWED", "Add the image: `shutup-and-run config set allowlist IMAGE --apply`, or validate as a polled task with `--poll`.", "Adicione a imagem: `shutup-and-run config set allowlist IMAGEM --apply`, ou valide como tarefa da poll URL com `--poll`."),
     // demo.
-    ("DEMO_IMAGE_NOT_ALLOWED", "Add the demo image: `shutup-and-run config set allowlist hello-world --apply`.", "Adicione a imagem da demo: `shutup-and-run config set allowlist hello-world --apply`."),
+    ("DEMO_IMAGE_NOT_ALLOWED", "Name an allowed image with `--image`, or allow this one: `shutup-and-run config set allowlist {} --apply`.", "Indique uma imagem permitida com `--image`, ou permita esta: `shutup-and-run config set allowlist {} --apply`."),
     ("DEMO_JOB_INVALID", "Run `shutup-and-run config check` and fix what it reports.", "Rode `shutup-and-run config check` e corrija o que ele apontar."),
     ("JOB_FAILED", "Run `shutup-and-run config check` and fix what it reports.", "Rode `shutup-and-run config check` e corrija o que ele apontar."),
     ("ADMISSION_FAILED", "The machine is short of memory or disk, or paused. Run `shutup-and-run status` and free what it names.", "A máquina está com pouca memória ou disco, ou pausada. Rode `shutup-and-run status` e libere o que ele citar."),
-    ("DEMO_TIMEOUT", "The demo container did not finish in time. Check the internet (the image is downloaded) and run the demo again.", "O container da demo não terminou a tempo. Confira a internet (a imagem é baixada) e rode a demo de novo."),
-    ("CONTAINER_FAILED", "Run `shutup-and-run doctor`; if Docker is fine, run the demo again.", "Rode `shutup-and-run doctor`; se o Docker estiver bem, rode a demo de novo."),
-    ("DEMO_IMAGE_UNAVAILABLE", "The image could not be downloaded. Check the internet and run the demo again.", "A imagem não pôde ser baixada. Confira a internet e rode a demo de novo."),
+    ("DEMO_TIMEOUT", "The demo container did not finish in time. Run `docker rm -f shutup-and-run-{}`, check the internet, then `shutup-and-run doctor`.", "O container da demo não terminou a tempo. Rode `docker rm -f shutup-and-run-{}`, confira a internet e depois `shutup-and-run doctor`."),
+    ("CONTAINER_FAILED", "The image could not be downloaded or run. Check the internet of this machine (a restricted network may block the registry), then run the command again.", "A imagem não pôde ser baixada ou executada. Confira a internet desta máquina (uma rede restrita pode bloquear o registro) e rode o comando de novo."),
+    ("DEMO_IMAGE_UNAVAILABLE", "The image has to be downloaded once. Check the internet, or run `docker pull {}`, then the demo again.", "A imagem precisa ser baixada uma vez. Confira a internet, ou rode `docker pull {}`, e depois a demo de novo."),
     ("IMAGE_FAILED", "The image could not be downloaded. Check the internet and run the demo again.", "A imagem não pôde ser baixada. Confira a internet e rode a demo de novo."),
-    ("DEMO_JOB_FAILED", "The demo container exited with an error. Run `shutup-and-run doctor`, then the demo again.", "O container da demo terminou com erro. Rode `shutup-and-run doctor` e depois a demo de novo."),
+    ("DEMO_JOB_FAILED", "The demo container exited with an error; its last lines are in `logs` (`--json`). Run `shutup-and-run doctor`, then the demo again.", "O container da demo terminou com erro; as últimas linhas estão em `logs` (`--json`). Rode `shutup-and-run doctor` e depois a demo de novo."),
     ("LIMITS_NOT_APPLIED", "Docker did not apply the limits. Update Docker, or on Windows run `shutup-and-run wsl reset`.", "O Docker não aplicou os limites. Atualize o Docker ou, no Windows, rode `shutup-and-run wsl reset`."),
     ("LIMITS_NOT_READ", "The limits could not be read back. Run the demo again; if it repeats, `shutup-and-run doctor --report`.", "Não foi possível ler os limites. Rode a demo de novo; se repetir, `shutup-and-run doctor --report`."),
     ("LIMITS_FAILED", "Docker did not apply the limits. Update Docker, or on Windows run `shutup-and-run wsl reset`.", "O Docker não aplicou os limites. Atualize o Docker ou, no Windows, rode `shutup-and-run wsl reset`."),
-    ("DEMO_CLEANUP_FAILED", "A demo container was left behind. Remove it: `docker rm -f` the container named in the detail.", "Um container da demo ficou para trás. Remova: `docker rm -f` no container citado no detalhe."),
+    ("DEMO_CLEANUP_FAILED", "A demo container was left behind. Run `docker rm -f shutup-and-run-{}`.", "Um container da demo ficou para trás. Rode `docker rm -f shutup-and-run-{}`."),
     ("CLEANUP_FAILED", "A demo container was left behind. Remove it: `docker rm -f` the container named in the detail.", "Um container da demo ficou para trás. Remova: `docker rm -f` no container citado no detalhe."),
     ("DEMO_WORKSPACE", "The demo could not create its temporary folder. Run it as root (Linux: `sudo`) and check free disk.", "A demo não conseguiu criar sua pasta temporária. Rode como root (Linux: `sudo`) e confira o disco livre."),
     ("WORKSPACE_FAILED", "The demo could not create its temporary folder. Run it as root (Linux: `sudo`) and check free disk.", "A demo não conseguiu criar sua pasta temporária. Rode como root (Linux: `sudo`) e confira o disco livre."),
@@ -122,6 +122,7 @@ pub const CATALOG: &[(&str, &str, &str)] = &[
     ("CERTIFICATE_MOUNT_WRITABLE", "The container could write to the certificate folder. Run `shutup-and-run doctor --report` and open the issue link.", "O container conseguiu gravar na pasta do certificado. Rode `shutup-and-run doctor --report` e abra o link de issue."),
     ("MOUNT_FAILED", "The certificate was not visible in the container. Run `shutup-and-run certificate status` and the demo again.", "O certificado não apareceu no container. Rode `shutup-and-run certificate status` e a demo de novo."),
     ("OPENSSL_MISSING", "Install openssl (Linux: `sudo apt-get install -y openssl`); on Windows run `shutup-and-run wsl reset`.", "Instale o openssl (Linux: `sudo apt-get install -y openssl`); no Windows rode `shutup-and-run wsl reset`."),
+    ("DEMO_SIGN_FAILED", "The signing demo needs an image with python3 and openssl: leave `--image` out to use the default. The container's last lines are in `logs` (`--json`).", "A demo de assinatura precisa de uma imagem com python3 e openssl: não passe `--image` para usar a padrão. As últimas linhas do container estão em `logs` (`--json`)."),
     // Windows.
     ("WSL_UNAVAILABLE", "In an administrator PowerShell run `wsl --install --no-distribution`, restart the PC, then `shutup-and-run wsl install`.", "Em um PowerShell de administrador rode `wsl --install --no-distribution`, reinicie o PC e depois `shutup-and-run wsl install`."),
     ("WSL_FAILED", "In an administrator PowerShell run `wsl --update`, restart the PC, then `shutup-and-run doctor`.", "Em um PowerShell de administrador rode `wsl --update`, reinicie o PC e depois `shutup-and-run doctor`."),
@@ -131,8 +132,8 @@ pub const CATALOG: &[(&str, &str, &str)] = &[
     ("TASK_NOT_REGISTERED", "Run `shutup-and-run wsl task register` so the worker starts at logon.", "Rode `shutup-and-run wsl task register` para o worker iniciar no logon."),
     ("TASK_WARNING", "Run `shutup-and-run wsl task register` so the worker starts at logon.", "Rode `shutup-and-run wsl task register` para o worker iniciar no logon."),
     ("WSL_LIMITS_WARNING", "Run `shutup-and-run wsl limits` to see what WSL2 may take; `shutup-and-run wsl limits --apply` sets the budget.", "Rode `shutup-and-run wsl limits` para ver quanto o WSL2 pode usar; `shutup-and-run wsl limits --apply` define o limite."),
-    ("WSL_LIMITS_ABOVE_BUDGET", "Run `shutup-and-run wsl limits --apply`, then `wsl --shutdown` and `shutup-and-run wsl start`.", "Rode `shutup-and-run wsl limits --apply`, depois `wsl --shutdown` e `shutup-and-run wsl start`."),
-    ("WSL_LIMITS_NOT_IN_EFFECT", "Restart WSL so the limits apply: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`.", "Reinicie o WSL para os limites valerem: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`."),
+    ("WSL_LIMITS_ABOVE_BUDGET", "Run `shutup-and-run wsl limits --apply` (it keeps every other line of .wslconfig), then restart WSL yourself: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`.", "Rode `shutup-and-run wsl limits --apply` (mantém as outras linhas do .wslconfig) e reinicie o WSL você mesmo: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`."),
+    ("WSL_LIMITS_NOT_IN_EFFECT", "The limits apply when WSL restarts: `shutup-and-run wsl stop`, `wsl --shutdown` (it stops every WSL distribution of this user), `shutup-and-run wsl start`.", "Os limites valem quando o WSL reinicia: `shutup-and-run wsl stop`, `wsl --shutdown` (para todas as distribuições WSL deste usuário), `shutup-and-run wsl start`."),
 ];
 
 pub fn hint_in(code: &str, lang: Lang) -> &'static str {
@@ -168,6 +169,10 @@ pub fn attach(json: &mut Value, exit_code: u8) {
         .to_string(),
     };
     json["hint"] = Value::String(hint(&code).to_string());
+    // One sentence under both names: `fix` is what 0.2.8 called it.
+    if json.get("fix").is_some() {
+        json["fix"] = json["hint"].clone();
+    }
     json["code"] = Value::String(code);
 }
 
