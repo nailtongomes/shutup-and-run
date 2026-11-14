@@ -17,10 +17,10 @@
     },
     "poll_interval_secs": {
       "type": "integer",
-      "description": "Seconds between polls.",
-      "minimum": 1,
+      "description": "Seconds between polls, counted from the end of one poll to the start of the next. At least 30: one poll URL serves many machines. A value from 1 to 29 is refused by `config set` and the local page. A file that already holds one, written by a release before 0.2.8, still loads: the worker polls every 30 seconds and the doctor says so.",
+      "minimum": 30,
       "maximum": 3600,
-      "default": 15
+      "default": 30
     },
     "max_slots": {
       "type": "integer",

@@ -237,11 +237,26 @@ pub fn config_command(path: &Path, words: &[&str], reveal: bool) -> Out {
     match words {
         ["show"] => match load() {
             Ok(map) => {
-                let problem = Settings::from_json_map(&map).err().map(|e| e.0);
+                let loaded = Settings::from_json_map(&map);
+                let problem = loaded.as_ref().err().map(|e| e.0.clone());
+                // What runs, defaults filled in: a key that is not in the
+                // file still has a value, and this is where it is seen.
+                let effective = loaded.as_ref().ok().map(effective_json);
+                let in_force = loaded
+                    .as_ref()
+                    .ok()
+                    .map(|s| {
+                        format!(
+                            "\nin force, defaults filled in:\n  poll_interval_secs {}\n  {}",
+                            s.poll_interval.as_secs(),
+                            crate::status::Limits::of(s).line()
+                        )
+                    })
+                    .unwrap_or_default();
                 let map = shown(&map);
                 Out::ok(
-                    json!({"path": path, "config": map, "valid": problem.is_none(), "problem": problem}),
-                    config::to_text(&map).trim_end(),
+                    json!({"path": path, "config": map, "valid": problem.is_none(), "problem": problem, "effective": effective}),
+                    format!("{}{in_force}", config::to_text(&map).trim_end()),
                 )
             }
             Err(err) => broken(err),
@@ -320,8 +335,17 @@ pub fn config_command(path: &Path, words: &[&str], reveal: bool) -> Out {
             map.remove(key.name);
             written(path, &map, key.name)
         }
-        ["validate"] => match load().and_then(|map| Settings::from_json_map(&map).map(|_| ())) {
-            Ok(()) => Out::ok(json!({"path": path}), format!("{} is valid", path.display())),
+        ["validate"] => match load().and_then(|map| Settings::from_json_map(&map)) {
+            Ok(settings) => {
+                let warning = poll_interval_note(&settings);
+                Out::ok(
+                    json!({"path": path, "warning": warning}),
+                    match &warning {
+                        Some(note) => format!("{} is valid\nwarning: {note}", path.display()),
+                        None => format!("{} is valid", path.display()),
+                    },
+                )
+            }
             Err(err) => Out::fail(EXIT_INVALID, err.0),
         },
         ["apply"] => match load().and_then(|map| Settings::from_json_map(&map).map(|_| ())) {
@@ -346,6 +370,36 @@ pub fn config_command(path: &Path, words: &[&str], reveal: bool) -> Out {
             "usage: shutup-and-run config show|get KEY|set KEY VALUE|unset KEY|validate|apply|reset|keys [--json]. See --help.",
         ),
     }
+}
+
+/// The values the service runs on for the keys that have a default worth
+/// seeing: the resource limits and the poll interval.
+pub fn effective_json(settings: &Settings) -> Value {
+    let mut value = serde_json::to_value(crate::status::Limits::of(settings)).unwrap_or_default();
+    value["poll_interval_secs"] = json!(settings.poll_interval.as_secs());
+    value["max_slots"] = json!(settings.max_slots);
+    value
+}
+
+/// Said wherever a config is looked at, when its interval was under the minimum.
+pub fn poll_interval_note(settings: &Settings) -> Option<String> {
+    settings.poll_interval_raised_from.map(|asked| {
+        format!(
+            "poll_interval_secs is {asked} in the config, under the minimum of {min}: the worker polls every {min} s",
+            min = config::MIN_POLL_INTERVAL_SECS
+        )
+    })
+}
+
+fn poll_interval_check(settings: &Settings) -> Option<Check> {
+    poll_interval_note(settings).map(|note| {
+        soft("poll-interval", false, note)
+            .coded("POLL_INTERVAL_RAISED")
+            .fix(format!(
+                "`shutup-and-run config set poll_interval_secs {} --apply`",
+                config::MIN_POLL_INTERVAL_SECS
+            ))
+    })
 }
 
 fn written(path: &Path, map: &JsonMap, name: &str) -> Out {
@@ -951,6 +1005,7 @@ pub async fn base_checks() -> (Found, Option<Settings>) {
             }),
     });
 
+    checks.extend(settings.as_ref().and_then(poll_interval_check));
     (
         Found {
             checks,
@@ -1416,6 +1471,57 @@ mod tests {
         assert_eq!(stale.code, EXIT_FAILED);
         assert_eq!(stale.json["ok"], false);
         assert_eq!(stale.json["stale"], true);
+    }
+
+    #[test]
+    fn a_poll_interval_under_30_is_refused_with_exit_3_and_an_old_one_is_warned_about() {
+        let path = temp("poll-min");
+        let set = |words: &[&str]| config_command(&path, words, false);
+        assert_eq!(set(&["set", "max_slots", "1"]).code, 0);
+        let before = std::fs::read_to_string(&path).unwrap();
+        for low in ["1", "2", "29"] {
+            let out = set(&["set", "poll_interval_secs", low]);
+            assert_eq!(out.code, EXIT_INVALID, "{low}");
+            assert!(out.json["error"].as_str().unwrap().contains("at least 30"));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(set(&["set", "poll_interval_secs", "30"]).code, 0);
+
+        // The default, and the limits, are visible though no key sets them.
+        assert_eq!(set(&["unset", "poll_interval_secs"]).code, 0);
+        let shown = set(&["show"]);
+        assert_eq!(shown.json["effective"]["poll_interval_secs"], 30);
+        assert_eq!(shown.json["effective"]["profile"], "none");
+        assert!(shown.json["effective"]
+            .get("max_job_memory_bytes")
+            .is_some());
+        assert!(shown.text.contains("in force, defaults filled in:"));
+        assert!(shown.text.contains("poll_interval_secs 30"));
+        assert!(shown.text.contains("per job: cpu"));
+
+        // A config installed by an older release, with 2: valid, with a warning
+        // and a soft check that names the fix.
+        let mut old = config::read_json(&path).unwrap();
+        old.insert("poll_interval_secs".into(), json!(2));
+        std::fs::write(&path, config::to_text(&old)).unwrap();
+        let valid = set(&["validate"]);
+        assert_eq!(valid.code, 0);
+        assert!(valid.json["warning"]
+            .as_str()
+            .unwrap()
+            .contains("polls every 30 s"));
+        assert_eq!(set(&["show"]).json["effective"]["poll_interval_secs"], 30);
+        let warned = poll_interval_check(&Settings::load_json(&path)).unwrap();
+        assert!(!warned.ok && warned.soft);
+        assert_eq!(warned.code(), "POLL_INTERVAL_RAISED");
+        assert!(warned
+            .fix
+            .contains("config set poll_interval_secs 30 --apply"));
+        assert!(report(&[warned]).1, "a warning must not fail the doctor");
+        assert!(
+            poll_interval_check(&Settings::from_json_map(&config::default_map()).unwrap())
+                .is_none()
+        );
     }
 
     #[test]

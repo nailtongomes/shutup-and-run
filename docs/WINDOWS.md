@@ -37,6 +37,8 @@ irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/i
 
 `install.ps1` downloads the `.exe` of the latest release, checks it against `SHA256SUMS`, puts it in `%ProgramData%\shutup-and-run`, adds that folder to the user's `PATH`, and runs `shutup-and-run wsl install`. That takes a few minutes: about 340 MiB for the rootfs, then `apt-get install docker.io` inside it. It ends with the doctor's table.
 
+The install ends with exit 0 when everything it does on this PC worked, also when the poll URL did not answer at that minute. That is someone else's server: the doctor's `poll` line says so, a `note:` repeats it, and the worker keeps trying. The desktop shortcut is written to the folder Windows reports, accents included (`C:\Users\...\OneDrive\Área de Trabalho`).
+
 Without the one-liner, with an `.exe` you already have:
 
 ```powershell
@@ -48,7 +50,7 @@ shutup-and-run.exe wsl install --poll-url https://orchestrator.example/poll --ma
 | --- | --- |
 | `--poll-url URL` | Or `SHUTUP_AND_RUN_POLL_URL`. Without it the worker is installed idle, see below. |
 | `--max-slots N` | Containers at once. Default 1. |
-| `--poll-interval-secs N` | Default 15. |
+| `--poll-interval-secs N` | Seconds between polls. Default 30, and not less: a lower number is refused. An upgrade that finds a lower value in the kept config raises it to 30. |
 | `--worker-name NAME` | What the poll body calls this machine. Default: the computer name. |
 | `--smoke-image IMAGE` | The image the doctor runs. Default `hello-world`. |
 | `--wsl-memory 4GB`, `--wsl-processors 2` | The limits of the whole WSL2 VM. Default: 40% of the PC's RAM and half its processors. See [Sharing the PC](#sharing-the-pc). |
@@ -101,7 +103,7 @@ shutup-and-run wsl limits --apply
 
 **A change to `.wslconfig` takes effect when WSL restarts**: at the next restart of the PC, or after `wsl --shutdown`. That command stops every WSL distribution of the user, so this program never runs it. Run it when no job and no other WSL work is open. Until then the doctor's `wsl-limits` line says `not in effect yet`.
 
-The per-job limits and the two free-space checks are in `config.json` and change like any other key. `resource_profile` is `shared-pc` on every Windows worker, also on one installed before 0.2.6; its config needs no change.
+The per-job limits and the two free-space checks are in `config.json` and change like any other key. `shutup-and-run config show` prints the values in force under the file, defaults included, and the local page has them under Advanced settings. `resource_profile` is `shared-pc` on every Windows worker, also on one installed before 0.2.6; its config needs no change.
 
 ```powershell
 shutup-and-run config set max_job_memory 1g --apply
@@ -237,7 +239,7 @@ Jobs that are running when you re-install are ended: the distribution is restart
 Each poll is a `POST` with the token and this body:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.7", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.8", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
 ```
 
 `cpus` and `memory_bytes` are what the WSL2 VM has, which is what the machine lends. The body has no address, because the worker only knows the VM's private one and could claim any other. The server takes the public address from the connection.

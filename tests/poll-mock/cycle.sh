@@ -41,7 +41,7 @@ default_timeout_secs = 60
 max_timeout_secs = 600
 history_path = "${WORK}/jobs.sqlite"
 poll_url = "http://${HOST}:${PORT}/poll"
-poll_interval_secs = 1
+poll_interval_secs = 30
 worker_name = "cycle-test"
 TOML
 
@@ -71,14 +71,14 @@ WORKER_PID=$!
 state() { sed -n 's/.*"state":"\([^"]*\)".*/\1/p' "$WORK/status.json" 2>/dev/null || true; }
 
 saw_active=0
-for _ in $(seq 1 600); do
+for _ in $(seq 1 960); do
   [[ "$(state)" == active ]] && saw_active=1
   kill -0 "$MOCK_PID" 2>/dev/null || break
   kill -0 "$WORKER_PID" 2>/dev/null || { echo "FAIL: the worker died"; cat "$WORK/worker.log"; exit 1; }
   sleep 0.5
 done
 if kill -0 "$MOCK_PID" 2>/dev/null; then
-  echo "FAIL: the mock is still waiting after 5 minutes"
+  echo "FAIL: the mock is still waiting after 8 minutes"
   cat "$WORK/worker.log"
   exit 1
 fi

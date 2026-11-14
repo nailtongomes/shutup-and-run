@@ -15,4 +15,4 @@ max_timeout_secs = 600
 history_path = "/tmp/shutup-and-run-test/jobs.sqlite"
 # The mock's address as this machine AND its containers see it. Not 127.0.0.1.
 poll_url = "http://192.0.2.10:8080/poll"
-poll_interval_secs = 2
+poll_interval_secs = 30

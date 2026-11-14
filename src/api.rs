@@ -1043,6 +1043,22 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(page.contains("max_slots must be between 1 and 256"));
+        // A poll interval under the minimum is refused the same way.
+        let (status, _, page) = send(
+            "POST",
+            "/local/config",
+            vec![("origin", ORIGIN.into())],
+            "max_slots=2&poll_interval_secs=5",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.contains("poll_interval_secs must be at least 30"));
+        assert!(crate::config::read_json(&path)
+            .unwrap()
+            .get("poll_interval_secs")
+            .is_none());
+        let (_, _, page) = send("GET", "/local/config", vec![], "").await;
+        assert!(page.contains("name=\"poll_interval_secs\" placeholder=\"30\" min=\"30\""));
         // Not from another site's form.
         let (status, _, _) = send(
             "POST",
@@ -1093,6 +1109,21 @@ mod tests {
         let (status, _, page) = send("GET", "/local/advanced", login.clone(), "").await;
         assert_eq!(status, StatusCode::OK);
         assert!(page.contains("name=\"allowlist\"") && page.contains("name=\"admin_password\""));
+        // The resource limits are there to see and change, with what runs
+        // now in grey when the file does not set them.
+        for key in [
+            "resource_profile",
+            "max_job_cpus",
+            "max_job_memory",
+            "min_free_memory",
+            "min_free_disk",
+        ] {
+            assert!(
+                page.contains(&format!("name=\"{key}\" placeholder=\"")),
+                "{key}"
+            );
+        }
+        assert!(page.contains("name=\"resource_profile\" placeholder=\"none\""));
         let (status, _, _) = send(
             "POST",
             "/local/advanced",

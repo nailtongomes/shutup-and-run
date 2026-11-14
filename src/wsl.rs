@@ -150,7 +150,7 @@ shutup-and-run wsl install [--poll-url URL] [options]
     poll URL decides whether to serve it.
     Afterwards the config changes with `shutup-and-run config set`, not here.
       --max-slots N              containers at once (default 1)
-      --poll-interval-secs N     default 15
+      --poll-interval-secs N     default 30, and not less
       --worker-name NAME         default: the computer name
       --smoke-image IMAGE        default hello-world
       --rootfs PATH              a downloaded Ubuntu WSL rootfs (skips the download)
@@ -678,6 +678,18 @@ pub(crate) fn install_config(
     }
     if let Some(token) = &options.poll_token {
         map.insert("poll_token".into(), json!(token));
+    }
+    // An install is a write: an interval kept from a release that allowed
+    // less than the minimum is raised here, once.
+    if map
+        .get("poll_interval_secs")
+        .and_then(Value::as_u64)
+        .is_some_and(|n| n < crate::config::MIN_POLL_INTERVAL_SECS)
+    {
+        map.insert(
+            "poll_interval_secs".into(),
+            json!(crate::config::MIN_POLL_INTERVAL_SECS),
+        );
     }
     map
 }
@@ -1515,7 +1527,10 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     let mut options = InstallOptions {
         poll_url: poll_url.clone(),
         max_slots: count("--max-slots", 1..=256)?,
-        poll_interval_secs: count("--poll-interval-secs", 1..=3600)?,
+        poll_interval_secs: count(
+            "--poll-interval-secs",
+            crate::config::MIN_POLL_INTERVAL_SECS..=3600,
+        )?,
         worker_name: flags.get("--worker-name").map(str::to_string),
         poll_token: given_token.clone(),
     };
@@ -1801,9 +1816,18 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
 
     println!("[8/8] doctor");
     let (checks, _) = doctor(smoke_image, INSTALL_SERVICE_WAIT_SECS)?;
-    let (text, healthy) = report(&checks);
+    let (text, _) = report(&checks);
     print!("{text}");
-    if !healthy {
+    for check in checks
+        .iter()
+        .filter(|c| !c.ok && !c.soft && c.name == "poll")
+    {
+        println!(
+            "note: the install is complete. {} The worker keeps trying and needs nothing done here.",
+            check.detail
+        );
+    }
+    if !install_healthy(&checks) {
         return Err(err(
             "the doctor found a problem. Run the `fix:` lines, then `shutup-and-run doctor`.",
         ));
@@ -1838,6 +1862,13 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     println!("page: http://{listen}/   config: shutup-and-run config show");
     println!("logs: shutup-and-run wsl logs");
     Ok(ExitCode::SUCCESS)
+}
+
+/// What makes an install fail. The poll URL is someone else's server: one
+/// that does not answer at this minute is reported, and the install, which
+/// did everything it does on this PC, still ends with 0.
+pub(crate) fn install_healthy(checks: &[Check]) -> bool {
+    checks.iter().all(|c| c.ok || c.soft || c.name == "poll")
 }
 
 pub(crate) fn service_answers(checks: &[Check]) -> bool {
@@ -1923,6 +1954,9 @@ fn refresh_host_backup() -> Option<JsonMap> {
     Some(map)
 }
 
+/// The desktop folder, asked of PowerShell as base64 of UTF-8. Printed as
+/// text it comes through the console's code page, and "Área de Trabalho"
+/// arrives as a folder that does not exist (error 3).
 fn desktop_dir() -> WslResult<PathBuf> {
     let out = run(
         "powershell.exe",
@@ -1930,16 +1964,26 @@ fn desktop_dir() -> WslResult<PathBuf> {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "[Environment]::GetFolderPath('Desktop')",
+            "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([Environment]::GetFolderPath('Desktop')))",
         ],
         None,
         SHORT,
     )?;
-    let dir = out.text().trim().to_string();
-    if !out.ok() || dir.is_empty() {
-        return Err(err("the desktop folder was not found"));
-    }
-    Ok(PathBuf::from(dir))
+    out.ok()
+        .then(|| path_from_base64(&out.text()))
+        .flatten()
+        .ok_or_else(|| err("the desktop folder was not found"))
+}
+
+/// A path PowerShell printed as base64 of its UTF-8 bytes.
+pub(crate) fn path_from_base64(text: &str) -> Option<PathBuf> {
+    use base64::Engine;
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(line)
+        .ok()?;
+    let path = String::from_utf8(bytes).ok()?;
+    (!path.trim().is_empty()).then(|| PathBuf::from(path.trim()))
 }
 
 fn write_shortcut(listen: &str) -> WslResult<PathBuf> {
@@ -2764,7 +2808,7 @@ mod tests {
     fn the_install_config_is_one_the_service_accepts() {
         let options = InstallOptions {
             poll_url: Some("https://orchestrator.example/poll?user=ana".into()),
-            poll_interval_secs: Some(20),
+            poll_interval_secs: Some(40),
             max_slots: Some(2),
             worker_name: None,
             poll_token: Some("b".repeat(32)),
@@ -2779,7 +2823,7 @@ mod tests {
             settings.poll_url.as_deref(),
             Some("https://orchestrator.example/poll?user=ana")
         );
-        assert_eq!(settings.poll_interval, Duration::from_secs(20));
+        assert_eq!(settings.poll_interval, Duration::from_secs(40));
         assert_eq!(settings.worker_name, "DESK-07");
         assert_eq!(settings.worker_os, "windows");
         assert!(settings.poll_token.is_some());
@@ -2988,6 +3032,62 @@ mod tests {
         assert!(asked.within());
         // A PC whose RAM cannot be read is treated as 8 GiB.
         assert_eq!(wsl_limits(None, 4, None, none).budget, (3276, 2));
+    }
+
+    #[test]
+    fn the_desktop_path_survives_accents_and_the_install_survives_a_silent_poll_url() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        // What PowerShell prints for a Portuguese OneDrive desktop.
+        let desktop = "C:\\Users\\José\\OneDrive\\Área de Trabalho";
+        let printed = format!("{}\r\n", b64(desktop));
+        let path = path_from_base64(&printed).unwrap();
+        assert_eq!(path, PathBuf::from(desktop));
+        assert!(path
+            .join(SHORTCUT_FILE)
+            .to_string_lossy()
+            .contains("Área de Trabalho"));
+        assert_eq!(
+            path_from_base64(&b64("C:\\Users\\Ana\\Desktop")).unwrap(),
+            PathBuf::from("C:\\Users\\Ana\\Desktop")
+        );
+        for bad in ["", "\r\n", "not base64 !!", &b64("   ")] {
+            assert!(path_from_base64(bad).is_none(), "{bad:?}");
+        }
+
+        // An upgrade whose poll URL does not answer this minute is complete.
+        let up = check("service", true, "running (idle)");
+        let silent = check(
+            "poll",
+            false,
+            "cannot reach https://q.example/poll: no answer in 8 s",
+        )
+        .coded("POLL_UNREACHABLE");
+        assert!(install_healthy(&[
+            up.clone(),
+            silent.clone(),
+            soft("task", false, "")
+        ]));
+        assert!(service_answers(&[up.clone(), silent]));
+        // Anything else that failed still fails it.
+        assert!(!install_healthy(&[up, check("docker", false, "down")]));
+
+        // A kept config with the old 2 s interval is raised by the install.
+        let mut old = JsonMap::new();
+        old.insert("poll_interval_secs".into(), serde_json::json!(2));
+        let options = InstallOptions {
+            poll_url: None,
+            max_slots: None,
+            poll_interval_secs: None,
+            worker_name: None,
+            poll_token: None,
+        };
+        let map = install_config(Some(&old), &options, "PC", "hello-world");
+        assert_eq!(map["poll_interval_secs"], 30);
+        assert_eq!(
+            install_config(None, &options, "PC", "hello-world").get("poll_interval_secs"),
+            None
+        );
     }
 
     #[test]

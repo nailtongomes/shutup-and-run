@@ -108,7 +108,7 @@ v0.1.0's `SHA256SUMS` named the file `dist/shutup-and-run-x86_64-unknown-linux-m
 
 Some machines cannot accept an inbound connection. The orchestrator already has the list of hosts for the ones that can. Adding a queue inside this process would throw away the "accept or refuse" decision above.
 
-When `poll_url` is unset, nothing calls out. When it is set, the process asks that URL for one task every `poll_interval_secs` (default 15), and only when a slot is free and the process is not draining. The returned object, if any, is the same JSON as `POST /v1/jobs` and goes through `launch`: allowlist, `job_key`, limits, `callback_url`. Empty responses and errors are logged. Errors back off, up to five minutes. The process does not exit. The poll body is capped at the same 64 KiB as a POST. Redirects are not followed.
+When `poll_url` is unset, nothing calls out. When it is set, the process asks that URL for one task every `poll_interval_secs` (default 30), and only when a slot is free and the process is not draining. The returned object, if any, is the same JSON as `POST /v1/jobs` and goes through `launch`: allowlist, `job_key`, limits, `callback_url`. Empty responses and errors are logged. Errors back off, up to five minutes. The process does not exit. The poll body is capped at the same 64 KiB as a POST. Redirects are not followed.
 
 `SHUTUP_AND_RUN_POLL_TOKEN` is environment only. A `poll_token` field in the TOML is an unknown field and startup fails. The URL is not logged, only its host. Credentials in the URL userinfo are rejected.
 
@@ -341,6 +341,19 @@ Some of the work these machines do is signing with the client's own A1 certifica
 - Diagnostic codes are a field added to each check. `name`, `status`, `detail`, `fix` and the exit codes are as they were.
 
 The cost: a demo container carries the worker's label, so a running service counts it against `max_slots` for the seconds it lives, and a service with pruning on could remove it first.
+
+## The poll interval has a floor of 30 seconds
+
+`poll_interval_secs` could be set to 1. The poll URL is one server for every worker, most of them clients' PCs configured by someone else, and a few machines at 2 seconds are a flood the server did not ask for. From 0.2.8 the minimum is 30 seconds and so is the default (it was 15). It is one constant, `config::MIN_POLL_INTERVAL_SECS`.
+
+- **Loading never fails on it.** A config written by an older release with a lower value still starts the worker, which polls every 30 seconds and says so: a `POLL_INTERVAL_RAISED` warning in `doctor` and `config check`, a `warning` in `config validate`, and `effective` in `config show`. Refusing to start would turn an upgrade into an outage on a PC nobody is sitting at.
+- **Writing a lower value is refused**, exit 3, by `config set`, the page and the install option, and the file is left as it was.
+- **The service does not rewrite the file.** `config.json` is written only by `config::save_json`, on a person's or an agent's command, and a service that edits its own config at start is a second writer with no one to report to. The migration happens at the first write instead: a save that finds the old low value still in the file raises it to 30 in that same write, and so does a re-install. Without that, an old install could not change any other key until someone fixed this one.
+- **It costs throughput.** A worker takes one task per poll, so a machine with four slots fills them in two minutes, not eight seconds. That is the trade the owner asked for. Rate limiting stays the orchestrator's job; this only removes the easy way to cause the problem.
+
+The tests paid for it too: the smoke test's poll check and the mock cycle now wait for real 30 second polls, about two more minutes of CI.
+
+Two fixes from the first run of 0.2.7 on a real PC ride along. An install whose poll URL does not answer at that minute ends with 0 and a note, because everything the install does on the PC worked and the URL is another machine. And the desktop folder is read from PowerShell as base64 of UTF-8: printed as text it came through the console code page, and `Área de Trabalho` became a folder that does not exist.
 
 ## Smoke test against a running instance
 

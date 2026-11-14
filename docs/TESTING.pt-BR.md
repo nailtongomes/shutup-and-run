@@ -8,9 +8,9 @@ Uma VPS Linux (sua, confiável) e um PC com Windows 11 (tratado como PC de clien
 
 As instalações de uma linha baixam da última release do GitHub.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a `v0.2.4` ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a versão do `Cargo.toml` (`v0.2.8` quando isto foi escrito) ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
-Se não estiver lá, crie a tag no `main`: `git tag v0.2.4 && git push origin v0.2.4`, e espere o workflow `release`.
+Se não estiver lá, crie a tag no `main`: `git tag v0.2.8 && git push origin v0.2.8` (a tag tem que ser a versão do `Cargo.toml`, porque o `.exe` baixa o binário Linux da própria versão), e espere o workflow `release`.
 
 ## 1. VPS Linux: push
 
@@ -111,7 +111,7 @@ Aprove a máquina, na VPS, na pasta onde o mock roda, com a linha que o mock imp
 echo <hash> >> approved.txt
 ```
 
-- [ ] Em até cinco minutos (o worker espaça as consultas enquanto é recusado) o mock imprime `TASK mock-...-1` e depois `ok   1/3 ... reason=exited exit=0`, três vezes, a cada 15 segundos, e então um `SUMMARY` com `ok 3`. Depois disso responde `204`.
+- [ ] Em até cinco minutos (o worker espaça as consultas enquanto é recusado) o mock imprime `TASK mock-...-1` e depois `ok   1/3 ... reason=exited exit=0`, três vezes, a cada 30 segundos, e então um `SUMMARY` com `ok 3`. Depois disso responde `204`.
 - [ ] `shutup-and-run wsl logs` mostra `poll started a job` três vezes.
 
 Instale de novo, mudando uma opção:
