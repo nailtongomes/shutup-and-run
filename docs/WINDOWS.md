@@ -239,7 +239,7 @@ Jobs that are running when you re-install are ended: the distribution is restart
 Each poll is a `POST` with the token and this body:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.9", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.10", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
 ```
 
 `cpus` and `memory_bytes` are what the WSL2 VM has, which is what the machine lends. The body has no address, because the worker only knows the VM's private one and could claim any other. The server takes the public address from the connection.

@@ -86,6 +86,9 @@ pub struct Launcher {
     /// Why the last poll failed, for status.json and the doctor. None after
     /// a poll that was answered.
     poll_error: std::sync::Mutex<Option<String>>,
+    /// When the last request to the poll URL was sent and how it ended:
+    /// `task`, `nothing`, `task_rejected`, `not_approved`, `error`.
+    last_poll: std::sync::Mutex<Option<(i64, &'static str)>>,
     /// Told when a job that ran has ended, so the poller can ask for the
     /// next one without waiting for its interval.
     job_ended: tokio::sync::Notify,
@@ -111,6 +114,7 @@ impl Launcher {
             timeouts: Mutex::new(HashSet::new()),
             starting: Mutex::new(HashSet::new()),
             poll_error: std::sync::Mutex::new(None),
+            last_poll: std::sync::Mutex::new(None),
             job_ended: tokio::sync::Notify::new(),
         }))
     }
@@ -196,6 +200,11 @@ impl Launcher {
         self.job_ended.notified().await
     }
 
+    /// Records a request to the poll URL: now, and how it ended.
+    pub fn note_poll(&self, status: &'static str) {
+        *self.last_poll.lock().expect("last poll") = Some((self.clock.now_unix() as i64, status));
+    }
+
     pub fn set_poll_error(&self, error: Option<String>) {
         *self.poll_error.lock().expect("poll error") = error;
     }
@@ -230,6 +239,7 @@ impl Launcher {
             docker_error,
             last,
             poll_error: self.poll_error.lock().expect("poll error").clone(),
+            last_poll: *self.last_poll.lock().expect("last poll"),
             waiting_for: self.shortage().map(|s| s.to_string()),
             limits: crate::status::Limits::of(&self.settings),
             config_warning: self.settings.config_warning.clone(),

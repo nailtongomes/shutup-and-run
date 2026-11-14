@@ -5,7 +5,7 @@ You are an AI agent setting up or repairing a shutup-and-run worker on someone's
 ## Rules of the CLI
 
 - Add `--json` to `config`, `status`, `doctor`, `jobs`, `pause` and `resume`: one JSON object on stdout, `"ok": true|false`, and `"error"`, `"code"` and `"hint"` when false.
-- `hint` is the next step: short, one concrete action, with the command when there is one. Run it if you have a shell; read it to the person if you are guiding one. Without `--json` it is the `hint:` line. Its language is the config key `language`: `shutup-and-run config set language pt` for Portuguese, `en` (the default) for English. The [catalogue](#codes-and-hints) lists every code.
+- `hint` is the next step: short, one concrete action, with the command when there is one. Run it if you have a shell; read it to the person if you are guiding one. Without `--json` it is the `hint:` line. Its language is the config key `language`: `shutup-and-run config set language pt` for Portuguese, `en` (the default) for English; `shutup-and-run wsl install --language pt` sets it at install. The local page opens in that language too, until the person presses its language button. The [catalogue](#codes-and-hints) lists every code.
 - Exit codes: `0` done. `1` it failed, or the doctor found a problem. `2` wrong command line. `3` invalid config or value; nothing was written.
 - `shutup-and-run config --help` documents every command. `shutup-and-run config keys` lists every key.
 - The config is one file, `config.json` (schema: [schemas/worker-config.schema.json](schemas/worker-config.schema.json)). On Windows it is inside the WSL distribution; the same commands reach it. Change it only with `shutup-and-run config`.
@@ -57,41 +57,15 @@ shutup-and-run demo --json                    # one container under the worker's
 shutup-and-run job validate task.json --json  # exit 3 and a code when this machine would refuse the task
 ```
 
-Each prints `ok`, a top-level `code`, and `checks[]` with `name`, `code`, `status`, `detail`, `fix`, `hint`. Act on `code`, show `detail` to a person, run `fix` (the exact command for this machine) or follow `hint` (the same step in the configured language). None of these changes the config or the job history. `demo` runs `hello-world`; with another image use `--image`, and if the answer is `DEMO_IMAGE_NOT_ALLOWED` its `fix` is the command that allows it. `job validate` is the static half of admission only: a `JOB_VALID` task can still meet a full or paused machine later.
-
-## Diagnostic codes
-
-`doctor --json`, `config check --json` and `demo --json` give every check a `code` that does not change between releases. A check that passed is `NAME_OK`. One that did not, and has no code of its own below, is `NAME_WARNING` or `NAME_FAILED`.
-
-| Code | Meaning | First thing to do |
-| --- | --- | --- |
-| `CONFIG_INVALID` | The config file does not validate | `shutup-and-run config validate`, then `config set` or `config reset` |
-| `CONFIG_FALLBACK_IN_USE` | The file was damaged; the service runs on an older copy or on defaults | `shutup-and-run config reset` |
-| `DOCKER_UNAVAILABLE` | Docker did not answer | Windows: `wsl stop`, `wsl start`. Linux: `systemctl start docker` |
-| `SERVICE_NOT_RUNNING`, `SERVICE_FAILED`, `SERVICE_PORT_IN_USE` | The service is down, crashed, or its port is taken | The check's `fix` |
-| `STORAGE_NOT_WRITABLE` | The service cannot write its history folder | Run as root; fix the folder's owner |
-| `LOW_MEMORY`, `LOW_DISK` | No new job starts until it clears | Wait, free disk, or lower `min_free_*` |
-| `SLOTS_EXCEED_MEMORY` | `max_slots` times `max_job_memory` does not fit | The `config set max_slots` in `fix` |
-| `POLL_INTERVAL_RAISED` | The config asks for a poll interval under 30 s, from an older release. The worker runs, on 30 | `shutup-and-run config set poll_interval_secs 30 --apply` |
-| `POLL_URL_UNSET` | No poll URL: the worker is idle | `config set poll_url URL --apply` |
-| `POLL_UNREACHABLE` | The poll URL's host did not answer. The network or the server, not the config | Check the network, DNS, the URL |
-| `POLL_NOT_APPROVED` | The server has not approved this machine | Nothing here: the owner approves it |
-| `POLL_HTTP_ERROR` | The poll URL answered 404, 405 or 5xx: a wrong path or a failing server. `config check` asks it once, with no token and no free slot | `config get poll_url --reveal`, then `config set poll_url URL --apply` |
-| `POLL_RATE_LIMITED` | The poll URL answered 429 | Nothing: the worker backs off by itself |
-| `POLL_ERROR` | The poll failed some other way | Check the URL and its query |
-| `WORKER_PAUSED` | Someone paused the worker | `shutup-and-run resume` |
-| `LOCAL_ADDRESS_BANNED`, `ADDRESS_BANNED` | Wrong tokens banned an address | `shutup-and-run bans lift IP` |
-| `WSL_UNAVAILABLE`, `DISTRIBUTION_MISSING`, `TASK_NOT_REGISTERED` | Windows: WSL, the distribution or the logon task is missing | `wsl --install --no-distribution`; `shutup-and-run wsl install`; `wsl task register` |
-| `WSL_LIMITS_ABOVE_BUDGET`, `WSL_LIMITS_NOT_IN_EFFECT` | `.wslconfig` lets WSL2 take too much, or WSL has not restarted | `shutup-and-run wsl limits --apply`; a restart of WSL |
-| `CERTIFICATE_MISSING`, `CERTIFICATE_INVALID`, `CERTIFICATE_PASSWORD_WRONG`, `CERTIFICATE_EXPIRED`, `CERTIFICATE_NO_PRIVATE_KEY` | Passthrough is on and the certificate cannot be used | `shutup-and-run certificate set --file PATH --accept-risk` with a good file, or `certificate disable` |
-| `OPENSSL_MISSING` | The openssl program is not installed where the service runs | `apt-get install -y openssl` |
-| `DEMO_IMAGE_NOT_ALLOWED`, `DEMO_IMAGE_UNAVAILABLE`, `DEMO_JOB_FAILED`, `DEMO_TIMEOUT`, `WORKER_BUSY`, `LIMITS_NOT_APPLIED`, `DEMO_CLEANUP_FAILED` | `demo`: which step failed | The check's `fix` |
-| `SIGNATURE_INVALID`, `CERTIFICATE_MOUNT_WRITABLE` | `demo sign`: the PDF did not verify, or the mount was not read-only | `doctor --report` and open the issue |
-| `JOB_VALID`, `JOB_INVALID_JSON`, `JOB_INVALID_FIELD`, `JOB_IMAGE_NOT_ALLOWED` | `job validate` | Fix the task, or the allowlist |
+Each prints `ok`, a top-level `code`, and `checks[]` with `name`, `code`, `status`, `detail`, `hint`. Act on `code`, show `detail` to a person, and do what `hint` says: it is the next step, with the command for this machine, in the configured language. None of these changes the config or the job history. `demo` runs `hello-world`; with another image use `--image`, and if the answer is `DEMO_IMAGE_NOT_ALLOWED` its `hint` is the command that allows it. `job validate` is the static half of admission only: a `JOB_VALID` task can still meet a full or paused machine later.
 
 ## Codes and hints
 
-Every error and warning code with its `hint`, in both languages, as the CLI prints it (`src/hints.rs`; a test keeps this table complete). A code that is not here gets the last line's hint. A check that passed is `NAME_OK` and has no hint.
+`doctor --json`, `config check --json` and `demo --json` give every check a `code` that does not change between releases, and every CLI failure has one too. A check that passed is `NAME_OK` and has no hint. One that did not, and has no code of its own, is `NAME_WARNING` or `NAME_FAILED`.
+
+Each code has one `hint`: the next step, in the configured language. `{}` is filled with what this machine needs: an address, an image, a number. This is the whole catalogue as the CLI prints it (`src/hints.rs`; a test keeps this table complete). A code that is not here gets the last line.
+
+The JSON also carries `fix`. It is the same sentence under the name 0.2.8 used; read `hint`.
 
 | Code | `hint` (en) | `hint` (pt) |
 | --- | --- | --- |
@@ -110,39 +84,39 @@ Every error and warning code with its `hint`, in both languages, as the CLI prin
 | `DOCKER_UNAVAILABLE` | Start Docker. Windows: `shutup-and-run wsl stop` then `shutup-and-run wsl start`. Linux: `sudo systemctl start docker`. | Inicie o Docker. Windows: `shutup-and-run wsl stop` e depois `shutup-and-run wsl start`. Linux: `sudo systemctl start docker`. |
 | `DOCKER_FAILED` | Windows: `shutup-and-run wsl stop` then `shutup-and-run wsl start`; still failing, `shutup-and-run wsl reset`. | Windows: `shutup-and-run wsl stop` e depois `shutup-and-run wsl start`; se continuar, `shutup-and-run wsl reset`. |
 | `SERVICE_PORT_IN_USE` | Pick another port: `shutup-and-run config set listen 127.0.0.1:8788`, then start the service again. | Escolha outra porta: `shutup-and-run config set listen 127.0.0.1:8788` e inicie o serviço de novo. |
-| `SERVICE_FAILED` | Fix the docker line first, then start the service: Windows `shutup-and-run wsl start`, Linux `sudo systemctl restart shutup-and-run`. | Corrija primeiro a linha do docker e inicie o serviço: Windows `shutup-and-run wsl start`, Linux `sudo systemctl restart shutup-and-run`. |
+| `SERVICE_FAILED` | Follow the docker line first if it failed, then start the service: Windows `shutup-and-run wsl start`, Linux `sudo systemctl restart shutup-and-run`. | Siga primeiro a linha do docker, se ela falhou, e inicie o serviço: Windows `shutup-and-run wsl start`, Linux `sudo systemctl restart shutup-and-run`. |
 | `SERVICE_NOT_RUNNING` | Start the service: Windows `shutup-and-run wsl start`, Linux `sudo systemctl restart shutup-and-run`. | Inicie o serviço: Windows `shutup-and-run wsl start`, Linux `sudo systemctl restart shutup-and-run`. |
 | `WORKER_PAUSED` | Run `shutup-and-run resume`. | Rode `shutup-and-run resume`. |
-| `LOCAL_ADDRESS_BANNED` | Run `shutup-and-run bans lift 127.0.0.1`, then check the token of whoever calls this machine. | Rode `shutup-and-run bans lift 127.0.0.1` e confira o token de quem chama esta máquina. |
+| `LOCAL_ADDRESS_BANNED` | Run `shutup-and-run bans lift {}`, then check the token of whoever calls this machine. | Rode `shutup-and-run bans lift {}` e confira o token de quem chama esta máquina. |
 | `ADDRESS_BANNED` | Only if one of the addresses is yours: `shutup-and-run bans lift IP`. | Só se um dos endereços for seu: `shutup-and-run bans lift IP`. |
 | `RESOURCES_FAILED` | Free memory or disk on this machine, or lower the need: `shutup-and-run config set max_slots 1 --apply`. | Libere memória ou disco nesta máquina, ou reduza a exigência: `shutup-and-run config set max_slots 1 --apply`. |
 | `RESOURCES_WARNING` | The worker waits until memory and disk are free again. Close heavy programs or free disk space. | O worker espera até haver memória e disco livres. Feche programas pesados ou libere espaço em disco. |
-| `LOW_MEMORY` | Close heavy programs on this machine, then try again; or lower the floor: `shutup-and-run config set min_free_memory 1g --apply`. | Feche programas pesados nesta máquina e tente de novo; ou reduza o mínimo: `shutup-and-run config set min_free_memory 1g --apply`. |
-| `LOW_DISK` | Free disk space: `docker image prune -af` (on Windows inside the distribution: `wsl -d shutup-and-run -u root docker image prune -af`). | Libere espaço em disco: `docker image prune -af` (no Windows, dentro da distribuição: `wsl -d shutup-and-run -u root docker image prune -af`). |
+| `LOW_MEMORY` | It clears when programs close or a job ends. To ask for less: `shutup-and-run config set min_free_memory 1g --apply`. On Windows, `shutup-and-run wsl limits` shows what WSL2 has. | Passa quando programas fecham ou uma tarefa termina. Para exigir menos: `shutup-and-run config set min_free_memory 1g --apply`. No Windows, `shutup-and-run wsl limits` mostra quanto o WSL2 tem. |
+| `LOW_DISK` | Free disk space: `docker image prune -af` (Windows: `wsl -d shutup-and-run -u root docker image prune -af`). To ask for less: `shutup-and-run config set min_free_disk 2g --apply`. | Libere espaço em disco: `docker image prune -af` (Windows: `wsl -d shutup-and-run -u root docker image prune -af`). Para exigir menos: `shutup-and-run config set min_free_disk 2g --apply`. |
 | `WORKER_BUSY` | Every slot is in use. Wait for the running job (`shutup-and-run jobs`) and try again. | Todos os slots estão em uso. Aguarde a tarefa em execução (`shutup-and-run jobs`) e tente de novo. |
-| `SLOTS_EXCEED_MEMORY` | Run `shutup-and-run config set max_slots 1 --apply`, or lower `max_job_memory`. | Rode `shutup-and-run config set max_slots 1 --apply`, ou reduza `max_job_memory`. |
+| `SLOTS_EXCEED_MEMORY` | Run `shutup-and-run config set max_slots {} --apply`, or lower `max_job_memory`. | Rode `shutup-and-run config set max_slots {} --apply`, ou reduza `max_job_memory`. |
 | `POLL_URL_UNSET` | Run `shutup-and-run config set poll_url URL --apply` with the URL the service gave you. | Rode `shutup-and-run config set poll_url URL --apply` com a URL que o serviço informou. |
-| `POLL_UNREACHABLE` | Check the internet and the address: `shutup-and-run config get poll_url --reveal`. Then `shutup-and-run doctor` again. | Confira a internet e o endereço: `shutup-and-run config get poll_url --reveal`. Depois rode `shutup-and-run doctor` de novo. |
-| `POLL_NOT_APPROVED` | Nothing to do on this machine: ask the service to approve this worker. It keeps asking by itself. | Nada a fazer nesta máquina: peça ao serviço para aprovar este worker. Ele continua tentando sozinho. |
+| `POLL_UNREACHABLE` | Check the internet and the address: `shutup-and-run config get poll_url --reveal`. On Windows, a URL on this PC or LAN is blocked by the firewall on a Public network (docs/FOR-AGENTS.md). | Confira a internet e o endereço: `shutup-and-run config get poll_url --reveal`. No Windows, uma URL neste PC ou na rede local é bloqueada pelo firewall em rede Pública (docs/FOR-AGENTS.md). |
+| `POLL_NOT_APPROVED` | Nothing to do on this machine: ask the service to approve worker {}. It keeps asking by itself. | Nada a fazer nesta máquina: peça ao serviço para aprovar o worker {}. Ele continua tentando sozinho. |
 | `POLL_HTTP_ERROR` | The poll URL answered with an error. Check the path and the query: `shutup-and-run config get poll_url --reveal`; fix with `shutup-and-run config set poll_url URL --apply`. | A poll URL respondeu com erro. Confira o caminho e os parâmetros: `shutup-and-run config get poll_url --reveal`; corrija com `shutup-and-run config set poll_url URL --apply`. |
 | `POLL_RATE_LIMITED` | The poll URL asked this machine to slow down (429). Wait: the worker backs off by itself. | A poll URL pediu para esta máquina ir mais devagar (429). Aguarde: o worker reduz o ritmo sozinho. |
 | `POLL_ERROR` | Check the URL and its query with `shutup-and-run config get poll_url --reveal`, then `shutup-and-run status`. | Confira a URL e seus parâmetros com `shutup-and-run config get poll_url --reveal` e depois `shutup-and-run status`. |
 | `JOB_INVALID_JSON` | Fix the JSON of the job file and run `shutup-and-run job validate FILE` again. | Corrija o JSON do arquivo da tarefa e rode `shutup-and-run job validate ARQUIVO` de novo. |
 | `JOB_INVALID_FIELD` | Fix the field named in the error; docs/INTEGRATION-CONTRACT.md lists the fields of a job. | Corrija o campo citado no erro; docs/INTEGRATION-CONTRACT.md lista os campos de uma tarefa. |
 | `JOB_IMAGE_NOT_ALLOWED` | Add the image: `shutup-and-run config set allowlist IMAGE --apply`, or validate as a polled task with `--poll`. | Adicione a imagem: `shutup-and-run config set allowlist IMAGEM --apply`, ou valide como tarefa da poll URL com `--poll`. |
-| `DEMO_IMAGE_NOT_ALLOWED` | Add the demo image: `shutup-and-run config set allowlist hello-world --apply`. | Adicione a imagem da demo: `shutup-and-run config set allowlist hello-world --apply`. |
+| `DEMO_IMAGE_NOT_ALLOWED` | Name an allowed image with `--image`, or allow this one: `shutup-and-run config set allowlist {} --apply`. | Indique uma imagem permitida com `--image`, ou permita esta: `shutup-and-run config set allowlist {} --apply`. |
 | `DEMO_JOB_INVALID` | Run `shutup-and-run config check` and fix what it reports. | Rode `shutup-and-run config check` e corrija o que ele apontar. |
 | `JOB_FAILED` | Run `shutup-and-run config check` and fix what it reports. | Rode `shutup-and-run config check` e corrija o que ele apontar. |
 | `ADMISSION_FAILED` | The machine is short of memory or disk, or paused. Run `shutup-and-run status` and free what it names. | A máquina está com pouca memória ou disco, ou pausada. Rode `shutup-and-run status` e libere o que ele citar. |
-| `DEMO_TIMEOUT` | The demo container did not finish in time. Check the internet (the image is downloaded) and run the demo again. | O container da demo não terminou a tempo. Confira a internet (a imagem é baixada) e rode a demo de novo. |
-| `CONTAINER_FAILED` | Run `shutup-and-run doctor`; if Docker is fine, run the demo again. | Rode `shutup-and-run doctor`; se o Docker estiver bem, rode a demo de novo. |
-| `DEMO_IMAGE_UNAVAILABLE` | The image could not be downloaded. Check the internet and run the demo again. | A imagem não pôde ser baixada. Confira a internet e rode a demo de novo. |
+| `DEMO_TIMEOUT` | The demo container did not finish in time. Run `docker rm -f shutup-and-run-{}`, check the internet, then `shutup-and-run doctor`. | O container da demo não terminou a tempo. Rode `docker rm -f shutup-and-run-{}`, confira a internet e depois `shutup-and-run doctor`. |
+| `CONTAINER_FAILED` | The image could not be downloaded or run. Check the internet of this machine (a restricted network may block the registry), then run the command again. | A imagem não pôde ser baixada ou executada. Confira a internet desta máquina (uma rede restrita pode bloquear o registro) e rode o comando de novo. |
+| `DEMO_IMAGE_UNAVAILABLE` | The image has to be downloaded once. Check the internet, or run `docker pull {}`, then the demo again. | A imagem precisa ser baixada uma vez. Confira a internet, ou rode `docker pull {}`, e depois a demo de novo. |
 | `IMAGE_FAILED` | The image could not be downloaded. Check the internet and run the demo again. | A imagem não pôde ser baixada. Confira a internet e rode a demo de novo. |
-| `DEMO_JOB_FAILED` | The demo container exited with an error. Run `shutup-and-run doctor`, then the demo again. | O container da demo terminou com erro. Rode `shutup-and-run doctor` e depois a demo de novo. |
+| `DEMO_JOB_FAILED` | The demo container exited with an error; its last lines are in `logs` (`--json`). Run `shutup-and-run doctor`, then the demo again. | O container da demo terminou com erro; as últimas linhas estão em `logs` (`--json`). Rode `shutup-and-run doctor` e depois a demo de novo. |
 | `LIMITS_NOT_APPLIED` | Docker did not apply the limits. Update Docker, or on Windows run `shutup-and-run wsl reset`. | O Docker não aplicou os limites. Atualize o Docker ou, no Windows, rode `shutup-and-run wsl reset`. |
 | `LIMITS_NOT_READ` | The limits could not be read back. Run the demo again; if it repeats, `shutup-and-run doctor --report`. | Não foi possível ler os limites. Rode a demo de novo; se repetir, `shutup-and-run doctor --report`. |
 | `LIMITS_FAILED` | Docker did not apply the limits. Update Docker, or on Windows run `shutup-and-run wsl reset`. | O Docker não aplicou os limites. Atualize o Docker ou, no Windows, rode `shutup-and-run wsl reset`. |
-| `DEMO_CLEANUP_FAILED` | A demo container was left behind. Remove it: `docker rm -f` the container named in the detail. | Um container da demo ficou para trás. Remova: `docker rm -f` no container citado no detalhe. |
+| `DEMO_CLEANUP_FAILED` | A demo container was left behind. Run `docker rm -f shutup-and-run-{}`. | Um container da demo ficou para trás. Rode `docker rm -f shutup-and-run-{}`. |
 | `CLEANUP_FAILED` | A demo container was left behind. Remove it: `docker rm -f` the container named in the detail. | Um container da demo ficou para trás. Remova: `docker rm -f` no container citado no detalhe. |
 | `DEMO_WORKSPACE` | The demo could not create its temporary folder. Run it as root (Linux: `sudo`) and check free disk. | A demo não conseguiu criar sua pasta temporária. Rode como root (Linux: `sudo`) e confira o disco livre. |
 | `WORKSPACE_FAILED` | The demo could not create its temporary folder. Run it as root (Linux: `sudo`) and check free disk. | A demo não conseguiu criar sua pasta temporária. Rode como root (Linux: `sudo`) e confira o disco livre. |
@@ -161,6 +135,7 @@ Every error and warning code with its `hint`, in both languages, as the CLI prin
 | `CERTIFICATE_MOUNT_WRITABLE` | The container could write to the certificate folder. Run `shutup-and-run doctor --report` and open the issue link. | O container conseguiu gravar na pasta do certificado. Rode `shutup-and-run doctor --report` e abra o link de issue. |
 | `MOUNT_FAILED` | The certificate was not visible in the container. Run `shutup-and-run certificate status` and the demo again. | O certificado não apareceu no container. Rode `shutup-and-run certificate status` e a demo de novo. |
 | `OPENSSL_MISSING` | Install openssl (Linux: `sudo apt-get install -y openssl`); on Windows run `shutup-and-run wsl reset`. | Instale o openssl (Linux: `sudo apt-get install -y openssl`); no Windows rode `shutup-and-run wsl reset`. |
+| `DEMO_SIGN_FAILED` | The signing demo needs an image with python3 and openssl: leave `--image` out to use the default. The container's last lines are in `logs` (`--json`). | A demo de assinatura precisa de uma imagem com python3 e openssl: não passe `--image` para usar a padrão. As últimas linhas do container estão em `logs` (`--json`). |
 | `WSL_UNAVAILABLE` | In an administrator PowerShell run `wsl --install --no-distribution`, restart the PC, then `shutup-and-run wsl install`. | Em um PowerShell de administrador rode `wsl --install --no-distribution`, reinicie o PC e depois `shutup-and-run wsl install`. |
 | `WSL_FAILED` | In an administrator PowerShell run `wsl --update`, restart the PC, then `shutup-and-run doctor`. | Em um PowerShell de administrador rode `wsl --update`, reinicie o PC e depois `shutup-and-run doctor`. |
 | `DISTRIBUTION_MISSING` | Run `shutup-and-run wsl install`. | Rode `shutup-and-run wsl install`. |
@@ -169,8 +144,8 @@ Every error and warning code with its `hint`, in both languages, as the CLI prin
 | `TASK_NOT_REGISTERED` | Run `shutup-and-run wsl task register` so the worker starts at logon. | Rode `shutup-and-run wsl task register` para o worker iniciar no logon. |
 | `TASK_WARNING` | Run `shutup-and-run wsl task register` so the worker starts at logon. | Rode `shutup-and-run wsl task register` para o worker iniciar no logon. |
 | `WSL_LIMITS_WARNING` | Run `shutup-and-run wsl limits` to see what WSL2 may take; `shutup-and-run wsl limits --apply` sets the budget. | Rode `shutup-and-run wsl limits` para ver quanto o WSL2 pode usar; `shutup-and-run wsl limits --apply` define o limite. |
-| `WSL_LIMITS_ABOVE_BUDGET` | Run `shutup-and-run wsl limits --apply`, then `wsl --shutdown` and `shutup-and-run wsl start`. | Rode `shutup-and-run wsl limits --apply`, depois `wsl --shutdown` e `shutup-and-run wsl start`. |
-| `WSL_LIMITS_NOT_IN_EFFECT` | Restart WSL so the limits apply: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`. | Reinicie o WSL para os limites valerem: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`. |
+| `WSL_LIMITS_ABOVE_BUDGET` | Run `shutup-and-run wsl limits --apply` (it keeps every other line of .wslconfig), then restart WSL yourself: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`. | Rode `shutup-and-run wsl limits --apply` (mantém as outras linhas do .wslconfig) e reinicie o WSL você mesmo: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`. |
+| `WSL_LIMITS_NOT_IN_EFFECT` | The limits apply when WSL restarts: `shutup-and-run wsl stop`, `wsl --shutdown` (it stops every WSL distribution of this user), `shutup-and-run wsl start`. | Os limites valem quando o WSL reinicia: `shutup-and-run wsl stop`, `wsl --shutdown` (para todas as distribuições WSL deste usuário), `shutup-and-run wsl start`. |
 | any other | Run `shutup-and-run doctor --report` and open the issue link it prints. | Rode `shutup-and-run doctor --report` e abra o link de issue que ele imprime. |
 
 ## Certificate passthrough (only when the owner asks)
@@ -228,10 +203,12 @@ None of this guarantees a responsive PC. The memory check reads the VM, not Wind
 ## Check that it works
 
 ```
-shutup-and-run status --json     # state: idle | active | draining | failed | stopped
-shutup-and-run doctor --json     # checks[], each with status ok|warn|fail, detail, fix, hint
+shutup-and-run status --json     # state: idle | active | draining | failed | stopped; last_poll_at, last_poll_status
+shutup-and-run doctor --json     # checks[], each with status ok|warn|fail, detail, hint
 shutup-and-run jobs --json       # the last 20 jobs and how each ended
 ```
+
+"Is it asking for work?" is `last_poll_at` and `last_poll_status` in `status --json`: when the last request went to the poll URL, and how it ended: `task`, `nothing`, `task_rejected` (a task came and this machine refused it), `not_approved` or `error`. Both are null while nothing was sent: no poll URL, or the worker is full, paused or short of memory or disk.
 
 `jobs` answers "did my petition run?". Newest first, `--limit N` up to 200:
 
@@ -250,7 +227,7 @@ The person at the PC sees the same at `http://127.0.0.1:8787/` (the desktop shor
 
 ## Problems already seen
 
-Run `shutup-and-run doctor` first. Every failed line has a `fix:`. The cases below are what those lines mean.
+Run `shutup-and-run doctor` first. Every failed line has a `hint:`. The cases below are what those lines mean.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
@@ -261,7 +238,7 @@ Run `shutup-and-run doctor` first. Every failed line has a `fix:`. The cases bel
 | `service` fails with "listen" or "in use" | Another program has port 8787 | `shutup-and-run config set listen 127.0.0.1:8788`, then on Windows `shutup-and-run wsl stop` and `shutup-and-run wsl start`. The desktop shortcut follows the port at the next `config apply`. |
 | `resources` warns: low on memory | Programs on the PC are using the memory. No new job starts; nothing is lost | It clears by itself. To ask for less: `shutup-and-run config set min_free_memory 1g --apply`. On Windows, `shutup-and-run wsl limits` shows what WSL2 has. |
 | `resources` warns: low on disk | Images and containers filled the disk | Windows: `wsl -d shutup-and-run -u root docker image prune -af`. Linux: `docker image prune -af`. Or `shutup-and-run config set min_free_disk 2g --apply`. |
-| `resources` warns: N jobs of X each is more than this machine has | `max_slots` times `max_job_memory` does not fit | Run the `config set max_slots` command in its `fix`. |
+| `resources` warns: N jobs of X each is more than this machine has | `max_slots` times `max_job_memory` does not fit | Run the `config set max_slots` command in its `hint`. |
 | `wsl-limits` warns | `.wslconfig` is missing, or lets WSL2 take more than 40% of the RAM or half the processors | `shutup-and-run wsl limits --apply`, then WSL has to restart (see above). "not in effect yet" needs only the restart. |
 | Jobs never start, and the log says `poll task rejected` | The task asks for more `cpu` or `memory` than `max_job_cpus` / `max_job_memory` | The owner sends a smaller task, or raise the limit: `shutup-and-run config set max_job_memory 3g --apply`. |
 | `paused` warns | Someone paused the worker on the page and forgot | `shutup-and-run resume`. A restart of the PC also resumes it. |

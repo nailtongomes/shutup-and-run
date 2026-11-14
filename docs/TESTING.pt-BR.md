@@ -8,9 +8,9 @@ Uma VPS Linux (sua, confiável) e um PC com Windows 11 (tratado como PC de clien
 
 As instalações de uma linha baixam da última release do GitHub.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a versão do `Cargo.toml` (`v0.2.9` quando isto foi escrito) ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a versão do `Cargo.toml` (`v0.2.10` quando isto foi escrito) ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
-Se não estiver lá, crie a tag no `main`: `git tag v0.2.9 && git push origin v0.2.9` (a tag tem que ser a versão do `Cargo.toml`, porque o `.exe` baixa o binário Linux da própria versão), e espere o workflow `release`.
+Se não estiver lá: o workflow `release` roda sozinho quando o `main` recebe uma versão do `Cargo.toml` que ainda não tem release, cria a tag e publica. Veja a última execução em Actions; "Run workflow" no `main` repete uma que falhou. Ninguém cria tag à mão.
 
 ## 1. VPS Linux: push
 
@@ -135,6 +135,7 @@ Abra um segundo PowerShell, rode `shutup-and-run wsl stop` e depois `shutup-and-
 - [ ] `shutup-and-run config set max_slots 0 --json` sai com 3, `"code":"INVALID_VALUE"` e um `"hint"`.
 - [ ] `shutup-and-run config set poll_url "http://IP_DA_SUA_VPS:8080/poll?cpf=00000000000&email=nobody@example.com" --apply`. O mock continua respondendo. `shutup-and-run config show`, `shutup-and-run doctor --report` e a Configuração da página mostram `?cpf=***&email=***`; nenhum mostra `00000000000`. `shutup-and-run config get poll_url --reveal` mostra a URL inteira. Salvar o formulário da página sem mexer mantém a URL.
 - [ ] `shutup-and-run config set poll_url "http://IP_DA_SUA_VPS:8080/nope" --json`, depois `shutup-and-run config check --json`: a linha `poll` é `POLL_HTTP_ERROR` com `HTTP 404`, não `POLL_OK`. Volte a URL certa com `--apply`.
+- [ ] 0.2.10: `shutup-and-run status --json` tem `last_poll_at` (segundos atrás, não minutos) e `last_poll_status` (`nothing` com a fila vazia). `shutup-and-run doctor --json`: toda linha que não está ok tem um `hint`, e `fix` é o mesmo texto. Depois de `config set language pt --apply`, a página em `http://127.0.0.1:8787/` abre em português num navegador que nunca apertou o botão de idioma.
 - [ ] `shutup-and-run wsl install --poll-interval-secs 5` sai com 3 (`$LASTEXITCODE`), diz `at least 30`, e não muda nada.
 
 O mesmo cadastro, fila e callback contra o n8n, sem o mock: [examples/n8n/README.md](../examples/n8n/README.md#7-smoke-test).

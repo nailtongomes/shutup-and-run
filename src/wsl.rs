@@ -135,7 +135,7 @@ pub fn usage() -> &'static str {
 shutup-and-run wsl doctor [--smoke-image IMAGE] [--json] [--report]
     check WSL2, the shutup-and-run distribution, Docker inside it, run one
     container as a smoke test, then the config, the service, a forgotten
-    pause, bans and the poll URL. Every failed line has a `fix:`. --report
+    pause, bans and the poll URL. Every failed line has a `hint:`. --report
     adds a report without secrets and a link that opens a GitHub issue.
     Exit 1 when something is wrong. `shutup-and-run doctor` is the same.
 
@@ -151,6 +151,7 @@ shutup-and-run wsl install [--poll-url URL] [options]
     Afterwards the config changes with `shutup-and-run config set`, not here.
       --max-slots N              containers at once (default 1)
       --poll-interval-secs N     default 30, and not less
+      --language en|pt           language of the hints and of the local page (default en)
       --worker-name NAME         default: the computer name
       --smoke-image IMAGE        default hello-world
       --rootfs PATH              a downloaded Ubuntu WSL rootfs (skips the download)
@@ -634,6 +635,8 @@ pub(crate) struct InstallOptions {
     pub max_slots: Option<u64>,
     pub worker_name: Option<String>,
     pub poll_token: Option<String>,
+    /// `en` or `pt`: the language of the hints and the page's default.
+    pub language: Option<String>,
 }
 
 /// config.json for this machine: the config it already has, or the factory
@@ -679,6 +682,9 @@ pub(crate) fn install_config(
     }
     if let Some(token) = &options.poll_token {
         map.insert("poll_token".into(), json!(token));
+    }
+    if let Some(language) = &options.language {
+        map.insert("language".into(), json!(language));
     }
     // An install is a write: an interval kept from a release that allowed
     // less than the minimum is raised here, once.
@@ -995,8 +1001,7 @@ pub(crate) fn wsl_limits_check(limits: &WslLimits, vm: Option<(u64, u64)>) -> Ch
             false,
             format!(".wslconfig: {}. {host}{now}", limits.problems.join("; ")),
         )
-        .coded("WSL_LIMITS_ABOVE_BUDGET")
-        .fix(format!("{LIMITS_APPLY}. Then {WSL_RESTART}"));
+        .coded("WSL_LIMITS_ABOVE_BUDGET");
     }
     // The file is right. Is the VM still running on what it had before?
     let budget_bytes = limits.budget.0 * 1024 * 1024;
@@ -1007,8 +1012,7 @@ pub(crate) fn wsl_limits_check(limits: &WslLimits, vm: Option<(u64, u64)>) -> Ch
                 false,
                 format!(".wslconfig is within the budget, but not in effect yet. {host}{now}"),
             )
-            .coded("WSL_LIMITS_NOT_IN_EFFECT")
-            .fix(WSL_RESTART);
+            .coded("WSL_LIMITS_NOT_IN_EFFECT");
         }
     }
     soft("wsl-limits", true, format!("{host}{now}"))
@@ -1313,26 +1317,16 @@ fn doctor(
     service_wait_secs: u32,
 ) -> WslResult<(Vec<Check>, Option<serde_json::Value>)> {
     let mut checks = Vec::new();
-    const INSTALL: &str = "`shutup-and-run wsl install` (safe to run again; it keeps the config)";
-    const RESET: &str = "`shutup-and-run wsl reset` rebuilds the distribution and keeps the config";
 
     let status = match wsl_status() {
         Ok(out) => out,
         Err(e) => {
-            checks.push(
-                check("wsl", false, e.to_string())
-                    .coded("WSL_UNAVAILABLE")
-                    .fix("run `wsl --install --no-distribution` as administrator and reboot"),
-            );
+            checks.push(check("wsl", false, e.to_string()).coded("WSL_UNAVAILABLE"));
             return Ok((checks, None));
         }
     };
     if !status.ok() {
-        checks.push(
-            check("wsl", false, status.one_line())
-                .coded("WSL_UNAVAILABLE")
-                .fix("run `wsl --install --no-distribution` as administrator and reboot"),
-        );
+        checks.push(check("wsl", false, status.one_line()).coded("WSL_UNAVAILABLE"));
         return Ok((checks, None));
     }
     checks.push(check("wsl", true, status.one_line()));
@@ -1344,21 +1338,17 @@ fn doctor(
             format!("{DISTRO} ({})", d.state),
         )),
         Some(d) => {
-            checks.push(
-                check(
-                    "distribution",
-                    false,
-                    format!("{DISTRO} is WSL version {}; it must be 2", d.version),
-                )
-                .fix(RESET),
-            );
+            checks.push(check(
+                "distribution",
+                false,
+                format!("{DISTRO} is WSL version {}; it must be 2", d.version),
+            ));
             return Ok((checks, None));
         }
         None => {
             checks.push(
                 check("distribution", false, format!("{DISTRO} is not registered"))
-                    .coded("DISTRIBUTION_MISSING")
-                    .fix(INSTALL),
+                    .coded("DISTRIBUTION_MISSING"),
             );
             return Ok((checks, None));
         }
@@ -1372,13 +1362,7 @@ fn doctor(
         DISTRO_START,
     )?;
     if !docker.ok() {
-        checks.push(
-            check("docker", false, docker.one_line())
-                .coded("DOCKER_UNAVAILABLE")
-                .fix(format!(
-            "`shutup-and-run wsl stop`, then `shutup-and-run wsl start`. Still failing: {RESET}"
-        )),
-        );
+        checks.push(check("docker", false, docker.one_line()).coded("DOCKER_UNAVAILABLE"));
         return Ok((checks, None));
     }
     checks.push(check(
@@ -1406,35 +1390,26 @@ fn doctor(
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    checks.push(
-        check(
-            "container",
-            smoke.ok(),
-            if smoke.ok() {
-                format!("{smoke_image} ran: {first}")
-            } else {
-                format!("{smoke_image}: {}", smoke.one_line())
-            },
-        )
-        .fix(
-            "the image could not be pulled or run: check the internet connection of this PC \
-         (a restricted network may block the registry), then run the doctor again",
-        ),
-    );
+    checks.push(check(
+        "container",
+        smoke.ok(),
+        if smoke.ok() {
+            format!("{smoke_image} ran: {first}")
+        } else {
+            format!("{smoke_image}: {}", smoke.one_line())
+        },
+    ));
 
     let bin = in_distro(&[INNER_BIN, "--help"], None, DISTRO_START)?;
-    checks.push(
-        check(
-            "binary",
-            bin.ok(),
-            if bin.ok() {
-                INNER_BIN.to_string()
-            } else {
-                format!("{INNER_BIN}: {}", bin.one_line())
-            },
-        )
-        .fix(INSTALL),
-    );
+    checks.push(check(
+        "binary",
+        bin.ok(),
+        if bin.ok() {
+            INNER_BIN.to_string()
+        } else {
+            format!("{INNER_BIN}: {}", bin.one_line())
+        },
+    ));
 
     // Right after an install the task has just started and the service is
     // still waiting for dockerd, so its first status file gets some seconds.
@@ -1455,14 +1430,11 @@ fn doctor(
                 // Docker was checked above, from the outside.
                 .filter(|c| c.name != "docker"),
         ),
-        None => checks.push(
-            check(
-                "config",
-                false,
-                "the binary in the distribution has no doctor",
-            )
-            .fix(INSTALL),
-        ),
+        None => checks.push(check(
+            "config",
+            false,
+            "the binary in the distribution has no doctor",
+        )),
     }
 
     let task = run("schtasks.exe", &["/Query", "/TN", TASK_NAME], None, SHORT);
@@ -1473,8 +1445,7 @@ fn doctor(
             false,
             format!("{TASK_NAME} is not registered, so the worker does not start at logon"),
         )
-        .coded("TASK_NOT_REGISTERED")
-        .fix("`shutup-and-run wsl task register`"),
+        .coded("TASK_NOT_REGISTERED"),
         Err(e) => soft("task", false, e.to_string()),
     });
     checks.push(wsl_limits_check(
@@ -1516,6 +1487,7 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
             "--poll-url",
             "--max-slots",
             "--poll-interval-secs",
+            "--language",
             "--worker-name",
             "--smoke-image",
             "--rootfs",
@@ -1553,12 +1525,22 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
             return Ok(ExitCode::from(crate::cli::EXIT_INVALID));
         }
     };
+    let language = flags.get("--language").map(str::to_string);
+    if let Some(other) = language.as_deref().filter(|l| !matches!(*l, "en" | "pt")) {
+        eprintln!("shutup-and-run wsl: --language must be en or pt, not {other}: nothing was installed or changed");
+        eprintln!("hint: {}", crate::hints::hint("INVALID_VALUE"));
+        return Ok(ExitCode::from(crate::cli::EXIT_INVALID));
+    }
+    if let Some(language) = &language {
+        crate::hints::set_language(language);
+    }
     let mut options = InstallOptions {
         poll_url: poll_url.clone(),
         max_slots: count("--max-slots", 1..=256)?,
         poll_interval_secs,
         worker_name: flags.get("--worker-name").map(str::to_string),
         poll_token: given_token.clone(),
+        language,
     };
     let computer = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-worker".to_string());
     let smoke_image = flags.get("--smoke-image").unwrap_or(DEFAULT_SMOKE_IMAGE);
@@ -1855,7 +1837,7 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     }
     if !install_healthy(&checks) {
         return Err(err(
-            "the doctor found a problem. Run the `fix:` lines, then `shutup-and-run doctor`.",
+            "the doctor found a problem. Follow the `hint:` lines, then `shutup-and-run doctor`.",
         ));
     }
     // Step 6 removed the old status file, so a service the doctor saw
@@ -2270,7 +2252,7 @@ pub fn forward_with_files(args: &[String]) -> ExitCode {
             if answer["ok"] == true {
                 "signing demo passed"
             } else {
-                "signing demo failed: run the `fix:` under each FAIL"
+                "signing demo failed: follow the `hint:` under each FAIL"
             }
         );
     }
@@ -2858,6 +2840,7 @@ mod tests {
             max_slots: Some(2),
             worker_name: None,
             poll_token: Some("b".repeat(32)),
+            language: None,
         };
         let map = install_config(None, &options, "DESK-07", "hello-world");
         let settings = crate::config::Settings::from_json_map(&map).unwrap();
@@ -2975,6 +2958,23 @@ mod tests {
             assert!(said.contains("at least 30"), "{bad}: {said}");
         }
 
+        // `--language pt` is the config key `language`.
+        let portuguese = install_config(
+            None,
+            &InstallOptions {
+                language: Some("pt".into()),
+                ..InstallOptions::default()
+            },
+            "X",
+            "hello-world",
+        );
+        assert_eq!(
+            crate::config::Settings::from_json_map(&portuguese)
+                .unwrap()
+                .language,
+            "pt"
+        );
+
         // A pairing query in the poll URL goes into the config whole.
         let paired = install_config(
             None,
@@ -3082,8 +3082,8 @@ mod tests {
         assert_eq!(limits.problems.len(), 2);
         let check = wsl_limits_check(&limits, None);
         assert!(!check.ok && check.soft);
-        assert!(check.fix.contains("shutup-and-run wsl limits --apply"));
-        assert!(check.fix.contains("wsl --shutdown"));
+        assert!(check.hint().contains("shutup-and-run wsl limits --apply"));
+        assert!(check.hint().contains("wsl --shutdown"));
 
         // A file above the budget, and one the owner set lower.
         let limits = wsl_limits(
@@ -3119,7 +3119,7 @@ mod tests {
         let stale = wsl_limits_check(&lower, Some((8 * GIB, 8)));
         assert!(!stale.ok && stale.soft);
         assert!(stale.detail.contains("not in effect yet"));
-        assert!(!stale.fix.contains("--apply"));
+        assert!(!stale.hint().contains("--apply"));
 
         // What the operator asked for replaces the worked-out budget.
         let asked = wsl_limits(
@@ -3180,6 +3180,7 @@ mod tests {
             poll_interval_secs: None,
             worker_name: None,
             poll_token: None,
+            language: None,
         };
         let map = install_config(Some(&old), &options, "PC", "hello-world");
         assert_eq!(map["poll_interval_secs"], 30);
@@ -3372,8 +3373,8 @@ mod tests {
 
         // The install insists on a service the doctor saw running.
         let up = check("service", true, "running (idle)");
-        let down = check("service", false, "not running").fix("`shutup-and-run wsl start`");
-        assert_eq!(down.fix, "`shutup-and-run wsl start`");
+        let down = check("service", false, "not running");
+        assert!(down.hint().contains("`shutup-and-run wsl start`"));
         assert!(!service_answers(&[check("wsl", true, ""), down]));
         assert!(service_answers(&[check("wsl", true, ""), up]));
     }

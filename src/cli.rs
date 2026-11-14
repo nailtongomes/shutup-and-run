@@ -59,7 +59,7 @@ shutup-and-run status
     Exit 1 when it is not running.
 shutup-and-run doctor [--report]
     check the config, Docker, the service, a forgotten pause, bans and the
-    poll URL. Every failed line has a `fix:` with the command to run.
+    poll URL. Every failed line has a `hint:` with the command to run.
     --report also prints a diagnostic report with secrets masked and a URL
     that opens a new GitHub issue with it filled in. Exit 1 when unhealthy.
 shutup-and-run pause | resume
@@ -420,14 +420,8 @@ pub fn poll_interval_note(settings: &Settings) -> Option<String> {
 }
 
 fn poll_interval_check(settings: &Settings) -> Option<Check> {
-    poll_interval_note(settings).map(|note| {
-        soft("poll-interval", false, note)
-            .coded("POLL_INTERVAL_RAISED")
-            .fix(format!(
-                "`shutup-and-run config set poll_interval_secs {} --apply`",
-                config::MIN_POLL_INTERVAL_SECS
-            ))
-    })
+    poll_interval_note(settings)
+        .map(|note| soft("poll-interval", false, note).coded("POLL_INTERVAL_RAISED"))
 }
 
 fn written(path: &Path, map: &JsonMap, name: &str) -> Out {
@@ -614,6 +608,12 @@ pub fn status_out(path: &Path, now: i64) -> Out {
     {
         text.push_str(&format!("limits: {}\n", limits.line()));
     }
+    if let (Some(at), Some(how)) = (
+        status["last_poll_at"].as_str(),
+        status["last_poll_status"].as_str(),
+    ) {
+        text.push_str(&format!("last poll: {at} ({how})\n"));
+    }
     for field in ["last_error", "poll_error", "waiting_for", "config_warning"] {
         if let Some(value) = status[field].as_str() {
             text.push_str(&format!("{field}: {value}\n"));
@@ -645,8 +645,9 @@ pub struct Check {
     pub soft: bool,
     /// What was found: the cause, when it failed.
     pub detail: String,
-    /// The command or the step that fixes it. Empty when it is fine.
-    pub fix: String,
+    /// What the hint of this check's code names: an address, an image, a
+    /// number. It fills the `{}` of the catalogue's sentence.
+    pub arg: String,
     /// A stable identifier of what was found, for a program: `DOCKER_UNAVAILABLE`.
     /// Empty means the default, the name and the outcome: `DOCKER_OK`.
     pub code: String,
@@ -661,7 +662,7 @@ pub fn check(name: &str, ok: bool, detail: impl Into<String>) -> Check {
         ok,
         soft: false,
         detail: detail.into(),
-        fix: String::new(),
+        arg: String::new(),
         code: String::new(),
         hint: String::new(),
     }
@@ -675,9 +676,10 @@ pub fn soft(name: &str, ok: bool, detail: impl Into<String>) -> Check {
 }
 
 impl Check {
-    pub fn fix(mut self, fix: impl Into<String>) -> Self {
+    /// The detail the hint names. Kept only on a check that is not ok.
+    pub fn with(mut self, arg: impl Into<String>) -> Self {
         if !self.ok {
-            self.fix = fix.into();
+            self.arg = arg.into();
         }
         self
     }
@@ -712,7 +714,7 @@ impl Check {
         } else if !self.hint.is_empty() {
             self.hint.clone()
         } else {
-            crate::hints::hint(&self.code()).to_string()
+            crate::hints::hint(&self.code()).replace("{}", &self.arg)
         }
     }
 
@@ -740,9 +742,6 @@ pub fn report(checks: &[Check]) -> (String, bool) {
             }
         };
         text.push_str(&format!("{mark} {:<22} {}\n", c.name, c.detail));
-        if !c.fix.is_empty() {
-            text.push_str(&format!("     {:<22} fix: {}\n", "", c.fix));
-        }
         if !c.ok {
             text.push_str(&format!("     {:<22} hint: {}\n", "", c.hint()));
         }
@@ -759,8 +758,9 @@ pub fn checks_json(checks: &[Check]) -> Value {
                 "code": c.code(),
                 "status": c.mark(),
                 "detail": c.detail,
-                "fix": if c.fix.is_empty() { Value::Null } else { Value::String(c.fix.clone()) },
                 "hint": if c.ok { Value::Null } else { Value::String(c.hint()) },
+                // The same sentence under its old name, for a reader of 0.2.8.
+                "fix": if c.ok { Value::Null } else { Value::String(c.hint()) },
             })
         })
         .collect()
@@ -776,7 +776,7 @@ pub fn checks_from_json(value: &Value) -> Vec<Check> {
                     ok: c["status"] == "ok",
                     soft: c["status"] == "warn",
                     detail: c["detail"].as_str().unwrap_or("").to_string(),
-                    fix: c["fix"].as_str().unwrap_or("").to_string(),
+                    arg: String::new(),
                     code: c["code"].as_str().unwrap_or("").to_string(),
                     hint: c["hint"].as_str().unwrap_or("").to_string(),
                 })
@@ -913,7 +913,7 @@ pub fn doctor_out(
         .iter()
         .map(|c| Check {
             detail: scrub(&c.detail, secrets),
-            fix: scrub(&c.fix, secrets),
+            hint: scrub(&c.hint(), secrets),
             ..c.clone()
         })
         .collect();
@@ -925,7 +925,7 @@ pub fn doctor_out(
     text.push_str(if healthy {
         "the worker is ready"
     } else {
-        "something is wrong: run the `fix:` under each FAIL, then the doctor again.\n\
+        "something is wrong: follow the `hint:` under each FAIL, then run the doctor again.\n\
          Still failing? `shutup-and-run doctor --report` prints a report and an issue link."
     });
     if with_report {
@@ -1012,11 +1012,7 @@ pub async fn base_checks() -> (Found, Option<Settings>) {
             }
             match read.and_then(|map| Settings::from_json_map(&map)) {
                 Ok(_) => checks.push(check("config", true, path.display().to_string())),
-                Err(err) => checks.push(check("config", false, err.0).coded("CONFIG_INVALID").fix(
-                    "`shutup-and-run config validate` names the bad value; set it again with \
-                     `shutup-and-run config set KEY VALUE`, or `shutup-and-run config reset` \
-                     for the factory defaults",
-                )),
+                Err(err) => checks.push(check("config", false, err.0).coded("CONFIG_INVALID")),
             }
             Some(Settings::load_json(path))
         }
@@ -1026,15 +1022,11 @@ pub async fn base_checks() -> (Found, Option<Settings>) {
                 Some(settings)
             }
             Err(err) => {
-                checks.push(check("config", false, err.0).coded("CONFIG_INVALID").fix(
-                    "fix /etc/shutup-and-run/config.toml or the environment, and run this as \
-                     root with the service's environment",
-                ));
+                checks.push(check("config", false, err.0).coded("CONFIG_INVALID"));
                 None
             }
         },
     };
-    let on_windows = settings.as_ref().is_some_and(|s| s.worker_os == "windows");
 
     let docker = match crate::bollard_rt::connect_docker() {
         Ok(docker) => tokio::time::timeout(Duration::from_secs(10), docker.ping())
@@ -1045,14 +1037,7 @@ pub async fn base_checks() -> (Found, Option<Settings>) {
     };
     checks.push(match docker {
         Ok(()) => check("docker", true, "answers"),
-        Err(err) => check("docker", false, err)
-            .coded("DOCKER_UNAVAILABLE")
-            .fix(if on_windows {
-                "`shutup-and-run wsl stop`, then `shutup-and-run wsl start`. Still failing: \
-             `shutup-and-run wsl reset` rebuilds the distribution"
-            } else {
-                "`systemctl start docker`, and run this as root"
-            }),
+        Err(err) => check("docker", false, err).coded("DOCKER_UNAVAILABLE"),
     });
 
     checks.extend(settings.as_ref().and_then(poll_interval_check));
@@ -1067,18 +1052,9 @@ pub async fn base_checks() -> (Found, Option<Settings>) {
     )
 }
 
-fn start_hint(settings: &Settings) -> &'static str {
-    if settings.worker_os == "windows" {
-        "`shutup-and-run wsl start`"
-    } else {
-        "`systemctl restart shutup-and-run`"
-    }
-}
-
 /// What only a running service can answer: its state, a pause, bans, the
 /// poll URL as the service last saw it.
 async fn service_checks(found: &mut Found, settings: &Settings) {
-    let start = start_hint(settings);
     let mut checks = std::mem::take(&mut found.checks);
     let status = read_status(&crate::status::status_path(&settings.history_path));
     let now = crate::status::now_unix();
@@ -1096,21 +1072,12 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
             format!("running ({state}), listening on {}", settings.listen),
         ),
         Some("failed") if last_error.contains("listen") || last_error.contains("in use") => {
-            check("service", false, format!("failed: {last_error}"))
-                .coded("SERVICE_PORT_IN_USE")
-                .fix(format!(
-            "the port is taken. Pick another: `shutup-and-run config set listen 127.0.0.1:8788`, \
-                 then {start}"
-        ))
+            check("service", false, format!("failed: {last_error}")).coded("SERVICE_PORT_IN_USE")
         }
-        Some("failed") => check("service", false, format!("failed: {last_error}"))
-            .coded("SERVICE_FAILED")
-            .fix(format!(
-                "{start}. If Docker is the cause, fix the docker line first"
-            )),
-        _ => check("service", false, "not running")
-            .coded("SERVICE_NOT_RUNNING")
-            .fix(start),
+        Some("failed") => {
+            check("service", false, format!("failed: {last_error}")).coded("SERVICE_FAILED")
+        }
+        _ => check("service", false, "not running").coded("SERVICE_NOT_RUNNING"),
     });
     checks.push(resources_check(
         settings,
@@ -1119,11 +1086,7 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
     ));
     checks.extend(certificate_check(settings));
     if let Some(warning) = &settings.config_warning {
-        checks.push(
-            soft("config-in-use", false, warning.clone())
-                .coded("CONFIG_FALLBACK_IN_USE")
-                .fix("`shutup-and-run config reset`, then set the poll URL again"),
-        );
+        checks.push(soft("config-in-use", false, warning.clone()).coded("CONFIG_FALLBACK_IN_USE"));
     }
 
     // The flag itself, not the status file, which is up to a second behind.
@@ -1133,9 +1096,7 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
             .unwrap_or(false);
     if paused {
         checks.push(
-            soft("paused", false, "the worker is paused and takes no work")
-                .coded("WORKER_PAUSED")
-                .fix("`shutup-and-run resume`"),
+            soft("paused", false, "the worker is paused and takes no work").coded("WORKER_PAUSED"),
         );
     }
 
@@ -1154,52 +1115,50 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
                         ),
                     )
                     .coded("LOCAL_ADDRESS_BANNED")
-                    .fix(format!("`shutup-and-run bans lift {local}`")),
+                    .with(local.clone()),
                 );
             } else if !ips.is_empty() {
                 checks.push(
                     soft("bans", false, format!("banned: {}", ips.join(", ")))
-                        .coded("ADDRESS_BANNED")
-                        .fix("`shutup-and-run bans lift IP` if one of them is yours"),
+                        .coded("ADDRESS_BANNED"),
                 );
             }
         }
     }
 
     match &settings.poll_url {
-        None => checks.push(
-            soft("poll", false, "no poll URL: the worker is idle")
-                .coded("POLL_URL_UNSET")
-                .fix("`shutup-and-run config set poll_url URL --apply`"),
-        ),
-        Some(url) => {
+        None => checks
+            .push(soft("poll", false, "no poll URL: the worker is idle").coded("POLL_URL_UNSET")),
+        Some(raw_url) => {
+            let url = raw_url;
             let reach = reach(url).await;
             // The query pairs the machine with a person: never printed.
             let url = &config::mask_query(url);
             let poll_error = fresh.and_then(|s| s["poll_error"].as_str());
             checks.push(match (reach, poll_error) {
-                (Err(err), _) => check("poll", false, format!("cannot reach {url}: {err}")).coded("POLL_UNREACHABLE").fix(
-                    "check the URL (`shutup-and-run config get poll_url --reveal`), the internet and DNS. \
-                     On Windows, when the URL is on this PC or this LAN, the Windows firewall \
-                     blocks WSL on a Public network: see docs/FOR-AGENTS.md",
-                ),
+                (Err(err), _) => check("poll", false, format!("cannot reach {url}: {err}"))
+                    .coded("POLL_UNREACHABLE"),
                 (Ok(()), Some(err)) if err.contains("not approved") => soft(
                     "poll",
                     false,
                     format!("{url} answers, and has not approved this machine ({err})"),
                 )
                 .coded("POLL_NOT_APPROVED")
-                .fix(format!(
-                    "approve worker {} at the poll URL; nothing to do on this machine",
-                    settings.worker_name
-                )),
+                .with(settings.worker_name.clone()),
                 (Ok(()), Some(err)) => match http_status_in(err) {
                     Some(status) => poll_answer_check(url, status, false),
-                    None => check("poll", false, format!("{url}: {err}")).coded("POLL_ERROR").fix(
-                        "check the URL and its query with `shutup-and-run config get poll_url --reveal`",
-                    ),
+                    None => check("poll", false, format!("{url}: {err}")).coded("POLL_ERROR"),
                 },
-                (Ok(()), None) => check("poll", true, format!("{url} is reachable")),
+                // A running service polled and had nothing to complain about.
+                (Ok(()), None) if fresh.is_some() => {
+                    check("poll", true, format!("{url} answers the service"))
+                }
+                // No service to say so: ask once, as `config check` does.
+                (Ok(()), None) => match probe(settings, raw_url).await {
+                    Ok(status) => poll_answer_check(url, status, true),
+                    Err(err) => check("poll", false, format!("cannot reach {url}: {err}"))
+                        .coded("POLL_UNREACHABLE"),
+                },
             });
         }
     }
@@ -1223,9 +1182,7 @@ pub fn certificate_check(settings: &Settings) -> Option<Check> {
             ),
         )
     } else {
-        check("certificate", false, found.detail.clone())
-            .coded(found.code)
-            .fix(found.fix.clone().unwrap_or_default())
+        check("certificate", false, found.detail.clone()).coded(found.code)
     })
 }
 
@@ -1241,15 +1198,6 @@ pub fn resources_check(
     if let Some(short) =
         crate::resources::shortage(free, settings.min_free_memory, settings.min_free_disk)
     {
-        let fix = if short.resource == "disk" {
-            "free disk space: `docker image prune -af` removes images no job is using (on \
-             Windows: `wsl -d shutup-and-run -u root docker image prune -af`). To ask for \
-             less: `shutup-and-run config set min_free_disk 2g --apply`"
-        } else {
-            "it clears when programs close or a job ends; nothing is lost meanwhile. To ask \
-             for less: `shutup-and-run config set min_free_memory 1g --apply`. On Windows, \
-             `shutup-and-run wsl limits` shows how much memory WSL2 has"
-        };
         return soft(
             "resources",
             false,
@@ -1259,8 +1207,7 @@ pub fn resources_check(
             "LOW_DISK"
         } else {
             "LOW_MEMORY"
-        })
-        .fix(fix);
+        });
     }
     if let (Some(per_job), Some(total)) = (settings.max_job_memory, memory_total) {
         let fit = (total / per_job.max(1)).max(1);
@@ -1276,10 +1223,7 @@ pub fn resources_check(
                 ),
             )
             .coded("SLOTS_EXCEED_MEMORY")
-            .fix(format!(
-                "`shutup-and-run config set max_slots {fit} --apply`, or a smaller \
-                 `max_job_memory`"
-            ));
+            .with(fit.to_string());
         }
     }
     let free_now = match (free.memory, free.disk) {
@@ -1328,15 +1272,12 @@ pub fn poll_answer_check(url: &str, status: u16, probe: bool) -> Check {
             false,
             format!("{url} answered HTTP 429: it asks this machine to slow down"),
         )
-        .coded("POLL_RATE_LIMITED")
-        .fix("wait: the worker backs off by itself, up to 5 minutes between polls"),
+        .coded("POLL_RATE_LIMITED"),
         _ => line(
             false,
             format!("{url} answered HTTP {status}: that is not a poll endpoint, or it is failing"),
         )
-        .coded("POLL_HTTP_ERROR")
-        .fix("check the path and the query of the URL with `shutup-and-run config get poll_url --reveal`; \
-              set it again with `shutup-and-run config set poll_url URL --apply`"),
+        .coded("POLL_HTTP_ERROR"),
     }
 }
 
@@ -1546,8 +1487,7 @@ mod tests {
                 false,
                 "poll-token-0123456789abcdef was refused at \
                  https://jobs.example/poll?cpf=00000000000&email=nobody@example.com",
-            )
-            .fix("approve it"),
+            ),
         ];
         let out = doctor_out(
             "linux x86_64",
@@ -1598,9 +1538,12 @@ mod tests {
         ));
         assert!(url.len() < 8000 * 3);
         assert_eq!(out.json["checks"][1]["status"], "fail");
-        assert_eq!(out.json["checks"][1]["fix"], "approve it");
-        assert!(out.text.contains("fix: approve it"));
-        assert_eq!(checks_from_json(&out.json["checks"])[1].fix, "approve it");
+        // One next step, under `hint` and under its old name `fix`.
+        let hint = out.json["checks"][1]["hint"].as_str().unwrap();
+        assert!(!hint.is_empty());
+        assert_eq!(out.json["checks"][1]["fix"], hint);
+        assert!(out.text.contains(&format!("hint: {hint}")) && !out.text.contains("fix:"));
+        assert_eq!(checks_from_json(&out.json["checks"])[1].hint(), hint);
     }
 
     #[test]
@@ -1667,7 +1610,7 @@ mod tests {
         assert!(!warned.ok && warned.soft);
         assert_eq!(warned.code(), "POLL_INTERVAL_RAISED");
         assert!(warned
-            .fix
+            .hint()
             .contains("config set poll_interval_secs 30 --apply"));
         assert!(report(&[warned]).1, "a warning must not fail the doctor");
         assert!(
@@ -1762,17 +1705,17 @@ mod tests {
         assert!(low
             .detail
             .starts_with("low on memory: 1.0 GiB free, 2.0 GiB needed"));
-        assert!(low.fix.contains("min_free_memory"));
+        assert!(low.hint().contains("min_free_memory"));
         let full = resources_check(&settings, Some(8 * GIB), free(4 * GIB, GIB));
         assert!(full.detail.starts_with("low on disk"));
-        assert!(full.fix.contains("docker image prune"));
+        assert!(full.hint().contains("docker image prune"));
         settings.max_slots = 3;
         let many = resources_check(&settings, Some(4 * GIB), free(4 * GIB, 50 * GIB));
         assert!(!many.ok && many.soft);
         assert!(
-            many.fix.contains("config set max_slots 2 --apply"),
+            many.hint().contains("config set max_slots 2 --apply"),
             "{}",
-            many.fix
+            many.hint()
         );
         // A soft line never makes the doctor exit 1.
         assert!(report(&[many]).1);
@@ -1808,9 +1751,7 @@ mod tests {
     fn every_check_has_a_stable_code_and_the_old_fields_stay() {
         let checks = vec![
             check("docker", true, "answers"),
-            check("docker", false, "no socket")
-                .coded("DOCKER_UNAVAILABLE")
-                .fix("start it"),
+            check("docker", false, "no socket").coded("DOCKER_UNAVAILABLE"),
             soft("wsl-limits", false, "above"),
             check("service", false, "down"),
             // A code is kept only on a check that is not ok.
@@ -1837,7 +1778,8 @@ mod tests {
         assert_eq!(
             json[1],
             json!({"name": "docker", "code": "DOCKER_UNAVAILABLE", "status": "fail",
-                   "detail": "no socket", "fix": "start it",
+                   "detail": "no socket",
+                   "fix": crate::hints::hint_in("DOCKER_UNAVAILABLE", crate::hints::Lang::En),
                    "hint": crate::hints::hint_in("DOCKER_UNAVAILABLE", crate::hints::Lang::En)})
         );
         // A line that is fine has no hint; one that is not always has one.
