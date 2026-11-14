@@ -125,6 +125,8 @@ pub struct Settings {
     pub config_json: Option<PathBuf>,
     /// The login for the dangerous fields on the local page. Not strong:
     /// it keeps a curious person out, like a BIOS password.
+    /// `en` or `pt`: the language of the hints the CLI prints.
+    pub language: String,
     pub admin_user: String,
     pub admin_password: String,
     /// Set when the JSON file was unusable and an older copy or the built-in
@@ -191,6 +193,7 @@ struct FileConfig {
     // config.json only. config.toml refuses these three.
     poll_token: Option<String>,
     admin_user: Option<String>,
+    language: Option<String>,
     admin_password: Option<String>,
 }
 
@@ -245,7 +248,17 @@ impl Settings {
         }
         let admin_user = file.admin_user.clone();
         let admin_password = file.admin_password.clone();
+        let language = file.language.clone();
         let mut settings = Self::build(file, &env)?;
+        match language.as_deref() {
+            None => {}
+            Some(lang @ ("en" | "pt")) => settings.language = lang.to_string(),
+            Some(other) => {
+                return Err(ConfigError(format!(
+                    "language must be en or pt, not {other:?}"
+                )))
+            }
+        }
         if let Some(user) = admin_user {
             settings.admin_user = validate_admin("admin_user", &user)?;
         }
@@ -291,9 +304,13 @@ impl Settings {
         } else {
             toml::from_str(toml_text).map_err(|err| ConfigError(format!("config.toml: {err}")))?
         };
-        if file.poll_token.is_some() || file.admin_user.is_some() || file.admin_password.is_some() {
+        if file.poll_token.is_some()
+            || file.admin_user.is_some()
+            || file.admin_password.is_some()
+            || file.language.is_some()
+        {
             return Err(ConfigError(
-                "config.toml: poll_token, admin_user and admin_password are config.json keys. \
+                "config.toml: poll_token, admin_user, admin_password and language are config.json keys. \
                  The poll token of a config.toml machine is SHUTUP_AND_RUN_POLL_TOKEN."
                     .into(),
             ));
@@ -607,6 +624,7 @@ impl Settings {
             config_json: None,
             admin_user: DEFAULT_ADMIN.to_string(),
             admin_password: DEFAULT_ADMIN.to_string(),
+            language: "en".to_string(),
             config_warning: None,
         })
     }
@@ -699,6 +717,7 @@ pub const KEYS: &[Key] = &[
     secret("poll_token"),
     key("admin_user", Kind::Text, OnPage::Locked),
     secret("admin_password"),
+    key("language", Kind::Text, OnPage::No),
     key("listen", Kind::Text, OnPage::No),
     key("http", Kind::Bool, OnPage::No),
     key("tls_cert", Kind::Text, OnPage::No),
@@ -771,7 +790,8 @@ pub fn parse_value(key: &Key, raw: &str) -> Result<serde_json::Value, ConfigErro
     }
 }
 
-/// The map with every secret that is set replaced by `***`.
+/// The map with every secret that is set replaced by `***`, and the values
+/// of the poll URL's query too.
 pub fn masked(map: &JsonMap) -> JsonMap {
     let mut out = map.clone();
     for key in KEYS.iter().filter(|k| k.secret) {
@@ -779,7 +799,58 @@ pub fn masked(map: &JsonMap) -> JsonMap {
             *value = serde_json::Value::String(MASK.to_string());
         }
     }
+    if let Some(url) = out.get("poll_url").and_then(|v| v.as_str()) {
+        out.insert("poll_url".into(), mask_query(url).into());
+    }
     out
+}
+
+/// The URL with every value of its query replaced by `***`. The query of a
+/// poll URL pairs the machine with a person (a tax id, an e-mail, a key), so
+/// it is not printed: `https://host/poll?cpf=***&email=***`.
+pub fn mask_query(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let (query, fragment) = match query.split_once('#') {
+        Some((query, fragment)) => (query, Some(fragment)),
+        None => (query, None),
+    };
+    let pairs: Vec<String> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((name, _)) => format!("{name}={MASK}"),
+            None => MASK.to_string(),
+        })
+        .collect();
+    let mut out = format!("{base}?{}", pairs.join("&"));
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
+}
+
+/// The values of a URL's query, raw and percent-decoded: what `scrub` takes
+/// out of any text that quoted the URL.
+pub fn query_values(url: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let query = query.split('#').next().unwrap_or("");
+    for pair in query.split('&') {
+        let value = pair.split_once('=').map(|(_, v)| v).unwrap_or(pair);
+        if value.is_empty() {
+            continue;
+        }
+        values.push(value.to_string());
+        if let Ok(parsed) = reqwest::Url::parse(&format!("http://x/?v={value}")) {
+            if let Some((_, decoded)) = parsed.query_pairs().next() {
+                values.push(decoded.into_owned());
+            }
+        }
+    }
+    values
 }
 
 /// The secrets a report must not carry, longest first so one is not left
@@ -789,8 +860,14 @@ pub fn secret_values(map: &JsonMap) -> Vec<String> {
         .iter()
         .filter(|k| k.secret)
         .filter_map(|k| map.get(k.name).and_then(|v| v.as_str()))
-        .filter(|v| v.len() >= 4)
         .map(str::to_string)
+        .chain(
+            map.get("poll_url")
+                .and_then(|v| v.as_str())
+                .map(query_values)
+                .unwrap_or_default(),
+        )
+        .filter(|v| v.len() >= 4)
         .collect();
     values.sort_by_key(|v| std::cmp::Reverse(v.len()));
     values
@@ -823,6 +900,7 @@ pub fn reset_map(old: Option<&JsonMap>) -> JsonMap {
             "poll_token",
             "worker_name",
             "worker_os",
+            "language",
             "listen",
             "http",
             "tls_cert",

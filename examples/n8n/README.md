@@ -71,7 +71,7 @@ Worker poll ─ Hash poll token ─ Identify, authorize, pick a job ─ Poll ans
 
 1. **Webhook for worker polling.** `POST n3-worker-poll`. The body is the [worker poll request](../../docs/schemas/worker-poll-request.schema.json).
 2. **Bearer-token validation.** There must be an `Authorization: Bearer` header with at least 16 characters. The Crypto node turns the token into its SHA-256, and only the hash is kept.
-3. **Worker identification.** The hash is the machine. `worker`, `os` and the rest of the body are recorded beside it as what the machine says about itself. The address comes from `X-Real-IP` or `X-Forwarded-For`, which your reverse proxy sets, never from the body.
+3. **Worker identification.** The hash is the machine. `worker`, `os` and the rest of the body are recorded beside it as what the machine says about itself. The address comes from `CF-Connecting-IP` when the request came through Cloudflare, then from `X-Real-IP`, then from the first entry of `X-Forwarded-For`, which your reverse proxy sets. Never from the body.
 4. **Authorization decision.** A hash that was never seen becomes a `pending` record and gets `403`. So does a `pending` or `revoked` one. A `403` has no body: no task, no image name, no secret. At most 200 pending records are kept.
 5. **No-job response.** `204`, when the machine is approved and nothing is queued for it.
 6. **Job response.** `200` `{"task": {...}}`. The workflow adds `job_key` and `callback_url` to the task you queued.

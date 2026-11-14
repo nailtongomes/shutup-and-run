@@ -355,6 +355,18 @@ The tests paid for it too: the smoke test's poll check and the mock cycle now wa
 
 Two fixes from the first run of 0.2.7 on a real PC ride along. An install whose poll URL does not answer at that minute ends with 0 and a note, because everything the install does on the PC worked and the URL is another machine. And the desktop folder is read from PowerShell as base64 of UTF-8: printed as text it came through the console code page, and `Área de Trabalho` became a folder that does not exist.
 
+## Hints, a jobs command, a poll right after a job, and a masked query (0.2.9)
+
+The worker goes to the PCs of the clients of a petition-filing service. Whoever installs and supports it is an AI that may have a shell or may only tell a person what to type, and the container posts its result to the service itself, so the worker's side of "did it run?" is all there is to ask the machine.
+
+- **A `hint` beside every code.** Every failure of the CLI and every check that is not ok carries `hint`: one short next step with the command, in `language` (`en` or `pt`, a config key). `fix` stays: it is the exact command for this machine, in English. The catalogue is one table in `src/hints.rs`; a test finds every code-shaped string in the sources and fails when one has no hint, and another keeps `docs/FOR-AGENTS.md` equal to it. A failure with no code of its own gets one from its exit code (`USAGE`, `INVALID_VALUE`, `FAILED`).
+- **`jobs`** reads the SQLite history that was already there. It prints when, how long, the exit code and one sentence of why, and never the env, command, callback, key or logs. The history gained a ceiling of 500 finished rows beside `history_days`.
+- **A poll right after a job ends**, when a slot is free, so a queue drains without 30 seconds of idle between tasks. It is one ordinary poll: "nothing" is followed by the interval, a failed poll (429 included) keeps its backoff, and a job that never started does not trigger it, so a task whose image cannot be pulled is not asked for in a loop. One second at least separates two polls.
+- **The query of the poll URL is masked.** It pairs the machine with a person (a tax id, an e-mail, a key). 0.2.5 said it was not a secret and showed it; it is still not what approves a machine, but it identifies someone, so `config show`, `config get`, the page, the doctor, the report and the poll error print `***` for its values. `--reveal` shows it. The page's form shows the masked URL and keeps the real one when it is sent back unchanged.
+- **`config check` asks the poll URL once**, with no token and `free_slots: 0`, so that a 404 is not called reachable. A request that could be answered with a task would lose that task, which is why it carries no token.
+
+The cost: `config get poll_url` no longer prints the usable URL without `--reveal`, which a script written for 0.2.5 may depend on. A poll server now sees one request with no token per `config check`, and more polls from a busy machine than two a minute.
+
 ## Smoke test against a running instance
 
 `scripts/accept.sh` starts its own instance. `scripts/smoke.sh` tests one that is already installed, through the API only, with the URL and token from the environment. It is safe on a live machine: its jobs echo and sleep under a short `timeout_secs`, it undrains what it drained, and it sends wrong tokens from `127.0.0.2`, never from the caller. What it cannot do from where it runs, it skips and says why.

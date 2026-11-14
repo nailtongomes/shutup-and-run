@@ -13,6 +13,8 @@ pub mod cli;
 pub mod clock;
 pub mod config;
 pub mod devx;
+pub mod hints;
+pub mod jobs;
 pub mod launcher;
 pub mod lock;
 pub mod poll;

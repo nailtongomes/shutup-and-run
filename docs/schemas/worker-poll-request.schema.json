@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/docs/schemas/worker-poll-request.schema.json",
   "title": "WorkerPollRequest",
-  "description": "The body of the POST a worker sends to poll_url. Who is asking and what it could lend. All eight keys are always present. It carries no address, token, config or job history. A poll is only sent when the worker has a free slot and is not draining, so free_slots is never 0. additionalProperties is false because that is what this version sends; the body grew in v0.2.0, so a production endpoint should read the keys it knows and ignore the rest.",
+  "description": "The body of the POST a worker sends to poll_url. Who is asking and what it could lend. All eight keys are always present. It carries no address, token, config or job history. A poll for work is only sent when the worker has a free slot and is not draining, so it never carries free_slots 0. The one body with free_slots 0 is the probe of `shutup-and-run config check`, which has no Authorization header and must not be given a task. additionalProperties is false because that is what this version sends; the body grew in v0.2.0, so a production endpoint should read the keys it knows and ignore the rest.",
   "type": "object",
   "required": [
     "worker",
@@ -47,9 +47,9 @@
       "maximum": 256
     },
     "free_slots": {
-      "description": "Slots free when the poll was sent. One task is taken per poll, whatever this says.",
+      "description": "Slots free when the poll was sent. One task is taken per poll, whatever this says. 0 only in the probe of `config check`, which takes no task.",
       "type": "integer",
-      "minimum": 1,
+      "minimum": 0,
       "maximum": 256
     },
     "cpus": {

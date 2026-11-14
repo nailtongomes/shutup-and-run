@@ -8,9 +8,9 @@ One Linux VPS (yours, trusted) and one Windows 11 PC (treated as a client's). Ab
 
 The one-line installs download from the latest GitHub release.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` is the version in `Cargo.toml` (`v0.2.8` when this was written) or later and has three files: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` is the version in `Cargo.toml` (`v0.2.9` when this was written) or later and has three files: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
-If it is not there, tag `main`: `git tag v0.2.8 && git push origin v0.2.8` (the tag must be the version in `Cargo.toml`, because the `.exe` downloads the Linux binary of its own version), and wait for the `release` workflow.
+If it is not there, tag `main`: `git tag v0.2.9 && git push origin v0.2.9` (the tag must be the version in `Cargo.toml`, because the `.exe` downloads the Linux binary of its own version), and wait for the `release` workflow.
 
 ## 1. Linux VPS: push
 
@@ -111,7 +111,7 @@ Approve it, on the VPS, in the folder where the mock runs, with the line the moc
 echo <hash> >> approved.txt
 ```
 
-- [ ] Within five minutes (the worker backs off while refused) the mock prints `TASK mock-...-1`, then `ok   1/3 ... reason=exited exit=0`, three times, 30 seconds apart, then a `SUMMARY` with `ok 3`. After that it answers `204`.
+- [ ] Within five minutes (the worker backs off while refused) the mock prints `TASK mock-...-1`, then `ok   1/3 ... reason=exited exit=0`, three times, a few seconds apart and not 30 (0.2.9: the worker polls again as soon as a job ends), then a `SUMMARY` with `ok 3`. After that it answers `204`, and the polls go back to one every 30 seconds.
 - [ ] `shutup-and-run wsl logs` shows `poll started a job` three times.
 
 Install again, with one option changed:
@@ -127,6 +127,15 @@ shutup-and-run wsl install --poll-url http://YOUR_VPS_IP:8080/poll --max-slots 2
 Open a second PowerShell, run `shutup-and-run wsl stop` and then `shutup-and-run wsl serve`, and leave it. In the first one, install again with the same command.
 
 - [ ] Either the install completes and the second terminal is back at its prompt, or the install stops before step 3 with `a shutup-and-run wsl serve is still running`. It never prints `done` with the old service still the one running. Note which you saw.
+
+### 0.2.9: hints, jobs, pairing query
+
+- [ ] `shutup-and-run jobs` lists the three jobs, newest first, each `ok`, `exit 0`, with a duration. `shutup-and-run jobs --limit 1 --json` has one entry with `id`, `image`, `started_at`, `ended_at`, `duration_secs`, `exit_code`, `status`, `failure`, and nothing else.
+- [ ] `shutup-and-run pause`, then `shutup-and-run doctor --json`: the `paused` line has `"code":"WORKER_PAUSED"` and a `"hint"` that names `shutup-and-run resume`. `shutup-and-run config set language pt`, the doctor again: the hint is in Portuguese. `shutup-and-run resume`.
+- [ ] `shutup-and-run config set max_slots 0 --json` exits 3 with `"code":"INVALID_VALUE"` and a `"hint"`.
+- [ ] `shutup-and-run config set poll_url "http://YOUR_VPS_IP:8080/poll?cpf=00000000000&email=nobody@example.com" --apply`. The mock keeps answering. `shutup-and-run config show`, `shutup-and-run doctor --report` and the page's Settings show `?cpf=***&email=***`; none shows `00000000000`. `shutup-and-run config get poll_url --reveal` shows the whole URL. Saving the page's form untouched keeps the URL.
+- [ ] `shutup-and-run config set poll_url "http://YOUR_VPS_IP:8080/nope" --json`, then `shutup-and-run config check --json`: the `poll` line is `POLL_HTTP_ERROR` with `HTTP 404`, not `POLL_OK`. Set the right URL back with `--apply`.
+- [ ] `shutup-and-run wsl install --poll-interval-secs 5` exits 3 (`$LASTEXITCODE`), says `at least 30`, and changes nothing.
 
 The same enrollment, queue and callback against n8n, with no mock: [examples/n8n/README.md](../examples/n8n/README.md#7-smoke-test).
 
