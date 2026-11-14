@@ -234,7 +234,6 @@ pub fn storage_check(settings: &Settings) -> Check {
         },
     )
     .coded("STORAGE_NOT_WRITABLE")
-    .fix("run as the user the service runs as (root), or fix the folder's owner and mode")
 }
 
 #[cfg(unix)]
@@ -277,16 +276,13 @@ pub fn allowlist_check(settings: &Settings) -> Check {
 pub async fn poll_check(settings: &Settings) -> Check {
     let Some(url) = &settings.poll_url else {
         return soft("poll", false, "no poll URL: the worker would be idle")
-            .coded("POLL_URL_UNSET")
-            .fix("`shutup-and-run config set poll_url URL --apply`");
+            .coded("POLL_URL_UNSET");
     };
     // The query pairs the machine with a person: never printed.
     let shown = crate::config::mask_query(url);
     let unreachable = |err: String| {
         // The service out there, not the config in here: a warning.
-        soft("poll", false, format!("cannot reach {shown}: {err}"))
-            .coded("POLL_UNREACHABLE")
-            .fix("the URL is well formed, and its host did not answer: check the network and DNS, or the URL with `shutup-and-run config get poll_url --reveal`")
+        soft("poll", false, format!("cannot reach {shown}: {err}")).coded("POLL_UNREACHABLE")
     };
     if let Err(err) = crate::cli::reach(url).await {
         return unreachable(err);
@@ -316,7 +312,7 @@ pub async fn config_check() -> Out {
         .into_iter()
         .map(|c| Check {
             detail: crate::cli::scrub(&c.detail, &found.secrets),
-            fix: crate::cli::scrub(&c.fix, &found.secrets),
+            hint: crate::cli::scrub(&c.hint(), &found.secrets),
             ..c
         })
         .collect();
@@ -324,7 +320,7 @@ pub async fn config_check() -> Out {
         &checks,
         json!({"config_valid": !config_invalid}),
         "the config and this machine are ready",
-        "not ready: run the `fix:` under each FAIL, then this again",
+        "not ready: follow the `hint:` under each FAIL, then this again",
     );
     if config_invalid {
         out.code = EXIT_INVALID;
@@ -542,17 +538,15 @@ async fn run_one(bench: &Bench, request: LaunchRequest, checks: &mut Vec<Check>)
                     format!("{image} is not on this machine's allowlist"),
                 )
                 .coded("DEMO_IMAGE_NOT_ALLOWED")
-                .fix(format!(
-                    "name an allowed image with --image, or allow this one: \
-                         `shutup-and-run config set allowlist {} --apply`",
+                .with(
                     settings
                         .allowlist
                         .iter()
                         .map(String::as_str)
                         .chain([image.as_str()])
                         .collect::<Vec<_>>()
-                        .join(",")
-                )),
+                        .join(","),
+                ),
             );
             return None;
         }
@@ -570,25 +564,13 @@ async fn run_one(bench: &Bench, request: LaunchRequest, checks: &mut Vec<Check>)
     let id = match launcher.launch_from(request, source).await {
         Ok(LaunchOutcome::Created(job)) | Ok(LaunchOutcome::Existing(job)) => job.id,
         Err(err) => {
-            let (code, fix) = match &err {
-                LaunchError::NoSlots { .. } => (
-                    "WORKER_BUSY",
-                    "every slot is in use: run the demo when a job has ended",
-                ),
-                LaunchError::LowResources(short) if short.resource == "disk" => {
-                    ("LOW_DISK", "free disk space: `docker image prune -af`")
-                }
-                LaunchError::LowResources(_) => (
-                    "LOW_MEMORY",
-                    "close programs, or wait; `shutup-and-run doctor` shows the limits",
-                ),
-                _ => ("DOCKER_UNAVAILABLE", "`shutup-and-run doctor`"),
+            let code = match &err {
+                LaunchError::NoSlots { .. } => "WORKER_BUSY",
+                LaunchError::LowResources(short) if short.resource == "disk" => "LOW_DISK",
+                LaunchError::LowResources(_) => "LOW_MEMORY",
+                _ => "DOCKER_UNAVAILABLE",
             };
-            checks.push(
-                check("admission", false, err.to_string())
-                    .coded(code)
-                    .fix(fix),
-            );
+            checks.push(check("admission", false, err.to_string()).coded(code));
             return None;
         }
     };
@@ -614,9 +596,7 @@ async fn run_one(bench: &Bench, request: LaunchRequest, checks: &mut Vec<Check>)
         checks.push(
             check("container", false, "the job did not end in time")
                 .coded("DEMO_TIMEOUT")
-                .fix(format!(
-                    "`docker rm -f shutup-and-run-{id}`, then `shutup-and-run doctor`"
-                )),
+                .with(id.to_string()),
         );
         return None;
     };
@@ -633,10 +613,7 @@ async fn run_one(bench: &Bench, request: LaunchRequest, checks: &mut Vec<Check>)
                 format!("{image} did not start: {}", ran.logs.trim()),
             )
             .coded("DEMO_IMAGE_UNAVAILABLE")
-            .fix(format!(
-                "the image has to be pulled once: check the internet connection, or \
-                 `docker pull {image}`, then run the demo again"
-            )),
+            .with(image.to_string()),
         );
         return Some(ran);
     }
@@ -652,8 +629,7 @@ async fn run_one(bench: &Bench, request: LaunchRequest, checks: &mut Vec<Check>)
                     .unwrap_or_else(|| "?".into())
             ),
         )
-        .coded("DEMO_JOB_FAILED")
-        .fix("the container's last lines are in `logs` (--json)"),
+        .coded("DEMO_JOB_FAILED"),
     );
 
     let want = (
@@ -687,8 +663,7 @@ async fn run_one(bench: &Bench, request: LaunchRequest, checks: &mut Vec<Check>)
                 got.nano_cpus, got.memory_bytes, want.0, want.1
             ),
         )
-        .coded("LIMITS_NOT_APPLIED")
-        .fix("`shutup-and-run doctor --report` and open the issue it links"),
+        .coded("LIMITS_NOT_APPLIED"),
         None => soft(
             "limits",
             false,
@@ -712,7 +687,7 @@ async fn run_one(bench: &Bench, request: LaunchRequest, checks: &mut Vec<Check>)
             },
         )
         .coded("DEMO_CLEANUP_FAILED")
-        .fix(format!("`docker rm -f shutup-and-run-{id}`")),
+        .with(id.to_string()),
     );
     Some(ran)
 }
@@ -760,9 +735,7 @@ async fn docker_runtime(settings: &Settings, checks: &mut Vec<Check>) -> Option<
 }
 
 fn docker_down(err: String) -> Check {
-    check("docker", false, err)
-        .coded("DOCKER_UNAVAILABLE")
-        .fix("`shutup-and-run doctor` names the cause; run this as root")
+    check("docker", false, err).coded("DOCKER_UNAVAILABLE")
 }
 
 /// `shutup-and-run demo`: one small container, start to finish.
@@ -788,7 +761,7 @@ pub async fn demo(settings: Settings, runtime: Option<Arc<dyn Runtime>>, image: 
         &checks,
         json!({"image": image, "logs": logs}),
         "demo passed: this machine runs a container under the worker's rules",
-        "demo failed: run the `fix:` under each FAIL, then the demo again",
+        "demo failed: follow the `hint:` under each FAIL, then the demo again",
     )
 }
 
@@ -990,7 +963,7 @@ pub async fn demo_sign(
         "output": Value::Null,
     });
     let good = "signing demo passed: a container signed a made-up PDF and the signature verifies";
-    let bad = "signing demo failed: run the `fix:` under each FAIL, then the demo again";
+    let bad = "signing demo failed: follow the `hint:` under each FAIL, then the demo again";
 
     // The workspace of this run: the throwaway certificate, and the files
     // openssl verifies. Removed at the end, whatever happened.
@@ -1023,8 +996,7 @@ pub async fn demo_sign(
                     found.detail.clone()
                 },
             )
-            .coded(found.code)
-            .fix(found.fix.clone().unwrap_or_default()),
+            .coded(found.code),
         );
         if !found.ok {
             return checks_out(&checks, extra, good, bad);
@@ -1045,8 +1017,7 @@ pub async fn demo_sign(
                     Err(err) => err.clone(),
                 },
             )
-            .coded("OPENSSL_MISSING")
-            .fix("the demo needs the openssl program: `apt-get install -y openssl`"),
+            .coded("OPENSSL_MISSING"),
         );
         if made.is_err() {
             return checks_out(&checks, extra, good, bad);
@@ -1081,10 +1052,7 @@ pub async fn demo_sign(
     let ran = run_one(&bench, job, &mut checks).await;
     let Some(ran) = ran.filter(|ran| ran.exit_code == Some(0)) else {
         if let Some(note) = checks.iter_mut().find(|c| c.name == "container" && !c.ok) {
-            note.fix = format!(
-                "the image needs python3 and the openssl program ({SIGN_IMAGE} has both). \
-                 The container's last lines are in `logs` (--json)"
-            );
+            note.code = "DEMO_SIGN_FAILED".into();
         }
         return checks_out(&checks, extra, good, bad);
     };
@@ -1137,8 +1105,7 @@ pub async fn demo_sign(
                         Err(err) => format!("{}: {err}", out.display()),
                     },
                 )
-                .coded("OUTPUT_NOT_WRITTEN")
-                .fix("name a file this user can write with --out"),
+                .coded("OUTPUT_NOT_WRITTEN"),
             );
             if wrote.is_ok() {
                 extra["output"] = json!(out);
@@ -1637,7 +1604,7 @@ mod tests {
         assert!(!wrong.ok);
         assert_eq!(wrong.code(), "POLL_HTTP_ERROR");
         assert!(wrong.detail.contains("HTTP 404") && !wrong.detail.contains("00000000000"));
-        assert!(!wrong.fix.is_empty() && !wrong.hint().is_empty());
+        assert!(wrong.hint().contains("config set poll_url"));
 
         assert_eq!(poll_check(&at("/busy")).await.code(), "POLL_RATE_LIMITED");
         let mut none = settings(&dir, "");

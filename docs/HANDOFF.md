@@ -137,7 +137,7 @@ Run the service: `shutup-and-run` or `shutup-and-run serve`. Config errors print
 
 `release.yml` runs on `v*` tags. Permissions: `contents: write`. It attaches `shutup-and-run-x86_64-unknown-linux-musl` and `SHA256SUMS` to the GitHub release. `scripts/install.sh` downloads that asset from `releases/latest` and refuses to install it when the hash does not match `SHA256SUMS`. `SHUTUP_AND_RUN_BIN` skips the download. A second job, `install`, waits for the assets, runs the README one-liner on a fresh runner, checks that the installed binary matches `SHA256SUMS`, and runs `smoke.sh`.
 
-To cut a release: merge to `main`, then `git tag vX.Y.Z && git push origin vX.Y.Z` from `main`, because the one-liner fetches `install.sh` from `main`. `Cargo.toml` must say the version of the tag (now `0.2.8`), because the Windows `.exe` downloads the Linux binary of its own version. `install.sh` and `install.ps1` download `releases/latest`. The tags and GitHub releases before v0.2.3 were removed.
+To cut a release: change `version` in `Cargo.toml` in the PR and merge to `main`. The `release` workflow sees a version with no release, builds, creates the tag `vX.Y.Z` on that commit and publishes; the one-liner fetches `install.sh` from `main`. A push to `main` that does not change the version releases nothing. "Run workflow" on `main` retries a release that failed.
 
 The workflows do not set `id-token` or a cloud deploy role. They use `GITHUB_TOKEN`.
 

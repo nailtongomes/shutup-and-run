@@ -107,7 +107,7 @@ shutup-and-run demo sign                     # a container signs a made-up PDF; 
 - **`job validate`** runs the same check as `POST /v1/jobs` on a file with a task (`-` for stdin, `--poll` to check it as a polled task). Exit 3 with a code (`JOB_INVALID_JSON`, `JOB_INVALID_FIELD`, `JOB_IMAGE_NOT_ALLOWED`) when the API would answer `400` or `403`. It does not pull, take a slot or write history, and a valid task can still be refused later: slots, a pause, free memory and disk, and the image pull are checked only when it is sent.
 - **`config check`** exits 3 when the config itself is invalid and 1 when something around it is wrong. A poll URL whose host does not answer in 8 seconds is a warning (`POLL_UNREACHABLE`), not an invalid config.
 - **`demo sign`** needs the openssl program and the image `python:3.12-slim` on the allowlist. It uses a throwaway certificate unless `--configured`. The signed PDF is written to `--out` (default `shutup-and-run-demo-signed.pdf`).
-- **`doctor --json`** gives every check a stable `code` beside `name`, `status`, `detail` and `fix`: `DOCKER_UNAVAILABLE`, `CONFIG_INVALID`, `SERVICE_NOT_RUNNING`, `POLL_NOT_APPROVED`, `LOW_MEMORY`, and `NAME_OK` for a check that passed. The list is in [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#diagnostic-codes).
+- **`doctor --json`** gives every check a stable `code` beside `name`, `status`, `detail` and `hint`: `DOCKER_UNAVAILABLE`, `CONFIG_INVALID`, `SERVICE_NOT_RUNNING`, `POLL_NOT_APPROVED`, `LOW_MEMORY`, and `NAME_OK` for a check that passed. The list is in [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#diagnostic-codes).
 
 ## Protecting the PC
 
@@ -199,12 +199,12 @@ shutup-and-run config validate                  # exit 3 and the reason when inv
 shutup-and-run config apply                     # restart on the file; containers are left alone
 shutup-and-run config reset                     # factory config; tokens, name and address kept
 shutup-and-run status                           # idle, active, draining, failed, stopped
-shutup-and-run doctor [--report]                # every failed line has a fix
+shutup-and-run doctor [--report]                # every failed line has a hint
 shutup-and-run pause | resume
 shutup-and-run jobs [--limit N]                 # the last jobs: status, exit code, duration, why it failed
 ```
 
-All are non-interactive and take `--json`. Every failure, and every doctor line that is not ok, has a `hint` with the next step, in English or Portuguese (`config set language pt`). The values of the poll URL's query print as `***` (`config get poll_url --reveal` shows them). Exit codes: `0` done, `1` failed or unhealthy, `2` wrong command line, `3` invalid config or value (nothing written). An invalid value is never saved, and a file damaged some other way does not stop the service: it runs on the copy from the last save, or on idle defaults, and says so.
+All are non-interactive and take `--json`. Every failure, and every doctor line that is not ok, has a `hint` with the next step, in English or Portuguese (`config set language pt`; the page follows it). `status` says when the worker last asked for work (`last_poll_at`, `last_poll_status`). The values of the poll URL's query print as `***` (`config get poll_url --reveal` shows them). Exit codes: `0` done, `1` failed or unhealthy, `2` wrong command line, `3` invalid config or value (nothing written). An invalid value is never saved, and a file damaged some other way does not stop the service: it runs on the copy from the last save, or on idle defaults, and says so.
 
 **`config.toml` plus environment** is what the Linux installer still writes: `/etc/shutup-and-run/config.toml`, or the file named by `SHUTUP_AND_RUN_CONFIG`. Environment variables override the file. After a change: `sudo systemctl restart shutup-and-run`; running jobs survive. On such a machine `shutup-and-run config` refuses and says so; `status`, `doctor`, `pause`, `resume` and `bans` work. A Linux machine uses `config.json` instead when that file exists and `SHUTUP_AND_RUN_CONFIG` does not name a TOML file. There is no converter.
 
@@ -315,7 +315,7 @@ Only `image` is required. Unknown fields are refused. `job_key` makes a retry sa
 **Pull.** With `poll_url` set, the machine POSTs to it every `poll_interval_secs` (30 seconds, and never less), only when it has a free slot, is not paused and is not short of memory or disk:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.9", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.10", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 The answer is nothing (`204`), a task, `{"task": {...}}`, or `{"manifest_url": "https://..."}`, which is fetched once and must be a task. `401` or `403` means "not approved yet": the worker starts nothing and keeps asking, backing off to five minutes. The server decides which machines get work; the worker's token is its identity.

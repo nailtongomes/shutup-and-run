@@ -121,8 +121,9 @@ impl Lang {
 }
 
 /// The cookie the language button sets, kept by the browser for ten years.
-/// Without it, the browser's own language decides.
-pub(crate) fn lang_of(headers: &HeaderMap) -> Lang {
+/// Without it, `language = "pt"` in the config decides, then the browser's
+/// own language.
+pub(crate) fn lang_of(headers: &HeaderMap, configured: &str) -> Lang {
     let text = |name| {
         headers
             .get(name)
@@ -137,6 +138,8 @@ pub(crate) fn lang_of(headers: &HeaderMap) -> Lang {
     match cookie {
         Some("pt") => Lang::Pt,
         Some("en") => Lang::En,
+        // `language` of the config, the same key the CLI's hints follow.
+        _ if configured == "pt" => Lang::Pt,
         _ if text(header::ACCEPT_LANGUAGE)
             .is_some_and(|accept| accept.trim_start().to_ascii_lowercase().starts_with("pt")) =>
         {
@@ -179,7 +182,7 @@ async fn page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Resp
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let view = View {
-        lang: lang_of(&headers),
+        lang: lang_of(&headers, &settings.language),
         worker: &settings.worker_name,
         os: &settings.worker_os,
         slots: live.slots_for_page(),
@@ -675,7 +678,7 @@ async fn advanced_page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap
 }
 
 fn edit_page(launcher: &Launcher, headers: &HeaderMap, group: OnPage) -> Response {
-    let lang = lang_of(headers);
+    let lang = lang_of(headers, &launcher.settings().language);
     let Some(path) = &launcher.settings().config_json else {
         return not_editable(lang);
     };
@@ -707,7 +710,7 @@ fn save_page(
     group: OnPage,
     form: &HashMap<String, String>,
 ) -> Response {
-    let lang = lang_of(headers);
+    let lang = lang_of(headers, &launcher.settings().language);
     let Some(path) = &launcher.settings().config_json else {
         return not_editable(lang);
     };
@@ -835,7 +838,7 @@ pub(crate) fn certificate_view(path: &Path, lang: Lang, note: Option<(bool, &str
 }
 
 async fn certificate_page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Response {
-    let lang = lang_of(&headers);
+    let lang = lang_of(&headers, &launcher.settings().language);
     let Some(path) = &launcher.settings().config_json else {
         return not_editable(lang);
     };
@@ -928,7 +931,7 @@ async fn certificate_save(
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    let lang = lang_of(&headers);
+    let lang = lang_of(&headers, &launcher.settings().language);
     let Some(path) = &launcher.settings().config_json else {
         return not_editable(lang);
     };
@@ -1021,6 +1024,8 @@ pub struct Live {
     pub last: Option<JobRecord>,
     /// Why the last poll failed. None when it was answered or nothing is polled.
     pub poll_error: Option<String>,
+    /// The last request sent to the poll URL: when, and how it ended.
+    pub last_poll: Option<(i64, &'static str)>,
     /// Why no new job starts right now, though a slot is free: low memory
     /// or disk. None when a job could start.
     pub waiting_for: Option<String>,
@@ -1170,6 +1175,11 @@ struct FileBody<'a> {
     last_job_at: Option<String>,
     last_error: Option<String>,
     poll_error: Option<String>,
+    /// The last request to the poll URL. Null until one was sent: nothing
+    /// is polled, or the worker is full, paused or short of memory.
+    last_poll_at: Option<String>,
+    /// `task`, `nothing`, `task_rejected`, `not_approved` or `error`.
+    last_poll_status: Option<&'a str>,
     waiting_for: Option<&'a str>,
     limits: &'a Limits,
     config_warning: Option<String>,
@@ -1195,6 +1205,8 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
         last_job_at: live.last_job_at.map(unix_to_iso),
         last_error: err,
         poll_error: live.poll_error.as_deref().map(one_line),
+        last_poll_at: live.last_poll.map(|(at, _)| unix_to_iso(at)),
+        last_poll_status: live.last_poll.map(|(_, status)| status),
         waiting_for: live.waiting_for.as_deref(),
         limits: &live.limits,
         config_warning: live.config_warning.as_deref().map(one_line),
@@ -1228,6 +1240,7 @@ fn empty_live() -> Live {
         docker_error: None,
         last: None,
         poll_error: None,
+        last_poll: None,
         waiting_for: None,
         limits: Limits::default(),
         config_warning: None,
@@ -1568,23 +1581,31 @@ mod tests {
             }
             map
         };
-        assert_eq!(lang_of(&headers(&[])), Lang::En);
+        assert_eq!(lang_of(&headers(&[]), "en"), Lang::En);
+        // The config's `language` is the default the cookie overrides, and
+        // it comes before the browser's own language.
+        assert_eq!(lang_of(&headers(&[]), "pt"), Lang::Pt);
         assert_eq!(
-            lang_of(&headers(&[("accept-language", "pt-BR,pt;q=0.9")])),
+            lang_of(&headers(&[("accept-language", "en-US")]), "pt"),
+            Lang::Pt
+        );
+        assert_eq!(lang_of(&headers(&[("cookie", "lang=en")]), "pt"), Lang::En);
+        assert_eq!(
+            lang_of(&headers(&[("accept-language", "pt-BR,pt;q=0.9")]), "en"),
             Lang::Pt
         );
         assert_eq!(
-            lang_of(&headers(&[("accept-language", "en-US,pt;q=0.5")])),
+            lang_of(&headers(&[("accept-language", "en-US,pt;q=0.5")]), "en"),
             Lang::En
         );
         assert_eq!(
-            lang_of(&headers(&[
-                ("accept-language", "pt-BR"),
-                ("cookie", "a=b; lang=en")
-            ])),
+            lang_of(
+                &headers(&[("accept-language", "pt-BR"), ("cookie", "a=b; lang=en")]),
+                "en"
+            ),
             Lang::En
         );
-        assert_eq!(lang_of(&headers(&[("cookie", "lang=pt")])), Lang::Pt);
+        assert_eq!(lang_of(&headers(&[("cookie", "lang=pt")]), "en"), Lang::Pt);
     }
 
     #[test]
@@ -1680,6 +1701,7 @@ mod tests {
             docker_error: None,
             last: None,
             poll_error: None,
+            last_poll: Some((1_700_000_000, "nothing")),
             waiting_for: Some("low on memory: 512 MiB free, 2.0 GiB needed".into()),
             limits: Limits {
                 profile: "shared-pc".into(),
@@ -1716,6 +1738,9 @@ mod tests {
         assert_eq!(value["job_ids"], serde_json::json!(["abc", "def"]));
         assert_eq!(value["last_job_at"], "2023-11-14T22:13:20Z");
         assert!(value["last_error"].is_null());
+        // Is it asking for work? When the last poll went out and how it ended.
+        assert_eq!(value["last_poll_at"], "2023-11-14T22:13:20Z");
+        assert_eq!(value["last_poll_status"], "nothing");
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert!(value["pid"].is_number());
         assert_eq!(value["updated_at"], "2023-11-14T22:15:00Z");

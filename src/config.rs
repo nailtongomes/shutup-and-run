@@ -472,6 +472,10 @@ impl Settings {
         };
         let worker_os = match take_string(env, "SHUTUP_AND_RUN_WORKER_OS", file.worker_os) {
             Some(os) => validate_worker_field("worker_os", &os)?,
+            // In a unit test the machine is a Linux server on every platform,
+            // so a fixture that names no OS does not get the Windows defaults
+            // (the shared-pc profile) when the tests run on Windows.
+            None if cfg!(test) => "linux".to_string(),
             None => std::env::consts::OS.to_string(),
         };
         let shared_pc = match take_string(
@@ -1582,7 +1586,7 @@ mod tests {
         let settings = Settings::from_toml_and_env(&base_toml(""), &HashMap::new()).unwrap();
         assert!(!settings.worker_name.is_empty());
         assert!(!settings.worker_name.contains(' '));
-        assert_eq!(settings.worker_os, std::env::consts::OS);
+        assert_eq!(settings.worker_os, "linux");
 
         let settings = Settings::from_toml_and_env(
             &base_toml("worker_name = \"desk-07\"\nworker_os = \"windows\""),

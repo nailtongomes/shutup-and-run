@@ -8,9 +8,9 @@ One Linux VPS (yours, trusted) and one Windows 11 PC (treated as a client's). Ab
 
 The one-line installs download from the latest GitHub release.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` is the version in `Cargo.toml` (`v0.2.9` when this was written) or later and has three files: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` is the version in `Cargo.toml` (`v0.2.10` when this was written) or later and has three files: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
-If it is not there, tag `main`: `git tag v0.2.9 && git push origin v0.2.9` (the tag must be the version in `Cargo.toml`, because the `.exe` downloads the Linux binary of its own version), and wait for the `release` workflow.
+If it is not there: the `release` workflow runs by itself when `main` gets a `Cargo.toml` version that has no release, creates the tag and publishes. Look at its last run under Actions; "Run workflow" on `main` retries one that failed. Nobody pushes a tag by hand.
 
 ## 1. Linux VPS: push
 
@@ -135,6 +135,7 @@ Open a second PowerShell, run `shutup-and-run wsl stop` and then `shutup-and-run
 - [ ] `shutup-and-run config set max_slots 0 --json` exits 3 with `"code":"INVALID_VALUE"` and a `"hint"`.
 - [ ] `shutup-and-run config set poll_url "http://YOUR_VPS_IP:8080/poll?cpf=00000000000&email=nobody@example.com" --apply`. The mock keeps answering. `shutup-and-run config show`, `shutup-and-run doctor --report` and the page's Settings show `?cpf=***&email=***`; none shows `00000000000`. `shutup-and-run config get poll_url --reveal` shows the whole URL. Saving the page's form untouched keeps the URL.
 - [ ] `shutup-and-run config set poll_url "http://YOUR_VPS_IP:8080/nope" --json`, then `shutup-and-run config check --json`: the `poll` line is `POLL_HTTP_ERROR` with `HTTP 404`, not `POLL_OK`. Set the right URL back with `--apply`.
+- [ ] 0.2.10: `shutup-and-run status --json` has `last_poll_at` (seconds ago, not minutes) and `last_poll_status` (`nothing` while the queue is empty). `shutup-and-run doctor --json`: every line that is not ok has one `hint`, and `fix` is the same text. After `config set language pt --apply`, the page at `http://127.0.0.1:8787/` opens in Portuguese in a browser that never pressed its language button.
 - [ ] `shutup-and-run wsl install --poll-interval-secs 5` exits 3 (`$LASTEXITCODE`), says `at least 30`, and changes nothing.
 
 The same enrollment, queue and callback against n8n, with no mock: [examples/n8n/README.md](../examples/n8n/README.md#7-smoke-test).
@@ -153,7 +154,7 @@ shutup-and-run status --json
 - [ ] `status --json` has `"limits"` with `"profile":"shared-pc"`, `"max_job_cpus":1.0`, and `"waiting_for":null`.
 - [ ] While a job from the mock runs: `wsl -d shutup-and-run -u root docker inspect -f '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}' $(wsl -d shutup-and-run -u root docker ps -q)` prints `1000000000` and the same number twice (2147483648 on a PC with 16 GiB).
 - [ ] Start the mock with `--memory 8g`: no job starts, and `shutup-and-run wsl logs` has `poll task rejected`.
-- [ ] `shutup-and-run config set min_free_memory 900g --apply`: `status` shows `waiting_for: low on memory`, the mock gets no more polls, and the doctor's `resources` line is a warning with a `fix:`. `shutup-and-run config unset min_free_memory --apply` and the polls come back.
+- [ ] `shutup-and-run config set min_free_memory 900g --apply`: `status` shows `waiting_for: low on memory`, the mock gets no more polls, and the doctor's `resources` line is a warning with a `hint:`. `shutup-and-run config unset min_free_memory --apply` and the polls come back.
 - [ ] With a `.wslconfig` of your own that has other keys and `memory=64GB`: `wsl limits` exits 1; `wsl limits --apply` changes only `memory=` and `processors=`, and `.wslconfig.bak` is the old file. The doctor says `not in effect yet` until the PC restarts or you run `wsl --shutdown` yourself.
 
 ### Certificate passthrough and the demos

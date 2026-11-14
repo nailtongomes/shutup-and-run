@@ -154,15 +154,21 @@ pub(crate) async fn poll_once(
     }
     // The error is kept in status.json and the log: without the URL, whose
     // query pairs the machine with a person.
-    let response = request
-        .send()
-        .await
-        .map_err(|err| PollError(err.without_url().to_string()))?;
+    let response = request.send().await.map_err(|err| {
+        launcher.note_poll("error");
+        PollError(err.without_url().to_string())
+    })?;
     let status = response.status();
     if status == reqwest::StatusCode::NO_CONTENT {
         tracing::debug!("poll: nothing to do");
+        launcher.note_poll("nothing");
         return Ok(PollOutcome::Idle);
     }
+    launcher.note_poll(match status.as_u16() {
+        200 => "answered",
+        401 | 403 => "not_approved",
+        _ => "error",
+    });
     let bytes = read_capped(response).await?;
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         // The server decides which machines it serves. Until it approves this
@@ -178,12 +184,14 @@ pub(crate) async fn poll_once(
         Ok(answer) => answer,
         Err(err) => {
             tracing::warn!(error = %err, "poll task rejected");
+            launcher.note_poll("task_rejected");
             return Ok(PollOutcome::Rejected);
         }
     };
     let task = match answer {
         Answer::Nothing => {
             tracing::debug!("poll: nothing to do");
+            launcher.note_poll("nothing");
             return Ok(PollOutcome::Idle);
         }
         Answer::Task(task) => *task,
@@ -192,29 +200,36 @@ pub(crate) async fn poll_once(
                 Ok(Some(task)) => task,
                 Ok(None) => {
                     tracing::warn!("manifest rejected: it holds no task");
+                    launcher.note_poll("task_rejected");
                     return Ok(PollOutcome::Rejected);
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "manifest rejected");
+                    launcher.note_poll("task_rejected");
                     return Ok(PollOutcome::Rejected);
                 }
             }
         }
     };
-    match launcher.launch_from(task, JobSource::Poll).await {
+    let outcome = match launcher.launch_from(task, JobSource::Poll).await {
         Ok(LaunchOutcome::Created(job)) => {
             tracing::info!(id = %job.id, image = %job.image, "poll started a job");
-            Ok(PollOutcome::Started)
+            PollOutcome::Started
         }
         Ok(LaunchOutcome::Existing(job)) => {
             tracing::info!(id = %job.id, "poll task already recorded");
-            Ok(PollOutcome::Existing)
+            PollOutcome::Existing
         }
         Err(err) => {
             tracing::warn!(error = %err, "poll task rejected");
-            Ok(PollOutcome::Rejected)
+            PollOutcome::Rejected
         }
-    }
+    };
+    launcher.note_poll(match outcome {
+        PollOutcome::Rejected => "task_rejected",
+        _ => "task",
+    });
+    Ok(outcome)
 }
 
 async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, PollError> {
@@ -580,7 +595,7 @@ mod tests {
         let body: Value =
             serde_json::from_str(server.body.lock().unwrap().as_deref().unwrap()).unwrap();
         assert_eq!(body["worker"], launcher.settings().worker_name);
-        assert_eq!(body["os"], std::env::consts::OS);
+        assert_eq!(body["os"], "linux");
         assert_eq!(body["free_slots"], 2);
         assert_eq!(body["max_slots"], 2);
         assert_eq!(body["arch"], std::env::consts::ARCH);
@@ -880,6 +895,20 @@ mod tests {
         let (launcher, _mock) = launcher_for(1, &format!("poll_url = \"{}\"", busy.url), &[]);
         let err = poll_once(&launcher, &client().unwrap()).await.unwrap_err();
         assert!(err.to_string().contains("429"));
+        // status.json says when the last poll went out and how it ended.
+        let asked = launcher.live_status().await.last_poll.unwrap();
+        assert_eq!(asked.1, "error");
+        assert!(asked.0 > 0);
+        let quiet = poll_server(StatusCode::NO_CONTENT, "").await;
+        let (launcher, _mock) = launcher_for(1, &format!("poll_url = \"{}\"", quiet.url), &[]);
+        assert!(launcher.live_status().await.last_poll.is_none());
+        poll_once(&launcher, &client().unwrap()).await.unwrap();
+        assert_eq!(launcher.live_status().await.last_poll.unwrap().1, "nothing");
+        // A poll that was not sent (the worker is paused) is not a poll.
+        let (launcher, _mock) = launcher_for(1, &format!("poll_url = \"{}\"", quiet.url), &[]);
+        launcher.set_draining(true).unwrap();
+        poll_once(&launcher, &client().unwrap()).await.unwrap();
+        assert!(launcher.live_status().await.last_poll.is_none());
     }
 
     /// The query of the poll URL pairs the machine with a person. It reaches

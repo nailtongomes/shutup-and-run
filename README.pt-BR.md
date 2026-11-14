@@ -107,7 +107,7 @@ shutup-and-run demo sign                     # um container assina um PDF fictí
 - **`job validate`** faz a mesma checagem do `POST /v1/jobs` num arquivo com uma tarefa (`-` para a entrada padrão, `--poll` para conferir como tarefa de poll). Sai com 3 e um código (`JOB_INVALID_JSON`, `JOB_INVALID_FIELD`, `JOB_IMAGE_NOT_ALLOWED`) quando a API responderia `400` ou `403`. Não baixa imagem, não ocupa slot, não grava histórico, e uma tarefa válida ainda pode ser recusada depois: slots, pausa, memória e disco livres e o download da imagem só são conferidos no envio.
 - **`config check`** sai com 3 quando a própria configuração é inválida e com 1 quando algo em volta está errado. Uma URL de poll cujo host não responde em 8 segundos é um aviso (`POLL_UNREACHABLE`), não uma configuração inválida.
 - **`demo sign`** precisa do programa openssl e da imagem `python:3.12-slim` na allowlist. Usa um certificado descartável, a menos que receba `--configured`. O PDF assinado vai para `--out` (padrão `shutup-and-run-demo-signed.pdf`).
-- **`doctor --json`** dá a cada checagem um `code` estável ao lado de `name`, `status`, `detail` e `fix`: `DOCKER_UNAVAILABLE`, `CONFIG_INVALID`, `SERVICE_NOT_RUNNING`, `POLL_NOT_APPROVED`, `LOW_MEMORY`, e `NOME_OK` para a checagem que passou. A lista está em [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#diagnostic-codes).
+- **`doctor --json`** dá a cada checagem um `code` estável ao lado de `name`, `status`, `detail` e `hint`: `DOCKER_UNAVAILABLE`, `CONFIG_INVALID`, `SERVICE_NOT_RUNNING`, `POLL_NOT_APPROVED`, `LOW_MEMORY`, e `NOME_OK` para a checagem que passou. A lista está em [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#diagnostic-codes).
 
 ## Protegendo o PC
 
@@ -199,12 +199,12 @@ shutup-and-run config validate                  # sai com 3 e o motivo quando in
 shutup-and-run config apply                     # reinicia com o arquivo; containers continuam
 shutup-and-run config reset                     # config de fábrica; tokens, nome e endereço mantidos
 shutup-and-run status                           # idle, active, draining, failed, stopped
-shutup-and-run doctor [--report]                # toda linha com falha tem um fix
+shutup-and-run doctor [--report]                # toda linha com falha tem um hint
 shutup-and-run pause | resume
 shutup-and-run jobs [--limit N]                 # as últimas tarefas: status, exit code, duração, motivo da falha
 ```
 
-Todos são não interativos e aceitam `--json`. Toda falha, e toda linha do doctor que não está ok, traz um `hint` com o próximo passo, em inglês ou português (`config set language pt`). Os valores da query da poll URL aparecem como `***` (`config get poll_url --reveal` mostra). Códigos de saída: `0` feito, `1` falhou ou não está saudável, `2` linha de comando errada, `3` configuração ou valor inválido (nada foi gravado). Um valor inválido nunca é salvo, e um arquivo danificado de outro jeito não derruba o serviço: ele roda com a cópia do último salvamento, ou com os padrões ociosos, e avisa.
+Todos são não interativos e aceitam `--json`. Toda falha, e toda linha do doctor que não está ok, traz um `hint` com o próximo passo, em inglês ou português (`config set language pt`; a página segue a mesma chave). O `status` diz quando o worker perguntou por trabalho pela última vez (`last_poll_at`, `last_poll_status`). Os valores da query da poll URL aparecem como `***` (`config get poll_url --reveal` mostra). Códigos de saída: `0` feito, `1` falhou ou não está saudável, `2` linha de comando errada, `3` configuração ou valor inválido (nada foi gravado). Um valor inválido nunca é salvo, e um arquivo danificado de outro jeito não derruba o serviço: ele roda com a cópia do último salvamento, ou com os padrões ociosos, e avisa.
 
 **`config.toml` mais ambiente** é o que o instalador do Linux ainda escreve: `/etc/shutup-and-run/config.toml`, ou o arquivo indicado por `SHUTUP_AND_RUN_CONFIG`. Variáveis de ambiente sobrepõem o arquivo. Depois de mudar: `sudo systemctl restart shutup-and-run`; os jobs em execução sobrevivem. Numa máquina assim `shutup-and-run config` recusa e explica; `status`, `doctor`, `pause`, `resume` e `bans` funcionam. Uma máquina Linux usa `config.json` quando esse arquivo existe e `SHUTUP_AND_RUN_CONFIG` não aponta para um TOML. Não há conversor.
 
@@ -315,7 +315,7 @@ Só `image` é obrigatório. Campos desconhecidos são recusados. `job_key` torn
 **Pull.** Com `poll_url` definida, a máquina faz POST nela a cada `poll_interval_secs` (30 segundos, e nunca menos), só quando tem um slot livre, não está pausada e não está com pouca memória ou disco:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.9", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.10", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 A resposta é nada (`204`), uma tarefa, `{"task": {...}}`, ou `{"manifest_url": "https://..."}`, que é buscado uma vez e precisa ser uma tarefa. `401` ou `403` quer dizer "ainda não aprovada": o worker não inicia nada e continua perguntando, espaçando até cinco minutos. O servidor decide quais máquinas recebem trabalho; o token do worker é a identidade dele.

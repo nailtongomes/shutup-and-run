@@ -367,6 +367,15 @@ The worker goes to the PCs of the clients of a petition-filing service. Whoever 
 
 The cost: `config get poll_url` no longer prints the usable URL without `--reveal`, which a script written for 0.2.5 may depend on. A poll server now sees one request with no token per `config check`, and more polls from a busy machine than two a minute.
 
+## One next step per code, and a release without a hand-pushed tag (0.2.10)
+
+- **`fix` and `hint` were two sentences for one thing.** 0.2.9 added `hint` beside `fix`: `fix` was written where the check was, in English, with the machine's own detail; `hint` came from the catalogue, in the configured language, without it. Now there is one: the catalogue's sentence, and a check hands it the one detail it needs (the address to unban, the image to allow, the slot count that fits), which fills the `{}`. The JSON still has `fix`, with the same text as `hint`, so a reader of 0.2.8 keeps working; the text output has only `hint:`. The cost: a few `fix` texts were longer than the hint that replaced them.
+- **One language setting.** The page followed a cookie and the browser, the CLI followed `language`. The page now opens in `language` unless the person pressed its button, and `wsl install --language pt` sets the key.
+- **`last_poll_at` and `last_poll_status`** in `status.json`. "Is it asking for work?" could only be guessed from `poll_error` being null. Only a request that was sent counts.
+- **The doctor asks the poll URL itself when no service is running** to say how its polls go, with the probe of `config check` (no token, no free slot).
+- **Unit tests run as a Linux server on every platform.** With no `worker_os`, a test's machine is `linux` (`cfg!(test)` in `config.rs`). Twice a fixture that named no OS took the Windows defaults on the Windows runner and failed there only.
+- **The release workflow runs when `Cargo.toml` on `main` has a version with no release**, creates the tag and publishes. Tags were pushed by hand, from the owner's machine, after every merge. The cost: merging a version bump publishes, so the bump is the decision to release.
+
 ## Smoke test against a running instance
 
 `scripts/accept.sh` starts its own instance. `scripts/smoke.sh` tests one that is already installed, through the API only, with the URL and token from the environment. It is safe on a live machine: its jobs echo and sleep under a short `timeout_secs`, it undrains what it drained, and it sends wrong tokens from `127.0.0.2`, never from the caller. What it cannot do from where it runs, it skips and says why.
