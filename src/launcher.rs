@@ -108,6 +108,10 @@ impl Launcher {
         }))
     }
 
+    pub fn runtime(&self) -> &Arc<dyn Runtime> {
+        &self.runtime
+    }
+
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
@@ -240,29 +244,12 @@ impl Launcher {
         req: LaunchRequest,
         source: JobSource,
     ) -> Result<LaunchOutcome, LaunchError> {
-        validate_image_name(&req.image).map_err(LaunchError::BadRequest)?;
-        let skip_allowlist = source == JobSource::Poll && self.settings.poll_any_image;
-        if !skip_allowlist && !image_allowed(&req.image, &self.settings.allowlist) {
-            return Err(LaunchError::Forbidden);
-        }
-        let timeout = resolve_timeout(req.timeout_secs, &self.settings)?;
-        let env = validate_env(req.env)?;
-        let command = validate_command(req.command)?;
-        let job_key = validate_job_key(req.job_key)?;
-        let callback_url = validate_callback(req.callback_url)?;
-        let nano_cpus = limit_cpu(req.cpu, self.settings.max_job_cpus)?;
-        let memory_bytes = limit_memory(req.memory_bytes, self.settings.max_job_memory)?;
-
-        let spec = StartSpec {
-            image: req.image.clone(),
-            env,
-            command,
-            // Set when the container starts. Pull time does not count.
-            deadline_unix: 0,
-            nano_cpus,
-            memory_bytes,
-            shm_bytes: req.shm_bytes,
-        };
+        let Checked {
+            spec,
+            timeout,
+            job_key,
+            callback_url,
+        } = check_request(req, &self.settings, source)?;
 
         let guard = self.slots.lock().await;
         if self.draining()? {
@@ -331,16 +318,30 @@ impl Launcher {
             }
             Ok(Ok(())) => {
                 spec.deadline_unix = self.clock.now_unix().saturating_add(timeout);
-                match self.runtime.start(&id, &spec).await {
-                    Ok(()) => None,
+                // The owner's certificate, when the machine shares one. Staged
+                // per job and never logged: only the failure's kind is.
+                let staged = if self.settings.certificate_enabled {
+                    crate::certificate::stage(&self.settings, &id, &mut spec)
+                } else {
+                    Ok(())
+                };
+                match staged {
                     Err(err) => {
-                        tracing::warn!(%id, image = %spec.image, error = %err, "start failed");
-                        Some("failed to start container")
+                        tracing::warn!(%id, error = %err, "certificate passthrough");
+                        Some("certificate passthrough is on, but the certificate could not be given to the job")
                     }
+                    Ok(()) => match self.runtime.start(&id, &spec).await {
+                        Ok(()) => None,
+                        Err(err) => {
+                            tracing::warn!(%id, image = %spec.image, error = %err, "start failed");
+                            Some("failed to start container")
+                        }
+                    },
                 }
             }
         };
         if let Some(message) = failure {
+            crate::certificate::unstage(&self.settings, &id);
             // Close the row before the slot is released, so a status request
             // cannot find the id neither starting nor recorded as failed.
             let ended = self.clock.now_unix() as i64;
@@ -437,6 +438,8 @@ impl Launcher {
         let logs = clip_logs(&logs, self.settings.log_lines);
         let code = exit_code.or(if timed_out { Some(137) } else { None });
         let ended = self.clock.now_unix() as i64;
+        // The container has stopped, so its copies of the certificate go.
+        crate::certificate::unstage(&self.settings, id);
         match self.store.finish(id, ended, code, reason, &logs) {
             Ok(Some(job)) => {
                 self.timeouts.lock().await.remove(id);
@@ -541,6 +544,14 @@ impl Launcher {
                 Err(err) => tracing::warn!(%id, error = %err, "reconcile inspect failed"),
             }
         }
+        // Certificate copies of jobs that ended while this process was down.
+        let running: HashSet<String> = self
+            .store
+            .running_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        crate::certificate::sweep(&self.settings, &running);
     }
 
     fn fire_callback(&self, job: &JobRecord) {
@@ -736,6 +747,54 @@ fn validate_callback(callback_url: Option<String>) -> Result<Option<String>, Lau
     };
     validate_callback_url(&url).map_err(LaunchError::BadRequest)?;
     Ok(Some(url))
+}
+
+/// A request that passed every check that needs no Docker and no slot.
+#[derive(Debug, Clone)]
+pub struct Checked {
+    pub spec: StartSpec,
+    pub timeout: u64,
+    pub job_key: Option<String>,
+    pub callback_url: Option<String>,
+}
+
+/// The static half of admission: the image name, the allowlist, the timeout,
+/// env, command, job_key, callback URL and the machine's CPU and memory
+/// limits. `launch_from` and `job validate` both call it, so they agree.
+/// It reads nothing but the settings and changes nothing.
+pub fn check_request(
+    req: LaunchRequest,
+    settings: &Settings,
+    source: JobSource,
+) -> Result<Checked, LaunchError> {
+    validate_image_name(&req.image).map_err(LaunchError::BadRequest)?;
+    let skip_allowlist = source == JobSource::Poll && settings.poll_any_image;
+    if !skip_allowlist && !image_allowed(&req.image, &settings.allowlist) {
+        return Err(LaunchError::Forbidden);
+    }
+    let timeout = resolve_timeout(req.timeout_secs, settings)?;
+    let env = validate_env(req.env)?;
+    let command = validate_command(req.command)?;
+    let job_key = validate_job_key(req.job_key)?;
+    let callback_url = validate_callback(req.callback_url)?;
+    let nano_cpus = limit_cpu(req.cpu, settings.max_job_cpus)?;
+    let memory_bytes = limit_memory(req.memory_bytes, settings.max_job_memory)?;
+    Ok(Checked {
+        spec: StartSpec {
+            image: req.image,
+            env,
+            command,
+            // Set when the container starts. Pull time does not count.
+            deadline_unix: 0,
+            nano_cpus,
+            memory_bytes,
+            shm_bytes: req.shm_bytes,
+            binds: Vec::new(),
+        },
+        timeout,
+        job_key,
+        callback_url,
+    })
 }
 
 /// A job that names no limit gets the machine's; one that names more than the
@@ -1020,6 +1079,115 @@ mod tests {
         launcher.settled().await;
         assert_eq!(mock.start_count().await, 1);
         assert!(launcher.live_status().await.waiting_for.is_none());
+    }
+
+    fn with_certificate(s: &mut Settings) {
+        let base = s.history_path.parent().unwrap().to_path_buf();
+        s.certificate_dir = base.join("certificate");
+        s.secrets_dir = base.join("secrets");
+        crate::certificate::import(&s.certificate_dir, b"not-a-real-pfx", "the-password").unwrap();
+        s.certificate_enabled = true;
+    }
+
+    #[tokio::test]
+    async fn every_container_gets_the_certificate_when_passthrough_is_on_and_none_when_off() {
+        // Off, the default: nothing is mounted and a job's env is its own.
+        let (launcher, mock) = harness_with(1, |_| {});
+        assert!(!launcher.settings().certificate_enabled);
+        let mut plain = job("alpine", None);
+        plain
+            .env
+            .insert("SHUTUP_AND_RUN_CERT_PATH".into(), "/mine".into());
+        launcher.launch(plain).await.unwrap();
+        launcher.settled().await;
+        let spec = &mock.specs().await[0];
+        assert!(spec.binds.is_empty());
+        assert_eq!(spec.env, vec!["SHUTUP_AND_RUN_CERT_PATH=/mine"]);
+
+        // On: two jobs at once, each with its own read-only copies.
+        let (launcher, mock) = harness_with(2, with_certificate);
+        let secrets = launcher.settings().secrets_dir.clone();
+        let mut sneaky = job("alpine", None);
+        sneaky
+            .env
+            .insert("SHUTUP_AND_RUN_CERT_PATH".into(), "/etc/shadow".into());
+        sneaky
+            .env
+            .insert("SHUTUP_AND_RUN_CERT_PASSWORD_FILE".into(), "/x".into());
+        sneaky.env.insert("JOB".into(), "a".into());
+        let first = match launcher.launch(sneaky).await.unwrap() {
+            LaunchOutcome::Created(job) => job.id,
+            other => panic!("{other:?}"),
+        };
+        let second = match launcher.launch(job("alpine", None)).await.unwrap() {
+            LaunchOutcome::Created(job) => job.id,
+            other => panic!("{other:?}"),
+        };
+        launcher.settled().await;
+        for spec in mock.specs().await {
+            assert_eq!(spec.binds.len(), 2);
+            assert!(spec.binds[0].ends_with(":/run/shutup-and-run/certificate/client.pfx:ro"));
+            assert!(spec.binds[1].ends_with(":/run/shutup-and-run/secrets/certificate-password:ro"));
+            // The paths are the machine's, whatever the job said. The password is in no variable.
+            assert!(spec.env.contains(
+                &"SHUTUP_AND_RUN_CERT_PATH=/run/shutup-and-run/certificate/client.pfx".to_string()
+            ));
+            assert!(spec.env.contains(
+                &"SHUTUP_AND_RUN_CERT_PASSWORD_FILE=/run/shutup-and-run/secrets/certificate-password"
+                    .to_string()
+            ));
+            assert!(!spec
+                .env
+                .iter()
+                .any(|e| e.contains("/etc/shadow") || e.ends_with("=/x")));
+            assert!(!spec.env.iter().any(|e| e.contains("the-password")));
+        }
+        for id in [&first, &second] {
+            assert_eq!(
+                std::fs::read_to_string(secrets.join(id).join("certificate-password")).unwrap(),
+                "the-password"
+            );
+        }
+        // A job that ends, here by its timeout, takes its copies with it.
+        // The other job's stay, and the stored job never held the password.
+        launcher.on_exit(&first, 0).await;
+        assert!(!secrets.join(&first).exists());
+        assert!(secrets.join(&second).exists());
+        let stored = format!("{:?}", launcher.job(&first, true).await.unwrap().unwrap());
+        assert!(!stored.contains("the-password") && !stored.contains("certificate"));
+        assert!(
+            !callback_body(&launcher.job(&first, false).await.unwrap().unwrap())
+                .to_string()
+                .contains("password")
+        );
+        // After a restart, copies of jobs that are gone are swept.
+        std::fs::create_dir_all(secrets.join("0123456789abcdef0123456789abcdef")).unwrap();
+        launcher.reconcile().await;
+        assert!(!secrets.join("0123456789abcdef0123456789abcdef").exists());
+        assert!(secrets.join(&second).exists());
+
+        // A start that fails leaves nothing behind either.
+        let (launcher, mock) = harness_with(1, with_certificate);
+        mock.fail_start(true).await;
+        launcher.launch(job("alpine", None)).await.unwrap();
+        launcher.settled().await;
+        assert_eq!(
+            std::fs::read_dir(&launcher.settings().secrets_dir)
+                .unwrap()
+                .count(),
+            0
+        );
+
+        // On, but the certificate is gone: the job fails rather than run without it.
+        let (launcher, mock) = harness_with(1, |s| {
+            with_certificate(s);
+            crate::certificate::forget(&s.certificate_dir);
+        });
+        launcher.launch(job("alpine", None)).await.unwrap();
+        launcher.settled().await;
+        assert_eq!(mock.start_count().await, 0);
+        let failed = launcher.last_job().unwrap().unwrap();
+        assert_eq!(failed.reason.as_deref(), Some(REASON_START_FAILED));
     }
 
     #[tokio::test]

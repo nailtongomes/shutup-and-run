@@ -91,6 +91,24 @@ curl -sk -H "Authorization: Bearer $SAR_TOKEN" "https://203.0.113.10:8787/v1/job
 
 `-k` skips certificate verification; pinning the fingerprint is in [docs/RECIPES.md](docs/RECIPES.md). Ready-made flows: [examples/kestra-dispatch.yml](examples/kestra-dispatch.yml), [examples/n8n-dispatch.json](examples/n8n-dispatch.json), and for pull [examples/kestra-poll.yml](examples/kestra-poll.yml), [examples/n8n-poll.json](examples/n8n-poll.json).
 
+## First run without an orchestrator
+
+Five commands, all non-interactive, all with `--json`. None changes the worker's config or its job history.
+
+```
+shutup-and-run version --json                # the build, platform, runtime (docker or wsl2), API version
+shutup-and-run config check                  # preflight: config, Docker, storage, limits, allowlist, poll host
+shutup-and-run demo                          # one container through the worker's own path
+shutup-and-run job validate task.json        # would this machine accept this task? Nothing runs
+shutup-and-run demo sign                     # a container signs a made-up PDF; the signature is verified
+```
+
+- **`demo`** starts `hello-world` (or `--image`) the way a task starts: the allowlist, the per-job limits and admission all apply. It checks that the container exited 0, that Docker really applied the CPU and memory limits, and that nothing is left. An image the machine may not run is a failure with the command that allows it, not something the demo works around.
+- **`job validate`** runs the same check as `POST /v1/jobs` on a file with a task (`-` for stdin, `--poll` to check it as a polled task). Exit 3 with a code (`JOB_INVALID_JSON`, `JOB_INVALID_FIELD`, `JOB_IMAGE_NOT_ALLOWED`) when the API would answer `400` or `403`. It does not pull, take a slot or write history, and a valid task can still be refused later: slots, a pause, free memory and disk, and the image pull are checked only when it is sent.
+- **`config check`** exits 3 when the config itself is invalid and 1 when something around it is wrong. A poll URL whose host does not answer in 8 seconds is a warning (`POLL_UNREACHABLE`), not an invalid config.
+- **`demo sign`** needs the openssl program and the image `python:3.12-slim` on the allowlist. It uses a throwaway certificate unless `--configured`. The signed PDF is written to `--out` (default `shutup-and-run-demo-signed.pdf`).
+- **`doctor --json`** gives every check a stable `code` beside `name`, `status`, `detail` and `fix`: `DOCKER_UNAVAILABLE`, `CONFIG_INVALID`, `SERVICE_NOT_RUNNING`, `POLL_NOT_APPROVED`, `LOW_MEMORY`, and `NAME_OK` for a check that passed. The list is in [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#diagnostic-codes).
+
 ## Protecting the PC
 
 The customer's interactive work has priority over job throughput. On a shared PC these layers enforce that:
@@ -126,6 +144,7 @@ With `status_page = true` (the Windows install turns it on; a Linux install does
 | `/` | Running, paused or Docker down. Whether the PC can be turned off. Jobs now, the last job, whether the queue answers, the machine's name. A button to pause or resume taking jobs. Reloads every 10 seconds | none |
 | Settings (`/local/config`) | Poll URL, poll interval, jobs at once, machine name | none |
 | Advanced settings (`/local/advanced`) | Allowed images, any-image, time limits, both tokens, the admin login | `admin` / `admin` until changed |
+| Certificate (`/local/certificate`) | Optional [certificate passthrough](#certificate-passthrough-optional): import a `.pfx` and its password, validate it, test PDF signing, turn it off. The password is never shown | the same login, and a confirmation |
 
 - The page edits the same `config.json` as the CLI, through the same validation. A saved change restarts the service on the new file; running containers are left alone. An invalid value is refused and nothing is written.
 - Change the admin password with `shutup-and-run config set admin_password "NEW" --apply`.
@@ -133,6 +152,35 @@ With `status_page = true` (the Windows install turns it on; a Linux install does
 - It is in English or Portuguese, one at a time; a link switches and the choice is remembered.
 
 Security of the page, plainly. It needs no token, so it answers only a loopback connection that names a loopback host, and accepts a form only from its own origin. It never shows a token, a job's env or logs. The admin login keeps a curious person out and is **not** a security boundary: whoever uses the PC can read the config file. Nothing on it is reachable from the network, and it is not meant to be put behind a proxy. On a machine set up with `config.toml` the page shows status only.
+
+## Certificate passthrough (optional)
+
+Off by default. Some jobs sign documents with the owner's digital certificate, a PKCS#12 file (`.pfx`, `.p12`) and its password. The owner of the machine can import one, and from then on **every container this machine starts** can read both. There is no per-image list, by decision: the owner trusts every job, or leaves it off.
+
+> When enabled, every container executed by this worker can access the configured certificate and its password. Read-only mounting protects the original file from modification but does not prevent copying, exporting, or using its private key. Enable this feature only if you trust every workload that may run on this machine.
+
+```
+SHUTUP_AND_RUN_CERT_PASSWORD='...' shutup-and-run certificate set --file "C:\Users\Ana\cert.pfx" --accept-risk --apply
+shutup-and-run certificate status          # on or off, and which file was imported
+shutup-and-run certificate validate        # opens with the password, has a key, not expired
+shutup-and-run demo sign --configured      # sign a made-up PDF with it, in a container
+shutup-and-run certificate disable --forget --apply
+```
+
+The same is on the local page, under Advanced settings, **Certificate**: choose the file, type the password, tick the confirmation. The password is never shown again, and never taken as a command-line argument: it comes from `SHUTUP_AND_RUN_CERT_PASSWORD` or, with `--password-stdin`, from stdin.
+
+What a container gets, whatever the original file was called:
+
+| | |
+| --- | --- |
+| `/run/shutup-and-run/certificate/client.pfx` | The certificate, read-only. Also in `SHUTUP_AND_RUN_CERT_PATH`. |
+| `/run/shutup-and-run/secrets/certificate-password` | The password, as the file's only content, read-only. Also in `SHUTUP_AND_RUN_CERT_PASSWORD_FILE`. |
+
+The two variables hold paths, never the password. A task cannot change either path, has no field that mounts anything, and its own values for those two variables are dropped.
+
+How it is kept. `certificate set` checks the file first (it must open with the password, hold a private key and not be expired) and then copies it beside the config, in `/etc/shutup-and-run/certificate/`, mode 600, with the password in a file of its own. Neither is in `config.json`, in a log, in the job history, in a callback, in a report, or in anything sent to the poll URL. The original file is only read. Each job gets its own copies in `/run/shutup-and-run/jobs/<id>/`, which is memory and not disk, and they are deleted when the job ends, also after a timeout, a failed start or a restart. A change of certificate applies to the next job; a running one keeps what it started with.
+
+What this is not. It is not isolation and not a vault. The imported password is a plain file that root on the machine can read; on Windows that machine is the WSL2 distribution, and its user is root there. Deleting a file does not erase it from the disk. `certificate validate` says the file is usable, not that a court's or a bank's system accepts it. `demo sign` makes a basic PDF signature (`adbe.pkcs7.detached`) and verifies it with openssl; it is not PAdES and says nothing about ICP-Brasil.
 
 ## Configuration
 
@@ -189,6 +237,7 @@ The keys are the same in both. An unknown key is refused.
 | `prune_interval_secs` | `SHUTUP_AND_RUN_PRUNE_INTERVAL_SECS` | Remove finished containers and unused images this often. Default 0, off. |
 | `reaper_interval_secs`, `purge_interval_secs` | `SHUTUP_AND_RUN_REAPER_INTERVAL_SECS`, `_PURGE_INTERVAL_SECS` | How often timeouts are enforced (2) and old history deleted (3600). |
 | `docker_config` | `SHUTUP_AND_RUN_DOCKER_CONFIG` | Path to Docker's `config.json`, for private images. |
+| `certificate_enabled`, `certificate_consent`, `certificate_name` (JSON only) | | Certificate passthrough. Written by `shutup-and-run certificate set`, not by hand. Default off. |
 
 **Allowlist.** `ghcr.io/you/worker` allows any tag or digest of that repository and nothing else: not `ghcr.io/you/worker-evil`, not `ghcr.io/you/other`. An entry with a tag allows exactly that string. A Windows worker has `poll_any_image` instead: its one source of work is your poll URL.
 
@@ -207,6 +256,11 @@ shutup-and-run wsl install --poll-url "https://queue.example/poll?user=ana"
 
 # 2. Configure. Exit 3 and a reason on an invalid value; nothing is written then.
 shutup-and-run config set max_job_memory 1g --apply --json
+
+# 2b. Prove it works before any orchestrator sends work.
+shutup-and-run config check --json  # exit 3: the config; exit 1: Docker, storage, or the poll host
+shutup-and-run demo --json          # one container, limits checked, nothing left behind
+shutup-and-run job validate task.json --json   # exit 3 and a code when the task would be refused
 
 # 3. Inspect what is in force.
 shutup-and-run status --json        # state, slots, limits, waiting_for, poll_error
@@ -259,7 +313,7 @@ Only `image` is required. Unknown fields are refused. `job_key` makes a retry sa
 **Pull.** With `poll_url` set, the machine POSTs to it every `poll_interval_secs`, only when it has a free slot, is not paused and is not short of memory or disk:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.6", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.7", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 The answer is nothing (`204`), a task, `{"task": {...}}`, or `{"manifest_url": "https://..."}`, which is fetched once and must be a task. `401` or `403` means "not approved yet": the worker starts nothing and keeps asking, backing off to five minutes. The server decides which machines get work; the worker's token is its identity.
@@ -277,6 +331,7 @@ Field limits, every status code, the callback, idempotency, and what is not guar
 - **A Windows worker is a computer you do not control.** Its user can read the poll token, every task's env and the image layers. Send it only short-lived secrets scoped to one task, and treat what comes back as a claim. Keep work with real secrets on your own Linux machines.
 - **The customer is trusting your orchestrator.** With `poll_any_image`, the poll URL decides which image runs on their PC.
 - The local page is for the person at the machine and is not a security boundary. See [The local page](#the-local-page).
+- **Certificate passthrough shares the owner's private key with every job.** It is off unless the owner turned it on, on the machine, with a confirmation. See [Certificate passthrough](#certificate-passthrough-optional).
 
 How the process defends itself: [SECURITY.md](SECURITY.md). What an operator accepts by running it: [docs/CONVENTIONS.md](docs/CONVENTIONS.md).
 
@@ -324,7 +379,7 @@ SMOKE_URL=https://203.0.113.10:8787 SMOKE_TOKEN=... SMOKE_FINGERPRINT=AA:BB:... 
 
 The image needs `sh` and `sleep`; the default is `ghcr.io/nailtongomes/shutup-and-run-smoke`, built from `examples/smoke-image`. A check that needs something you did not give is `SKIP`, with the reason. The header of the script lists every variable.
 
-`scripts/accept.sh` is the developer's test: its own instance against a real Docker daemon, the per-job limits on the container included. CI runs it and `smoke.sh` on every push, a pull cycle against `tests/poll-mock`, and `smoke.sh` again against a service installed by `install.sh`. A hand test of a Windows PC and a Linux server, step by step, is [docs/TESTING.md](docs/TESTING.md).
+`scripts/accept.sh` is the developer's test: its own instance against a real Docker daemon, the per-job limits on the container included, and the first-run commands (`demo`, `job validate`, `demo sign` with a mounted certificate). CI runs it and `smoke.sh` on every push, a pull cycle against `tests/poll-mock`, and `smoke.sh` again against a service installed by `install.sh`. A hand test of a Windows PC and a Linux server, step by step, is [docs/TESTING.md](docs/TESTING.md).
 
 ## Limits
 
@@ -374,6 +429,7 @@ MIT license. More reading:
 - [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md): the contract for an orchestrator, with JSON Schemas in `docs/schemas`.
 - [docs/WINDOWS.md](docs/WINDOWS.md): the Windows worker, and sharing the PC.
 - [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md): for an AI agent setting up or repairing a worker.
+- [examples](examples/README.md): dispatch, job key, callback, status and failure, end to end, for n8n and Kestra.
 - [examples/n8n](examples/n8n/README.md): n8n as the orchestrator, and a smoke test.
 - [docs/RECIPES.md](docs/RECIPES.md): copy-and-paste answers for common cases.
 - [docs/CONVENTIONS.md](docs/CONVENTIONS.md): what the operator agrees to.

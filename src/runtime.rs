@@ -9,6 +9,17 @@ pub struct StartSpec {
     pub nano_cpus: Option<i64>,
     pub memory_bytes: Option<i64>,
     pub shm_bytes: Option<i64>,
+    /// Read-only file mounts, `host:container:ro`. Only the machine's own
+    /// certificate passthrough fills this. A request has no field for it.
+    pub binds: Vec<String>,
+}
+
+/// What Docker says it applied to a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applied {
+    pub nano_cpus: i64,
+    pub memory_bytes: i64,
+    pub memory_swap: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +47,8 @@ pub trait Runtime: Send + Sync {
     /// call takes that same id.
     async fn start(&self, id: &str, spec: &StartSpec) -> Result<(), RuntimeError>;
     async fn inspect(&self, id: &str) -> Result<Inspected, RuntimeError>;
+    /// The limits on a container that still exists. None when it is gone.
+    async fn applied(&self, id: &str) -> Result<Option<Applied>, RuntimeError>;
     async fn list_expired(&self, now_unix: u64) -> Result<Vec<String>, RuntimeError>;
     async fn kill(&self, id: &str) -> Result<(), RuntimeError>;
     async fn tail_logs(&self, id: &str, lines: usize) -> Result<String, RuntimeError>;

@@ -91,6 +91,24 @@ curl -sk -H "Authorization: Bearer $SAR_TOKEN" "https://203.0.113.10:8787/v1/job
 
 `-k` pula a verificação do certificado; como fixar a impressão digital está em [docs/RECIPES.md](docs/RECIPES.md). Fluxos prontos: [examples/kestra-dispatch.yml](examples/kestra-dispatch.yml), [examples/n8n-dispatch.json](examples/n8n-dispatch.json), e para pull [examples/kestra-poll.yml](examples/kestra-poll.yml), [examples/n8n-poll.json](examples/n8n-poll.json).
 
+## Primeira execução, sem orquestrador
+
+Cinco comandos, todos não interativos, todos com `--json`. Nenhum altera a configuração do worker nem o histórico de tarefas.
+
+```
+shutup-and-run version --json                # o build, a plataforma, o runtime (docker ou wsl2), a versão da API
+shutup-and-run config check                  # pré-checagem: config, Docker, armazenamento, limites, allowlist, host do poll
+shutup-and-run demo                          # um container pelo caminho do próprio worker
+shutup-and-run job validate task.json        # esta máquina aceitaria esta tarefa? Nada roda
+shutup-and-run demo sign                     # um container assina um PDF fictício; a assinatura é verificada
+```
+
+- **`demo`** inicia `hello-world` (ou `--image`) do jeito que uma tarefa inicia: a allowlist, os limites por job e a admissão valem. Ele confere que o container saiu com 0, que o Docker aplicou mesmo os limites de CPU e memória, e que nada sobrou. Uma imagem que a máquina não pode rodar é uma falha com o comando que a libera, não algo que a demo contorna.
+- **`job validate`** faz a mesma checagem do `POST /v1/jobs` num arquivo com uma tarefa (`-` para a entrada padrão, `--poll` para conferir como tarefa de poll). Sai com 3 e um código (`JOB_INVALID_JSON`, `JOB_INVALID_FIELD`, `JOB_IMAGE_NOT_ALLOWED`) quando a API responderia `400` ou `403`. Não baixa imagem, não ocupa slot, não grava histórico, e uma tarefa válida ainda pode ser recusada depois: slots, pausa, memória e disco livres e o download da imagem só são conferidos no envio.
+- **`config check`** sai com 3 quando a própria configuração é inválida e com 1 quando algo em volta está errado. Uma URL de poll cujo host não responde em 8 segundos é um aviso (`POLL_UNREACHABLE`), não uma configuração inválida.
+- **`demo sign`** precisa do programa openssl e da imagem `python:3.12-slim` na allowlist. Usa um certificado descartável, a menos que receba `--configured`. O PDF assinado vai para `--out` (padrão `shutup-and-run-demo-signed.pdf`).
+- **`doctor --json`** dá a cada checagem um `code` estável ao lado de `name`, `status`, `detail` e `fix`: `DOCKER_UNAVAILABLE`, `CONFIG_INVALID`, `SERVICE_NOT_RUNNING`, `POLL_NOT_APPROVED`, `LOW_MEMORY`, e `NOME_OK` para a checagem que passou. A lista está em [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#diagnostic-codes).
+
 ## Protegendo o PC
 
 O trabalho interativo do cliente tem prioridade sobre a vazão de jobs. Num PC compartilhado, estas camadas garantem isso:
@@ -126,6 +144,7 @@ Com `status_page = true` (a instalação no Windows liga; a do Linux não), o se
 | `/` | Rodando, pausado ou Docker parado. Se o PC pode ser desligado. Tarefas agora, a última tarefa, se a fila responde, o nome da máquina. Um botão para pausar ou voltar a aceitar tarefas. Recarrega a cada 10 segundos | nenhum |
 | Configuração (`/local/config`) | URL de poll, intervalo de poll, tarefas ao mesmo tempo, nome da máquina | nenhum |
 | Configuração avançada (`/local/advanced`) | Imagens permitidas, qualquer imagem, limites de tempo, os dois tokens, o login de admin | `admin` / `admin` até ser trocado |
+| Certificado (`/local/certificate`) | [Repasse de certificado](#repasse-de-certificado-opcional), opcional: importar um `.pfx` e a senha, validar, testar assinatura de PDF, desligar. A senha nunca é mostrada | o mesmo login, e uma confirmação |
 
 - A página edita o mesmo `config.json` que o CLI, pela mesma validação. Uma mudança salva reinicia o serviço com o arquivo novo; os containers em execução não são tocados. Um valor inválido é recusado e nada é gravado.
 - Troque a senha de admin com `shutup-and-run config set admin_password "NOVA" --apply`.
@@ -133,6 +152,35 @@ Com `status_page = true` (a instalação no Windows liga; a do Linux não), o se
 - Ela fica em inglês ou em português, um idioma por vez; um link troca e a escolha é lembrada.
 
 A segurança da página, sem rodeios. Ela não pede token, então só responde a uma conexão de loopback que nomeia um host de loopback, e só aceita um formulário da própria origem. Nunca mostra token, env de job nem logs. O login de admin afasta um curioso e **não** é uma barreira de segurança: quem usa o PC consegue ler o arquivo de configuração. Nada nela é acessível pela rede, e ela não foi feita para ficar atrás de um proxy. Numa máquina configurada com `config.toml` a página só mostra o status.
+
+## Repasse de certificado (opcional)
+
+Desligado por padrão. Algumas tarefas assinam documentos com o certificado digital do dono, um arquivo PKCS#12 (`.pfx`, `.p12`) e a senha dele. O dono da máquina pode importar um, e a partir daí **todo container que esta máquina iniciar** consegue ler os dois. Não há lista por imagem, por decisão: ou o dono confia em toda tarefa, ou deixa desligado.
+
+> Quando ativado, todo container executado por este worker pode acessar o certificado configurado e a senha dele. A montagem somente leitura protege o arquivo original contra alteração, mas não impede copiar, exportar ou usar a chave privada. Ative este recurso apenas se você confia em toda carga de trabalho que pode rodar nesta máquina.
+
+```
+SHUTUP_AND_RUN_CERT_PASSWORD='...' shutup-and-run certificate set --file "C:\Users\Ana\cert.pfx" --accept-risk --apply
+shutup-and-run certificate status          # ligado ou não, e qual arquivo foi importado
+shutup-and-run certificate validate        # abre com a senha, tem chave, não expirou
+shutup-and-run demo sign --configured      # assina um PDF fictício com ele, num container
+shutup-and-run certificate disable --forget --apply
+```
+
+O mesmo está na página local, em Configuração avançada, **Certificado**: escolha o arquivo, digite a senha, marque a confirmação. A senha nunca é mostrada de novo, e nunca é um argumento de linha de comando: vem de `SHUTUP_AND_RUN_CERT_PASSWORD` ou, com `--password-stdin`, da entrada padrão.
+
+O que o container recebe, qualquer que fosse o nome do arquivo original:
+
+| | |
+| --- | --- |
+| `/run/shutup-and-run/certificate/client.pfx` | O certificado, somente leitura. Também em `SHUTUP_AND_RUN_CERT_PATH`. |
+| `/run/shutup-and-run/secrets/certificate-password` | A senha, como único conteúdo do arquivo, somente leitura. Também em `SHUTUP_AND_RUN_CERT_PASSWORD_FILE`. |
+
+As duas variáveis contêm caminhos, nunca a senha. Uma tarefa não muda nenhum dos caminhos, não tem campo que monte nada, e os valores que ela mesma der a essas duas variáveis são descartados.
+
+Como fica guardado. `certificate set` confere o arquivo primeiro (precisa abrir com a senha, ter chave privada e não estar expirado) e depois o copia para junto da configuração, em `/etc/shutup-and-run/certificate/`, modo 600, com a senha num arquivo próprio. Nenhum dos dois está no `config.json`, em log, no histórico de tarefas, em callback, em relatório, nem em nada enviado à URL de poll. O arquivo original é só lido. Cada tarefa recebe suas próprias cópias em `/run/shutup-and-run/jobs/<id>/`, que é memória e não disco, e elas são apagadas quando a tarefa termina, também depois de timeout, falha ao iniciar ou reinício. A troca de certificado vale para a próxima tarefa; a que está rodando fica com o que tinha.
+
+O que isto não é. Não é isolamento nem cofre. A senha importada é um arquivo comum que o root da máquina lê; no Windows essa máquina é a distribuição WSL2, e o usuário dela é root ali. Apagar um arquivo não o elimina do disco. `certificate validate` diz que o arquivo é utilizável, não que o sistema de um tribunal ou de um banco o aceita. `demo sign` faz uma assinatura básica de PDF (`adbe.pkcs7.detached`) e a verifica com openssl; não é PAdES e não diz nada sobre ICP-Brasil.
 
 ## Configuração
 
@@ -189,6 +237,7 @@ As chaves são as mesmas nos dois. Chave desconhecida é recusada.
 | `prune_interval_secs` | `SHUTUP_AND_RUN_PRUNE_INTERVAL_SECS` | Remove containers terminados e imagens sem uso nesse intervalo. Padrão 0, desligado. |
 | `reaper_interval_secs`, `purge_interval_secs` | `SHUTUP_AND_RUN_REAPER_INTERVAL_SECS`, `_PURGE_INTERVAL_SECS` | De quanto em quanto os timeouts são aplicados (2) e o histórico antigo é apagado (3600). |
 | `docker_config` | `SHUTUP_AND_RUN_DOCKER_CONFIG` | Caminho do `config.json` do Docker, para imagens privadas. |
+| `certificate_enabled`, `certificate_consent`, `certificate_name` (só JSON) | | Repasse de certificado. Escritas por `shutup-and-run certificate set`, não à mão. Padrão desligado. |
 
 **Allowlist.** `ghcr.io/you/worker` permite qualquer tag ou digest desse repositório e nada mais: nem `ghcr.io/you/worker-evil`, nem `ghcr.io/you/other`. Uma entrada com tag permite exatamente aquele texto. Um worker Windows usa `poll_any_image` no lugar: a única fonte de trabalho dele é a sua URL de poll.
 
@@ -207,6 +256,11 @@ shutup-and-run wsl install --poll-url "https://queue.example/poll?user=ana"
 
 # 2. Configurar. Sai com 3 e o motivo num valor inválido; nada é gravado.
 shutup-and-run config set max_job_memory 1g --apply --json
+
+# 2b. Provar que funciona antes de qualquer orquestrador mandar trabalho.
+shutup-and-run config check --json  # sai com 3: a config; com 1: Docker, armazenamento ou o host do poll
+shutup-and-run demo --json          # um container, limites conferidos, nada deixado para trás
+shutup-and-run job validate task.json --json   # sai com 3 e um código quando a tarefa seria recusada
 
 # 3. Inspecionar o que está em vigor.
 shutup-and-run status --json        # state, slots, limits, waiting_for, poll_error
@@ -259,7 +313,7 @@ Só `image` é obrigatório. Campos desconhecidos são recusados. `job_key` torn
 **Pull.** Com `poll_url` definida, a máquina faz POST nela a cada `poll_interval_secs`, só quando tem um slot livre, não está pausada e não está com pouca memória ou disco:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.6", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.7", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 A resposta é nada (`204`), uma tarefa, `{"task": {...}}`, ou `{"manifest_url": "https://..."}`, que é buscado uma vez e precisa ser uma tarefa. `401` ou `403` quer dizer "ainda não aprovada": o worker não inicia nada e continua perguntando, espaçando até cinco minutos. O servidor decide quais máquinas recebem trabalho; o token do worker é a identidade dele.
@@ -277,6 +331,7 @@ Limites de cada campo, todos os códigos de status, o callback, idempotência, e
 - **Um worker Windows é um computador que você não controla.** O usuário dele consegue ler o token de poll, o env de cada tarefa e as camadas da imagem. Mande só segredos de vida curta, restritos a uma tarefa, e trate o que volta como uma alegação. Deixe o trabalho com segredos de verdade nas suas máquinas Linux.
 - **O cliente está confiando no seu orquestrador.** Com `poll_any_image`, a URL de poll decide qual imagem roda no PC dele.
 - A página local é para a pessoa na máquina e não é uma barreira de segurança. Veja [A página local](#a-página-local).
+- **O repasse de certificado compartilha a chave privada do dono com toda tarefa.** Fica desligado até o dono ligar, na própria máquina, com uma confirmação. Veja [Repasse de certificado](#repasse-de-certificado-opcional).
 
 Como o processo se defende: [SECURITY.md](SECURITY.md). O que o operador aceita ao rodar: [docs/CONVENTIONS.md](docs/CONVENTIONS.md).
 
@@ -324,7 +379,7 @@ SMOKE_URL=https://203.0.113.10:8787 SMOKE_TOKEN=... SMOKE_FINGERPRINT=AA:BB:... 
 
 A imagem precisa de `sh` e `sleep`; a padrão é `ghcr.io/nailtongomes/shutup-and-run-smoke`, feita a partir de `examples/smoke-image`. Um teste que precisa de algo que você não informou sai como `SKIP`, com o motivo. O cabeçalho do script lista todas as variáveis.
 
-`scripts/accept.sh` é o teste do desenvolvedor: uma instância própria contra um Docker de verdade, incluindo os limites por job no container. O CI roda ele e o `smoke.sh` a cada push, um ciclo de pull contra `tests/poll-mock`, e o `smoke.sh` de novo contra um serviço instalado pelo `install.sh`. Um teste manual de um PC Windows e de um servidor Linux, passo a passo, é [docs/TESTING.pt-BR.md](docs/TESTING.pt-BR.md).
+`scripts/accept.sh` é o teste do desenvolvedor: uma instância própria contra um Docker de verdade, incluindo os limites por job no container e os comandos de primeira execução (`demo`, `job validate`, `demo sign` com um certificado montado). O CI roda ele e o `smoke.sh` a cada push, um ciclo de pull contra `tests/poll-mock`, e o `smoke.sh` de novo contra um serviço instalado pelo `install.sh`. Um teste manual de um PC Windows e de um servidor Linux, passo a passo, é [docs/TESTING.pt-BR.md](docs/TESTING.pt-BR.md).
 
 ## Limites
 
@@ -374,6 +429,7 @@ Licença MIT. Mais leitura:
 - [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md): o contrato para um orquestrador, com JSON Schemas em `docs/schemas`.
 - [docs/WINDOWS.md](docs/WINDOWS.md): o worker Windows, e como o PC é compartilhado.
 - [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md): para um agente de IA que instala ou conserta um worker.
+- [examples](examples/README.md): envio, job key, callback, status e falha, de ponta a ponta, para n8n e Kestra.
 - [examples/n8n](examples/n8n/README.md): o n8n como orquestrador, e um smoke test.
 - [docs/RECIPES.md](docs/RECIPES.md): respostas de copiar e colar para casos comuns.
 - [docs/CONVENTIONS.md](docs/CONVENTIONS.md): o que o operador aceita.

@@ -1096,7 +1096,7 @@ mod tests {
         let (status, _, _) = send(
             "POST",
             "/local/advanced",
-            login,
+            login.clone(),
             "allowlist=alpine%0D%0Aghcr.io%2Fo%2Fimg&token=&poll_token=&admin_user=admin&admin_password=",
         )
         .await;
@@ -1105,6 +1105,80 @@ mod tests {
         assert_eq!(saved["allowlist"], json!(["alpine", "ghcr.io/o/img"]));
         assert_eq!(saved["admin_password"], "open-sesame");
         assert_eq!(saved["token"], map["token"]);
+
+        // The certificate section: behind the same login, the same origin
+        // rule, and a confirmation. Off until all three are there.
+        let (status, _, _) = send("GET", "/local/certificate", vec![], "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _, _) = send(
+            "POST",
+            "/local/certificate",
+            vec![("origin", ORIGIN.into())],
+            "action=forget",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _, _) = send(
+            "POST",
+            "/local/certificate",
+            vec![
+                ("origin", "https://evil.example".into()),
+                ("authorization", basic("admin:open-sesame")),
+            ],
+            "action=forget",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, page) = send("GET", "/local/certificate", login.clone(), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains("Off. No certificate."));
+        assert!(page.contains("every container executed by this worker can access"));
+        assert!(page.contains("name=\"confirm\"") && page.contains("value=\"sign\""));
+        // No confirmation, then a confirmation with something that is no certificate.
+        let (status, _, page) = send(
+            "POST",
+            "/local/certificate",
+            login.clone(),
+            "action=save&pfx_base64=AAAA&password=pw-not-shown",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.contains("tick the box") && !page.contains("pw-not-shown"));
+        let (status, _, page) = send(
+            "POST",
+            "/local/certificate",
+            login.clone(),
+            "action=save&confirm=on&pfx_base64=AAAA&password=pw-not-shown",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!page.contains("pw-not-shown"));
+        let saved = crate::config::read_json(&path).unwrap();
+        assert!(saved.get("certificate_enabled").is_none());
+        assert!(!crate::certificate::imported(&dir.join("certificate")));
         let _ = std::fs::remove_dir_all(&dir);
+
+        // Not through the API, with the machine's token, from the network.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/local/certificate")
+            .header("host", "203.0.113.10:8787")
+            .header(
+                "authorization",
+                format!("Bearer {}", map["token"].as_str().unwrap()),
+            )
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("action=forget"))
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(stamp(request, [203, 0, 113, 5]))
+            .await
+            .unwrap();
+        assert!(
+            !response.status().is_success(),
+            "a remote caller reached the certificate page: {}",
+            response.status()
+        );
     }
 }

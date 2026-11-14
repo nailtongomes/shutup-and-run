@@ -113,6 +113,60 @@ A job that asks for more `cpu` or `memory` than the machine's limit is refused, 
 
 **What this does not do.** It is not a guarantee that the PC stays responsive. The free-memory check sees the VM, not Windows: a PC whose Windows side is out of memory still looks fine from inside. It is taken when a job starts, not while it runs. Disk and network use of a job are not limited. Nothing watches the keyboard or the mouse, and a running job is never stopped to make room. The pause button on the local page is how the person at the PC says "not now".
 
+## Certificate passthrough
+
+Optional and off by default. The owner of the PC can let jobs use a digital certificate that is on the PC: a PKCS#12 file (`.pfx` or `.p12`) and its password.
+
+> When enabled, every container executed by this worker can access the configured certificate and its password. Read-only mounting protects the original file from modification but does not prevent copying, exporting, or using its private key. Enable this feature only if you trust every workload that may run on this machine.
+
+There is no list of images that may use it. That is the decision: every job, or none.
+
+**On the local page.** `http://127.0.0.1:8787/`, Settings, Advanced settings, **Certificate**. Choose the file, type its password, tick the confirmation, **Enable certificate passthrough**. **Validate certificate** checks it, **Test PDF signing** runs a container that signs a made-up PDF with it, and the two **Disable** buttons turn it off, one of them deleting the imported copy. The password is never shown again.
+
+**From a terminal**, with the password in a variable or on stdin, never as an argument:
+
+```powershell
+$env:SHUTUP_AND_RUN_CERT_PASSWORD = Read-Host "Certificate password"
+shutup-and-run certificate set --file "C:\Users\Ana\Documents\Meu Certificado.pfx" --accept-risk --apply
+Remove-Item Env:SHUTUP_AND_RUN_CERT_PASSWORD
+shutup-and-run certificate status
+shutup-and-run certificate validate
+shutup-and-run demo sign --configured
+shutup-and-run certificate disable --forget --apply
+```
+
+**How it gets from Windows into a container.** The WSL2 distribution mounts no Windows drive, so the service cannot open `C:\...` and a job cannot be handed a Windows path. Instead:
+
+1. The `.exe` (or the browser, on the local page) reads the file you chose and hands its bytes and the password to the service inside the distribution, on stdin or in the form. Nothing goes over the network and nothing is put on a command line.
+2. The service checks it with openssl (it opens with that password, it has a private key, it has not expired) and only then keeps a copy in `/etc/shutup-and-run/certificate/`, mode 600, with the password in a file of its own beside it. The original on `C:` is only read, never changed. Its path is not kept, only its file name.
+3. When a job starts, the service puts copies for that one job in `/run/shutup-and-run/jobs/<id>/` (memory, not disk) and Docker mounts them read-only into the container:
+
+| In every container | |
+| --- | --- |
+| `/run/shutup-and-run/certificate/client.pfx` | The certificate. The same path whatever the file was called. Also in `SHUTUP_AND_RUN_CERT_PATH`. |
+| `/run/shutup-and-run/secrets/certificate-password` | The password, the only content of the file. Also in `SHUTUP_AND_RUN_CERT_PASSWORD_FILE`. |
+
+4. When the job ends, by itself, at its timeout or because it failed to start, its copies are deleted. Copies of jobs that ended while the service was down are deleted when it starts. A restart of WSL empties `/run` anyway.
+
+In Python, inside a job:
+
+```python
+import os
+pfx = open(os.environ["SHUTUP_AND_RUN_CERT_PATH"], "rb").read()
+password = open(os.environ["SHUTUP_AND_RUN_CERT_PASSWORD_FILE"]).read()
+```
+
+A task cannot ask for the certificate, move it, or mount anything: there is no such field, and its own values for those two variables are dropped. It is given to every job or to none. Enabling, disabling or replacing the certificate restarts the service and leaves running containers alone: they keep what they started with, and the next job gets the new state.
+
+**What you are accepting.**
+
+- Any job can copy the certificate and the password and use them elsewhere. Read-only stops a job from changing the file, nothing more.
+- The imported copy and its password are plain files inside the distribution, readable by root there, and the PC's user is root there. Windows' own credential store is not used: the service that needs the password at every job start runs inside WSL, where that store does not reach.
+- The copy is included in `%ProgramData%\shutup-and-run\vhd`, the distribution's disk. `certificate disable --forget` deletes the files; it does not erase their blocks from that disk. `shutup-and-run wsl uninstall` deletes the whole disk.
+- `wsl reset` rebuilds the distribution and the certificate is gone with it: the install turns passthrough off and says so, and you import it again. It is not in the Windows-side config backup, on purpose.
+- The password is not in `config.json`, in `status.json`, in the supervisor log, in the job history, in a callback, in `doctor --report`, or in the poll request. The orchestrator never receives it and cannot turn the feature on.
+- A valid certificate here is one openssl can open and use. Whether a court's system accepts it is decided there. The signing test makes a basic PDF signature (`adbe.pkcs7.detached`); it is not PAdES and is not checked against ICP-Brasil.
+
 ## Check it
 
 ```powershell
@@ -183,7 +237,7 @@ Jobs that are running when you re-install are ended: the distribution is restart
 Each poll is a `POST` with the token and this body:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.6", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.7", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
 ```
 
 `cpus` and `memory_bytes` are what the WSL2 VM has, which is what the machine lends. The body has no address, because the worker only knows the VM's private one and could claim any other. The server takes the public address from the connection.

@@ -124,7 +124,7 @@ cat >"$WORK/config.toml" <<EOF
 listen = "127.0.0.1:${PORT}"
 token = "${TOKEN}"
 max_slots = 2
-allowlist = ["alpine"]
+allowlist = ["alpine", "python"]
 max_job_cpus = "1"
 max_job_memory = "256m"
 default_timeout_secs = 60
@@ -227,6 +227,48 @@ if [[ "$total" != 2 || "$used" != 0 ]]; then
   echo "FAIL: unexpected initial health: $health"
   echo "If slots_used is not 0, a container labeled shutup-and-run=1 is already running."
   exit 1
+fi
+
+# The commands for a first run, against a real Docker, before any job is sent:
+# the demo container, a dry run of a task, and a PDF signed in a container
+# with a certificate the worker mounted read-only.
+cli() { SHUTUP_AND_RUN_CONFIG="$WORK/config.toml" HOME="${HOME:-/tmp}" "$BIN" "$@"; }
+if cli version --json | grep -q '"api_version":"v1"'; then
+  pass "version --json"
+else
+  fail "version --json"
+fi
+if cli config check --json >"$WORK/check.json"; then
+  pass "config check"
+else
+  fail "config check: $(cat "$WORK/check.json")"
+fi
+if cli demo --image alpine --json >"$WORK/demo.json" && grep -q '"code":"LIMITS_OK"' "$WORK/demo.json"; then
+  pass "demo: one container, limits applied, removed"
+else
+  fail "demo: $(cat "$WORK/demo.json")"
+fi
+echo '{"image":"alpine","memory":"1g"}' >"$WORK/big.json"
+cli job validate "$WORK/big.json" --json >"$WORK/validate.json"
+if [[ $? == 3 ]] && grep -q JOB_INVALID_FIELD "$WORK/validate.json"; then
+  pass "job validate refuses what the API refuses"
+else
+  fail "job validate: $(cat "$WORK/validate.json")"
+fi
+if command -v openssl >/dev/null; then
+  if cli demo sign --out "$WORK/signed.pdf" --json >"$WORK/sign.json" &&
+    grep -q '"code":"SIGNATURE_OK"' "$WORK/sign.json" &&
+    grep -q '"code":"MOUNT_OK"' "$WORK/sign.json" &&
+    head -c 5 "$WORK/signed.pdf" | grep -q '%PDF'; then
+    pass "demo sign: a container signed a PDF with the mounted certificate"
+  else
+    fail "demo sign: $(cat "$WORK/sign.json")"
+  fi
+else
+  echo "SKIP: demo sign (no openssl)"
+fi
+if [[ -n "$(docker ps -aq --filter label=shutup-and-run=1)" ]]; then
+  fail "a demo left a container behind"
 fi
 
 post() {

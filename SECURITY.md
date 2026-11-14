@@ -57,6 +57,19 @@ The poll body carries `worker_name`, `worker_os` and the free slot count, nothin
 
 The `.exe` is a supervisor for a WSL2 distribution it creates. The service, Docker Engine and the containers live inside that distribution. It mounts no Windows drive and cannot launch Windows programs. Both tokens are written only to `/etc/shutup-and-run/env` inside it, mode 600, and the API listens on `127.0.0.1` inside the distribution only. Downloads (the rootfs, the Linux binary, the `.exe` itself through `install.ps1`) are checked against the publisher's `SHA256SUMS` before use. The `.exe` is not code signed. `wsl stop` terminates the distribution, which kills every container in it.
 
+## Certificate passthrough
+
+Off by default. When the machine's owner turns it on, every container the machine starts gets a read-only copy of one PKCS#12 certificate and of its password, at fixed paths. This is sharing by the owner's decision, not isolation: a container that can read both can export the private key, and there is no per-image list.
+
+What the process does about it:
+
+- **Only the owner, on the machine.** It is turned on by `shutup-and-run certificate set --accept-risk` as root, or on the local page behind the admin login, from the page's own origin, with a confirmation box. `certificate_enabled` without `certificate_consent` is an invalid config. No API route, job field, poll answer or manifest can enable it, name a certificate, or add a mount.
+- **Validated before it is kept.** The file is opened with the password by the `openssl` program in a private folder. One that does not open, has no private key or has expired changes nothing.
+- **Kept out of everything that travels.** The certificate and the password are files beside the config, mode 600, not keys in it. They are in no log line, job row, callback, status file, report or poll body. The password reaches `openssl` on stdin and a container as a file, never as an argument or an environment variable.
+- **Per-job copies, removed.** A job's copies live under `/run/shutup-and-run/jobs/<id>`, a directory only root can enter, in memory where `/run` is a tmpfs, and are deleted when the job ends, fails to start, or is found gone after a restart. A job's own values for the two path variables are dropped.
+
+What it does not do: the stored password is plaintext on the machine's disk, readable by root; deleting it is not a secure erase; and a job that has copied the key keeps it. An owner who cannot accept that leaves the feature off.
+
 ## Reporting
 
 Open a private security report with the repository host if you can. Otherwise open an issue without exploit detail and ask for a private channel.

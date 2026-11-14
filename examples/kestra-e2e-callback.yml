@@ -1,0 +1,24 @@
+id: sar_e2e_callback
+namespace: example.jobs
+
+description: >
+  Receives the POST a shutup-and-run machine sends when a job ends. The body
+  is the job: id, job_key, image, status, exit_code, reason, started_at,
+  ended_at, duration_secs. The request carries no header of its own, so the
+  webhook key in the URL is the secret. Put this flow's URL in the job's
+  callback_url. job_key is the execution id of sar_e2e.
+
+triggers:
+  - id: finish
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: REPLACE_WITH_WEBHOOK_KEY
+
+tasks:
+  - id: failed
+    type: io.kestra.plugin.core.execution.Fail
+    runIf: "{{ trigger.body.reason != 'exited' or trigger.body.exit_code != 0 }}"
+    errorMessage: "job {{ trigger.body.job_key }} failed: {{ trigger.body.reason }}, exit {{ trigger.body.exit_code }}"
+
+  - id: succeeded
+    type: io.kestra.plugin.core.log.Log
+    message: "job {{ trigger.body.job_key }} succeeded in {{ trigger.body.duration_secs }} s"
