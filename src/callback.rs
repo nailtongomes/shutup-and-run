@@ -17,32 +17,39 @@ pub fn validate_callback_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn spawn_callback(url: String, body: Value) {
-    tokio::spawn(async move {
-        // shortcut: a fresh client per callback, three tries, no redirects.
-        // Upgrade to a shared client if callback volume ever matters.
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-        {
-            Ok(client) => client,
+/// The first tries, right when the job ends. A callback they do not deliver
+/// stays `pending` in the history and is tried again once a minute.
+pub const FIRST_TRIES: u64 = 3;
+
+/// True when the receiver answered 2xx.
+pub async fn deliver(url: &str, body: &Value, tries: u64) -> bool {
+    // shortcut: a fresh client per callback, no redirects.
+    // Upgrade to a shared client if callback volume ever matters.
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(error = %err, "callback client");
+            return false;
+        }
+    };
+    for attempt in 1..=tries {
+        // The error goes to the log without the URL, which is a credential.
+        match client.post(url).json(body).send().await {
+            Ok(response) if response.status().is_success() => return true,
+            Ok(response) => {
+                tracing::warn!(status = %response.status(), attempt, "callback rejected");
+            }
             Err(err) => {
-                tracing::warn!(error = %err, "callback client");
-                return;
+                tracing::warn!(error = %err.without_url(), attempt, "callback failed");
             }
-        };
-        for attempt in 1..=3 {
-            match client.post(&url).json(&body).send().await {
-                Ok(response) if response.status().is_success() => return,
-                Ok(response) => {
-                    tracing::warn!(status = %response.status(), attempt, "callback rejected");
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, attempt, "callback failed");
-                }
-            }
+        }
+        if attempt < tries {
             tokio::time::sleep(Duration::from_millis(200 * attempt)).await;
         }
-    });
+    }
+    false
 }

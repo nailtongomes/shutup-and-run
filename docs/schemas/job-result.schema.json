@@ -51,18 +51,19 @@
       ]
     },
     "exit_code": {
-      "description": "The container's exit code. 137 after a timeout kill. null while running, when the image could not be pulled or the container could not be started, and when the container was gone before the runner saw it end.",
+      "description": "The container's exit code. 137 after a timeout kill. null while running, when the image could not be pulled or the container could not be started, and for an 'interrupted' job whose container was gone.",
       "type": [
         "integer",
         "null"
       ]
     },
     "reason": {
-      "description": "null while running. 'exited': the container ended by itself or was killed by something other than the timeout; read exit_code. 'timeout_kill': SIGKILL at timeout_secs. 'start_failed': the pull or the start failed and no container ran.",
+      "description": "null while running. 'exited': the container ended by itself or was killed by something other than the timeout; read exit_code. 'timeout_kill': SIGKILL at timeout_secs. 'start_failed': the pull or the start failed and no container ran. 'interrupted' (0.2.11): the PC, WSL, Docker or the runner stopped under the job, so the runner cannot say how it ended: its container was gone, or it stopped with a non-zero exit_code while the runner was not running. The runner does not run it again.",
       "enum": [
         "exited",
         "timeout_kill",
         "start_failed",
+        "interrupted",
         null
       ]
     },
@@ -99,7 +100,8 @@
           "enum": [
             "exited",
             "timeout_kill",
-            "start_failed"
+            "start_failed",
+            "interrupted"
           ]
         },
         "duration_secs": {

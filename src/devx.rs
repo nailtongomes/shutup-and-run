@@ -568,6 +568,7 @@ async fn run_one(bench: &Bench, request: LaunchRequest, checks: &mut Vec<Check>)
                 LaunchError::NoSlots { .. } => "WORKER_BUSY",
                 LaunchError::LowResources(short) if short.resource == "disk" => "LOW_DISK",
                 LaunchError::LowResources(_) => "LOW_MEMORY",
+                LaunchError::UserActive(_) => "USER_ACTIVE",
                 _ => "DOCKER_UNAVAILABLE",
             };
             checks.push(check("admission", false, err.to_string()).coded(code));

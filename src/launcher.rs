@@ -1,10 +1,10 @@
 use crate::allowlist::{image_allowed, validate_image_name};
-use crate::callback::{spawn_callback, validate_callback_url};
+use crate::callback::validate_callback_url;
 use crate::clock::{Clock, SystemClock};
 use crate::config::Settings;
 use crate::runtime::{Inspected, Runtime, RuntimeError, StartSpec};
 use crate::store::{JobRecord, NewJob, Store, StoreError};
-use crate::{REASON_EXITED, REASON_START_FAILED, REASON_TIMEOUT};
+use crate::{REASON_EXITED, REASON_INTERRUPTED, REASON_START_FAILED, REASON_TIMEOUT};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,9 +59,35 @@ pub enum LaunchError {
     /// The machine is short of memory or disk right now. Nothing was stored.
     #[error("{0}")]
     LowResources(crate::resources::Shortage),
+    /// `min_idle_secs` is set and the person at the PC is using it.
+    #[error("{0}")]
+    UserActive(UserActive),
     #[error("{0}")]
     Unavailable(String),
 }
+
+/// Why a job waits under `min_idle_secs`. It can start later, unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserActive {
+    pub idle_secs: u64,
+    pub needed_secs: u64,
+}
+
+impl std::fmt::Display for UserActive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the PC is in use: idle for {}s, {}s needed",
+            self.idle_secs, self.needed_secs
+        )
+    }
+}
+
+/// A callback not answered is tried again once a minute for this long after
+/// its job ended, then given up as `failed`.
+pub const CALLBACK_RETRY_SECS: i64 = 3600;
+/// The first tries are still running this soon after a job ended.
+const CALLBACK_SETTLE_SECS: i64 = 30;
 
 /// The most finished jobs the history keeps, whatever `history_days` is.
 pub const MAX_HISTORY_ROWS: usize = 500;
@@ -195,6 +221,24 @@ impl Launcher {
         crate::resources::shortage(crate::resources::read(&path), memory, disk)
     }
 
+    /// Set while `min_idle_secs` is on and the Windows supervisor says the
+    /// person touched the keyboard or mouse more recently than that. A
+    /// reading that is missing or old does not block, like `shortage`.
+    pub fn user_active(&self) -> Option<UserActive> {
+        user_active(self.settings.min_idle_secs, crate::host::current())
+    }
+
+    /// Why no new job starts now though a slot may be free.
+    pub fn waiting_for(&self) -> Option<String> {
+        self.shortage()
+            .map(|s| s.to_string())
+            .or_else(|| self.user_active().map(|u| u.to_string()))
+    }
+
+    pub fn delivery(&self) -> crate::store::Delivery {
+        self.store.delivery().unwrap_or_default()
+    }
+
     /// Resolves when a job that ran has ended since the last call.
     pub async fn job_ended(&self) {
         self.job_ended.notified().await
@@ -240,7 +284,8 @@ impl Launcher {
             last,
             poll_error: self.poll_error.lock().expect("poll error").clone(),
             last_poll: *self.last_poll.lock().expect("last poll"),
-            waiting_for: self.shortage().map(|s| s.to_string()),
+            waiting_for: self.waiting_for(),
+            computer: crate::status::Computer::read(self),
             limits: crate::status::Limits::of(&self.settings),
             config_warning: self.settings.config_warning.clone(),
         }
@@ -293,6 +338,9 @@ impl Launcher {
         // memory that only one of them will get.
         if let Some(shortage) = self.shortage() {
             return Err(LaunchError::LowResources(shortage));
+        }
+        if let Some(active) = self.user_active() {
+            return Err(LaunchError::UserActive(active));
         }
         let id = random_id();
         let record = NewJob {
@@ -404,13 +452,13 @@ impl Launcher {
             match self.runtime.inspect(id).await.map_err(unavailable)? {
                 Inspected::Running => {}
                 Inspected::Exited { exit_code } => {
-                    self.complete(id, Some(exit_code)).await;
+                    self.complete(id, Some(exit_code), true).await;
                     if let Some(updated) = self.store.get(id).map_err(store_err)? {
                         record = updated;
                     }
                 }
                 Inspected::NotFound => {
-                    self.complete(id, None).await;
+                    self.complete(id, None, true).await;
                     if let Some(updated) = self.store.get(id).map_err(store_err)? {
                         record = updated;
                     }
@@ -435,10 +483,12 @@ impl Launcher {
 
     /// Called from the Docker die event and from the reaper.
     pub async fn on_exit(&self, id: &str, exit_code: i64) {
-        self.complete(id, Some(exit_code)).await;
+        self.complete(id, Some(exit_code), true).await;
     }
 
-    async fn complete(&self, id: &str, exit_code: Option<i64>) {
+    /// `witnessed` is false for a container found stopped when the worker
+    /// started: it ended while nobody was watching.
+    async fn complete(&self, id: &str, exit_code: Option<i64>, witnessed: bool) {
         let Some(current) = self.store.get(id).ok().flatten() else {
             return;
         };
@@ -447,11 +497,7 @@ impl Launcher {
             return;
         }
         let timed_out = self.timeouts.lock().await.contains(id);
-        let reason = if timed_out {
-            REASON_TIMEOUT
-        } else {
-            REASON_EXITED
-        };
+        let reason = end_reason(timed_out, exit_code, witnessed);
         let logs = self
             .runtime
             .tail_logs(id, self.settings.log_lines)
@@ -488,7 +534,7 @@ impl Launcher {
                 tracing::warn!(%id, error = %err, "failed to kill expired container");
                 continue;
             }
-            self.complete(&id, Some(137)).await;
+            self.complete(&id, Some(137), true).await;
             tracing::info!(%id, "timeout: container killed");
             killed.push(id);
         }
@@ -530,7 +576,7 @@ impl Launcher {
                 .map_err(store_err)?
                 .is_some_and(|job| !job.is_finished())
             {
-                self.complete(&id, None).await;
+                self.complete(&id, None, true).await;
             }
             match self.runtime.remove(&id).await {
                 Ok(()) => containers += 1,
@@ -569,8 +615,10 @@ impl Launcher {
         for id in ids {
             match self.runtime.inspect(&id).await {
                 Ok(Inspected::Running) => {}
-                Ok(Inspected::Exited { exit_code }) => self.complete(&id, Some(exit_code)).await,
-                Ok(Inspected::NotFound) => self.complete(&id, None).await,
+                Ok(Inspected::Exited { exit_code }) => {
+                    self.complete(&id, Some(exit_code), false).await
+                }
+                Ok(Inspected::NotFound) => self.complete(&id, None, false).await,
                 Err(err) => tracing::warn!(%id, error = %err, "reconcile inspect failed"),
             }
         }
@@ -589,7 +637,39 @@ impl Launcher {
             return;
         };
         let body = callback_body(job);
-        spawn_callback(url, body);
+        let (store, id) = (self.store.clone(), job.id.clone());
+        tokio::spawn(async move {
+            if crate::callback::deliver(&url, &body, crate::callback::FIRST_TRIES).await {
+                let _ = store.set_callback_state(&id, "delivered");
+            }
+        });
+    }
+
+    /// One more try for each callback that was not answered, and the end of
+    /// the ones older than `CALLBACK_RETRY_SECS`. Returns how many were tried.
+    pub async fn retry_callbacks(&self) -> Result<usize, LaunchError> {
+        let now = self.clock.now_unix() as i64;
+        let expired = self
+            .store
+            .expire_callbacks(now - CALLBACK_RETRY_SECS)
+            .map_err(store_err)?;
+        if expired > 0 {
+            tracing::warn!(expired, "gave up on callbacks nobody answered for an hour");
+        }
+        let due = self
+            .store
+            .pending_callbacks(now - CALLBACK_RETRY_SECS, now - CALLBACK_SETTLE_SECS)
+            .map_err(store_err)?;
+        for job in &due {
+            let Some(url) = job.callback_url.as_deref() else {
+                continue;
+            };
+            if crate::callback::deliver(url, &callback_body(job), 1).await {
+                let _ = self.store.set_callback_state(&job.id, "delivered");
+                tracing::info!(id = %job.id, "callback delivered on a later try");
+            }
+        }
+        Ok(due.len())
     }
 }
 
@@ -597,6 +677,16 @@ pub fn spawn_maintenance(launcher: Arc<Launcher>) {
     let reaper = launcher.settings.reaper_interval;
     let purge = launcher.settings.purge_interval;
     let prune = launcher.settings.prune_interval;
+    // A loop of its own: a receiver that hangs must not delay the reaper.
+    let callbacks = launcher.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            if let Err(err) = callbacks.retry_callbacks().await {
+                tracing::warn!(error = %err, "callbacks");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -629,6 +719,30 @@ pub fn spawn_maintenance(launcher: Arc<Launcher>) {
             }
         }
     });
+}
+
+/// How a job that held a container ended. A timeout the worker itself
+/// enforced stays a timeout. Otherwise the job was interrupted when the
+/// container is gone (no exit code), or when it stopped with a non-zero code
+/// while the worker was not running: nobody saw why.
+fn end_reason(timed_out: bool, exit_code: Option<i64>, witnessed: bool) -> &'static str {
+    match (timed_out, exit_code) {
+        (true, _) => REASON_TIMEOUT,
+        (false, None) => REASON_INTERRUPTED,
+        (false, Some(code)) if code != 0 && !witnessed => REASON_INTERRUPTED,
+        (false, Some(_)) => REASON_EXITED,
+    }
+}
+
+pub(crate) fn user_active(
+    min_idle_secs: u64,
+    feed: Option<crate::host::Feed>,
+) -> Option<UserActive> {
+    let idle_secs = feed?.idle_secs?;
+    (min_idle_secs > 0 && idle_secs < min_idle_secs).then_some(UserActive {
+        idle_secs,
+        needed_secs: min_idle_secs,
+    })
 }
 
 pub fn callback_body(job: &JobRecord) -> Value {
@@ -1109,6 +1223,194 @@ mod tests {
         launcher.settled().await;
         assert_eq!(mock.start_count().await, 1);
         assert!(launcher.live_status().await.waiting_for.is_none());
+    }
+
+    async fn started(launcher: &Arc<Launcher>, request: LaunchRequest) -> String {
+        let id = match launcher.launch(request).await.unwrap() {
+            LaunchOutcome::Created(job) | LaunchOutcome::Existing(job) => job.id,
+        };
+        launcher.settled().await;
+        id
+    }
+
+    async fn ended(launcher: &Launcher, id: &str) -> (Option<String>, Option<i64>) {
+        let job = launcher.job(id, false).await.unwrap().unwrap();
+        (job.reason, job.exit_code)
+    }
+
+    #[tokio::test]
+    async fn a_job_that_ended_while_nobody_watched_is_interrupted() {
+        let (launcher, mock, _) = harness(4);
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            ids.push(started(&launcher, job("alpine", None)).await);
+        }
+        // The worker comes back after the PC was shut down under three jobs.
+        mock.vanish(&ids[0]).await;
+        mock.stop_unseen(&ids[1], 255).await;
+        mock.stop_unseen(&ids[2], 0).await;
+        launcher.reconcile().await;
+        let interrupted = Some(REASON_INTERRUPTED.to_string());
+        let exited = Some(REASON_EXITED.to_string());
+        assert_eq!(ended(&launcher, &ids[0]).await, (interrupted.clone(), None));
+        assert_eq!(ended(&launcher, &ids[1]).await, (interrupted, Some(255)));
+        // It finished well while the worker was away: that is what it is.
+        assert_eq!(ended(&launcher, &ids[2]).await, (exited.clone(), Some(0)));
+        // The fourth still runs, and nothing was started again.
+        assert_eq!(ended(&launcher, &ids[3]).await, (None, None));
+        assert_eq!(mock.start_count().await, 4);
+        // A non-zero exit the worker saw is a job that failed, as before.
+        launcher.on_exit(&ids[3], 255).await;
+        assert_eq!(ended(&launcher, &ids[3]).await, (exited, Some(255)));
+        // A second pass finds nothing to end twice.
+        launcher.reconcile().await;
+        assert_eq!(launcher.delivery().interrupted, 2);
+        assert_eq!(launcher.counts().unwrap().finished, 4);
+    }
+
+    #[tokio::test]
+    async fn an_interruption_reaches_the_callback_and_a_refused_callback_is_tried_again() {
+        use std::sync::Mutex as StdMutex;
+        // A receiver that is down for the first three requests.
+        let seen: Arc<StdMutex<Vec<Value>>> = Arc::new(StdMutex::new(Vec::new()));
+        let hits = seen.clone();
+        let app = axum::Router::new().route(
+            "/callback",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let hits = hits.clone();
+                async move {
+                    let mut hits = hits.lock().unwrap();
+                    hits.push(body);
+                    if hits.len() <= 3 {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/callback", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let wait_for = |count: usize| {
+            let seen = seen.clone();
+            async move {
+                for _ in 0..500 {
+                    if seen.lock().unwrap().len() >= count {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("{count} callbacks never came");
+            }
+        };
+
+        let (launcher, mock, clock) = harness(2);
+        let mut request = job("alpine", None);
+        request.job_key = Some("case-0001".into());
+        request.callback_url = Some(url);
+        let id = started(&launcher, request).await;
+        mock.vanish(&id).await;
+        clock.set(1_700_000_100);
+        launcher.reconcile().await;
+        wait_for(3).await;
+        let body = seen.lock().unwrap()[0].clone();
+        assert_eq!(body["id"], id.as_str());
+        assert_eq!(body["job_key"], "case-0001");
+        assert_eq!(body["status"], "exited");
+        assert_eq!(body["reason"], "interrupted");
+        assert!(body["exit_code"].is_null());
+        // Nobody answered, and the page says so.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let waiting = launcher.delivery();
+        assert_eq!(
+            (
+                waiting.interrupted,
+                waiting.interrupted_unnotified,
+                waiting.pending,
+                waiting.failed
+            ),
+            (1, 1, 1, 0)
+        );
+        // Not while the first tries may still be running.
+        assert_eq!(launcher.retry_callbacks().await.unwrap(), 0);
+        clock.set(1_700_000_100 + 31);
+        assert_eq!(launcher.retry_callbacks().await.unwrap(), 1);
+        assert_eq!(seen.lock().unwrap().len(), 4);
+        assert_eq!(seen.lock().unwrap()[3], body);
+        let done = launcher.delivery();
+        assert_eq!(
+            (done.interrupted, done.interrupted_unnotified, done.pending),
+            (1, 0, 0)
+        );
+        // Answered once, it is not sent again, and the job was not run again.
+        assert_eq!(launcher.retry_callbacks().await.unwrap(), 0);
+        assert_eq!(seen.lock().unwrap().len(), 4);
+        assert_eq!(mock.start_count().await, 1);
+
+        // A receiver that never answers: an hour of tries, then given up.
+        let mut request = job("alpine", None);
+        request.callback_url = Some("http://127.0.0.1:9/nobody".into());
+        let lost = started(&launcher, request).await;
+        launcher.on_exit(&lost, 0).await;
+        clock.set(1_700_000_131 + CALLBACK_RETRY_SECS as u64 + 1);
+        assert_eq!(launcher.retry_callbacks().await.unwrap(), 0);
+        let gave_up = launcher.delivery();
+        assert_eq!((gave_up.pending, gave_up.failed), (0, 1));
+        // A job without a callback URL is only recorded.
+        let quiet = started(&launcher, job("alpine", None)).await;
+        mock.vanish(&quiet).await;
+        launcher.reconcile().await;
+        let last = launcher.delivery();
+        assert_eq!(
+            (last.interrupted, last.interrupted_unnotified, last.pending),
+            (2, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pc_in_use_makes_a_new_job_wait_and_an_unknown_idle_time_does_not() {
+        use crate::host::Feed;
+        let idle = |secs| {
+            Some(Feed {
+                idle_secs: Some(secs),
+                ..Feed::default()
+            })
+        };
+        assert_eq!(user_active(0, idle(0)), None);
+        assert_eq!(user_active(300, None), None);
+        assert_eq!(user_active(300, Some(Feed::default())), None);
+        assert_eq!(user_active(300, idle(300)), None);
+        assert_eq!(
+            user_active(300, idle(299)),
+            Some(UserActive {
+                idle_secs: 299,
+                needed_secs: 300
+            })
+        );
+
+        // The only test that sets the feed and a launcher that reads it.
+        let (launcher, mock) = harness_with(2, |s| s.min_idle_secs = 300);
+        crate::host::note(idle(1000).unwrap());
+        let first = started(&launcher, job("alpine", None)).await;
+        // The person comes back: the running job stays, a new one waits.
+        crate::host::note(idle(2).unwrap());
+        match launcher.launch(job("alpine", None)).await {
+            Err(LaunchError::UserActive(active)) => assert_eq!(active.idle_secs, 2),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(mock.start_count().await, 1);
+        assert_eq!(mock.killed().await, Vec::<String>::new());
+        assert_eq!(ended(&launcher, &first).await, (None, None));
+        let live = launcher.live_status().await;
+        assert_eq!(
+            live.waiting_for.as_deref(),
+            Some("the PC is in use: idle for 2s, 300s needed")
+        );
+        assert!(live.computer.user_active);
+        crate::host::note(idle(300).unwrap());
+        started(&launcher, job("alpine", None)).await;
+        assert_eq!(mock.start_count().await, 2);
     }
 
     fn with_certificate(s: &mut Settings) {

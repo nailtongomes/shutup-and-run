@@ -111,6 +111,9 @@ pub struct Settings {
     pub min_free_memory: u64,
     /// The same for the disk Docker writes to.
     pub min_free_disk: u64,
+    /// Windows only: no new job starts until the person has not touched the
+    /// keyboard or mouse for this many seconds. Zero: off.
+    pub min_idle_secs: u64,
     /// Certificate passthrough: every container of this machine gets the
     /// owner's PKCS#12 file and its password. Off unless the owner turned it
     /// on and accepted that in the config.
@@ -187,6 +190,7 @@ struct FileConfig {
     max_job_memory: Option<String>,
     min_free_memory: Option<String>,
     min_free_disk: Option<String>,
+    min_idle_secs: Option<u64>,
     certificate_enabled: Option<bool>,
     certificate_consent: Option<bool>,
     certificate_name: Option<String>,
@@ -528,6 +532,13 @@ impl Settings {
                 None if shared_pc => crate::resources::SHARED_PC_MIN_DISK,
                 None => 0,
             };
+        let min_idle_secs =
+            take_u64(env, "SHUTUP_AND_RUN_MIN_IDLE_SECS", file.min_idle_secs)?.unwrap_or(0);
+        if min_idle_secs > 86_400 {
+            return Err(ConfigError(
+                "min_idle_secs must be between 0 and 86400".into(),
+            ));
+        }
         let certificate_enabled = file.certificate_enabled.unwrap_or(false);
         if certificate_enabled && !file.certificate_consent.unwrap_or(false) {
             return Err(ConfigError(
@@ -621,6 +632,7 @@ impl Settings {
             max_job_memory,
             min_free_memory,
             min_free_disk,
+            min_idle_secs,
             certificate_enabled,
             certificate_name,
             certificate_dir: PathBuf::from(CERTIFICATE_DIR),
@@ -733,6 +745,7 @@ pub const KEYS: &[Key] = &[
     key("max_job_memory", Kind::Text, OnPage::Locked),
     key("min_free_memory", Kind::Text, OnPage::Locked),
     key("min_free_disk", Kind::Text, OnPage::Locked),
+    key("min_idle_secs", Kind::Int, OnPage::Open),
     key("certificate_enabled", Kind::Bool, OnPage::No),
     key("certificate_consent", Kind::Bool, OnPage::No),
     key("certificate_name", Kind::Text, OnPage::No),

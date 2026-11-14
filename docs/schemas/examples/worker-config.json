@@ -16,6 +16,7 @@
   "max_job_memory": "2g",
   "min_free_memory": "2g",
   "min_free_disk": "5g",
+  "min_idle_secs": 300,
   "history_path": "/var/lib/shutup-and-run/jobs.sqlite",
   "token": "REPLACE-WITH-32-RANDOM-CHARACTERS",
   "poll_token": "REPLACE-WITH-THE-MACHINE-POLL-TOKEN"

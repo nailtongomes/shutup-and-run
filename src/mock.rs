@@ -58,6 +58,18 @@ impl MockRuntime {
             .insert(id.to_string(), deadline);
     }
 
+    /// The container is gone and nobody was told, as after a power cut.
+    pub async fn vanish(&self, id: &str) {
+        self.inner.lock().await.running.remove(id);
+    }
+
+    /// The container stopped with `code` and no die event was delivered.
+    pub async fn stop_unseen(&self, id: &str, code: i64) {
+        let mut inner = self.inner.lock().await;
+        inner.running.remove(id);
+        inner.stopped.insert(id.to_string(), code);
+    }
+
     pub async fn start_count(&self) -> u64 {
         self.inner.lock().await.starts
     }

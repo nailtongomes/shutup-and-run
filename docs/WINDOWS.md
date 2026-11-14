@@ -76,6 +76,7 @@ The person who owns the PC is working on it. Their work comes first, and three l
 | The WSL2 VM | 40% of the PC's RAM, half its logical processors | `%UserProfile%\.wslconfig` |
 | Each job | 1 CPU, 2 GiB of memory, no swap beyond it; one job at a time | `config.json`: `max_job_cpus`, `max_job_memory`, `max_slots` |
 | Starting a job | not while the VM has under 2 GiB of memory or 5 GiB of disk free | `config.json`: `min_free_memory`, `min_free_disk` |
+| Starting a job, optional | only after the PC was not used for some time (off by default) | `config.json`: `min_idle_secs` |
 
 The figures follow the PC:
 
@@ -110,6 +111,8 @@ shutup-and-run config set max_job_memory 1g --apply
 shutup-and-run config set min_free_disk 10g --apply
 shutup-and-run status --json     # "limits" and "waiting_for"
 ```
+
+**Only while the PC is not in use (optional).** `shutup-and-run config set min_idle_secs 300 --apply` makes a new job wait until nobody touched the keyboard or mouse for five minutes. `0`, the default, starts jobs at any time. The supervisor reads the idle time from Windows (`GetLastInputInfo`) and hands it to the service every ten seconds; the service only compares two numbers when a job asks to start. A job that is already running is never stopped when the person comes back. While waiting, the worker does not ask for work, `status` shows `waiting_for: the PC is in use`, and the status page says so. If the supervisor stops reporting for 45 seconds, the wait is dropped rather than held forever. A video or a presentation with no keyboard or mouse input counts as idle.
 
 A job that asks for more `cpu` or `memory` than the machine's limit is refused, and the supervisor log says `poll task rejected`. While memory or disk is short the worker does not ask for work; `status` shows `waiting_for`, and it resumes by itself.
 
@@ -260,7 +263,7 @@ Get-Process wsl, shutup-and-run, conhost, WindowsTerminal, OpenConsole -ErrorAct
 
 The terminal you type that in is listed; nothing titled `wsl.exe` or `shutup-and-run` should be.
 
-**Status page.** `http://127.0.0.1:8787/` in a browser on the PC shows whether the worker is running, how many jobs are running, whether the PC can be turned off, the last job, and the version. One button pauses or resumes taking new work. It opens only on that PC and shows no token. Ask for a screenshot of it when someone needs support.
+**Status page.** `http://127.0.0.1:8787/` in a browser on the PC shows whether the worker is running, how many jobs are running, whether the PC can be turned off, the last job, and the version. Under **Computer resources** it lists, each on its own line: the PC's processors and memory as Windows reports them, what the WSL2 VM has (its limit) and has free, the limit of each job, running jobs against the maximum, how long the PC has not been used, whether a new job could start and why not, how many jobs were interrupted, and callbacks still waiting or given up. A figure that was not read says "not reported". The CPU and memory a running container is using right now are not shown: asking Docker takes about a second per container, and the page asks nothing that slow. One button pauses or resumes taking new work. It opens only on that PC and shows no token. Ask for a screenshot of it when someone needs support.
 
 **Status file.** The same facts are in `C:\ProgramData\shutup-and-run\status.json`, written by the supervisor, so a script can read it without HTTP and without an administrator. `state` is `idle`, `active`, `draining`, `failed`, or `stopped`. If `updated_at` is more than 60 seconds ago, the worker is dead. After `wsl stop` the state is `stopped`.
 
@@ -278,7 +281,18 @@ A full hand test of a Windows PC and a Linux server is in [TESTING.md](TESTING.m
 
 ## Shutdown, restart, sign-out
 
-Windows ends the WSL2 VM when the user signs out or the machine shuts down. The supervisor hears that and stops the service, then gives each running container SIGTERM and **three seconds** before it is killed; Windows allows about five in all. `wsl stop` gives ten. A job that needs longer is cut. Nothing is left behind: a container is never restarted, and when the service next starts it closes the job's row, removes the container, and sends the callback. Such a job has `reason` `exited` with a non-zero `exit_code` (usually 137 or 255), or no `exit_code` if it was still pulling its image. The orchestrator offers the work again under a new `job_key`. Tasks should be safe to run twice.
+**With no job running**, Windows shuts down, restarts or signs out as usual.
+
+**With a job running**, Windows shows its own "this app is preventing shutdown" screen with `shutup-and-run` and the sentence "A job is running on this PC. It will be interrupted if you shut down now." (in Portuguese when `language` is `pt`). The person chooses:
+
+- **Cancel**: nothing was stopped, the job goes on.
+- **Shut down anyway** (or sign out anyway): Windows ends the supervisor and the WSL2 VM, and the job with them.
+
+The supervisor does this with a window that is never shown (Windows only asks programs that have one), answering from the last status line of the service, so the answer does not wait on WSL or Docker. It has no dialog, notification or service of its own. A shutdown that does not ask (`shutdown /f`, the power button held, a power cut, a crash, some Windows Update restarts) is not held by anything: do not rely on this to protect a job.
+
+When the session ends without asking and there is time, the supervisor stops the service and gives each running container SIGTERM and **three seconds** before it is killed; Windows allows about five in all. `wsl stop` gives ten. A job that needs longer is cut.
+
+**Afterwards.** Nothing is left behind and nothing is started again. When the service next starts it finds each job it was running, closes its row with `reason` `interrupted` (with the exit code Docker kept, or none if the container is gone), removes the container, and sends the callback of that job, if it had one. A callback nobody answers is tried again once a minute for an hour. `shutup-and-run jobs` shows such a job as `interrupted`, and the status page counts them. The orchestrator decides whether to offer the work again, under a new `job_key`. Tasks should be safe to run twice.
 
 ## The machine is not yours
 

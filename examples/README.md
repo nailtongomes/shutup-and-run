@@ -14,7 +14,7 @@ No orchestrator yet? `shutup-and-run demo` runs one container on the machine wit
 | 4. Inspect the status | `n8n/push-to-linux.json`: **Wait 20 s**, **GET /v1/jobs/{id}** | `kestra-e2e.yml`: `wait`, `status` |
 | 5. Succeeded or failed | **Succeeded, failed or still running** | `failed`, `succeeded` |
 
-A job failed when `reason` is `start_failed` or `timeout_kill`, or `exit_code` is not `0`. `202` only means the machine took the job.
+A job failed when `reason` is `start_failed` or `timeout_kill`, or `exit_code` is not `0`. `interrupted` means the machine stopped under it and whether the work was done is unknown: check, then decide whether to send it again. `202` only means the machine took the job.
 
 Step 4 needs the orchestrator to reach the runner, so it is for a Linux machine. A Windows worker is behind the PC's NAT and pulls: there the callback (step 3) is the only way the result comes back.
 

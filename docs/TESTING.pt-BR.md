@@ -157,6 +157,18 @@ shutup-and-run status --json
 - [ ] `shutup-and-run config set min_free_memory 900g --apply`: `status` mostra `waiting_for: low on memory`, o mock não recebe mais polls, e a linha `resources` do doctor é um aviso com `fix:`. `shutup-and-run config unset min_free_memory --apply` e os polls voltam.
 - [ ] Com um `.wslconfig` seu, com outras chaves e `memory=64GB`: `wsl limits` sai com 1; `wsl limits --apply` muda só `memory=` e `processors=`, e `.wslconfig.bak` é o arquivo antigo. O doctor diz `not in effect yet` até o PC reiniciar ou você mesmo rodar `wsl --shutdown`.
 
+### 0.2.11: espera por ociosidade, pergunta ao desligar, tarefas interrompidas
+
+Nada disto rodou num PC Windows de verdade antes da release: o CI compila e roda os testes unitários, e não consegue encerrar uma sessão.
+
+- [ ] `http://127.0.0.1:8787/` tem **Recursos do computador**: "Este PC (Windows)" com processadores e memória do PC, "WSL2" com números menores, o limite por tarefa, "PC sem uso há" contando enquanto você não mexe no PC, e "Pode começar tarefa nova? sim".
+- [ ] `shutup-and-run config set min_idle_secs 120 --apply`. Enquanto você usa o PC: `shutup-and-run status` tem `waiting_for: the PC is in use`, a página diz "esperando: o PC está em uso", e o mock não recebe polls. Deixe o PC parado por dois minutos: os polls voltam e uma tarefa roda. Mexa no mouse enquanto ela roda: a tarefa continua. `shutup-and-run config unset min_idle_secs --apply`.
+- [ ] Nenhuma janela apareceu em momento algum (a linha `Get-Process` de [WINDOWS.md](WINDOWS.md#for-the-person-at-the-pc)).
+- [ ] Sem tarefa rodando, Iniciar > Desligar > Reiniciar: o PC reinicia sem perguntar nada.
+- [ ] Com uma tarefa de cinco minutos rodando (seção 5), Iniciar > Sair: o Windows mostra `shutup-and-run` e "Há uma tarefa em execução neste PC..." (com `language` `pt`). Aperte **Cancelar**: `shutup-and-run wsl logs` tem `the shutdown was cancelled; the jobs go on`, e a tarefa termina bem depois (`ok` no mock).
+- [ ] O mesmo, e aperte **Sair mesmo assim**. Entre de novo: `shutup-and-run jobs` mostra essa tarefa como `interrupted`, o mock imprimiu uma linha para ela com `reason=interrupted`, a página conta 1 tarefa interrompida, e nenhum container foi iniciado de novo para ela (`wsl -d shutup-and-run -u root -- docker ps -a` vazio).
+- [ ] Com uma tarefa rodando e o mock parado, reinicie o PC. Suba o mock de novo dentro de uma hora: o callback chega numa tentativa posterior, e "Entrega de callbacks" na página volta a 0 aguardando.
+
 ### Repasse de certificado e as demos
 
 Ainda não rodou no Windows. No PC Windows, com um `.pfx` de teste (nunca um real para isto) numa pasta com espaço e acento no nome:

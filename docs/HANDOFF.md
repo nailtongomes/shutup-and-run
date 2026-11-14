@@ -49,7 +49,8 @@ Pull mode is `spawn_poller` in `src/poll.rs`. It is not started when `poll_url` 
 | `src/bollard_rt.rs` | Docker create/start/kill/logs/prune. Host config is built here. |
 | `src/registry.rs` | Pull credentials from the machine's Docker config. The request cannot supply them. |
 | `src/store.rs` | SQLite: `jobs`, `meta` (drain), `auth_failures`, `bans`. Mode `600` on unix. |
-| `src/callback.rs` | URL check and the three-try POST. |
+| `src/callback.rs` | URL check and the POST. Three tries at the end of a job; `launcher::retry_callbacks` tries the unanswered ones again for an hour. |
+| `src/host.rs` | The feed the Windows supervisor writes to the service's stdin: idle time and the PC's memory. |
 | `src/bytesize.rs` | `512m`, `1g`, or a raw byte count. |
 | `src/cert.rs` | SHA-256 fingerprint of the PEM, same shape as `openssl x509 -fingerprint -sha256`. |
 | `src/clock.rs` | Clock, plus a fake clock for tests. |

@@ -42,7 +42,7 @@ It is also built to be run by the customer's own **AI agent**. Every command is 
 
 - **Linux** runs the service under systemd. It usually takes pushes over HTTPS. It can also pull, for a machine behind NAT.
 - **Windows 11** runs the same Linux binary inside a WSL2 distribution of its own, in pull mode only. No port is opened on the PC and nothing is pushed to it. The `.exe` is a supervisor: it installs the distribution, keeps the service running while the user is logged on, and never shows a window. Details: [docs/WINDOWS.md](docs/WINDOWS.md).
-- **A job** is one container. `202` means the machine took it and holds a slot; the image is pulled afterwards. When it ends, by itself, at its timeout, or because it could not start, the result is POSTed to the task's `callback_url`.
+- **A job** is one container. `202` means the machine took it and holds a slot; the image is pulled afterwards. When it ends, by itself, at its timeout, or because it could not start, the result is POSTed to the task's `callback_url`, and sent again for up to an hour if nobody answers.
 - **The contract** for an orchestrator, with JSON Schemas, is [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md). A complete n8n example, with worker approval, is in [examples/n8n](examples/n8n/README.md).
 
 ## Quick start
@@ -119,6 +119,7 @@ The customer's interactive work has priority over job throughput. On a shared PC
 | Each job | 1 CPU, 2 GiB of memory, no swap beyond it | `max_job_cpus`, `max_job_memory` |
 | Jobs at once | 1 | `max_slots` |
 | Starting a job | only with 2 GiB of memory and 5 GiB of disk free | `min_free_memory`, `min_free_disk` |
+| Starting a job (Windows, optional) | only after the PC was not used for N seconds; off by default | `min_idle_secs` |
 
 - The limits are enforced by Docker (`NanoCpus`, `Memory`, `MemorySwap`), on a pushed job and on a pulled one. A task that names no `cpu` or `memory` gets the machine's limit; one that names less gets what it asked; one that names more is refused with the limit in the answer.
 - While memory or disk is short, a push is answered `503` `insufficient resources` and a pull worker simply does not ask for work, so no task is claimed and then dropped. It resumes by itself. `status` shows `waiting_for`.
@@ -133,7 +134,7 @@ shutup-and-run config set max_job_memory 1g --apply
 shutup-and-run wsl limits             # Windows: the PC, the budget, what .wslconfig says
 ```
 
-**This reduces the risk; it does not remove it.** Free memory is measured inside the WSL2 VM, which is not the same as free memory on the Windows host, and only at the moment a job starts. Disk and network use of a job are not limited. There is no idle detection, no monitoring daemon, and a running job is never stopped to make room. A PC can still get slow. The pause button on the local page, or `shutup-and-run pause`, is how the person at the PC says "not now". More: [docs/WINDOWS.md](docs/WINDOWS.md#sharing-the-pc).
+**This reduces the risk; it does not remove it.** Free memory is measured inside the WSL2 VM, which is not the same as free memory on the Windows host, and only at the moment a job starts. Disk and network use of a job are not limited. There is no monitoring daemon, and a running job is never stopped to make room or because the person came back. With a job running, Windows asks before it shuts down or signs out; "shut down anyway" and a power cut still end the job, which is then reported as `interrupted` and not run again. A PC can still get slow. The pause button on the local page, or `shutup-and-run pause`, is how the person at the PC says "not now". More: [docs/WINDOWS.md](docs/WINDOWS.md#sharing-the-pc).
 
 ## The local page
 
@@ -221,6 +222,7 @@ The keys are the same in both. An unknown key is refused.
 | `max_job_memory` | `SHUTUP_AND_RUN_MAX_JOB_MEMORY` | The same for memory: `"2g"`, `"512m"`. |
 | `min_free_memory` | `SHUTUP_AND_RUN_MIN_FREE_MEMORY` | No new job below this much available memory. `"0"`: not checked. |
 | `min_free_disk` | `SHUTUP_AND_RUN_MIN_FREE_DISK` | The same for the disk Docker writes to. |
+| `min_idle_secs` | `SHUTUP_AND_RUN_MIN_IDLE_SECS` | Windows only: a new job waits until the PC was not used for this many seconds. `0` (the default): off. |
 | `default_timeout_secs` | `SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS` | Default 3600. |
 | `max_timeout_secs` | `SHUTUP_AND_RUN_MAX_TIMEOUT_SECS` | Default 21600. At most 7 days. |
 | `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Optional. Turns pull mode on. |
@@ -310,7 +312,7 @@ A task, the same JSON on a push, in a poll answer, and in a manifest:
 }
 ```
 
-Only `image` is required. Unknown fields are refused. `job_key` makes a retry safe on that one machine: the same key returns the same job and starts nothing. `reason` in the result is `exited`, `timeout_kill` or `start_failed`. There is no cancel call.
+Only `image` is required. Unknown fields are refused. `job_key` makes a retry safe on that one machine: the same key returns the same job and starts nothing. `reason` in the result is `exited`, `timeout_kill`, `start_failed` or `interrupted` (the machine, WSL, Docker or the worker stopped under the job; it is not run again). There is no cancel call.
 
 **Pull.** With `poll_url` set, the machine POSTs to it every `poll_interval_secs` (30 seconds, and never less), only when it has a free slot, is not paused and is not short of memory or disk:
 
@@ -322,7 +324,7 @@ The answer is nothing (`204`), a task, `{"task": {...}}`, or `{"manifest_url": "
 
 Field limits, every status code, the callback, idempotency, and what is not guaranteed: [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md).
 
-**`status.json`** has the same facts as the local page, for a script that should not call HTTP: `state` (`idle`, `active`, `draining`, `failed`, `stopped`), `slots_total`, `slots_used`, `job_ids`, `last_job_at`, `last_error`, `poll_error`, `waiting_for`, `limits`, `config_warning`, `version`, `pid`, `started_at`, `updated_at`. Linux: beside the history file, `/var/lib/shutup-and-run/status.json`, root only. Windows: `C:\ProgramData\shutup-and-run\status.json`, readable by the user. If `updated_at` is more than 60 seconds old, the worker is dead. `shutup-and-run status --json` reads it for you.
+**`status.json`** has the same facts as the local page, for a script that should not call HTTP: `state` (`idle`, `active`, `draining`, `failed`, `stopped`), `slots_total`, `slots_used`, `job_ids`, `last_job_at`, `last_error`, `poll_error`, `waiting_for`, `callbacks` (interrupted jobs, callbacks pending and given up), `limits`, `config_warning`, `version`, `pid`, `started_at`, `updated_at`. Linux: beside the history file, `/var/lib/shutup-and-run/status.json`, root only. Windows: `C:\ProgramData\shutup-and-run\status.json`, readable by the user. If `updated_at` is more than 60 seconds old, the worker is dead. `shutup-and-run status --json` reads it for you.
 
 ## Security
 

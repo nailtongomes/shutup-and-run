@@ -157,6 +157,18 @@ shutup-and-run status --json
 - [ ] `shutup-and-run config set min_free_memory 900g --apply`: `status` shows `waiting_for: low on memory`, the mock gets no more polls, and the doctor's `resources` line is a warning with a `hint:`. `shutup-and-run config unset min_free_memory --apply` and the polls come back.
 - [ ] With a `.wslconfig` of your own that has other keys and `memory=64GB`: `wsl limits` exits 1; `wsl limits --apply` changes only `memory=` and `processors=`, and `.wslconfig.bak` is the old file. The doctor says `not in effect yet` until the PC restarts or you run `wsl --shutdown` yourself.
 
+### 0.2.11: idle wait, shutdown question, interrupted jobs
+
+None of this ran on a real Windows PC before the release: CI builds it and runs the unit tests, and cannot shut a session down.
+
+- [ ] `http://127.0.0.1:8787/` has **Computer resources**: "This PC (Windows)" with the PC's processors and memory, "WSL2" with smaller figures, the job limit, "PC without use for" counting up while you do not touch the PC, and "Can a new job start? yes".
+- [ ] `shutup-and-run config set min_idle_secs 120 --apply`. While you use the PC: `shutup-and-run status` has `waiting_for: the PC is in use`, the page says "waiting: the PC is in use", and the mock gets no polls. Leave the PC alone for two minutes: the polls come back and a task runs. Touch the mouse while it runs: the job goes on. `shutup-and-run config unset min_idle_secs --apply`.
+- [ ] No window appeared at any point (the `Get-Process` line of [WINDOWS.md](WINDOWS.md#for-the-person-at-the-pc)).
+- [ ] With no job running, Start > Shut down > Restart: the PC restarts with no question.
+- [ ] With a five-minute job running (section 5), Start > Sign out: Windows shows `shutup-and-run` and "A job is running on this PC...". Press **Cancel**: `shutup-and-run wsl logs` has `the shutdown was cancelled; the jobs go on`, and the job ends well later (`ok` at the mock).
+- [ ] The same, and press **Sign out anyway**. Sign in again: `shutup-and-run jobs` shows that job as `interrupted`, the mock printed a line for it with `reason=interrupted`, the page counts 1 interrupted job, and no container was started for it again (`wsl -d shutup-and-run -u root -- docker ps -a` is empty).
+- [ ] With a job running and the mock stopped, restart the PC. Start the mock again within the hour: the callback arrives on a later try, and "Callback delivery" on the page goes back to 0 waiting.
+
 ### Certificate passthrough and the demos
 
 Not run on Windows yet. On the Windows PC, with a test `.pfx` (never a real one for this) in a folder whose name has a space and an accent:
@@ -203,7 +215,7 @@ When the mock prints `TASK mock-...-1`, wait half a minute for the image to down
 
 - [ ] `Jobs now: 1` and `NAO DESLIGUE AGORA. / DO NOT TURN OFF NOW.` Press `P`.
 - [ ] `[PARADO / STOPPED]  PODE DESLIGAR O PC.` within about 15 seconds.
-- [ ] Double-click again: it starts the service and says `RUNNING`. The mock then prints `FAIL 1/1` for the interrupted job, with a non-zero `exit`.
+- [ ] Double-click again: it starts the service and says `RUNNING`. The mock then prints `FAIL 1/1` for the interrupted job, with `reason=interrupted`.
 
 Start a long job again, then sign out of Windows while it runs, and sign in again.
 

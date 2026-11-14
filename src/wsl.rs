@@ -616,9 +616,10 @@ pub(crate) fn render_serve_script() -> String {
     format!(
         "#!/bin/sh\n\
          # Started by shutup-and-run.exe wsl serve. Keeps the distribution up while it runs.\n\
+         # stdin is the supervisor's feed (idle time, the PC's memory): only the service reads it.\n\
          i=0\n\
-         until docker info >/dev/null 2>&1; do\n\
-         \x20 [ \"$i\" -eq 0 ] && systemctl start docker >/dev/null 2>&1\n\
+         until docker info </dev/null >/dev/null 2>&1; do\n\
+         \x20 [ \"$i\" -eq 0 ] && systemctl start docker </dev/null >/dev/null 2>&1\n\
          \x20 i=$((i + 1))\n\
          \x20 if [ \"$i\" -ge 60 ]; then echo 'dockerd did not answer within 60s' >&2; exit 1; fi\n\
          \x20 sleep 1\n\
@@ -746,8 +747,13 @@ pub(crate) fn wsl_budget(ram_bytes: u64, cpus: u64) -> (u64, u64) {
 }
 
 /// Physical RAM of this PC. None when it cannot be read.
-#[cfg(windows)]
 fn host_memory_bytes() -> Option<u64> {
+    host_memory().map(|(total, _)| total)
+}
+
+/// Physical RAM of this PC and how much of it is available.
+#[cfg(windows)]
+fn host_memory() -> Option<(u64, u64)> {
     #[repr(C)]
     struct MemoryStatusEx {
         length: u32,
@@ -768,13 +774,16 @@ fn host_memory_bytes() -> Option<u64> {
     unsafe {
         let mut status: MemoryStatusEx = std::mem::zeroed();
         status.length = std::mem::size_of::<MemoryStatusEx>() as u32;
-        (GlobalMemoryStatusEx(&mut status) != 0).then_some(status.total_phys)
+        (GlobalMemoryStatusEx(&mut status) != 0).then_some((status.total_phys, status.avail_phys))
     }
 }
 
 #[cfg(not(windows))]
-fn host_memory_bytes() -> Option<u64> {
-    crate::resources::memory_total()
+fn host_memory() -> Option<(u64, u64)> {
+    Some((
+        crate::resources::memory_total()?,
+        crate::resources::memory_available()?,
+    ))
 }
 
 fn host_cpus() -> u64 {
@@ -2477,13 +2486,24 @@ fn run_service(log: &Logger) -> WslResult<Option<i32>> {
     let mut command = Command::new("wsl.exe");
     command
         .args(&args)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     no_window(&mut command);
     let mut child = command.spawn().map_err(|e| err(format!("wsl.exe: {e}")))?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    // What only Windows knows goes down the service's stdin: one line every
+    // ten seconds. The thread ends when the service does and the pipe breaks.
+    if let Some(mut stdin) = child.stdin.take() {
+        std::thread::spawn(move || loop {
+            let line = crate::host::line(&host_feed());
+            if stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err() {
+                break;
+            }
+            std::thread::sleep(crate::host::FEED_EVERY);
+        });
+    }
     let a = log.clone();
     let b = log.clone();
     let t1 = std::thread::spawn(move || pump(stdout, &a));
@@ -2491,6 +2511,8 @@ fn run_service(log: &Logger) -> WslResult<Option<i32>> {
     let status = child.wait().map_err(|e| err(format!("wsl.exe: {e}")))?;
     let _ = t1.join();
     let _ = t2.join();
+    // No service, so nothing it started is being watched any more.
+    JOBS_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
     Ok(status.code())
 }
 
@@ -2582,11 +2604,260 @@ fn no_window(_command: &mut Command) {}
 
 static SESSION_LOG: std::sync::OnceLock<Logger> = std::sync::OnceLock::new();
 
-/// Sign-out, shutdown and restart reach a console process as a control
-/// event, and Windows then gives it about five seconds. That is spent on the
-/// jobs: stop the service, SIGTERM to each container, three seconds, kill.
-/// The task runs under a headless console host, so the event arrives though
-/// there is no window.
+/// Whether the service last said a job holds a slot. Kept from its status
+/// line, so the answer to "may Windows shut down?" costs nothing: no call
+/// into WSL or Docker from a window message.
+static JOBS_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when a status document says a job is running.
+pub(crate) fn jobs_running_in(status_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(status_json).is_ok_and(|doc| {
+        doc["slots_used"].as_u64().unwrap_or(0) > 0
+            || doc["job_ids"].as_array().is_some_and(|ids| !ids.is_empty())
+    })
+}
+
+/// What Windows shows beside the program's name when it holds a shutdown.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn block_reason() -> &'static str {
+    match crate::hints::lang() {
+        crate::hints::Lang::Pt => {
+            "Há uma tarefa em execução neste PC. Ela será interrompida se você desligar agora."
+        }
+        crate::hints::Lang::En => {
+            "A job is running on this PC. It will be interrupted if you shut down now."
+        }
+    }
+}
+
+/// The session is really ending and Windows gives about five seconds. They
+/// are spent on the jobs: stop the service, SIGTERM to each container, three
+/// seconds, kill. Their rows are closed as `interrupted` at the next start.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn session_is_ending() {
+    if let Some(log) = SESSION_LOG.get() {
+        log.line("the session is ending; stopping the jobs");
+    }
+    let _ = sh_in_distro(&graceful_stop_script(3), None, Duration::from_secs(8));
+    mark_stopped();
+}
+
+/// The PC's side of the feed. A reading Windows does not give is left out.
+fn host_feed() -> crate::host::Feed {
+    let memory = host_memory();
+    crate::host::Feed {
+        idle_secs: user_idle_secs(),
+        memory_total: memory.map(|(total, _)| total),
+        memory_available: memory.map(|(_, available)| available),
+        cpus: Some(host_cpus()),
+    }
+}
+
+/// Seconds since the last keyboard or mouse input of this session.
+#[cfg(windows)]
+fn user_idle_secs() -> Option<u64> {
+    session::idle_secs()
+}
+
+#[cfg(not(windows))]
+fn user_idle_secs() -> Option<u64> {
+    None
+}
+
+/// Sign-out, shutdown and restart. Windows asks every program with a window
+/// first (`WM_QUERYENDSESSION`); a program that says no, with a reason, is
+/// listed on the "this app is preventing shutdown" screen, where the person
+/// cancels or shuts down anyway. The supervisor says no only while a job is
+/// running, and stops nothing until the session is really ending, so a
+/// cancelled shutdown costs no job. "Shut down anyway", a forced shutdown and
+/// a power cut end the jobs: nothing here can prevent those.
+///
+/// The window is never shown. It has to be a top-level one, because a
+/// message-only window is not asked. Once user32 is loaded Windows no longer
+/// sends the console's logoff and shutdown events to this process, so the
+/// console handler below is left with a closed console only.
+#[cfg(windows)]
+mod session {
+    use super::{block_reason, session_is_ending, JOBS_RUNNING, SESSION_LOG};
+    use std::ffi::c_void;
+    use std::sync::atomic::Ordering;
+
+    type Hwnd = *mut c_void;
+    type WndProc = unsafe extern "system" fn(Hwnd, u32, usize, isize) -> isize;
+
+    #[repr(C)]
+    struct WndClassW {
+        style: u32,
+        wnd_proc: Option<WndProc>,
+        cls_extra: i32,
+        wnd_extra: i32,
+        instance: *mut c_void,
+        icon: *mut c_void,
+        cursor: *mut c_void,
+        background: *mut c_void,
+        menu_name: *const u16,
+        class_name: *const u16,
+    }
+
+    #[repr(C)]
+    struct Msg {
+        hwnd: Hwnd,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        time: u32,
+        pt: [i32; 2],
+        private: u32,
+    }
+
+    #[repr(C)]
+    struct LastInputInfo {
+        size: u32,
+        time: u32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn RegisterClassW(class: *const WndClassW) -> u16;
+        fn CreateWindowExW(
+            ex_style: u32,
+            class_name: *const u16,
+            window_name: *const u16,
+            style: u32,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            parent: Hwnd,
+            menu: *mut c_void,
+            instance: *mut c_void,
+            param: *mut c_void,
+        ) -> Hwnd;
+        fn DefWindowProcW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
+        fn GetMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32) -> i32;
+        fn DispatchMessageW(msg: *const Msg) -> isize;
+        fn ShutdownBlockReasonCreate(hwnd: Hwnd, reason: *const u16) -> i32;
+        fn ShutdownBlockReasonDestroy(hwnd: Hwnd) -> i32;
+        fn GetLastInputInfo(info: *mut LastInputInfo) -> i32;
+    }
+
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+        fn GetTickCount() -> u32;
+    }
+
+    const WM_QUERYENDSESSION: u32 = 0x0011;
+    const WM_ENDSESSION: u32 = 0x0016;
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn log(line: &str) {
+        if let Some(log) = SESSION_LOG.get() {
+            log.line(line);
+        }
+    }
+
+    pub fn idle_secs() -> Option<u64> {
+        let mut info = LastInputInfo {
+            size: std::mem::size_of::<LastInputInfo>() as u32,
+            time: 0,
+        };
+        // SAFETY: the struct is the documented LASTINPUTINFO with its size
+        // set. Both values are milliseconds since boot that wrap together.
+        unsafe {
+            (GetLastInputInfo(&mut info) != 0)
+                .then(|| u64::from(GetTickCount().wrapping_sub(info.time)) / 1000)
+        }
+    }
+
+    unsafe extern "system" fn wnd_proc(
+        hwnd: Hwnd,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize {
+        match msg {
+            WM_QUERYENDSESSION => {
+                if JOBS_RUNNING.load(Ordering::SeqCst) {
+                    let reason = wide(block_reason());
+                    ShutdownBlockReasonCreate(hwnd, reason.as_ptr());
+                    log(
+                        "Windows asked to end the session while a job runs: asked the person first",
+                    );
+                    0
+                } else {
+                    ShutdownBlockReasonDestroy(hwnd);
+                    1
+                }
+            }
+            WM_ENDSESSION => {
+                if wparam == 0 {
+                    // The person cancelled. Nothing was stopped.
+                    ShutdownBlockReasonDestroy(hwnd);
+                    log("the shutdown was cancelled; the jobs go on");
+                } else {
+                    session_is_ending();
+                }
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// Runs the window on a thread of its own. A PC where the window cannot
+    /// be made (no interactive desktop) goes on without the question.
+    pub fn watch() {
+        std::thread::spawn(|| {
+            let name = wide("shutup-and-run");
+            // SAFETY: the class and the window live on this thread, whose
+            // loop runs for the whole process; every pointer passed outlives
+            // the call that takes it, and `wnd_proc` is a plain function.
+            unsafe {
+                let instance = GetModuleHandleW(std::ptr::null());
+                let class = WndClassW {
+                    style: 0,
+                    wnd_proc: Some(wnd_proc),
+                    cls_extra: 0,
+                    wnd_extra: 0,
+                    instance,
+                    icon: std::ptr::null_mut(),
+                    cursor: std::ptr::null_mut(),
+                    background: std::ptr::null_mut(),
+                    menu_name: std::ptr::null(),
+                    class_name: name.as_ptr(),
+                };
+                RegisterClassW(&class);
+                // No WS_VISIBLE and never a ShowWindow: it is not on screen
+                // and not on the taskbar.
+                let hwnd = CreateWindowExW(
+                    0,
+                    name.as_ptr(),
+                    name.as_ptr(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    instance,
+                    std::ptr::null_mut(),
+                );
+                if hwnd.is_null() {
+                    log("no hidden window: a shutdown will not ask before ending a job");
+                    return;
+                }
+                let mut msg: Msg = std::mem::zeroed();
+                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                    DispatchMessageW(&msg);
+                }
+            }
+        });
+    }
+}
+
 #[cfg(windows)]
 fn stop_jobs_when_the_session_ends(log: &Logger) {
     extern "system" {
@@ -2603,11 +2874,7 @@ fn stop_jobs_when_the_session_ends(log: &Logger) {
             // Ctrl+C in a terminal: the default, which ends the supervisor.
             return 0;
         }
-        if let Some(log) = SESSION_LOG.get() {
-            log.line("the session is ending; stopping the jobs");
-        }
-        let _ = sh_in_distro(&graceful_stop_script(3), None, Duration::from_secs(8));
-        mark_stopped();
+        session_is_ending();
         1
     }
     let _ = SESSION_LOG.set(log.clone());
@@ -2616,6 +2883,7 @@ fn stop_jobs_when_the_session_ends(log: &Logger) {
     unsafe {
         SetConsoleCtrlHandler(Some(handler), 1);
     }
+    session::watch();
 }
 
 #[cfg(not(windows))]
@@ -2662,6 +2930,7 @@ fn stop_cli() -> WslResult<ExitCode> {
 /// `status.json` on the Windows side. The bytes are the service's own
 /// document, copied from its log line, so the host file and the page match.
 fn publish_host_status(json: &str) {
+    JOBS_RUNNING.store(jobs_running_in(json), std::sync::atomic::Ordering::SeqCst);
     let path = data_dir().join("status.json");
     let mut bytes = json.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
@@ -3252,6 +3521,12 @@ mod tests {
         ));
         assert!(script.contains("$q = [char]34"));
         assert!(graceful_stop_script(3).contains("docker stop -t 3 $ids"));
+        // The answer to a shutdown comes from the last status line.
+        assert!(jobs_running_in(r#"{"slots_used":1,"job_ids":["a"]}"#));
+        assert!(jobs_running_in(r#"{"slots_used":null,"job_ids":["a"]}"#));
+        assert!(!jobs_running_in(r#"{"slots_used":0,"job_ids":[]}"#));
+        assert!(!jobs_running_in("not json"));
+        assert!(block_reason().chars().count() < 256);
         assert!(graceful_stop_script(10).starts_with("pkill -TERM -x shutup-and-run;"));
         // Tied to the current user, which is what a non-administrator may register.
         assert!(script.contains(r"$u = $env:USERDOMAIN + '\' + $env:USERNAME"));

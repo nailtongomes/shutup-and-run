@@ -111,6 +111,7 @@ Content-Type: application/json
 | `429` | `{"error":"no free slots","slots_total":2,"slots_used":2,"slots_free":0}` | Full. Nothing was stored, the `job_key` included. | Try the next machine, or this one later. |
 | `503` | `{"error":"draining","draining":true}` | Draining for maintenance. Nothing was stored. | Try the next machine. |
 | `503` | `{"error":"insufficient resources","resource":"memory","free_bytes":536870912,"needed_bytes":2147483648}` | The machine is short of memory or disk right now (`resource` is `memory` or `disk`). Nothing was stored, the `job_key` included. It clears by itself. | Try the next machine, or this one later. |
+| `503` | `{"error":"user active","idle_secs":12,"needed_secs":300}` | A Windows PC with `min_idle_secs` set, and its owner is using it. Nothing was stored, the `job_key` included. It clears by itself. | Try the next machine, or this one later. |
 | `502` | `{"error":"docker is unavailable"}` | The Docker daemon did not answer. | Try the next machine. Tell a person. |
 | `502` | `{"error":"job history is unavailable"}` | The SQLite file could not be read or written. | Same. |
 
@@ -147,8 +148,8 @@ If the pull or the start fails, the job ends with `reason` `start_failed` and `e
 | `job_key` | string or `null` | As requested. |
 | `started_at` | integer | Unix seconds, UTC. When the job was accepted, before the pull. |
 | `ended_at` | integer or `null` | Unix seconds, UTC. |
-| `exit_code` | integer or `null` | The container's exit code. `137` after a timeout kill. `null` while running, after `start_failed`, and when the container was gone before the runner saw it end. |
-| `reason` | `exited`, `timeout_kill`, `start_failed`, or `null` | `null` while running. |
+| `exit_code` | integer or `null` | The container's exit code. `137` after a timeout kill. `null` while running, after `start_failed`, and for an `interrupted` job whose container was gone. |
+| `reason` | `exited`, `timeout_kill`, `start_failed`, `interrupted`, or `null` | `null` while running. |
 | `duration_secs` | integer or `null` | `ended_at - started_at`. It includes the pull. |
 
 All nine keys are always present.
@@ -399,8 +400,8 @@ The body is the [JobResult](#jobresult) of a job that has ended: the same nine k
 | `reason` | `exit_code` | What happened |
 | --- | --- | --- |
 | `exited` | the container's | The container ended by itself. `0` is the image's own idea of success. |
-| `exited` | not `0`, often `137` or `255` | It was killed by something other than the timeout: the machine shut down, someone ran `docker kill`, the kernel ran out of memory. |
-| `exited` | `null` | The container was gone before the runner saw it end, for example the machine went down while the image was still being pulled. Whether anything ran is unknown. |
+| `exited` | not `0`, often `137` | The runner saw the container end that way: the image's own failure, `docker kill`, the kernel out of memory. |
+| `interrupted` | `null`, or not `0` (often `137`, `143` or `255`) | Something stopped under the job and the runner cannot say how it ended: the PC was shut down, signed out or lost power, WSL or Docker stopped, or the runner itself was not running. Either the container was gone (`null`), or it was found stopped with that code when the runner started again. Whether the work was done is unknown. **The runner does not start it again**: the orchestrator decides. |
 | `timeout_kill` | `137` | SIGKILL at `timeout_secs`. |
 | `start_failed` | `null` | The image could not be pulled, or the container could not be started. Nothing ran. |
 
@@ -408,9 +409,11 @@ The body is the [JobResult](#jobresult) of a job that has ended: the same nine k
 
 - No header is added: no `Authorization`, no signature. Authenticate the callback with a secret in the URL, in the path or the query, and treat the URL as a credential.
 - Any `2xx` is success. Anything else, a `3xx` included, is a failed try.
-- Three tries: at once, 0.2 seconds after the first fails, 0.4 seconds after the second. Each waits at most 5 seconds for an answer. After the third, the runner gives up for good and only its own log says so.
-- **A callback can be missing.** The three tries take under 20 seconds in all, so an orchestrator that is down for a minute misses it. The tries are not stored: if the machine loses power between the end of the job and the request, it is not sent later.
-- **A callback can arrive twice.** If the receiver takes more than 5 seconds to answer, the runner tries again though the first request arrived.
+- Three tries: at once, 0.2 seconds after the first fails, 0.4 seconds after the second. Each waits at most 5 seconds for an answer.
+- A callback that got no `2xx` is kept as pending in the job history and sent again, the same body, once a minute for one hour after the job ended (0.2.11). That survives a restart of the runner and of the machine. After the hour the runner gives up, and its status page counts it under "Callback delivery".
+- **A callback can be missing.** An orchestrator that is down for over an hour misses it, and so does one whose machine stays off: the hour counts from the end of the job.
+- **A callback can arrive twice.** If the receiver takes more than 5 seconds to answer, or answered and the answer was lost, the runner tries again though the first request arrived. The body is the same; tell them apart by `id`.
+- **One job has one end.** An interruption is reported once, like any other end, and a job that already ended is not reported again with another reason.
 - A job that ended while the runner process was not running is reported when the process next starts. On a Windows PC that was switched off, that can be the next morning.
 - The request comes from the machine that ran the job. From a Windows worker that is the client's network.
 
@@ -500,18 +503,18 @@ What the schemas do not express, and the runner still checks: control characters
 Found while writing this document. None was changed here. Each is something an orchestrator has to design around today.
 
 1. **No acknowledgement in pull mode.** The server never learns that an offered task was accepted, dropped or invalid. A task with a typo is dropped on every poll, forever, with only a line in the worker's own log. Test a new task shape with a push to a Linux machine, or against the schema, before queueing it for a Windows worker.
-2. **A busy worker is silent.** A machine with no free slot, or short of memory or disk, does not poll. With `max_slots = 1`, a job that runs for an hour is an hour without a poll. The server cannot tell busy from switched off. Use the offered job's own deadline, not the time since the last poll, to decide a machine is gone.
-3. **A lost callback cannot be recovered in pull mode.** Nothing outside the PC can call `GET /v1/jobs/{id}` on a Windows worker, and offering the same `job_key` again returns the stored job to nobody: the callback is not sent a second time. If the three tries fail, the result exists only on that PC. Have the container report its own result.
-4. **Callbacks are not authenticated or signed**, and are neither persisted nor retried beyond three quick tries. See [section 5](#5-callback).
+2. **A busy worker is silent.** A machine with no free slot, short of memory or disk, or waiting for its owner to stop using it (`min_idle_secs`), does not poll. With `max_slots = 1`, a job that runs for an hour is an hour without a poll. The server cannot tell busy from switched off. Use the offered job's own deadline, not the time since the last poll, to decide a machine is gone.
+3. **A lost callback cannot be recovered in pull mode.** Nothing outside the PC can call `GET /v1/jobs/{id}` on a Windows worker, and offering the same `job_key` again returns the stored job to nobody: the callback is not sent a second time. If an hour of tries fails, the result exists only on that PC. Have the container report its own result.
+4. **Callbacks are not authenticated or signed**, and are retried for one hour only. See [section 5](#5-callback).
 5. **Drain hides `job_key`.** `503` comes before the key lookup. See [section 6](#6-idempotency-and-delivery).
 6. **A repeat with a different body is not an error.** The first request with a key wins and the caller is not told that the bodies differ.
 7. **No output in the contract.** A job returns an exit code and a reason. Its last log lines are readable only on the machine, with the machine's token. A result that is data is sent by the container itself.
 8. **No cancel.** A job ends by itself, at its timeout, or because someone on the machine killed the container.
 9. **The poll needs a public certificate.** See the TLS row in [section 3](#3-poll). An n8n behind a private certificate authority cannot be polled over `https`.
 10. **One task per poll, no jitter.** Many machines started at the same moment poll at the same moment. With hundreds of them, spread the load at the server.
-11. **`reason` is coarse.** A job cut by a shutdown, by an out-of-memory kill or by `docker kill` is `exited` with a non-zero or `null` `exit_code`. There is no separate reason for them.
+11. **`reason` is coarse.** A job cut by an out-of-memory kill or by `docker kill` while the runner watched is `exited` with a non-zero `exit_code`. `interrupted` says only that the runner did not see the end; a job that failed by itself in the seconds the runner was restarting is `interrupted` too, with its own exit code.
 12. **A machine's limits are not discoverable.** The poll body does not carry `max_timeout_secs`, `max_job_cpus`, `max_job_memory` or the allowlist, by decision. A task over a machine's timeout, CPU or memory limit is dropped there (limit 1 applies).
-13. **A re-install on Windows ends the jobs that are running.** `shutup-and-run wsl install` restarts the WSL2 distribution. Their callbacks are sent when the service comes back, as `exited` with a non-zero or `null` `exit_code`.
+13. **A re-install on Windows ends the jobs that are running.** `shutup-and-run wsl install` restarts the WSL2 distribution. Their callbacks are sent when the service comes back, as `interrupted`.
 14. **Free memory is measured where the service runs.** On Windows that is the WSL2 VM, not the PC: the VM can have memory free while Windows is short, and the check does not see it. `.wslconfig` is what bounds the VM. The check is also taken once, at admission: a job that grows later is held by its own memory limit, and a PC can still slow down.
 15. **A task claimed in the instant memory runs out is dropped.** The worker checks before it polls and again when it starts the task. Between the two, another program can take the memory. The window is one HTTP round trip (limit 1 applies).
 
@@ -522,7 +525,7 @@ One constant in the source, `launcher_kill`, is a `reason` that no code path emi
 What an orchestrator may rely on, and what `src/contract.rs` fails on if it changes:
 
 - The nine keys of a JobResult, the eight keys of the poll body, and the five keys of `/health`.
-- The status codes and error bodies in [section 2](#2-push-post-v1jobs). `503` `insufficient resources` and the two `above this machine's limit` messages were added in 0.2.6; a caller that already routes on `400` and `503` needs no change.
+- The status codes and error bodies in [section 2](#2-push-post-v1jobs). `503` `insufficient resources` and the two `above this machine's limit` messages were added in 0.2.6; a caller that already routes on `400` and `503` needs no change. `503` `user active` and the `reason` `interrupted` were added in 0.2.11: until then such a job was `exited` with a `null` or non-zero `exit_code`, so a caller that treats every reason it does not know as "not succeeded" needs no change either.
 - Every poll answer form in [section 3](#3-poll), the bare task and the empty forms included.
 - Unknown fields rejected in a JobRequest, a poll answer and a manifest.
 - No `schema_version`, no register call, no new required field.

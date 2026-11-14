@@ -91,6 +91,9 @@ min_free_disk (sizes like 2g or 512m; 0 turns a min_free check off). A job
 that asks for more than the machine's limit is refused with the limit in the
 answer. `status --json` shows the limits in force under `limits`, and
 `waiting_for` says why no job starts while memory or disk is short.
+On Windows, `config set min_idle_secs 300 --apply` starts a job only after the
+PC was not used for five minutes (0, the default: at any time). A running job
+is never stopped for it.
 
 First run, with no orchestrator: `shutup-and-run demo --help` documents
 version, config check, job validate, demo, demo sign and certificate.
@@ -406,6 +409,7 @@ pub fn effective_json(settings: &Settings) -> Value {
     let mut value = serde_json::to_value(crate::status::Limits::of(settings)).unwrap_or_default();
     value["poll_interval_secs"] = json!(settings.poll_interval.as_secs());
     value["max_slots"] = json!(settings.max_slots);
+    value["min_idle_secs"] = json!(settings.min_idle_secs);
     value
 }
 

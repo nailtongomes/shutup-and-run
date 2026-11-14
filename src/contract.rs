@@ -77,6 +77,7 @@ const CALLBACK_EXAMPLES: &[(&str, &str)] = &[
     example!("callback.exited.json"),
     example!("callback.timeout.json"),
     example!("callback.start-failed.json"),
+    example!("callback.interrupted.json"),
 ];
 
 /// A Draft 2020-12 validator for one published schema, or for a `$defs`
@@ -1173,6 +1174,8 @@ fn the_config_schema_matches_the_keys_and_the_validation() {
         ("max_job_memory", json!("lots")),
         ("min_free_memory", json!(2)),
         ("min_free_disk", json!("5 apples")),
+        ("min_idle_secs", json!(90_000)),
+        ("min_idle_secs", json!("300")),
     ] {
         let mut map = config::default_map();
         map.insert(key.to_string(), bad.clone());

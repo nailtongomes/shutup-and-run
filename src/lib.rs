@@ -14,6 +14,7 @@ pub mod clock;
 pub mod config;
 pub mod devx;
 pub mod hints;
+pub mod host;
 pub mod jobs;
 pub mod launcher;
 pub mod lock;
@@ -39,3 +40,6 @@ pub const REASON_EXITED: &str = "exited";
 pub const REASON_TIMEOUT: &str = "timeout_kill";
 pub const REASON_LAUNCHER: &str = "launcher_kill";
 pub const REASON_START_FAILED: &str = "start_failed";
+/// The container ended and the worker cannot say how: it is gone, or it
+/// stopped with a non-zero code while the worker was not running.
+pub const REASON_INTERRUPTED: &str = "interrupted";

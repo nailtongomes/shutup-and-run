@@ -38,6 +38,19 @@ impl JobRecord {
     }
 }
 
+/// Counts over the rows the history still holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Delivery {
+    /// Jobs that ended with reason `interrupted`.
+    pub interrupted: u64,
+    /// Of those, the ones whose callback was not answered (yet, or ever).
+    pub interrupted_unnotified: u64,
+    /// Callbacks still being retried.
+    pub pending: u64,
+    /// Callbacks the worker gave up on.
+    pub failed: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobCounts {
     pub started: u64,
@@ -108,6 +121,13 @@ impl Store {
             ",
         )
         .map_err(sql)?;
+        // A history written before 0.2.11 has no such column. Its rows keep
+        // NULL: their callbacks were sent, or not, by the old three tries.
+        match conn.execute("ALTER TABLE jobs ADD COLUMN callback_state TEXT", []) {
+            Ok(_) => {}
+            Err(err) if err.to_string().contains("duplicate column") => {}
+            Err(err) => return Err(sql(err)),
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -196,7 +216,8 @@ impl Store {
         let conn = self.conn.lock().expect("sqlite");
         let changed = conn
             .execute(
-                "UPDATE jobs SET ended_at = ?1, exit_code = ?2, reason = ?3, logs = ?4
+                "UPDATE jobs SET ended_at = ?1, exit_code = ?2, reason = ?3, logs = ?4,
+                 callback_state = CASE WHEN callback_url IS NOT NULL THEN 'pending' END
                  WHERE id = ?5 AND ended_at IS NULL",
                 params![ended_at, exit_code, reason, logs, id],
             )
@@ -211,6 +232,66 @@ impl Store {
         )
         .optional()
         .map_err(sql)
+    }
+
+    /// `delivered` once the callback was answered with 2xx, `failed` when
+    /// the worker gave up. Only a row still `pending` changes.
+    pub fn set_callback_state(&self, id: &str, state: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute(
+            "UPDATE jobs SET callback_state = ?1 WHERE id = ?2 AND callback_state = 'pending'",
+            params![state, id],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Callbacks not answered yet, of jobs that ended in `[from, until]`.
+    pub fn pending_callbacks(&self, from: i64, until: i64) -> Result<Vec<JobRecord>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs
+                 FROM jobs WHERE callback_state = 'pending' AND ended_at BETWEEN ?1 AND ?2",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([from, until], map_job)
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)?;
+        Ok(rows)
+    }
+
+    /// Gives up on callbacks of jobs that ended before `cutoff`.
+    pub fn expire_callbacks(&self, cutoff: i64) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute(
+            "UPDATE jobs SET callback_state = 'failed'
+             WHERE callback_state = 'pending' AND ended_at < ?1",
+            [cutoff],
+        )
+        .map_err(sql)
+    }
+
+    /// For the status page: interrupted jobs in the history, how many of
+    /// them nobody was told about, and callbacks waiting and given up.
+    pub fn delivery(&self) -> Result<Delivery, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let count = |sql_text: &str| -> Result<u64, StoreError> {
+            conn.query_row(sql_text, [], |row| row.get::<_, i64>(0))
+                .map(|n| n.max(0) as u64)
+                .map_err(sql)
+        };
+        Ok(Delivery {
+            interrupted: count("SELECT COUNT(*) FROM jobs WHERE reason = 'interrupted'")?,
+            interrupted_unnotified: count(
+                "SELECT COUNT(*) FROM jobs WHERE reason = 'interrupted'
+                 AND callback_state IN ('pending', 'failed')",
+            )?,
+            pending: count("SELECT COUNT(*) FROM jobs WHERE callback_state = 'pending'")?,
+            failed: count("SELECT COUNT(*) FROM jobs WHERE callback_state = 'failed'")?,
+        })
     }
 
     pub fn running_ids(&self) -> Result<Vec<String>, StoreError> {
