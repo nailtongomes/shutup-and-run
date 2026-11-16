@@ -22,6 +22,7 @@ pub mod poll;
 pub mod registry;
 pub mod resources;
 pub mod runtime;
+pub mod safety;
 pub mod status;
 pub mod store;
 pub mod wsl;

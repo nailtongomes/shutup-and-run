@@ -17,7 +17,23 @@ pub struct JobRecord {
     pub reason: Option<String>,
     pub callback_url: Option<String>,
     pub logs: Option<String>,
+    /// Docker confirmed the kernel killed a process of this container for
+    /// memory. False for every other end, a plain SIGKILL included.
+    pub oom_killed: bool,
 }
+
+/// Something that happened to the machine or to a job's resources, kept for
+/// the owner and for a report: what, when, and the numbers. Never a job's
+/// env, command or output.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Incident {
+    pub at: i64,
+    pub kind: String,
+    pub detail: String,
+}
+
+/// The most incidents kept. Older ones go when a new one is written.
+pub const MAX_INCIDENTS: usize = 200;
 
 impl JobRecord {
     pub fn is_finished(&self) -> bool {
@@ -118,15 +134,23 @@ impl Store {
                 ip TEXT PRIMARY KEY,
                 banned_until INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS incidents (
+                at INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                detail TEXT NOT NULL
+            );
             ",
         )
         .map_err(sql)?;
         // A history written before 0.2.11 has no such column. Its rows keep
         // NULL: their callbacks were sent, or not, by the old three tries.
-        match conn.execute("ALTER TABLE jobs ADD COLUMN callback_state TEXT", []) {
-            Ok(_) => {}
-            Err(err) if err.to_string().contains("duplicate column") => {}
-            Err(err) => return Err(sql(err)),
+        // The same for `oom_killed`, added after 0.2.12: NULL reads as false.
+        for column in ["callback_state TEXT", "oom_killed INTEGER"] {
+            match conn.execute(&format!("ALTER TABLE jobs ADD COLUMN {column}"), []) {
+                Ok(_) => {}
+                Err(err) if err.to_string().contains("duplicate column") => {}
+                Err(err) => return Err(sql(err)),
+            }
         }
         #[cfg(unix)]
         {
@@ -140,7 +164,7 @@ impl Store {
 
     pub fn get(&self, id: &str) -> Result<Option<JobRecord>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
-        conn.query_row("SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs FROM jobs WHERE id = ?1", [id], map_job)
+        conn.query_row("SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed FROM jobs WHERE id = ?1", [id], map_job)
             .optional()
             .map_err(sql)
     }
@@ -149,7 +173,7 @@ impl Store {
     pub fn last_job(&self) -> Result<Option<JobRecord>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         conn.query_row(
-            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs FROM jobs ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed FROM jobs ORDER BY started_at DESC, rowid DESC LIMIT 1",
             [],
             map_job,
         )
@@ -160,7 +184,7 @@ impl Store {
     pub fn get_by_key(&self, key: &str) -> Result<Option<JobRecord>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         conn.query_row(
-            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs FROM jobs WHERE job_key = ?1",
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed FROM jobs WHERE job_key = ?1",
             [key],
             map_job,
         )
@@ -226,7 +250,7 @@ impl Store {
             return Ok(None);
         }
         conn.query_row(
-            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs FROM jobs WHERE id = ?1",
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed FROM jobs WHERE id = ?1",
             [id],
             map_job,
         )
@@ -251,7 +275,7 @@ impl Store {
         let conn = self.conn.lock().expect("sqlite");
         let mut stmt = conn
             .prepare(
-                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs
+                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed
                  FROM jobs WHERE callback_state = 'pending' AND ended_at BETWEEN ?1 AND ?2",
             )
             .map_err(sql)?;
@@ -324,7 +348,7 @@ impl Store {
         let conn = self.conn.lock().expect("sqlite");
         let mut stmt = conn
             .prepare(
-                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs
+                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed
                  FROM jobs ORDER BY started_at DESC, rowid DESC LIMIT ?1",
             )
             .map_err(sql)?;
@@ -386,6 +410,94 @@ impl Store {
             .collect::<Result<Vec<String>, _>>()
             .map_err(sql)?;
         Ok(rows)
+    }
+
+    /// Marks a job as killed for memory. Before `finish`, so the row the
+    /// callback is built from already says so.
+    pub fn mark_oom(&self, id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute("UPDATE jobs SET oom_killed = 1 WHERE id = ?1", [id])
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub fn add_incident(&self, at: i64, kind: &str, detail: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute(
+            "INSERT INTO incidents (at, kind, detail) VALUES (?1, ?2, ?3)",
+            params![at, kind, detail],
+        )
+        .map_err(sql)?;
+        conn.execute(
+            "DELETE FROM incidents WHERE rowid NOT IN
+             (SELECT rowid FROM incidents ORDER BY rowid DESC LIMIT ?1)",
+            [MAX_INCIDENTS as i64],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+
+    /// The newest incidents first.
+    pub fn incidents(&self, limit: usize) -> Result<Vec<Incident>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn
+            .prepare("SELECT at, kind, detail FROM incidents ORDER BY rowid DESC LIMIT ?1")
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([limit as i64], |row| {
+                Ok(Incident {
+                    at: row.get(0)?,
+                    kind: row.get(1)?,
+                    detail: row.get(2)?,
+                })
+            })
+            .map_err(sql)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sql)
+    }
+
+    /// When the jobs killed for memory since `since` ended.
+    pub fn oom_times(&self, since: i64) -> Result<Vec<i64>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn
+            .prepare("SELECT at FROM incidents WHERE kind = 'oom' AND at >= ?1")
+            .map_err(sql)?;
+        let rows = stmt.query_map([since], |row| row.get(0)).map_err(sql)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sql)
+    }
+
+    fn meta(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(sql)
+    }
+
+    /// The owner's authorization to run under a warning, when one was given
+    /// and not withdrawn. A value that does not parse is no authorization.
+    pub fn safety_consent(&self) -> Result<Option<crate::safety::Consent>, StoreError> {
+        Ok(self
+            .meta("safety_consent")?
+            .and_then(|text| serde_json::from_str(&text).ok()))
+    }
+
+    /// Writes or, with None, withdraws the authorization.
+    pub fn set_safety_consent(
+        &self,
+        consent: Option<&crate::safety::Consent>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        match consent {
+            Some(consent) => conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('safety_consent', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [serde_json::to_string(consent).unwrap_or_default()],
+            ),
+            None => conn.execute("DELETE FROM meta WHERE key = 'safety_consent'", []),
+        }
+        .map_err(sql)?;
+        Ok(())
     }
 
     pub fn draining(&self) -> Result<bool, StoreError> {
@@ -531,6 +643,7 @@ fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
         reason: row.get(6)?,
         callback_url: row.get(7)?,
         logs: row.get(8)?,
+        oom_killed: row.get::<_, Option<i64>>(9)?.unwrap_or(0) != 0,
     })
 }
 

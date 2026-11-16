@@ -112,10 +112,12 @@ Content-Type: application/json
 | `503` | `{"error":"draining","draining":true}` | Draining for maintenance. Nothing was stored. | Try the next machine. |
 | `503` | `{"error":"insufficient resources","resource":"memory","free_bytes":536870912,"needed_bytes":2147483648}` | The machine is short of memory or disk right now (`resource` is `memory` or `disk`). Nothing was stored, the `job_key` included. It clears by itself. | Try the next machine, or this one later. |
 | `503` | `{"error":"user active","idle_secs":12,"needed_secs":300}` | A Windows PC with `min_idle_secs` set, and its owner is using it. Nothing was stored, the `job_key` included. It clears by itself. | Try the next machine, or this one later. |
+| `503` | `{"error":"blocked for safety","code":"SAFETY_BLOCKED","reasons":[{"code":"SAFETY_MEMORY_CRITICAL","level":"blocked","detail":"this PC: 600 MiB of 5.0 GiB available"}]}` | A shared PC (`resource_profile` `shared-pc`) in a critical state: memory, disk or processor at a critical level, a reading the worker could not take, or three jobs killed for memory in half an hour (`SAFETY_OOM_BREAKER`, a 15 minute pause). Nothing was stored, the `job_key` included. It clears by itself, and nothing a caller or the owner does lifts it sooner. | Try the next machine, or this one later. After `SAFETY_OOM_BREAKER`, send work that needs less memory, or give it more. |
+| `503` | `{"error":"authorization required","code":"AUTHORIZATION_REQUIRED","notice_version":1,"reasons":[{"code":"SAFETY_SMALL_MACHINE","level":"warning","detail":"this PC: 2 processors, 5.0 GiB of memory"}]}` | A shared PC where running a job is a risk for its owner, and the owner has not agreed to it. Nothing was stored. Only a person at that computer can agree, on its local page or in a terminal; no request field, token, config key or route does. | Try the next machine. Do not retry in a loop: it stays until a person acts. Tell whoever is responsible for that PC. |
 | `502` | `{"error":"docker is unavailable"}` | The Docker daemon did not answer. | Try the next machine. Tell a person. |
 | `502` | `{"error":"job history is unavailable"}` | The SQLite file could not be read or written. | Same. |
 
-A request is checked in this order, and the first failure answers: ban, token, body size, JSON shape, `image` name, allowlist, `timeout_secs`, `env`, `command`, `job_key`, `callback_url`, `cpu`, `memory`, drain, `job_key` lookup, slots, free memory and disk. Two consequences: a draining machine answers `503` even for a `job_key` it already holds, and a repeat of a known `job_key` with an invalid body is a `400`.
+A request is checked in this order, and the first failure answers: ban, token, body size, JSON shape, `image` name, allowlist, `timeout_secs`, `env`, `command`, `job_key`, `callback_url`, `cpu`, `memory`, drain, `job_key` lookup, slots, safety block, owner's authorization, free memory and disk, idle time. Two consequences: a draining machine answers `503` even for a `job_key` it already holds, and a repeat of a known `job_key` with an invalid body is a `400`.
 
 The `400` messages: `invalid image name`, `timeout_secs must be greater than zero`, `timeout_secs <n> is above the maximum <max>`, `env accepts at most 128 variables`, `invalid environment variable: <name>`, `invalid value for <name>`, `command accepts at most 32 arguments`, `invalid command argument`, `job_key must be 1-200 characters of letters, digits, '.', '_', ':' or '-'`, `callback_url is invalid`, `callback_url must be http or https`, `cpu must be a number between 0 and 128`, `cpu is invalid`, `cpu <n> is above this machine's limit of <max> per job`, `memory <bytes> is above this machine's limit of <max> bytes per job`. Match on the status, not on the text.
 
@@ -152,7 +154,7 @@ If the pull or the start fails, the job ends with `reason` `start_failed` and `e
 | `reason` | `exited`, `timeout_kill`, `start_failed`, `interrupted`, or `null` | `null` while running. |
 | `duration_secs` | integer or `null` | `ended_at - started_at`. It includes the pull. |
 
-All nine keys are always present.
+All nine keys are always present. A tenth, `"oom_killed": true`, is added only when Docker recorded that the kernel killed a process of the container for memory: the job reached its memory limit. It is never `false`: a job that was not killed for memory, a plain `SIGKILL` with `exit_code` 137 included, does not carry the key. `reason` stays `exited`. The same work with the same `memory` will most likely end the same way, so change one of the two before sending it again.
 
 `GET /v1/jobs/{id}` returns the same object, for as long as the row is in the history (`history_days`, 30 by default), across restarts. `?logs=true` adds `logs`, the last `log_lines` (200) lines the container printed, or one line saying why the start failed. An unknown id is `404` `{"id":"<id>","status":"not_found"}`. There is no listing of jobs and no lookup by `job_key` other than pushing the same key again. There is no cancel.
 
@@ -522,7 +524,7 @@ What the schemas do not express, and the runner still checks: control characters
 Found while writing this document. None was changed here. Each is something an orchestrator has to design around today.
 
 1. **No acknowledgement in pull mode.** The server never learns that an offered task was accepted, dropped or invalid. A task with a typo is dropped on every poll, forever, with only a line in the worker's own log. Test a new task shape with a push to a Linux machine, or against the schema, before queueing it for a Windows worker.
-2. **A busy worker is silent.** A machine with no free slot, short of memory or disk, or waiting for its owner to stop using it (`min_idle_secs`), does not poll. With `max_slots = 1`, a job that runs for an hour is an hour without a poll. The server cannot tell busy from switched off. Use the offered job's own deadline, not the time since the last poll, to decide a machine is gone.
+2. **A busy worker is silent.** A machine with no free slot, short of memory or disk, blocked for safety, waiting for its owner's authorization, or waiting for its owner to stop using it (`min_idle_secs`), does not poll. With `max_slots = 1`, a job that runs for an hour is an hour without a poll. The server cannot tell busy from switched off. Use the offered job's own deadline, not the time since the last poll, to decide a machine is gone.
 3. **A lost callback cannot be recovered in pull mode.** Nothing outside the PC can call `GET /v1/jobs/{id}` on a Windows worker, and offering the same `job_key` again returns the stored job to nobody: the callback is not sent a second time. If an hour of tries fails, the result exists only on that PC. Have the container report its own result.
 4. **Callbacks are not authenticated or signed**, and are retried for one hour only. See [section 5](#5-callback).
 5. **Drain hides `job_key`.** `503` comes before the key lookup. See [section 6](#6-idempotency-and-delivery).
@@ -543,8 +545,9 @@ One constant in the source, `launcher_kill`, is a `reason` that no code path emi
 
 What an orchestrator may rely on, and what `src/contract.rs` fails on if it changes:
 
-- The nine keys of a JobResult, the eight keys of the poll body, and the five keys of `/health`.
+- The nine keys of a JobResult, the eight keys of the poll body, and the five keys of `/health`. `oom_killed` (after 0.2.12) is a tenth key that exists only when it is `true`; a reader that ignores unknown keys needs no change, and one that validates against the schema needs the new schema.
 - The status codes and error bodies in [section 2](#2-push-post-v1jobs). `503` `insufficient resources` and the two `above this machine's limit` messages were added in 0.2.6; a caller that already routes on `400` and `503` needs no change. `503` `user active` and the `reason` `interrupted` were added in 0.2.11: until then such a job was `exited` with a `null` or non-zero `exit_code`, so a caller that treats every reason it does not know as "not succeeded" needs no change either.
+- `503` `blocked for safety` and `503` `authorization required` were added after 0.2.12, on machines with the `shared-pc` profile only. Both are one more "not now, on this machine", and a caller that routes on `503` needs no change.
 - Every poll answer form in [section 3](#3-poll), the bare task and the empty forms included.
 - Unknown fields rejected in a JobRequest, a poll answer and a manifest.
 - No `schema_version`, no register call, no new required field.

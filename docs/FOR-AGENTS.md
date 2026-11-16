@@ -94,6 +94,17 @@ The JSON also carries `fix`. It is the same sentence under the name 0.2.8 used; 
 | `LOW_MEMORY` | It clears when programs close or a job ends. To ask for less: `shutup-and-run config set min_free_memory 1g --apply`. On Windows, `shutup-and-run wsl limits` shows what WSL2 has. | Passa quando programas fecham ou uma tarefa termina. Para exigir menos: `shutup-and-run config set min_free_memory 1g --apply`. No Windows, `shutup-and-run wsl limits` mostra quanto o WSL2 tem. |
 | `LOW_DISK` | Free disk space: `docker image prune -af` (Windows: `wsl -d shutup-and-run -u root docker image prune -af`). To ask for less: `shutup-and-run config set min_free_disk 2g --apply`. | Libere espaço em disco: `docker image prune -af` (Windows: `wsl -d shutup-and-run -u root docker image prune -af`). Para exigir menos: `shutup-and-run config set min_free_disk 2g --apply`. |
 | `USER_ACTIVE` | The PC is in use and `min_idle_secs` makes jobs wait; it clears by itself. To start jobs at any time: `shutup-and-run config set min_idle_secs 0 --apply`. | O PC está em uso e `min_idle_secs` faz as tarefas esperarem; passa sozinho. Para começar tarefas a qualquer hora: `shutup-and-run config set min_idle_secs 0 --apply`. |
+| `AUTHORIZATION_REQUIRED` | Do not answer for the owner. Ask the person at this computer to open http://127.0.0.1:8787/ and authorize, or to run `shutup-and-run safety authorize` in a terminal. | Não responda pelo dono. Peça à pessoa neste computador para abrir http://127.0.0.1:8787/ e autorizar, ou rodar `shutup-and-run safety authorize` em um terminal. |
+| `SAFETY_BLOCKED` | It clears by itself when the computer recovers; no authorization lifts it. `shutup-and-run safety` shows which reading is critical. | Passa sozinho quando o computador se recupera; nenhuma autorização libera. `shutup-and-run safety` mostra qual leitura está crítica. |
+| `SAFETY_TELEMETRY_MISSING` | The worker could not read memory, disk or load, so it starts nothing. Run `shutup-and-run doctor --report` and open the issue link. | O worker não conseguiu ler memória, disco ou carga, então não inicia nada. Rode `shutup-and-run doctor --report` e abra o link de issue. |
+| `SAFETY_MEMORY_CRITICAL` | Close programs to free memory; jobs start again by themselves once it is back above the recovery line. On Windows, `shutup-and-run wsl limits` shows what WSL2 has. | Feche programas para liberar memória; as tarefas voltam sozinhas quando ela passar da linha de recuperação. No Windows, `shutup-and-run wsl limits` mostra o que o WSL2 tem. |
+| `SAFETY_DISK_CRITICAL` | Free disk space until at least 3 GiB are free: `docker image prune -af` (Windows: `wsl -d shutup-and-run -u root docker image prune -af`), or delete files on the PC. | Libere espaço em disco até sobrar pelo menos 3 GiB: `docker image prune -af` (Windows: `wsl -d shutup-and-run -u root docker image prune -af`), ou apague arquivos no PC. |
+| `SAFETY_CPU_CRITICAL` | The processor is saturated by other programs. Wait or close them; jobs start again by themselves when the load drops. | O processador está saturado por outros programas. Aguarde ou feche-os; as tarefas voltam sozinhas quando a carga cair. |
+| `SAFETY_OOM_BREAKER` | Jobs ran out of memory three times in 30 minutes, so new ones pause for 15. Give the task more memory or a smaller workload at the service that sends it; see `shutup-and-run jobs`. | Tarefas estouraram a memória três vezes em 30 minutos, então as novas pausam por 15. Dê mais memória à tarefa ou reduza a carga no serviço que a envia; veja `shutup-and-run jobs`. |
+| `SAFETY_SMALL_MACHINE` | This computer has under 8 GiB of memory or at most 2 processors, so its owner has to authorize jobs: see the hint of `AUTHORIZATION_REQUIRED`. | Este computador tem menos de 8 GiB de memória ou no máximo 2 processadores, então o dono precisa autorizar as tarefas: veja a dica de `AUTHORIZATION_REQUIRED`. |
+| `SAFETY_MEMORY_LOW` | Less than 20% of the memory is available. Close programs, or the owner authorizes jobs under this condition: see the hint of `AUTHORIZATION_REQUIRED`. | Menos de 20% da memória está disponível. Feche programas, ou o dono autoriza tarefas nessa condição: veja a dica de `AUTHORIZATION_REQUIRED`. |
+| `SAFETY_CPU_BUSY` | The processor is busy with other programs. It clears by itself, or the owner authorizes jobs under this condition: see the hint of `AUTHORIZATION_REQUIRED`. | O processador está ocupado com outros programas. Passa sozinho, ou o dono autoriza tarefas nessa condição: veja a dica de `AUTHORIZATION_REQUIRED`. |
+| `SAFETY_HOST_UNKNOWN` | Windows is not telling the worker about the PC. Run `shutup-and-run wsl stop` then `shutup-and-run wsl start`; if it stays, update with the install line. | O Windows não está informando o worker sobre o PC. Rode `shutup-and-run wsl stop` e depois `shutup-and-run wsl start`; se continuar, atualize com a linha de instalação. |
 | `WORKER_BUSY` | Every slot is in use. Wait for the running job (`shutup-and-run jobs`) and try again. | Todos os slots estão em uso. Aguarde a tarefa em execução (`shutup-and-run jobs`) e tente de novo. |
 | `SLOTS_EXCEED_MEMORY` | Run `shutup-and-run config set max_slots {} --apply`, or lower `max_job_memory`. | Rode `shutup-and-run config set max_slots {} --apply`, ou reduza `max_job_memory`. |
 | `POLL_URL_UNSET` | Run `shutup-and-run config set poll_url URL --apply` with the URL the service gave you. | Rode `shutup-and-run config set poll_url URL --apply` com a URL que o serviço informou. |
@@ -186,7 +197,7 @@ Inspect what is in force, and whether the worker is waiting for memory or disk:
 
 ```
 shutup-and-run config show --json   # "effective": the limits and the poll interval that run, defaults filled in
-shutup-and-run status --json     # "limits": {...}, "waiting_for": null or "low on memory: ..."
+shutup-and-run status --json     # "limits": {...}, "waiting_for": null or "low on memory: ...", "safety": {...}
 shutup-and-run doctor --json     # the "resources" check; on Windows also "wsl-limits"
 ```
 
@@ -200,7 +211,33 @@ shutup-and-run wsl limits --memory 4GB --processors 2 --apply
 
 `--apply` saves the old file as `.wslconfig.bak`. The new limits take effect when WSL restarts. **Do not run `wsl --shutdown` on your own**: it stops every WSL distribution, the user's included. Tell the person, or wait for the next restart of the PC. If the PC has Docker Desktop or another distribution, ask before `--apply`.
 
-None of this guarantees a responsive PC. The memory check reads the VM, not Windows, and only when a job starts. See [WINDOWS.md](WINDOWS.md#sharing-the-pc).
+None of this guarantees a responsive PC. See [WINDOWS.md](WINDOWS.md#sharing-the-pc).
+
+## Safety of the owner's computer: what you may and may not do
+
+Under the `shared-pc` profile the worker asks, before every job, whether starting it is safe for the person who owns the computer. It reads memory, disk and processor load where the containers run, and on Windows also the PC's own memory, processor use and disk. The answer is one of three:
+
+| `safety.level` | `safety.admission` | What happens |
+| --- | --- | --- |
+| `healthy` | `open` | Jobs start. |
+| `warning` | `authorization_required` | No job starts until the owner of the computer says yes to the risks listed. |
+| `warning` | `open` | The owner said yes to those risks; jobs start. |
+| `blocked` | `blocked` | No job starts. It clears by itself. No authorization lifts it. |
+
+```
+shutup-and-run safety --json     # {"ok":true,"safety":{"level","admission","reasons":[{"code","level","detail"}],"needs_authorization":[...],"authorization":{...}|null,"incidents":[...]}}
+shutup-and-run status --json     # the same object under "safety", and "waiting_for" says it in one line
+shutup-and-run doctor --json     # the "safety" check: ok, or warn with the code below
+shutup-and-run safety revoke     # withdraw the owner's authorization (always allowed)
+```
+
+**You do not authorize.** `AUTHORIZATION_REQUIRED` is a decision that belongs to the person whose computer it is. `shutup-and-run safety authorize` asks that person, at a terminal, to type a word after reading the risks; with `--json`, or without a terminal (which is every call through `shutup-and-run.exe` on Windows), it exits 1 with `AUTHORIZATION_REQUIRED` and changes nothing. There is no flag, config key, environment variable or API field that says yes, and none should be looked for. Do not drive the local page, pipe the word in through a pseudo-terminal, or write to the history file: tell the person what the worker found, in their language, and where to decide: `http://127.0.0.1:8787/` on that computer (the desktop shortcut), "Safety of this computer". If they say no, leave the worker waiting or run `shutup-and-run pause`.
+
+The warnings (`reasons[].level` `warning`): `SAFETY_SMALL_MACHINE` (under 8 GiB of memory, or 2 processors or fewer), `SAFETY_MEMORY_LOW` (under 20% of memory available), `SAFETY_CPU_BUSY` (the PC's processors 75% busy or more, or a load of 1 per processor where the containers run), `SAFETY_HOST_UNKNOWN` (Windows is not reporting the PC to the worker). The owner's yes covers the warnings shown at that moment; a new one asks again, and so does a new version of the notice (`notice_version`).
+
+The blocks (`level` `blocked`): `SAFETY_MEMORY_CRITICAL` (under 10% of memory, or under 1 GiB on the PC, 256 MiB inside WSL2), `SAFETY_DISK_CRITICAL` (under 2 GiB free), `SAFETY_CPU_CRITICAL` (processors 95% busy, or a load of 2 per processor), `SAFETY_TELEMETRY_MISSING` (a reading could not be taken), `SAFETY_OOM_BREAKER` (three jobs killed for memory in 30 minutes: 15 minutes without new jobs). Each clears a little above the line it tripped at, so it does not flap. A running job is never stopped for any of them. Nothing in the config changes these lines.
+
+`incidents` are the last few things recorded for the owner: `oom` (a job reached its memory limit; `jobs --json` has `"oom_killed": true` for it), `cpu_throttled` (a job was held at its CPU limit for most of its time), `blocked`, `recovered`, `authorization_granted`, `authorization_revoked`. They stay on the machine.
 
 ## Check that it works
 
@@ -217,11 +254,11 @@ shutup-and-run jobs --json       # the last 20 jobs and how each ended
 ```json
 {"ok": true, "limit": 20, "jobs": [
   {"id": "9f2c...", "image": "registry.example/protocol:1", "started_at": "2026-11-14T12:00:00Z",
-   "ended_at": "2026-11-14T12:00:42Z", "duration_secs": 42, "exit_code": 0, "status": "ok", "failure": null}
+   "ended_at": "2026-11-14T12:00:42Z", "duration_secs": 42, "exit_code": 0, "status": "ok", "failure": null, "oom_killed": false}
 ]}
 ```
 
-`status` is `running`, `ok` (exit 0), `failed` (another exit code, or the container never started), `timeout` (it ran past its time limit), `killed` (exit 137: out of memory, or stopped) or `interrupted` (the PC, WSL or Docker stopped under it, or the worker was not running when it ended; it is not run again, the service that sent it decides). `failure` says why in one sentence, and is null for `ok` and `running`. The history keeps the last 500 finished jobs at most, for `history_days`. It never holds or prints a job's env, command, payload or logs. The result of a job is not here either: the container sends it to the service itself.
+`status` is `running`, `ok` (exit 0), `failed` (another exit code, or the container never started), `timeout` (it ran past its time limit), `killed` (exit 137: stopped from outside; `oom_killed` is true when Docker confirmed it was for memory) or `interrupted` (the PC, WSL or Docker stopped under it, or the worker was not running when it ended; it is not run again, the service that sent it decides). `failure` says why in one sentence, and is null for `ok` and `running`. The history keeps the last 500 finished jobs at most, for `history_days`. It never holds or prints a job's env, command, payload or logs. The result of a job is not here either: the container sends it to the service itself.
 
 "Is the machine broken, or is it the server?" is two fields of `doctor --json` (and of `config check --json`), since 0.2.12:
 

@@ -18,7 +18,8 @@ shutup-and-run jobs [--limit N] [--json]
     the last N jobs of this machine, newest first (default 20, at most 200):
     id, image, start, end, duration, exit code, status and, when it did not
     end well, why. Status is running, ok, failed, timeout, killed or
-    interrupted (the PC, WSL or Docker stopped under the job). The
+    interrupted (the PC, WSL or Docker stopped under the job). A job that
+    Docker confirmed was killed for memory says so (oom_killed). The
     history holds at most the last 500 finished jobs, and never a job's env,
     command, payload or logs."
 }
@@ -50,9 +51,14 @@ pub fn failure_of(job: &JobRecord) -> Option<String> {
         "killed" if job.reason.as_deref() == Some(REASON_LAUNCHER) => {
             Some("stopped by the worker".into())
         }
-        "killed" => {
-            Some("killed from outside (exit 137): out of memory, or stopped by hand".into())
-        }
+        _ if job.oom_killed => Some(
+            "ran out of memory: it reached its memory limit and the kernel killed it (confirmed by Docker)"
+                .into(),
+        ),
+        "killed" => Some(
+            "killed from outside (exit 137), and not for memory as far as Docker recorded: stopped by hand, or by the system"
+                .into(),
+        ),
         "failed" if job.reason.as_deref() == Some(REASON_START_FAILED) => {
             // The launcher's own fixed sentence, not container output.
             Some(format!(
@@ -85,6 +91,7 @@ pub fn job_json(job: &JobRecord) -> Value {
         "exit_code": job.exit_code,
         "status": status_of(job),
         "failure": failure_of(job),
+        "oom_killed": job.oom_killed,
     })
 }
 
@@ -258,6 +265,7 @@ mod tests {
                 "failure",
                 "id",
                 "image",
+                "oom_killed",
                 "started_at",
                 "status"
             ]

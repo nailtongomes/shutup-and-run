@@ -36,6 +36,7 @@ pub fn router(launcher: Arc<Launcher>) -> Router {
         .route("/local/pause", post(pause))
         .route("/local/resume", post(resume))
         .route("/local/lang", get(set_lang))
+        .route("/local/safety", get(safety_page).post(safety_save))
         .route("/local/config", get(config_page).post(config_save))
         .route("/local/advanced", get(advanced_page).post(advanced_save))
         .route(
@@ -196,8 +197,248 @@ async fn page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Resp
         computer: Some(&live.computer),
         limits: Some(&live.limits),
         waiting_for: live.waiting_for.as_deref(),
+        safety: Some(&live.safety),
     };
     html(StatusCode::OK, render(&view))
+}
+
+// ---------------------------------------------------------------------------
+// Safety: what stands between this computer and a new job, and the one
+// question only its owner answers. Not behind the admin login: that password
+// is the operator's, and the yes has to be the person's at the PC.
+
+fn findings_list(found: &[&crate::safety::Finding], lang: Lang) -> String {
+    found
+        .iter()
+        .map(|f| {
+            format!(
+                "<li>{} <small>({})</small></li>",
+                crate::safety::label(&f.code, lang == Lang::Pt),
+                escape(&f.detail)
+            )
+        })
+        .collect()
+}
+
+/// The safety page. `note` is the answer to the last button.
+pub(crate) fn safety_view(
+    report: &crate::safety::Report,
+    lang: Lang,
+    note: Option<(bool, &str)>,
+) -> String {
+    use crate::safety::Admission;
+    let note = note
+        .map(|(ok, text)| {
+            format!(
+                "<p{}><b>{}</b></p>",
+                if ok { "" } else { " class=\"bad\"" },
+                escape(text)
+            )
+        })
+        .unwrap_or_default();
+    let back = format!(
+        "<p><a href=\"/\">{}</a></p>",
+        lang.t("Back to the status", "Voltar ao status")
+    );
+    if !report.applies {
+        return format!(
+            "<h2>{}</h2>{note}<p>{}</p>{back}",
+            lang.t("Safety of this computer", "Segurança deste computador"),
+            lang.t(
+                "This machine is dedicated to jobs (resource_profile = none), so it is not assessed.",
+                "Esta máquina é dedicada a tarefas (resource_profile = none), então não é avaliada.",
+            )
+        );
+    }
+    let state = match report.admission {
+        Admission::Open if report.reasons.is_empty() => lang.t(
+            "Healthy: nothing stands in the way of a new job.",
+            "Saudável: nada impede uma tarefa nova.",
+        ),
+        Admission::Open => lang.t(
+            "There is a risk, and you authorized jobs under it.",
+            "Há um risco, e você autorizou tarefas nessa condição.",
+        ),
+        Admission::AuthorizationRequired => lang.t(
+            "New jobs are waiting for your decision.",
+            "As tarefas novas estão esperando a sua decisão.",
+        ),
+        Admission::Blocked => lang.t(
+            "New jobs are blocked to protect this computer. This clears by itself; no authorization lifts it.",
+            "As tarefas novas estão bloqueadas para proteger este computador. Isso passa sozinho; nenhuma autorização libera.",
+        ),
+    };
+    let section = |title: &str, found: Vec<&crate::safety::Finding>| {
+        if found.is_empty() {
+            String::new()
+        } else {
+            format!("<h2>{title}</h2><ul>{}</ul>", findings_list(&found, lang))
+        }
+    };
+    let blocked = section(
+        lang.t(
+            "Critical now (blocks every new job)",
+            "Crítico agora (bloqueia toda tarefa nova)",
+        ),
+        report.blocked(),
+    );
+    let asked = report.unauthorized();
+    let covered: Vec<&crate::safety::Finding> = report
+        .reasons
+        .iter()
+        .filter(|f| f.level == crate::safety::Level::Warning && !asked.contains(f))
+        .collect();
+    let form = if asked.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<h2>{t_risks}</h2><ul>{risks}</ul>{notice}\
+             <form method=\"post\" action=\"/local/safety\">\
+             <label><input type=\"checkbox\" name=\"confirm\" required> {t_confirm}</label>\
+             <p><button name=\"action\" value=\"authorize\">{t_yes}</button></p></form>\
+             <p><small>{t_no}</small></p>",
+            t_risks = lang.t(
+                "Risks that need your authorization",
+                "Riscos que precisam da sua autorização"
+            ),
+            risks = findings_list(&asked, lang),
+            notice = crate::safety::notice(lang == Lang::Pt)
+                .split("\n\n")
+                .map(|p| format!("<p>{}</p>", escape(p)))
+                .collect::<String>(),
+            t_confirm = lang.t(
+                "I own or answer for this computer, I read the text above, and I authorize jobs to start under the conditions listed.",
+                "Sou dono ou responsável por este computador, li o texto acima e autorizo que tarefas comecem nas condições listadas.",
+            ),
+            t_yes = lang.t("Authorize", "Autorizar"),
+            t_no = lang.t(
+                "To refuse, do nothing: no job starts under these conditions.",
+                "Para recusar, não faça nada: nenhuma tarefa começa nessas condições.",
+            ),
+        )
+    };
+    let authorization = match &report.authorization {
+        Some(consent) => format!(
+            "<h2>{}</h2><p>{} {} ({} v{}): {}</p>{}\
+             <form method=\"post\" action=\"/local/safety\"><p>\
+             <button name=\"action\" value=\"revoke\">{}</button></p></form>",
+            lang.t("Your authorization", "Sua autorização"),
+            lang.t("Given on", "Dada em"),
+            escape(&unix_to_iso(consent.at)),
+            lang.t("notice", "aviso"),
+            consent.notice_version,
+            consent
+                .codes
+                .iter()
+                .map(|code| crate::safety::label(code, lang == Lang::Pt))
+                .collect::<Vec<_>>()
+                .join("; "),
+            if covered.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<p>{}</p><ul>{}</ul>",
+                    lang.t("In effect now for:", "Valendo agora para:"),
+                    findings_list(&covered, lang)
+                )
+            },
+            lang.t("Withdraw the authorization", "Retirar a autorização"),
+        ),
+        None => String::new(),
+    };
+    let incidents = if report.incidents.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<h2>{}</h2><table>{}</table>",
+            lang.t("Last incidents", "Últimos incidentes"),
+            report
+                .incidents
+                .iter()
+                .map(|i| format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    escape(&unix_to_iso(i.at)),
+                    escape(&i.kind),
+                    escape(&i.detail)
+                ))
+                .collect::<String>()
+        )
+    };
+    format!(
+        "<h2>{title}</h2>{note}<p><b>{state}</b></p>{blocked}{form}{authorization}{incidents}{back}",
+        title = lang.t("Safety of this computer", "Segurança deste computador"),
+    )
+}
+
+async fn safety_page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Response {
+    let lang = lang_of(&headers, &launcher.settings().language);
+    let report = launcher.live_status().await.safety;
+    html(
+        StatusCode::OK,
+        shell(
+            lang,
+            "/local/safety",
+            None,
+            &safety_view(&report, lang, None),
+        ),
+    )
+}
+
+async fn safety_save(
+    State(launcher): State<Arc<Launcher>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let lang = lang_of(&headers, &launcher.settings().language);
+    let note = match form.get("action").map(String::as_str) {
+        // The box is the yes. A post without it, however it was made, is not.
+        Some("authorize") if form.get("confirm").map(String::as_str) != Some("on") => (
+            false,
+            lang.t(
+                "Not authorized: tick the box to confirm.",
+                "Não autorizado: marque a caixa para confirmar.",
+            ),
+        ),
+        Some("authorize") => match launcher.authorize("page") {
+            Ok(_) => (true, lang.t("Authorized.", "Autorizado.")),
+            Err(crate::safety::GrantError::NothingToAuthorize) => (
+                true,
+                lang.t(
+                    "Nothing is waiting for an authorization.",
+                    "Nada está esperando autorização.",
+                ),
+            ),
+            Err(_) => (
+                false,
+                lang.t("Could not be saved.", "Não foi possível salvar."),
+            ),
+        },
+        Some("revoke") => match launcher.revoke_authorization("page") {
+            Ok(_) => (
+                true,
+                lang.t("Authorization withdrawn.", "Autorização retirada."),
+            ),
+            Err(_) => (
+                false,
+                lang.t("Could not be saved.", "Não foi possível salvar."),
+            ),
+        },
+        _ => (false, lang.t("Unknown action.", "Ação desconhecida.")),
+    };
+    let report = launcher.live_status().await.safety;
+    html(
+        if note.0 {
+            StatusCode::OK
+        } else {
+            StatusCode::BAD_REQUEST
+        },
+        shell(
+            lang,
+            "/local/safety",
+            None,
+            &safety_view(&report, lang, Some(note)),
+        ),
+    )
 }
 
 fn html(status: StatusCode, body: String) -> Response {
@@ -222,6 +463,8 @@ pub(crate) struct View<'a> {
     pub computer: Option<&'a Computer>,
     pub limits: Option<&'a Limits>,
     pub waiting_for: Option<&'a str>,
+    /// What stands between this computer and a new job. None leaves it out.
+    pub safety: Option<&'a crate::safety::Report>,
 }
 
 /// Everything around a page's body: one language, and a link to the other.
@@ -260,7 +503,53 @@ pub(crate) fn render(view: &View) -> String {
     ) {
         "failed" => (lang.t("DOCKER IS DOWN", "DOCKER PAROU"), "#b00020"),
         "draining" => (lang.t("PAUSED", "PAUSADO"), "#8a6d00"),
-        _ => (lang.t("RUNNING", "RODANDO"), "#0a7a2f"),
+        _ => match view.safety.map(|s| s.admission) {
+            Some(crate::safety::Admission::AuthorizationRequired) => (
+                lang.t(
+                    "WAITING FOR YOUR AUTHORIZATION",
+                    "ESPERANDO A SUA AUTORIZAÇÃO",
+                ),
+                "#8a6d00",
+            ),
+            Some(crate::safety::Admission::Blocked) => (
+                lang.t(
+                    "NEW JOBS BLOCKED FOR SAFETY",
+                    "TAREFAS NOVAS BLOQUEADAS POR SEGURANÇA",
+                ),
+                "#8a6d00",
+            ),
+            _ => (lang.t("RUNNING", "RODANDO"), "#0a7a2f"),
+        },
+    };
+    let safety = match view.safety.filter(|s| s.applies) {
+        None => String::new(),
+        Some(report) => {
+            use crate::safety::Admission;
+            let link = format!(
+                "<a href=\"/local/safety\">{}</a>",
+                lang.t("Safety of this computer", "Segurança deste computador")
+            );
+            match report.admission {
+                Admission::Open => format!("<p>{link}</p>"),
+                Admission::AuthorizationRequired => format!(
+                    "<p class=\"bad\">{}</p><ul>{}</ul><p><b>{link}: {}</b></p>",
+                    lang.t(
+                        "No job starts until you decide. Running jobs on this computer now has a risk:",
+                        "Nenhuma tarefa começa até você decidir. Rodar tarefas neste computador agora tem um risco:",
+                    ),
+                    findings_list(&report.unauthorized(), lang),
+                    lang.t("read and decide", "leia e decida"),
+                ),
+                Admission::Blocked => format!(
+                    "<p class=\"bad\">{}</p><ul>{}</ul><p>{link}</p>",
+                    lang.t(
+                        "No new job starts now, to protect this computer. It clears by itself:",
+                        "Nenhuma tarefa nova começa agora, para proteger este computador. Passa sozinho:",
+                    ),
+                    findings_list(&report.blocked(), lang),
+                ),
+            }
+        }
     };
     let (slots, off) = match view.slots {
         Some((used, total)) => (
@@ -326,7 +615,7 @@ pub(crate) fn render(view: &View) -> String {
         String::new()
     };
     let body = format!(
-        "<p class=\"state\" style=\"color:{color}\">{state}</p>{warning}\
+        "<p class=\"state\" style=\"color:{color}\">{state}</p>{warning}{safety}\
          <table>\
          <tr><td>{t_off}</td><td><b>{off}</b></td></tr>\
          <tr><td>{t_jobs}</td><td>{slots}</td></tr>\
@@ -475,6 +764,26 @@ fn computer_section(view: &View) -> String {
                 "não: ocupado, todas as vagas em uso",
             )
             .to_string(),
+        _ if view
+            .safety
+            .is_some_and(|s| s.admission == crate::safety::Admission::Blocked) =>
+        {
+            lang.t(
+                "no: blocked to protect this computer",
+                "não: bloqueado para proteger este computador",
+            )
+            .to_string()
+        }
+        _ if view
+            .safety
+            .is_some_and(|s| s.admission == crate::safety::Admission::AuthorizationRequired) =>
+        {
+            lang.t(
+                "no: waiting for your authorization",
+                "não: esperando a sua autorização",
+            )
+            .to_string()
+        }
         (_, _, Some(_)) if computer.user_active => lang
             .t("waiting: the PC is in use", "esperando: o PC está em uso")
             .to_string(),
@@ -1214,6 +1523,7 @@ pub struct Live {
     pub limits: Limits,
     pub config_warning: Option<String>,
     pub computer: Computer,
+    pub safety: crate::safety::Report,
 }
 
 /// Readings for the page's "Computer resources". On Windows `host` is the
@@ -1231,14 +1541,12 @@ pub struct Computer {
 }
 
 impl Computer {
-    pub fn read(launcher: &Launcher) -> Self {
+    pub fn read(launcher: &Launcher, machine: &crate::safety::Readings) -> Self {
         Self {
-            host: crate::host::current(),
-            cpus: std::thread::available_parallelism()
-                .ok()
-                .map(|n| n.get() as u64),
-            memory_total: crate::resources::memory_total(),
-            memory_available: crate::resources::memory_available(),
+            host: machine.host.or_else(crate::host::current),
+            cpus: machine.inner.cpus,
+            memory_total: machine.inner.memory_total,
+            memory_available: machine.inner.memory_available,
             min_idle_secs: launcher.settings().min_idle_secs,
             user_active: launcher.shortage().is_none() && launcher.user_active().is_some(),
             delivery: launcher.delivery(),
@@ -1316,7 +1624,7 @@ impl Live {
             // Not the text: its byte counts change every second.
             self.waiting_for.is_some(),
             self.computer.delivery
-        )
+        ) + &self.safety.signature()
     }
 
     pub fn state(&self, stopped: bool) -> &'static str {
@@ -1397,6 +1705,9 @@ struct FileBody<'a> {
     waiting_for: Option<&'a str>,
     /// Interrupted jobs and callbacks not answered, over the history.
     callbacks: &'a crate::store::Delivery,
+    /// Whether a new job may start for the sake of this computer's owner:
+    /// the level, why, the owner's authorization, and the last incidents.
+    safety: &'a crate::safety::Report,
     limits: &'a Limits,
     config_warning: Option<String>,
     version: &'a str,
@@ -1425,6 +1736,7 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
         last_poll_status: live.last_poll.map(|(_, status)| status),
         waiting_for: live.waiting_for.as_deref(),
         callbacks: &live.computer.delivery,
+        safety: &live.safety,
         limits: &live.limits,
         config_warning: live.config_warning.as_deref().map(one_line),
         version: env!("CARGO_PKG_VERSION"),
@@ -1462,6 +1774,7 @@ fn empty_live() -> Live {
         limits: Limits::default(),
         config_warning: None,
         computer: Computer::default(),
+        safety: crate::safety::Report::default(),
     }
 }
 
@@ -1724,6 +2037,7 @@ mod tests {
             computer: None,
             limits: None,
             waiting_for: None,
+            safety: None,
         }
     }
 
@@ -1776,6 +2090,8 @@ mod tests {
                 memory_total: Some(12 * GIB),
                 memory_available: Some(5 * GIB),
                 cpus: Some(8),
+                cpu_busy_percent: None,
+                disk_available: None,
             }),
             cpus: Some(4),
             memory_total: Some(4 * GIB),
@@ -2013,6 +2329,7 @@ mod tests {
             },
             config_warning: None,
             computer: Computer::default(),
+            safety: crate::safety::Report::default(),
         };
         let bytes = document(&live, 1_700_000_100, false, None);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

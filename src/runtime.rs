@@ -59,4 +59,30 @@ pub trait Runtime: Send + Sync {
     async fn remove_image(&self, image: &str) -> Result<(), RuntimeError>;
     /// Remove our containers left in `created` after a crash between create and start.
     async fn cleanup_created(&self) -> Result<usize, RuntimeError>;
+    /// Did the kernel kill a process of this stopped container for memory?
+    /// What Docker recorded (`State.OOMKilled`), not a guess from exit 137.
+    async fn oom_killed(&self, _id: &str) -> Result<bool, RuntimeError> {
+        Ok(false)
+    }
+    /// The CPU periods a running container has had, and how many of them it
+    /// spent held back at its CPU limit. None where the daemon does not say.
+    async fn cpu_throttling(&self, _id: &str) -> Result<Option<Throttling>, RuntimeError> {
+        Ok(None)
+    }
+}
+
+/// Counted by the kernel since the container started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Throttling {
+    pub periods: u64,
+    pub throttled_periods: u64,
+}
+
+impl Throttling {
+    /// Held back in at least half of its periods, over at least twenty
+    /// seconds of them (a period is 100 ms): the job wanted clearly more CPU
+    /// than its limit, for long enough not to be a start-up spike.
+    pub fn significant(&self) -> bool {
+        self.periods >= 200 && self.throttled_periods * 2 >= self.periods
+    }
 }

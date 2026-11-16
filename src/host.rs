@@ -31,6 +31,13 @@ pub struct Feed {
     /// Logical processors of the PC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<u64>,
+    /// How busy those processors were since the line before this one, 0 to
+    /// 100. Missing on the first line: there is nothing to compare with yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_busy_percent: Option<u64>,
+    /// Free bytes on the Windows drive that holds the WSL2 disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_available: Option<u64>,
 }
 
 static LAST: Mutex<Option<(Instant, Feed)>> = Mutex::new(None);
@@ -83,6 +90,8 @@ mod tests {
             memory_total: Some(8 << 30),
             memory_available: None,
             cpus: Some(8),
+            cpu_busy_percent: Some(12),
+            disk_available: None,
         };
         let text = line(&feed);
         assert!(text.starts_with("host-feed {") && text.ends_with("}\n"));

@@ -116,7 +116,19 @@ shutup-and-run status --json     # "limits" and "waiting_for"
 
 A job that asks for more `cpu` or `memory` than the machine's limit is refused, and the supervisor log says `poll task rejected`. While memory or disk is short the worker does not ask for work; `status` shows `waiting_for`, and it resumes by itself.
 
-**What this does not do.** It is not a guarantee that the PC stays responsive. The free-memory check sees the VM, not Windows: a PC whose Windows side is out of memory still looks fine from inside. It is taken when a job starts, not while it runs. Disk and network use of a job are not limited. Nothing watches the keyboard or the mouse, and a running job is never stopped to make room. The pause button on the local page is how the person at the PC says "not now".
+**The PC itself is watched before a job starts, and its owner is asked when it is a risk.** Every ten seconds the supervisor tells the service what only Windows knows: the PC's memory and how much is available, how busy its processors were, and the free space on the drive that holds the WSL2 disk. Before a job starts the service puts that next to its own view of the VM and decides:
+
+| | When | What the person sees |
+| --- | --- | --- |
+| Blocked | The PC has under 10% of its memory, or under 1 GiB, available; its processors are 95% busy; under 2 GiB of disk is free; the VM is at its own floor; a reading is missing; or three jobs were killed for memory in half an hour. | The page says **NEW JOBS BLOCKED FOR SAFETY** and why. It ends by itself, a little above the line it started at. Nobody can override it, the owner included. |
+| The owner is asked | The PC is small (under 8 GiB, or 2 processors or fewer), has under 20% of memory available, its processors are 75% busy, or Windows is not reporting it. | The page says **WAITING FOR YOUR AUTHORIZATION**. "Safety of this computer" lists the risks with their numbers, explains what can happen and what the worker does about it, and has one box and one button. |
+| Healthy | Otherwise. | Jobs start; nothing is asked. |
+
+The yes is asked once and kept (in the job history, with the date, the version of the notice and the risks it covered). A risk that was not on the list when the person agreed asks again; so does a new version of the notice. The person can withdraw it on the same page. It is not behind the admin login, because that password is the operator's and the decision is the person's at the PC; and it cannot be given from anywhere else: not by the poll URL, not by a config key, not by `shutup-and-run.exe` (which has no terminal inside the distribution to ask in). A running job is never stopped by any of this: only new ones wait.
+
+A job that reaches its memory limit is stopped by that limit, and `shutup-and-run jobs` and the page say it was for memory, as Docker recorded it, and not a plain kill. After three in half an hour new jobs pause for fifteen minutes.
+
+**What this does not do.** It is not a guarantee that the PC stays responsive. The readings are taken when a job starts, and every ten seconds from Windows; a PC that gets busy a minute into a job is not noticed until the next job. The thresholds are conservative starting points, not measurements of any one PC: on a small one, measure before trusting them ([TESTING.md](TESTING.md#a-small-windows-pc-2-processors-5-gb)). Disk and network use of a job are not limited. Nothing watches the keyboard or the mouse, and a running job is never stopped to make room. The pause button on the local page is how the person at the PC says "not now".
 
 ## Certificate passthrough
 

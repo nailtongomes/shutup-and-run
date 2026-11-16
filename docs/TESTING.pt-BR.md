@@ -169,6 +169,72 @@ Nada disto rodou num PC Windows de verdade antes da release: o CI compila e roda
 - [ ] O mesmo, e aperte **Sair mesmo assim**. Entre de novo: `shutup-and-run jobs` mostra essa tarefa como `interrupted`, o mock imprimiu uma linha para ela com `reason=interrupted`, a página conta 1 tarefa interrompida, e nenhum container foi iniciado de novo para ela (`wsl -d shutup-and-run -u root -- docker ps -a` vazio).
 - [ ] Com uma tarefa rodando e o mock parado, reinicie o PC. Suba o mock de novo dentro de uma hora: o callback chega numa tentativa posterior, e "Entrega de callbacks" na página volta a 0 aguardando.
 
+### Segurança de recursos e a autorização do dono
+
+Automatizado no Linux: `cargo test` cobre admissão saudável, cada leitura crítica, leituras ausentes, o consentimento e o seu alcance, as respostas não interativas, o disjuntor e o fim dele, OOM contra um kill comum, throttling e o perfil `none`, tudo com leituras simuladas. Contra um Docker real, sem estressar a máquina:
+
+```bash
+cargo build --release --locked
+sudo bash tests/safety/linux.sh target/release/shutup-and-run
+```
+
+Ele prende o próprio worker a dois processadores para que veja um computador pequeno, autoriza por um pseudo-terminal como uma pessoa faria, segura uma tarefa em um quinto de processador, para e reinicia o `dockerd` sob uma tarefa em execução e estoura três vezes um limite de 16 MiB. 34 verificações; cerca de um minuto e meio. Não está no CI: termina com o disjuntor aberto.
+
+| Simulado no Linux | Como | Observado |
+| --- | --- | --- |
+| Máquina pequena | worker preso a 2 de 4 processadores | `authorization_required`, push `503`, nenhum container |
+| Autorização não interativa | `--json`; a palavra enviada por pipe, sem terminal | saída 1, `AUTHORIZATION_REQUIRED`, nada mudou |
+| Pessoa em um terminal | pseudo-terminal, palavra errada, depois a palavra | não; depois registrado com canal `terminal`, e as tarefas começam |
+| Pouca memória, CPU saturada, disco cheio, leituras velhas ou ausentes | leituras simuladas nos testes unitários | `503` `SAFETY_BLOCKED` com o código; nada gravado; libera depois da linha de recuperação |
+| Throttling de CPU | tarefa real com `cpu: 0.2` por 40 s | saída 0, um incidente `cpu_throttled` (99% do tempo) |
+| Falha do daemon do Docker | `dockerd` parado sob uma tarefa em execução, depois iniciado | push `502`, worker vivo, `state: failed`; tarefas aceitas de novo sem reiniciar; a tarefa perdida fechada uma vez |
+| Kill comum | `docker kill` | saída 137, sem `oom_killed` |
+| OOM de container, repetido | tarefa real, `memory: 16m`, `tail /dev/zero`, três vezes | saída 137, `oom_killed: true`, um incidente cada; depois `SAFETY_OOM_BREAKER`, que uma autorização não libera |
+
+Não simulado no Linux: falta real de memória ou disco no host (só as leituras são falsas), e tudo do lado do Windows.
+
+#### Um PC Windows pequeno: 2 processadores, 5 GB
+
+Uma VM Windows 11 com 2 vCPU e 5 GB de RAM, com virtualização aninhada. Nada abaixo foi executado no Windows: as leituras de CPU e disco do supervisor são novas e só foram compiladas. **Não considere esta configuração segura até que os números abaixo digam isso.** Deixe o Gerenciador de Tarefas (Desempenho) aberto e anote os valores.
+
+1. Antes de instalar, com a VM ociosa por dois minutos: memória **disponível** e % de CPU no Gerenciador de Tarefas.
+
+   | | Memória disponível | CPU | Sensação |
+   | --- | --- | --- | --- |
+   | Ociosa, antes de instalar | | | |
+   | Instalado, sem tarefa | | | |
+   | Uma tarefa rodando | | | |
+
+2. Instale (seção 3), com o mock da seção 2 servindo três tarefas.
+   - [ ] A instalação termina com saída 0. O doctor tem uma linha `--  safety` com `SAFETY_SMALL_MACHINE` e uma `hint:` que diz para não responder pelo dono.
+   - [ ] `http://127.0.0.1:8787/` diz **ESPERANDO A SUA AUTORIZAÇÃO** (ou em inglês) e "computador pequeno". O mock imprimiu `WORKER` no máximo uma vez e nenhum `TASK`.
+   - [ ] `shutup-and-run safety --json` tem `"admission":"authorization_required"`; o `detail` do motivo traz os processadores e a memória reais deste PC.
+   - [ ] `shutup-and-run safety authorize` sai com 1 e `AUTHORIZATION_REQUIRED`, e nada muda. O mesmo com `--json`.
+3. Na página, abra **Segurança deste computador**.
+   - [ ] Os riscos, o aviso (ele diz que as proteções não eliminam o risco, e que autorizar não muda as responsabilidades do fornecedor), uma caixa, um botão. O link no canto superior direito mostra a página só em um idioma por vez.
+   - [ ] O botão sem a caixa não faz nada (o navegador pede a caixa).
+   - [ ] Marque a caixa, **Autorizar**: "Autorizado." A página volta para **RODANDO**, o mock imprime `TASK` e a tarefa termina `ok`. Preencha as duas últimas linhas da tabela enquanto uma tarefa roda. O mouse está suave, uma aba do navegador abre em tempo normal?
+   - [ ] As duas tarefas seguintes começam sem nova pergunta. `shutup-and-run safety --json` tem `"authorization"` com `"channel":"page"`.
+4. Pressão de memória no PC. Em uma janela do PowerShell (ocupa cerca de 1,5 GB e segura):
+
+   ```powershell
+   $hold = @(); 1..15 | ForEach-Object { $b = New-Object byte[] 100MB; for ($i = 0; $i -lt $b.Length; $i += 4096) { $b[$i] = 1 }; $hold += ,$b }
+   ```
+
+   - [ ] Quando o Gerenciador de Tarefas mostrar menos de 1 GB disponível: em até 15 segundos a página diz **TAREFAS NOVAS BLOQUEADAS POR SEGURANÇA**, memória em nível crítico, "this PC: ... available". O mock não recebe polls. Uma tarefa que já estava rodando continua e termina.
+   - [ ] O botão Autorizar não é oferecido para isso, e `shutup-and-run safety authorize` diz que nada está esperando.
+   - [ ] Feche essa janela do PowerShell. Nada muda até haver 1,5 GB disponível de novo; então a página volta sozinha e os polls retornam. "Últimos incidentes" tem `blocked` e `recovered`.
+   - [ ] Se o Gerenciador de Tarefas nunca mostrou 1 GB disponível, nem antes do script, este PC fica bloqueado a maior parte do tempo: anote. Essa é a resposta para "5 GB bastam?", não um defeito.
+5. Saturação do processador. `1..2 | ForEach-Object { Start-Job { while ($true) {} } }`.
+   - [ ] Em cerca de 20 segundos: bloqueado, "O processador está saturado", "this PC: processors 9x% busy". `Get-Job | Remove-Job -Force`: volta sozinho quando ficar abaixo de 85%.
+6. Uma tarefa que estoura a memória. Reinicie o mock com `--tasks 3 --image alpine --command "tail /dev/zero" --memory 64m --expect-failures 3`.
+   - [ ] Cada uma termina em segundos. `shutup-and-run jobs` diz "ran out of memory ... (confirmed by Docker)" para cada; a memória disponível no Gerenciador de Tarefas não caiu mais que os 64 MB da tarefa.
+   - [ ] Depois da terceira: bloqueado, "Tarefas estouraram a memória repetidamente". Quinze minutos depois termina sozinho.
+7. Na página, **Retirar a autorização**: **ESPERANDO A SUA AUTORIZAÇÃO** de novo, e o mock não recebe polls.
+8. Nenhuma janela apareceu em momento algum, e `shutup-and-run wsl logs` não tem linha com token nem com o env de uma tarefa.
+
+O que relatar: a tabela, quais caixas falharam, e se os passos 4 e 5 bloquearam e se recuperaram nos valores que o Gerenciador de Tarefas mostrou. Se o PC ocioso já fica abaixo de 1 GB disponível, ou a VM fica lenta com uma tarefa nos limites padrão, este PC não deve emprestar recursos, autorize o dono o que autorizar.
+
 ### Repasse de certificado e as demos
 
 Ainda não rodou no Windows. No PC Windows, com um `.pfx` de teste (nunca um real para isto) numa pasta com espaço e acento no nome:
