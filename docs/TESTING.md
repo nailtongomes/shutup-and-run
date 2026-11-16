@@ -8,7 +8,7 @@ One Linux VPS (yours, trusted) and one Windows 11 PC (treated as a client's). Ab
 
 The one-line installs download from the latest GitHub release.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` is the version in `Cargo.toml` (`v0.2.12` when this was written) or later and has three files: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` is the version in `Cargo.toml` (`v0.2.13` when this was written) or later and has three files: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
 If it is not there: the `release` workflow runs by itself when `main` gets a `Cargo.toml` version that has no release, creates the tag and publishes. Look at its last run under Actions; "Run workflow" on `main` retries one that failed. Nobody pushes a tag by hand.
 
@@ -169,7 +169,7 @@ None of this ran on a real Windows PC before the release: CI builds it and runs 
 - [ ] The same, and press **Sign out anyway**. Sign in again: `shutup-and-run jobs` shows that job as `interrupted`, the mock printed a line for it with `reason=interrupted`, the page counts 1 interrupted job, and no container was started for it again (`wsl -d shutup-and-run -u root -- docker ps -a` is empty).
 - [ ] With a job running and the mock stopped, restart the PC. Start the mock again within the hour: the callback arrives on a later try, and "Callback delivery" on the page goes back to 0 waiting.
 
-### Resource safety and the owner's authorization
+### 0.2.13: resource safety and the owner's authorization
 
 Automated on Linux: `cargo test` covers healthy admission, each critical reading, missing readings, the consent and its scope, the non-interactive answers, the breaker and its end, OOM against a plain kill, throttling and profile `none`, all with simulated readings. Against a real Docker, without stressing the machine:
 

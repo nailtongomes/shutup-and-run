@@ -144,7 +144,7 @@ impl Store {
         .map_err(sql)?;
         // A history written before 0.2.11 has no such column. Its rows keep
         // NULL: their callbacks were sent, or not, by the old three tries.
-        // The same for `oom_killed`, added after 0.2.12: NULL reads as false.
+        // The same for `oom_killed`, added in 0.2.13: NULL reads as false.
         for column in ["callback_state TEXT", "oom_killed INTEGER"] {
             match conn.execute(&format!("ALTER TABLE jobs ADD COLUMN {column}"), []) {
                 Ok(_) => {}

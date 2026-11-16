@@ -406,7 +406,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** `worker_ready` is "no check but `poll` failed", so a paused worker, or one short of memory, is `true` with a warning beside it. The word for the poll URL is in two fields, a boolean for a quick `if` and a string for why it is null. The one-task run takes a minute and a half of CI, because the 30 second poll interval is not shortened for tests.
 
-## The owner's computer comes before the job: assessment, consent, incidents (after 0.2.12)
+## The owner's computer comes before the job: assessment, consent, incidents (0.2.13)
 
 **Context.** The shared-PC profile already capped every container and made a new job wait for free memory and disk. Four things were missing. The free-memory read was the WSL2 VM's, so a Windows PC out of memory looked fine from inside. A reading that failed counted as fine. Nothing looked at the processor. And a 2-processor, 5 GB PC started jobs exactly like a 16-core one, without its owner ever being told what that costs. A container killed for memory was "exit 137", the same as a `docker kill`, and the next task could do it again at once.
 

@@ -545,9 +545,9 @@ One constant in the source, `launcher_kill`, is a `reason` that no code path emi
 
 What an orchestrator may rely on, and what `src/contract.rs` fails on if it changes:
 
-- The nine keys of a JobResult, the eight keys of the poll body, and the five keys of `/health`. `oom_killed` (after 0.2.12) is a tenth key that exists only when it is `true`; a reader that ignores unknown keys needs no change, and one that validates against the schema needs the new schema.
+- The nine keys of a JobResult, the eight keys of the poll body, and the five keys of `/health`. `oom_killed` (0.2.13) is a tenth key that exists only when it is `true`; a reader that ignores unknown keys needs no change, and one that validates against the schema needs the new schema.
 - The status codes and error bodies in [section 2](#2-push-post-v1jobs). `503` `insufficient resources` and the two `above this machine's limit` messages were added in 0.2.6; a caller that already routes on `400` and `503` needs no change. `503` `user active` and the `reason` `interrupted` were added in 0.2.11: until then such a job was `exited` with a `null` or non-zero `exit_code`, so a caller that treats every reason it does not know as "not succeeded" needs no change either.
-- `503` `blocked for safety` and `503` `authorization required` were added after 0.2.12, on machines with the `shared-pc` profile only. Both are one more "not now, on this machine", and a caller that routes on `503` needs no change.
+- `503` `blocked for safety` and `503` `authorization required` were added in 0.2.13, on machines with the `shared-pc` profile only. Both are one more "not now, on this machine", and a caller that routes on `503` needs no change.
 - Every poll answer form in [section 3](#3-poll), the bare task and the empty forms included.
 - Unknown fields rejected in a JobRequest, a poll answer and a manifest.
 - No `schema_version`, no register call, no new required field.

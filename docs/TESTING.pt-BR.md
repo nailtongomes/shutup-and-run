@@ -8,7 +8,7 @@ Uma VPS Linux (sua, confiável) e um PC com Windows 11 (tratado como PC de clien
 
 As instalações de uma linha baixam da última release do GitHub.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a versão do `Cargo.toml` (`v0.2.12` quando isto foi escrito) ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a versão do `Cargo.toml` (`v0.2.13` quando isto foi escrito) ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
 Se não estiver lá: o workflow `release` roda sozinho quando o `main` recebe uma versão do `Cargo.toml` que ainda não tem release, cria a tag e publica. Veja a última execução em Actions; "Run workflow" no `main` repete uma que falhou. Ninguém cria tag à mão.
 
@@ -169,7 +169,7 @@ Nada disto rodou num PC Windows de verdade antes da release: o CI compila e roda
 - [ ] O mesmo, e aperte **Sair mesmo assim**. Entre de novo: `shutup-and-run jobs` mostra essa tarefa como `interrupted`, o mock imprimiu uma linha para ela com `reason=interrupted`, a página conta 1 tarefa interrompida, e nenhum container foi iniciado de novo para ela (`wsl -d shutup-and-run -u root -- docker ps -a` vazio).
 - [ ] Com uma tarefa rodando e o mock parado, reinicie o PC. Suba o mock de novo dentro de uma hora: o callback chega numa tentativa posterior, e "Entrega de callbacks" na página volta a 0 aguardando.
 
-### Segurança de recursos e a autorização do dono
+### 0.2.13: segurança de recursos e a autorização do dono
 
 Automatizado no Linux: `cargo test` cobre admissão saudável, cada leitura crítica, leituras ausentes, o consentimento e o seu alcance, as respostas não interativas, o disjuntor e o fim dele, OOM contra um kill comum, throttling e o perfil `none`, tudo com leituras simuladas. Contra um Docker real, sem estressar a máquina:
 
