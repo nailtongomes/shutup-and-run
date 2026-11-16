@@ -316,9 +316,11 @@ pub async fn config_check() -> Out {
             ..c
         })
         .collect();
+    let mut extra = crate::cli::readiness(&checks);
+    extra["config_valid"] = Value::Bool(!config_invalid);
     let mut out = checks_out(
         &checks,
-        json!({"config_valid": !config_invalid}),
+        extra,
         "the config and this machine are ready",
         "not ready: follow the `hint:` under each FAIL, then this again",
     );
@@ -1607,10 +1609,20 @@ mod tests {
         assert!(wrong.detail.contains("HTTP 404") && !wrong.detail.contains("00000000000"));
         assert!(wrong.hint().contains("config set poll_url"));
 
+        // The machine is fine and the endpoint is not: two separate answers.
+        let ready = crate::cli::readiness(&[check("docker", true, "answers"), wrong.clone()]);
+        assert_eq!(ready["worker_ready"], true);
+        assert_eq!(ready["poll_endpoint_ok"], false);
+        assert_eq!(ready["poll_endpoint"], "error");
+
         assert_eq!(poll_check(&at("/busy")).await.code(), "POLL_RATE_LIMITED");
         let mut none = settings(&dir, "");
         none.poll_url = None;
-        assert_eq!(poll_check(&none).await.code(), "POLL_URL_UNSET");
+        let unset = poll_check(&none).await;
+        assert_eq!(unset.code(), "POLL_URL_UNSET");
+        let off = crate::cli::readiness(&[unset]);
+        assert_eq!(off["poll_endpoint"], "disabled");
+        assert!(off["poll_endpoint_ok"].is_null());
 
         // The doctor reads the same from what the service said.
         assert_eq!(

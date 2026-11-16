@@ -397,3 +397,11 @@ The cost is that the instance must allowlist an image for the test. The owner ch
 ## The name
 
 The owner named it `shutup-and-run`. It is the whole product: send a job, get a container, or get a refusal. Earlier nautical names (`berth`, `kedge`, `cleat`, and others) were already used by other Docker tools.
+
+## The doctor says whose fault it is (0.2.12)
+
+**Context.** On a client's PC the worker ran `hello-world` and served its page while the configured poll URL answered 404. The doctor said `"ok": false` and "something is wrong", and an agent reading that went looking for a fault on a machine that had none.
+
+**Decision.** `doctor --json` and `config check --json` gain three fields computed from the checks they already had: `worker_ready`, `poll_endpoint_ok` (true, false or null) and `poll_endpoint` (`ok`, `error`, `disabled`, `not_checked`). `ok`, the exit codes and the check codes do not change: a poll URL that answers 404 to the service is still exit 1. The text output, when `poll` is the only failed check, ends by saying the worker is ready and the fault is at the poll URL. `tests/poll-mock/cycle.sh ... one` is the flow an integrator needs to see once: one task, the callback with its `job_key`, and a second offer that starts nothing.
+
+**Cost.** `worker_ready` is "no check but `poll` failed", so a paused worker, or one short of memory, is `true` with a warning beside it. The word for the poll URL is in two fields, a boolean for a quick `if` and a string for why it is null. The one-task run takes a minute and a half of CI, because the 30 second poll interval is not shortened for tests.
