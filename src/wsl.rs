@@ -3754,18 +3754,22 @@ mod tests {
         if !cfg!(target_os = "linux") || !have("pgrep") || !have("pkill") {
             return;
         }
-        // A stand-in for the old service: `sleep` under a name of its own,
-        // short enough for the 15 characters `pgrep -x` compares.
+        // A stand-in for the old service: a script under a name of its own,
+        // short enough for the 15 characters `pgrep -x` compares. The kernel
+        // names the process after the script. Not a copy of `sleep`: where
+        // coreutils is one multi-call binary, a copy under another name
+        // refuses to run.
         let name = format!("sar-old-{}", std::process::id() % 100_000);
         let dir = std::env::temp_dir().join(format!("{name}-dir"));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join(&name);
-        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
-            .iter()
-            .find(|p| Path::new(p).exists())
-            .unwrap();
-        std::fs::copy(sleep, &fake).unwrap();
-        let mut old = Command::new(&fake).arg("300").spawn().unwrap();
+        std::fs::write(&fake, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut old = Command::new(&fake).spawn().unwrap();
         let pid = old.id().to_string();
         // Reaped as it dies, as init does in the distribution. Unreaped, it
         // would stay in the process table and the script would wait for it.
