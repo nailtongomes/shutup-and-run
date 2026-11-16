@@ -29,7 +29,7 @@ async fn main() -> ExitCode {
     // distribution, so these run there. `status` reads the host's copy.
     if cfg!(windows) {
         match args.first().map(String::as_str) {
-            Some("config" | "bans" | "pause" | "resume" | "jobs") => {
+            Some("config" | "bans" | "pause" | "resume" | "jobs" | "safety") => {
                 return shutup_and_run::wsl::forward(&args)
             }
             // These need a file or a result to cross between Windows and
@@ -62,6 +62,7 @@ async fn main() -> ExitCode {
         Some("status") => shutup_and_run::cli::status_cli(rest),
         Some("jobs") => shutup_and_run::jobs::jobs_cli(rest),
         Some("doctor") => shutup_and_run::cli::doctor_cli(rest).await,
+        Some("safety") => shutup_and_run::cli::safety_cli(rest),
         Some("pause") => shutup_and_run::cli::pause_cli(true, rest),
         Some("resume") => shutup_and_run::cli::pause_cli(false, rest),
         Some("wsl") => shutup_and_run::wsl::cli(rest).await,
@@ -92,6 +93,10 @@ shutup-and-run pause | resume
 shutup-and-run jobs [--limit N]
     for an agent or a script: no questions, --json, stable exit codes.
     `shutup-and-run config --help` documents all of them.
+
+shutup-and-run safety [status|authorize|revoke]
+    is it safe for this computer's owner to start a job, and the owner's
+    authorization when it is a risk. Only a person at the machine authorizes.
 
 shutup-and-run version
 shutup-and-run config check

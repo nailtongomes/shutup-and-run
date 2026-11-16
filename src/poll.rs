@@ -982,4 +982,42 @@ mod tests {
         assert_eq!(outcome, PollOutcome::Rejected);
         assert_eq!(mock.start_count().await, 0);
     }
+
+    /// A machine that is blocked, or whose owner has not said yes, does not
+    /// ask for a task: one handed out and then refused is lost to the server.
+    #[tokio::test]
+    async fn a_machine_that_is_not_safe_or_not_authorized_does_not_poll() {
+        use crate::safety::Readings;
+        let server = poll_server(
+            StatusCode::OK,
+            r#"{"task":{"image":"alpine","command":["true"]}}"#,
+        )
+        .await;
+        let (plain, _) = launcher_for(1, &format!("poll_url = \"{}\"", server.url), &[]);
+        let mut settings = plain.settings().clone();
+        settings.shared_pc = true;
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let launcher = Launcher::new(settings, runtime).unwrap();
+
+        let mut small = Readings::healthy();
+        small.inner.cpus = Some(2);
+        launcher.set_readings(small);
+        let outcome = poll_once(&launcher, &client().unwrap()).await.unwrap();
+        assert_eq!(outcome, PollOutcome::Idle);
+        let mut critical = Readings::healthy();
+        critical.inner.disk_free = Some(1 << 30);
+        launcher.set_readings(critical);
+        let outcome = poll_once(&launcher, &client().unwrap()).await.unwrap();
+        assert_eq!(outcome, PollOutcome::Idle);
+        assert_eq!(server.hits.load(Ordering::Relaxed), 0);
+        assert_eq!(mock.start_count().await, 0);
+
+        // The owner agreed to the small machine: the next poll takes the task.
+        launcher.set_readings(small);
+        launcher.authorize("page").unwrap();
+        let outcome = poll_once(&launcher, &client().unwrap()).await.unwrap();
+        assert_eq!(outcome, PollOutcome::Started);
+        assert_eq!(server.hits.load(Ordering::Relaxed), 1);
+    }
 }

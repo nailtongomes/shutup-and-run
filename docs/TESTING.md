@@ -8,7 +8,7 @@ One Linux VPS (yours, trusted) and one Windows 11 PC (treated as a client's). Ab
 
 The one-line installs download from the latest GitHub release.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` is the version in `Cargo.toml` (`v0.2.12` when this was written) or later and has three files: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` is the version in `Cargo.toml` (`v0.2.13` when this was written) or later and has three files: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
 If it is not there: the `release` workflow runs by itself when `main` gets a `Cargo.toml` version that has no release, creates the tag and publishes. Look at its last run under Actions; "Run workflow" on `main` retries one that failed. Nobody pushes a tag by hand.
 
@@ -168,6 +168,72 @@ None of this ran on a real Windows PC before the release: CI builds it and runs 
 - [ ] With a five-minute job running (section 5), Start > Sign out: Windows shows `shutup-and-run` and "A job is running on this PC...". Press **Cancel**: `shutup-and-run wsl logs` has `the shutdown was cancelled; the jobs go on`, and the job ends well later (`ok` at the mock).
 - [ ] The same, and press **Sign out anyway**. Sign in again: `shutup-and-run jobs` shows that job as `interrupted`, the mock printed a line for it with `reason=interrupted`, the page counts 1 interrupted job, and no container was started for it again (`wsl -d shutup-and-run -u root -- docker ps -a` is empty).
 - [ ] With a job running and the mock stopped, restart the PC. Start the mock again within the hour: the callback arrives on a later try, and "Callback delivery" on the page goes back to 0 waiting.
+
+### 0.2.13: resource safety and the owner's authorization
+
+Automated on Linux: `cargo test` covers healthy admission, each critical reading, missing readings, the consent and its scope, the non-interactive answers, the breaker and its end, OOM against a plain kill, throttling and profile `none`, all with simulated readings. Against a real Docker, without stressing the machine:
+
+```bash
+cargo build --release --locked
+sudo bash tests/safety/linux.sh target/release/shutup-and-run
+```
+
+It pins its own worker to two processors so that it sees a small computer, authorizes through a pseudo-terminal the way a person would, holds a job at a fifth of a processor, stops and restarts `dockerd` under a running job, and runs a job out of a 16 MiB limit three times. 34 checks; about a minute and a half. It is not in CI: it ends with the breaker open.
+
+| Simulated on Linux | How | Observed |
+| --- | --- | --- |
+| Small machine | worker pinned to 2 of 4 processors | `authorization_required`, push `503`, no container |
+| Non-interactive authorization | `--json`; the word piped in with no terminal | exit 1, `AUTHORIZATION_REQUIRED`, nothing changed |
+| Person at a terminal | pseudo-terminal, wrong word, then the word | no; then recorded with channel `terminal`, and jobs start |
+| Low memory, CPU saturation, disk exhaustion, stale or missing readings | simulated readings in unit tests | `503` `SAFETY_BLOCKED` with the code; nothing stored; clears past the recovery line |
+| CPU throttling | real job at `cpu: 0.2` for 40 s | exit 0, one `cpu_throttled` incident (99% of its time) |
+| Docker daemon failure | `dockerd` stopped under a running job, then started | push `502`, worker alive, `state: failed`; jobs accepted again with no restart; the lost job closed once |
+| Plain kill | `docker kill` | exit 137, no `oom_killed` |
+| Container OOM, repeated | real job, `memory: 16m`, `tail /dev/zero`, three times | exit 137, `oom_killed: true`, one incident each; then `SAFETY_OOM_BREAKER`, which an authorization does not lift |
+
+Not simulated on Linux: a real shortage of host memory or disk (only the readings are faked), and anything on the Windows side.
+
+#### A small Windows PC: 2 processors, 5 GB
+
+A Windows 11 VM with 2 vCPU and 5 GB of RAM, nested virtualization on. Nothing below has been run on Windows: the supervisor's CPU and disk readings are new and were only compiled. **Do not take this configuration to be safe until the numbers below say so.** Keep Task Manager (Performance) open and write the figures down.
+
+1. Before installing, with the VM idle for two minutes: memory **available** and CPU % in Task Manager.
+
+   | | Available memory | CPU | Feels |
+   | --- | --- | --- | --- |
+   | Idle, before install | | | |
+   | Installed, no job | | | |
+   | One job running | | | |
+
+2. Install (section 3), with the mock from section 2 serving three tasks.
+   - [ ] The install ends with exit 0. The doctor has a `--  safety` line with `SAFETY_SMALL_MACHINE` and a `hint:` that says not to answer for the owner.
+   - [ ] `http://127.0.0.1:8787/` says **WAITING FOR YOUR AUTHORIZATION** and "a small computer". The mock printed `WORKER` at most once and no `TASK`.
+   - [ ] `shutup-and-run safety --json` has `"admission":"authorization_required"`; the reason's `detail` has this PC's real processors and memory.
+   - [ ] `shutup-and-run safety authorize` exits 1 with `AUTHORIZATION_REQUIRED` and nothing changes. So does `shutup-and-run safety authorize --json`.
+3. On the page, open **Safety of this computer**.
+   - [ ] The risks, the notice (it says the safeguards do not remove the risk, and that authorizing does not change the provider's responsibilities), one box, one button. The link at the top right shows it in Portuguese only.
+   - [ ] The button without the box does nothing (the browser asks for the box).
+   - [ ] Tick the box, **Authorize**: "Authorized." The page goes back to **RUNNING**, the mock prints `TASK`, and the job ends `ok`. Fill in the table's last two rows while a job runs. Is the mouse smooth, does a browser tab open in a normal time?
+   - [ ] The next two tasks start with no further question. `shutup-and-run safety --json` has `"authorization"` with `"channel":"page"`.
+4. Memory pressure on the PC. In a PowerShell window (it takes about 1.5 GB and holds it):
+
+   ```powershell
+   $hold = @(); 1..15 | ForEach-Object { $b = New-Object byte[] 100MB; for ($i = 0; $i -lt $b.Length; $i += 4096) { $b[$i] = 1 }; $hold += ,$b }
+   ```
+
+   - [ ] When Task Manager shows under 1 GB available: within 15 seconds the page says **NEW JOBS BLOCKED FOR SAFETY**, memory critically low, "this PC: ... available". The mock gets no polls. A job that was already running goes on and ends.
+   - [ ] The Authorize button is not offered for it, and `shutup-and-run safety authorize` says nothing is waiting.
+   - [ ] Close that PowerShell window. Nothing changes until 1.5 GB are available again; then the page goes back by itself and the polls resume. "Last incidents" has `blocked` and `recovered`.
+   - [ ] If Task Manager never showed 1 GB available even before the script, this PC is blocked most of the time: write that down. It is the answer to "is 5 GB enough", not a bug.
+5. Processor saturation. `1..2 | ForEach-Object { Start-Job { while ($true) {} } }`.
+   - [ ] Within about 20 seconds: blocked, "The processor is saturated", "this PC: processors 9x% busy". `Get-Job | Remove-Job -Force`: back by itself once it is under 85%.
+6. A job that runs out of memory. Restart the mock with `--tasks 3 --image alpine --command "tail /dev/zero" --memory 64m --expect-failures 3`.
+   - [ ] Each ends in seconds. `shutup-and-run jobs` says "ran out of memory ... (confirmed by Docker)" for each; Task Manager's available memory did not drop by more than the job's 64 MB.
+   - [ ] After the third: blocked, "Jobs ran out of memory repeatedly". Fifteen minutes later it ends by itself.
+7. On the page, **Withdraw the authorization**: **WAITING FOR YOUR AUTHORIZATION** again, and the mock gets no polls.
+8. No window appeared at any point, and `shutup-and-run wsl logs` has no line with a token or a task's env.
+
+What to report: the table, which of the boxes failed, and whether steps 4 and 5 blocked and recovered at the figures Task Manager showed. If the idle PC already sits under 1 GB available, or the VM feels slow with one job at the default limits, this PC should not lend its resources, whatever its owner authorizes.
 
 ### Certificate passthrough and the demos
 

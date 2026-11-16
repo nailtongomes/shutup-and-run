@@ -120,9 +120,11 @@ O trabalho interativo do cliente tem prioridade sobre a vazão de jobs. Num PC c
 | Jobs ao mesmo tempo | 1 | `max_slots` |
 | Iniciar um job | só com 2 GiB de memória e 5 GiB de disco livres | `min_free_memory`, `min_free_disk` |
 | Iniciar um job (Windows, opcional) | só depois de o PC ficar N segundos sem uso; desligado por padrão | `min_idle_secs` |
+| Iniciar um job, a segurança do computador | nunca com memória, disco ou processador em nível crítico; num computador pequeno ou ocupado, só depois que o dono autorizar | não é configurável; o dono decide na página local |
 
 - Quem aplica os limites é o Docker (`NanoCpus`, `Memory`, `MemorySwap`), num job de push e num de pull. Tarefa que não informa `cpu` ou `memory` recebe o limite da máquina; a que informa menos recebe o que pediu; a que informa mais é recusada, com o limite na resposta.
 - Enquanto faltar memória ou disco, um push recebe `503` `insufficient resources` e um worker em pull simplesmente não pede trabalho, então nenhuma tarefa é retirada da fila e depois descartada. Ele volta sozinho. O `status` mostra `waiting_for`.
+- Antes de cada job o worker também avalia o computador em si, no Windows o PC e não só a VM do WSL2: **saudável**, **alerta** ou **bloqueado**. Bloqueado (menos de 10% de memória ou 2 GiB de disco, processadores saturados, uma leitura que não pôde ser feita, três jobs mortos por memória em meia hora) não inicia nada, responde um push com `503` `blocked for safety` e passa sozinho. Um alerta (menos de 8 GiB de memória ou 2 processadores ou menos, memória abaixo de 20%, processadores ocupados) só inicia um job depois que o dono do computador leu os riscos e disse sim, uma vez, na página local ou com `shutup-and-run safety authorize` em um terminal; até lá um push recebe `503` `authorization required`. Nenhuma flag, chave de config ou campo da API diz sim, e o sim nunca libera um bloqueio. `shutup-and-run safety` mostra o estado; um job morto por memória é informado como tal (`oom_killed`). Os limiares e o que não é coberto estão em [docs/WINDOWS.md](docs/WINDOWS.md#sharing-the-pc).
 - Onde o serviço enxerga menos de 4 GiB (um PC de 8 GiB dá ao WSL2 cerca de 3,2 GiB), os dois valores de memória são a metade do que ele enxerga. Nem todo PC aguenta um job de 2 GiB.
 - O perfil `shared-pc` é o padrão no Windows, inclusive para um worker instalado antes da 0.2.6. Num desktop Linux: `shutup-and-run config set resource_profile shared-pc --apply`. Um servidor Linux não muda, a menos que você configure.
 - O `.wslconfig` é do usuário e vale para todas as distribuições WSL2. A instalação só o escreve quando ele não existe e o PC não tem outra distribuição. Um arquivo existente só muda com `shutup-and-run wsl limits --apply`, que preserva todas as outras linhas e guarda um backup. A mudança vale quando o WSL reinicia; este programa nunca roda `wsl --shutdown`.
@@ -317,7 +319,7 @@ Só `image` é obrigatório. Campos desconhecidos são recusados. `job_key` torn
 **Pull.** Com `poll_url` definida, a máquina faz POST nela a cada `poll_interval_secs` (30 segundos, e nunca menos), só quando tem um slot livre, não está pausada e não está com pouca memória ou disco:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.12", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.13", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 A resposta é nada (`204`), uma tarefa, `{"task": {...}}`, ou `{"manifest_url": "https://..."}`, que é buscado uma vez e precisa ser uma tarefa. `401` ou `403` quer dizer "ainda não aprovada": o worker não inicia nada e continua perguntando, espaçando até cinco minutos. O servidor decide quais máquinas recebem trabalho; o token do worker é a identidade dele.

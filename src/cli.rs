@@ -68,6 +68,11 @@ shutup-and-run jobs [--limit N]
     the last N jobs, newest first (default 20): id, image, start, end,
     duration, exit code, status (running, ok, failed, timeout, killed) and
     why it failed. Never a job's env, command, payload or logs.
+shutup-and-run safety [status] | revoke
+    whether a new job may start for the sake of the computer's owner, and
+    why not. `safety authorize` is the one command here that asks a
+    question: it is for the owner, at a terminal, and nothing answers it
+    for them. `shutup-and-run safety --help`.
 
 Every failure, and every doctor or check line that is not ok, carries a
 `hint`: the next step, short, with the command when there is one. In JSON it
@@ -559,6 +564,255 @@ pub fn pause_cli(pause: bool, args: &[String]) -> ExitCode {
         Err(msg) => Out::fail(EXIT_FAILED, msg),
     };
     emit(out, parsed.json)
+}
+
+// ---------------------------------------------------------------------------
+// safety
+
+pub fn safety_usage() -> &'static str {
+    "\
+shutup-and-run safety [status] [--json]
+    whether a new job may start for the sake of this computer's owner:
+    healthy, warning or blocked, why, the owner's authorization and the last
+    resource incidents. From the running service.
+shutup-and-run safety authorize
+    for the owner, at the machine, in a terminal: shows the risks there are
+    now and the notice, and asks. There is no flag that answers for the
+    owner: without a terminal, or with --json, it exits 1 with
+    AUTHORIZATION_REQUIRED and changes nothing. On Windows use the local page.
+shutup-and-run safety revoke [--json]
+    withdraw the authorization. Jobs under a warning wait again."
+}
+
+/// What the running service last said about safety. None when it is not
+/// running, or is a build from before there was such a thing.
+fn safety_from_status() -> Result<crate::safety::Report, String> {
+    let path = Settings::history_path()
+        .map(|history| crate::status::status_path(&history))
+        .map_err(|e| e.0)?;
+    let status = read_status(&path)
+        .filter(|s| !is_stopped(s))
+        .ok_or("the worker is not running: its safety state is not known")?;
+    serde_json::from_value(status["safety"].clone())
+        .map_err(|_| "the running service does not report safety: restart it".to_string())
+}
+
+fn machine_store() -> Result<crate::store::Store, String> {
+    let path = Settings::history_path().map_err(|e| e.0)?;
+    if !path.exists() {
+        return Err(format!(
+            "{} does not exist: the service has not run yet",
+            path.display()
+        ));
+    }
+    crate::store::Store::open(&path).map_err(|e| e.to_string())
+}
+
+fn safety_text(report: &crate::safety::Report, portuguese: bool) -> String {
+    use crate::safety::Admission;
+    if !report.applies {
+        return "not assessed: this machine's resource_profile is `none`".to_string();
+    }
+    let mut text = format!(
+        "level: {}\nnew jobs: {}\n",
+        serde_json::to_value(report.level)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default(),
+        match report.admission {
+            Admission::Open => "may start",
+            Admission::Blocked => "blocked (no authorization lifts this; it clears by itself)",
+            Admission::AuthorizationRequired => "wait for the owner's authorization",
+        }
+    );
+    for finding in &report.reasons {
+        text.push_str(&format!(
+            "- {}: {} [{}]\n",
+            crate::safety::label(&finding.code, portuguese),
+            finding.detail,
+            finding.code
+        ));
+    }
+    match &report.authorization {
+        Some(consent) => text.push_str(&format!(
+            "authorization: given {} on the {}, notice v{}, for {}\n",
+            crate::status::unix_to_iso(consent.at),
+            consent.channel,
+            consent.notice_version,
+            consent.codes.join(", ")
+        )),
+        None => text.push_str("authorization: none\n"),
+    }
+    for incident in &report.incidents {
+        text.push_str(&format!(
+            "incident {} {} {}\n",
+            crate::status::unix_to_iso(incident.at),
+            incident.kind,
+            incident.detail
+        ));
+    }
+    text.trim_end().to_string()
+}
+
+/// The answer to anything that is not a person at a terminal.
+fn human_required(report: &crate::safety::Report) -> Out {
+    let mut out = Out::fail(
+        EXIT_FAILED,
+        "only the owner of this computer can authorize, in person: on the local page, or in a \
+         terminal with `shutup-and-run safety authorize`. Nothing was changed.",
+    );
+    out.json["code"] = Value::String(crate::safety::AUTHORIZATION_REQUIRED.to_string());
+    out.json["notice_version"] = json!(crate::safety::NOTICE_VERSION);
+    out.json["reasons"] = json!(report.unauthorized());
+    out
+}
+
+/// The question, asked of whoever is at `input`. Only the exact word is a yes.
+fn ask_owner(
+    report: &crate::safety::Report,
+    portuguese: bool,
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> bool {
+    let word = if portuguese { "AUTORIZO" } else { "AUTHORIZE" };
+    let mut text = String::new();
+    for finding in report.unauthorized() {
+        text.push_str(&format!(
+            "- {} ({})\n",
+            crate::safety::label(&finding.code, portuguese),
+            finding.detail
+        ));
+    }
+    text.push_str(&format!("\n{}\n\n", crate::safety::notice(portuguese)));
+    text.push_str(&if portuguese {
+        format!("Digite {word} para permitir tarefas nessas condições, ou qualquer outra coisa para recusar: ")
+    } else {
+        format!("Type {word} to allow jobs under these conditions, or anything else to refuse: ")
+    });
+    let _ = output.write_all(text.as_bytes());
+    let _ = output.flush();
+    let mut answer = String::new();
+    input.read_line(&mut answer).is_ok() && answer.trim() == word
+}
+
+pub fn safety_cli(args: &[String]) -> ExitCode {
+    use std::io::IsTerminal;
+    let parsed = match split_args(args) {
+        Ok(parsed) if parsed.help => {
+            println!("{}", safety_usage());
+            return ExitCode::SUCCESS;
+        }
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            return emit(
+                Out::fail(EXIT_USAGE, msg),
+                args.iter().any(|a| a == "--json"),
+            )
+        }
+    };
+    let portuguese = crate::hints::lang() == crate::hints::Lang::Pt;
+    let now = crate::status::now_unix();
+    let out = match parsed.words.first().map(String::as_str) {
+        None | Some("status") => match safety_from_status() {
+            Ok(report) => Out::ok(json!({"safety": report}), safety_text(&report, portuguese)),
+            Err(msg) => Out::fail(EXIT_FAILED, msg),
+        },
+        Some("revoke") => match machine_store().and_then(|store| {
+            crate::safety::revoke(&store, "terminal", now).map_err(|e| e.to_string())
+        }) {
+            Ok(had) => Out::ok(
+                json!({"revoked": had}),
+                if had {
+                    "withdrawn: jobs under a warning wait for a new authorization"
+                } else {
+                    "there was no authorization"
+                },
+            ),
+            Err(msg) => Out::fail(EXIT_FAILED, msg),
+        },
+        Some("authorize") => match safety_from_status() {
+            Err(msg) => Out::fail(EXIT_FAILED, msg),
+            Ok(report) if report.needs_authorization.is_empty() => Out::ok(
+                json!({"authorized": false, "safety": report}),
+                "nothing is waiting for an authorization",
+            ),
+            // No terminal, or a program asking for JSON: nobody to ask.
+            Ok(report)
+                if parsed.json
+                    || !std::io::stdin().is_terminal()
+                    || !std::io::stdout().is_terminal() =>
+            {
+                human_required(&report)
+            }
+            Ok(report) => {
+                let yes = ask_owner(
+                    &report,
+                    portuguese,
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stdout(),
+                );
+                if !yes {
+                    Out::ok(
+                        json!({"authorized": false}),
+                        "not authorized: nothing was changed",
+                    )
+                } else {
+                    match machine_store().and_then(|store| {
+                        crate::safety::grant(&store, &report.needs_authorization, "terminal", now)
+                            .map_err(|e| e.to_string())
+                    }) {
+                        Ok(consent) => Out::ok(
+                            json!({"authorized": true, "authorization": consent}),
+                            "authorized. `shutup-and-run safety revoke` withdraws it.",
+                        ),
+                        Err(msg) => Out::fail(EXIT_FAILED, msg),
+                    }
+                }
+            }
+        },
+        Some(other) => Out::fail(
+            EXIT_USAGE,
+            format!("unknown safety command {other}. See `shutup-and-run safety --help`."),
+        ),
+    };
+    emit(out, parsed.json)
+}
+
+/// The doctor's line about safety, from what the service reported. Never a
+/// hard failure: the worker runs, and waits.
+pub fn safety_check(report: &crate::safety::Report) -> Check {
+    use crate::safety::Admission;
+    let why = report.waiting_for().unwrap_or_default();
+    match report.admission {
+        Admission::Open => check(
+            "safety",
+            true,
+            match &report.authorization {
+                Some(consent) if !report.reasons.is_empty() => format!(
+                    "warning ({}), authorized by the owner on {} (notice v{})",
+                    report
+                        .reasons
+                        .iter()
+                        .map(|f| f.code.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    crate::status::unix_to_iso(consent.at),
+                    consent.notice_version
+                ),
+                _ => "healthy: nothing in the way of a new job".to_string(),
+            },
+        ),
+        Admission::AuthorizationRequired => {
+            soft("safety", false, why).coded(crate::safety::AUTHORIZATION_REQUIRED)
+        }
+        Admission::Blocked => soft("safety", false, why).coded(
+            report
+                .blocked()
+                .first()
+                .map(|f| f.code.as_str())
+                .unwrap_or("SAFETY_BLOCKED"),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,6 +1390,12 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
         crate::resources::read(&crate::resources::disk_path(&settings.history_path)),
     ));
     checks.extend(certificate_check(settings));
+    if let Some(report) = fresh
+        .and_then(|s| serde_json::from_value::<crate::safety::Report>(s["safety"].clone()).ok())
+        .filter(|report| report.applies)
+    {
+        checks.push(safety_check(&report));
+    }
     if let Some(warning) = &settings.config_warning {
         checks.push(soft("config-in-use", false, warning.clone()).coded("CONFIG_FALLBACK_IN_USE"));
     }
@@ -1365,6 +1625,87 @@ pub(crate) async fn reach(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nothing but a person typing the word is a yes, and a program that
+    /// asks gets a state it can read instead of a prompt.
+    #[test]
+    fn only_a_person_at_a_terminal_authorizes() {
+        use crate::safety::{Finding, Level, Report};
+        let mut report = Report {
+            applies: true,
+            level: Level::Warning,
+            admission: crate::safety::Admission::AuthorizationRequired,
+            reasons: vec![Finding {
+                code: crate::safety::SMALL_MACHINE.into(),
+                level: Level::Warning,
+                detail: "this PC: 2 processors, 5.0 GiB of memory".into(),
+            }],
+            needs_authorization: vec![crate::safety::SMALL_MACHINE.into()],
+            ..Report::default()
+        };
+        let mut out = human_required(&report);
+        crate::hints::attach(&mut out.json, out.code);
+        assert_eq!(out.code, EXIT_FAILED);
+        assert_eq!(out.json["ok"], false);
+        assert_eq!(out.json["code"], "AUTHORIZATION_REQUIRED");
+        assert_eq!(out.json["reasons"][0]["code"], "SAFETY_SMALL_MACHINE");
+        assert!(out.json["hint"]
+            .as_str()
+            .unwrap()
+            .starts_with("Do not answer for the owner"));
+
+        let ask = |typed: &str, portuguese: bool| {
+            let mut shown = Vec::new();
+            let yes = ask_owner(&report, portuguese, &mut typed.as_bytes(), &mut shown);
+            (yes, String::from_utf8(shown).unwrap())
+        };
+        let (yes, shown) = ask("AUTHORIZE\n", false);
+        assert!(yes);
+        assert!(shown.contains("small computer") && shown.contains("5.0 GiB"));
+        assert!(shown.contains("They do not remove it") && shown.contains("Type AUTHORIZE"));
+        for typed in [
+            "",
+            "\n",
+            "y\n",
+            "yes\n",
+            "authorize\n",
+            "AUTORIZO\n",
+            "--yes\n",
+        ] {
+            assert!(!ask(typed, false).0, "{typed:?}");
+        }
+        let (yes, shown) = ask("AUTORIZO\n", true);
+        assert!(yes && shown.contains("Digite AUTORIZO") && !shown.contains("Type AUTHORIZE"));
+
+        // The doctor: a warning with the code and the hint, never a failure.
+        let waiting = safety_check(&report);
+        assert_eq!((waiting.ok, waiting.soft), (false, true));
+        assert_eq!(waiting.code(), "AUTHORIZATION_REQUIRED");
+        assert!(waiting.detail.contains("SAFETY_SMALL_MACHINE"));
+        report.admission = crate::safety::Admission::Blocked;
+        report.reasons.push(Finding {
+            code: crate::safety::MEMORY_CRITICAL.into(),
+            level: Level::Blocked,
+            detail: "this PC: 600 MiB of 5.0 GiB available".into(),
+        });
+        let blocked = safety_check(&report);
+        assert_eq!(
+            (blocked.soft, blocked.code().as_str()),
+            (true, "SAFETY_MEMORY_CRITICAL")
+        );
+        assert!(blocked.hint().contains("Close programs"));
+        assert!(
+            safety_check(&Report {
+                applies: true,
+                ..Report::default()
+            })
+            .ok
+        );
+        let text = safety_text(&report, false);
+        assert!(text.contains("level: warning") && text.contains("blocked (no authorization"));
+        // A worker that is ready, by the doctor's own word, while it waits.
+        assert_eq!(readiness(&[waiting])["worker_ready"], true);
+    }
 
     /// A running worker whose poll URL answers 404: the doctor still exits 1
     /// with the same code, and says in both outputs that the machine is fine.

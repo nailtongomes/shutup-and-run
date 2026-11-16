@@ -487,9 +487,15 @@ impl Bench {
         ));
         std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
         private_dir(&work);
+        // The demo runs on a history of its own and under the machine's own
+        // safety: the owner's authorization and the incidents are the real ones.
+        let machine = Some(settings.history_path.clone())
+            .filter(|path| path.exists())
+            .and_then(|path| crate::store::Store::open(&path).ok())
+            .map(Arc::new);
         settings.history_path = work.join("jobs.sqlite");
         settings.log_lines = 2000;
-        let launcher = Launcher::new(settings, runtime).map_err(|e| e.to_string())?;
+        let launcher = Launcher::for_demo(settings, runtime, machine).map_err(|e| e.to_string())?;
         Ok(Self { launcher, work })
     }
 }
@@ -571,8 +577,14 @@ async fn run_one(bench: &Bench, request: LaunchRequest, checks: &mut Vec<Check>)
                 LaunchError::LowResources(short) if short.resource == "disk" => "LOW_DISK",
                 LaunchError::LowResources(_) => "LOW_MEMORY",
                 LaunchError::UserActive(_) => "USER_ACTIVE",
+                LaunchError::AuthorizationRequired(_) => crate::safety::AUTHORIZATION_REQUIRED,
+                LaunchError::SafetyBlocked(found) => {
+                    found.first().map_or("SAFETY_BLOCKED", |f| f.code.as_str())
+                }
                 _ => "DOCKER_UNAVAILABLE",
-            };
+            }
+            .to_string();
+            let code = code.as_str();
             checks.push(check("admission", false, err.to_string()).coded(code));
             return None;
         }

@@ -17,6 +17,9 @@ struct Inner {
     fail_list: bool,
     fail_start: bool,
     exit_on_start: Option<i64>,
+    oom_on_start: bool,
+    oom: std::collections::HashSet<String>,
+    throttling: Option<crate::runtime::Throttling>,
 }
 
 pub struct MockRuntime {
@@ -46,6 +49,9 @@ impl MockRuntime {
                 fail_list: false,
                 fail_start: false,
                 exit_on_start: None,
+                oom_on_start: false,
+                oom: std::collections::HashSet::new(),
+                throttling: None,
             }),
         }
     }
@@ -101,6 +107,24 @@ impl MockRuntime {
         self.inner.lock().await.exit_on_start = code;
     }
 
+    /// Every container started from now on is killed for memory at once:
+    /// exit 137, and Docker says OOMKilled.
+    pub async fn oom_on_start(&self, yes: bool) {
+        let mut inner = self.inner.lock().await;
+        inner.oom_on_start = yes;
+        inner.exit_on_start = yes.then_some(137);
+    }
+
+    /// What every running container reports about CPU throttling.
+    pub async fn throttle(&self, throttling: Option<crate::runtime::Throttling>) {
+        self.inner.lock().await.throttling = throttling;
+    }
+
+    /// The container stopped with `code`, as a die event would say.
+    pub async fn stop(&self, id: &str, code: i64) {
+        self.stop_unseen(id, code).await
+    }
+
     pub async fn fail_start(&self, yes: bool) {
         self.inner.lock().await.fail_start = yes;
     }
@@ -140,6 +164,9 @@ impl Runtime for MockRuntime {
         match inner.exit_on_start {
             Some(code) => {
                 inner.stopped.insert(id.clone(), code);
+                if inner.oom_on_start {
+                    inner.oom.insert(id.clone());
+                }
             }
             None => {
                 inner.running.insert(id.clone(), spec.deadline_unix);
@@ -246,5 +273,17 @@ impl Runtime for MockRuntime {
 
     async fn cleanup_created(&self) -> Result<usize, RuntimeError> {
         Ok(0)
+    }
+
+    async fn oom_killed(&self, id: &str) -> Result<bool, RuntimeError> {
+        Ok(self.inner.lock().await.oom.contains(id))
+    }
+
+    async fn cpu_throttling(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::runtime::Throttling>, RuntimeError> {
+        let inner = self.inner.lock().await;
+        Ok(inner.throttling.filter(|_| inner.running.contains_key(id)))
     }
 }

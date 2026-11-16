@@ -62,9 +62,29 @@ pub enum LaunchError {
     /// `min_idle_secs` is set and the person at the PC is using it.
     #[error("{0}")]
     UserActive(UserActive),
+    /// A critical condition of the computer. No consent lifts it; it clears
+    /// by itself. Nothing was stored.
+    #[error("blocked to protect this computer: {}", codes_of(.0))]
+    SafetyBlocked(Vec<crate::safety::Finding>),
+    /// A risk for the owner of the computer that the owner has not agreed
+    /// to. Only a person at the machine can; nothing was stored.
+    #[error("the owner of this computer has to authorize: {}", codes_of(.0))]
+    AuthorizationRequired(Vec<crate::safety::Finding>),
     #[error("{0}")]
     Unavailable(String),
 }
+
+fn codes_of(findings: &[crate::safety::Finding]) -> String {
+    findings
+        .iter()
+        .map(|f| f.code.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How often a running job's CPU throttling is read: once per job every
+/// this long, one small Docker call, kept in memory until the job ends.
+pub const THROTTLE_SAMPLE_SECS: u64 = 30;
 
 /// Why a job waits under `min_idle_secs`. It can start later, unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +138,19 @@ pub struct Launcher {
     /// Told when a job that ran has ended, so the poller can ask for the
     /// next one without waiting for its interval.
     job_ended: tokio::sync::Notify,
+    /// Where the owner's authorization and the incidents are kept: this
+    /// machine's history. A demo runs on a throwaway history and still
+    /// answers to the machine's own.
+    safety_store: Arc<Store>,
+    /// Critical conditions held until they recover (`safety::Latch`).
+    latch: std::sync::Mutex<crate::safety::Latch>,
+    /// The admission and the blocked codes last seen by the status loop,
+    /// so a change is logged and recorded once.
+    safety_seen: std::sync::Mutex<Option<(crate::safety::Admission, Vec<String>)>>,
+    /// Readings given instead of the machine's own. Tests only.
+    readings: std::sync::Mutex<Option<crate::safety::Readings>>,
+    /// The last CPU throttling read of each running job.
+    throttling: std::sync::Mutex<HashMap<String, crate::runtime::Throttling>>,
 }
 
 impl Launcher {
@@ -130,8 +163,33 @@ impl Launcher {
         runtime: Arc<dyn Runtime>,
         clock: Arc<dyn Clock>,
     ) -> Result<Arc<Self>, StoreError> {
+        Self::build(settings, runtime, clock, None)
+    }
+
+    /// A launcher on a history of its own (a demo) that reads the owner's
+    /// authorization and writes incidents in `machine`, the real history.
+    pub fn for_demo(
+        settings: Settings,
+        runtime: Arc<dyn Runtime>,
+        machine: Option<Arc<Store>>,
+    ) -> Result<Arc<Self>, StoreError> {
+        Self::build(settings, runtime, Arc::new(SystemClock), machine)
+    }
+
+    fn build(
+        settings: Settings,
+        runtime: Arc<dyn Runtime>,
+        clock: Arc<dyn Clock>,
+        machine: Option<Arc<Store>>,
+    ) -> Result<Arc<Self>, StoreError> {
         let store = Arc::new(Store::open(&settings.history_path)?);
         Ok(Arc::new(Self {
+            safety_store: machine.unwrap_or_else(|| store.clone()),
+            latch: std::sync::Mutex::new(crate::safety::Latch::new()),
+            safety_seen: std::sync::Mutex::new(None),
+            // A test must not depend on how busy the machine running it is.
+            readings: std::sync::Mutex::new(cfg!(test).then(crate::safety::Readings::healthy)),
+            throttling: std::sync::Mutex::new(HashMap::new()),
             settings,
             runtime,
             clock,
@@ -210,15 +268,139 @@ impl Launcher {
         })
     }
 
+    /// What the machine says about itself now. A handful of small reads.
+    fn read_machine(&self) -> crate::safety::Readings {
+        if let Some(given) = *self.readings.lock().expect("readings") {
+            return given;
+        }
+        crate::safety::Readings::read(
+            self.settings.worker_os == "windows",
+            &crate::resources::disk_path(&self.settings.history_path),
+        )
+    }
+
+    /// Readings to use instead of the machine's own.
+    #[cfg(test)]
+    pub fn set_readings(&self, readings: crate::safety::Readings) {
+        *self.readings.lock().expect("readings") = Some(readings);
+    }
+
     /// Set when the machine has too little memory or disk for one more job.
     /// Read fresh every time: it is two small reads, and it clears by itself.
     pub fn shortage(&self) -> Option<crate::resources::Shortage> {
-        let (memory, disk) = (self.settings.min_free_memory, self.settings.min_free_disk);
+        self.shortage_for(None, &self.read_machine())
+    }
+
+    /// On a shared PC a job that asks for more memory than the usual needs
+    /// that much free, not the usual: its limit is what it may come to use.
+    fn shortage_for(
+        &self,
+        job_memory: Option<i64>,
+        machine: &crate::safety::Readings,
+    ) -> Option<crate::resources::Shortage> {
+        let disk = self.settings.min_free_disk;
+        let mut memory = self.settings.min_free_memory;
+        if self.settings.shared_pc && memory > 0 {
+            memory = memory.max(job_memory.unwrap_or(0).max(0) as u64);
+        }
         if memory == 0 && disk == 0 {
             return None;
         }
-        let path = crate::resources::disk_path(&self.settings.history_path);
-        crate::resources::shortage(crate::resources::read(&path), memory, disk)
+        let free = crate::resources::Free {
+            memory: machine.inner.memory_available,
+            disk: machine.inner.disk_free,
+        };
+        crate::resources::shortage(free, memory, disk)
+    }
+
+    /// Is it safe for the owner of this computer to start one more job, and
+    /// did the owner agree to the risks there are? Only under the shared-PC
+    /// profile; elsewhere the answer is always "open".
+    pub fn safety(&self) -> crate::safety::Report {
+        self.safety_with(&self.read_machine())
+    }
+
+    fn safety_with(&self, machine: &crate::safety::Readings) -> crate::safety::Report {
+        if !self.settings.shared_pc {
+            return crate::safety::Report::default();
+        }
+        let now = self.clock.now_unix() as i64;
+        // A history that cannot be read is no reason to call the machine safe:
+        // without the consent a warning still asks, and a block needs neither.
+        let ooms = self
+            .safety_store
+            .oom_times(now - crate::safety::OOM_BREAKER_WINDOW_SECS)
+            .unwrap_or_default();
+        let consent = self.safety_store.safety_consent().ok().flatten();
+        let assessment = crate::safety::assess(
+            machine,
+            &ooms,
+            now,
+            &mut self.latch.lock().expect("safety latch"),
+        );
+        crate::safety::Report::new(&assessment, consent)
+    }
+
+    /// Logs and records a change of the admission, once. Called from the
+    /// status loop, so a number that moves every second writes nothing.
+    fn note_safety(&self, report: &crate::safety::Report) {
+        use crate::safety::Admission;
+        let blocked: Vec<String> = report.blocked().iter().map(|f| f.code.clone()).collect();
+        let now = (report.admission, blocked);
+        let mut seen = self.safety_seen.lock().expect("safety seen");
+        if seen.as_ref() == Some(&now) {
+            return;
+        }
+        let was = seen.replace(now).map(|(admission, _)| admission);
+        let why = report.waiting_for().unwrap_or_default();
+        let at = self.clock.now_unix() as i64;
+        if was == Some(Admission::Blocked) && report.admission != Admission::Blocked {
+            tracing::info!("safety: the critical condition is over");
+            let _ = self.safety_store.add_incident(at, "recovered", "");
+        }
+        match report.admission {
+            Admission::Blocked => {
+                tracing::warn!(%why, "safety: new jobs are blocked");
+                let _ = self.safety_store.add_incident(at, "blocked", &why);
+            }
+            Admission::AuthorizationRequired => {
+                tracing::warn!(%why, "safety: new jobs wait for the owner's authorization");
+            }
+            Admission::Open => {}
+        }
+    }
+
+    /// The owner said yes, at this machine, to the warnings there are now.
+    /// `channel` is where: the local page is the only caller in the service.
+    pub fn authorize(
+        &self,
+        channel: &str,
+    ) -> Result<crate::safety::Consent, crate::safety::GrantError> {
+        let report = self.safety();
+        crate::safety::grant(
+            &self.safety_store,
+            &report.needs_authorization,
+            channel,
+            self.clock.now_unix() as i64,
+        )
+    }
+
+    pub fn revoke_authorization(&self, channel: &str) -> Result<bool, crate::safety::GrantError> {
+        crate::safety::revoke(&self.safety_store, channel, self.clock.now_unix() as i64)
+    }
+
+    /// One reading of each running job's CPU throttling, kept until the job
+    /// ends. A job that ends before its first reading has none.
+    pub async fn sample_throttling(&self) {
+        let ids = self.store.running_ids().unwrap_or_default();
+        for id in ids {
+            if self.starting.lock().await.contains(&id) {
+                continue;
+            }
+            if let Ok(Some(read)) = self.runtime.cpu_throttling(&id).await {
+                self.throttling.lock().expect("throttling").insert(id, read);
+            }
+        }
     }
 
     /// Set while `min_idle_secs` is on and the Windows supervisor says the
@@ -230,8 +412,18 @@ impl Launcher {
 
     /// Why no new job starts now though a slot may be free.
     pub fn waiting_for(&self) -> Option<String> {
-        self.shortage()
-            .map(|s| s.to_string())
+        let machine = self.read_machine();
+        self.waiting_for_with(&self.safety_with(&machine), &machine)
+    }
+
+    fn waiting_for_with(
+        &self,
+        safety: &crate::safety::Report,
+        machine: &crate::safety::Readings,
+    ) -> Option<String> {
+        safety
+            .waiting_for()
+            .or_else(|| self.shortage_for(None, machine).map(|s| s.to_string()))
             .or_else(|| self.user_active().map(|u| u.to_string()))
     }
 
@@ -267,6 +459,10 @@ impl Launcher {
         let mut job_ids = self.store.running_ids().unwrap_or_default();
         job_ids.sort();
         let last = self.last_job().ok().flatten();
+        let machine = self.read_machine();
+        let mut safety = self.safety_with(&machine);
+        self.note_safety(&safety);
+        safety.incidents = self.safety_store.incidents(5).unwrap_or_default();
         let last_job_error = match (&docker_error, &last) {
             (None, Some(job)) => crate::status::job_error(job),
             _ => None,
@@ -284,8 +480,9 @@ impl Launcher {
             last,
             poll_error: self.poll_error.lock().expect("poll error").clone(),
             last_poll: *self.last_poll.lock().expect("last poll"),
-            waiting_for: self.waiting_for(),
-            computer: crate::status::Computer::read(self),
+            waiting_for: self.waiting_for_with(&safety, &machine),
+            computer: crate::status::Computer::read(self, &machine),
+            safety,
             limits: crate::status::Limits::of(&self.settings),
             config_warning: self.settings.config_warning.clone(),
         }
@@ -335,8 +532,24 @@ impl Launcher {
             });
         }
         // Inside the slot lock, so two requests cannot both pass on the
-        // memory that only one of them will get.
-        if let Some(shortage) = self.shortage() {
+        // memory that only one of them will get. The computer's owner comes
+        // first: a block, then the owner's say, then this job's own room.
+        let machine = self.read_machine();
+        let safety = self.safety_with(&machine);
+        match safety.admission {
+            crate::safety::Admission::Open => {}
+            crate::safety::Admission::Blocked => {
+                return Err(LaunchError::SafetyBlocked(
+                    safety.blocked().into_iter().cloned().collect(),
+                ))
+            }
+            crate::safety::Admission::AuthorizationRequired => {
+                return Err(LaunchError::AuthorizationRequired(
+                    safety.unauthorized().into_iter().cloned().collect(),
+                ))
+            }
+        }
+        if let Some(shortage) = self.shortage_for(spec.memory_bytes, &machine) {
             return Err(LaunchError::LowResources(shortage));
         }
         if let Some(active) = self.user_active() {
@@ -498,6 +711,12 @@ impl Launcher {
         }
         let timed_out = self.timeouts.lock().await.contains(id);
         let reason = end_reason(timed_out, exit_code, witnessed);
+        // Asked while the container still exists, and written on the row
+        // before it is closed, so the callback is built with it.
+        let oom = exit_code.is_some() && self.runtime.oom_killed(id).await.unwrap_or(false);
+        if oom {
+            let _ = self.store.mark_oom(id);
+        }
         let logs = self
             .runtime
             .tail_logs(id, self.settings.log_lines)
@@ -510,6 +729,9 @@ impl Launcher {
         crate::certificate::unstage(&self.settings, id);
         match self.store.finish(id, ended, code, reason, &logs) {
             Ok(Some(job)) => {
+                // Only the call that closed the row: the die event and a
+                // status request can both get here for the same job.
+                self.note_resource_incidents(&job);
                 self.timeouts.lock().await.remove(id);
                 let _ = self.runtime.remove(id).await;
                 self.fire_callback(&job);
@@ -521,6 +743,32 @@ impl Launcher {
                 let _ = self.runtime.remove(id).await;
             }
             Err(err) => tracing::warn!(%id, error = %err, "could not finish job"),
+        }
+    }
+
+    /// What Docker and the kernel said about how a job used its limits,
+    /// recorded once as it ends: killed for memory, or held at its CPU limit
+    /// most of the time. For the owner; the job's exit code is not changed.
+    fn note_resource_incidents(&self, job: &JobRecord) {
+        let at = self.clock.now_unix() as i64;
+        let throttled = self.throttling.lock().expect("throttling").remove(&job.id);
+        if let Some(read) = throttled.filter(|read| read.significant()) {
+            let detail = format!(
+                "job {} ({}) was held at its CPU limit in {}% of its time",
+                job.id,
+                job.image,
+                read.throttled_periods * 100 / read.periods.max(1)
+            );
+            tracing::warn!(%detail, "cpu throttling");
+            let _ = self.safety_store.add_incident(at, "cpu_throttled", &detail);
+        }
+        if job.oom_killed {
+            let detail = format!(
+                "job {} ({}) reached its memory limit and the kernel killed it",
+                job.id, job.image
+            );
+            tracing::warn!(%detail, "out of memory");
+            let _ = self.safety_store.add_incident(at, "oom", &detail);
         }
     }
 
@@ -687,6 +935,15 @@ pub fn spawn_maintenance(launcher: Arc<Launcher>) {
             }
         }
     });
+    // Also apart: a Docker that is slow to answer about one job's CPU must
+    // not hold the reaper either.
+    let throttling = launcher.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(THROTTLE_SAMPLE_SECS)).await;
+            throttling.sample_throttling().await;
+        }
+    });
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -746,7 +1003,7 @@ pub(crate) fn user_active(
 }
 
 pub fn callback_body(job: &JobRecord) -> Value {
-    json!({
+    let mut body = json!({
         "id": job.id,
         "job_key": job.job_key,
         "image": job.image,
@@ -756,7 +1013,12 @@ pub fn callback_body(job: &JobRecord) -> Value {
         "started_at": job.started_at,
         "ended_at": job.ended_at,
         "duration_secs": job.duration_secs(),
-    })
+    });
+    // Present only when true, so every other body is what it always was.
+    if job.oom_killed {
+        body["oom_killed"] = Value::Bool(true);
+    }
+    body
 }
 
 pub fn metrics_text(slots: Slots, counts: crate::store::JobCounts) -> String {
@@ -1714,5 +1976,444 @@ mod tests {
         clock.set(1_700_000_000 + 10 + 31 * 86_400);
         assert_eq!(launcher.purge_once().unwrap(), 1);
         assert!(launcher.job(&created.id, false).await.unwrap().is_none());
+    }
+
+    // ----- safety of the computer's owner (shared-pc profile) -----
+
+    use crate::safety::{Admission, Level, Readings};
+
+    const GIB: u64 = 1024 * MIB;
+    const T0: u64 = 1_700_000_000;
+
+    /// A shared PC, with the memory and disk waits off unless a test sets them.
+    fn shared(slots: usize) -> (Arc<Launcher>, Arc<MockRuntime>, Arc<FakeClock>) {
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let mut settings = settings(slots);
+        settings.shared_pc = true;
+        let clock = Arc::new(FakeClock::new(T0));
+        let launcher = Launcher::with_clock(settings, runtime, clock.clone()).unwrap();
+        (launcher, mock, clock)
+    }
+
+    fn with_memory(available: u64) -> Readings {
+        let mut readings = Readings::healthy();
+        readings.inner.memory_available = Some(available);
+        readings
+    }
+
+    /// The 2 vCPU, 5 GB Windows PC of the manual test, with room left.
+    fn small_windows_pc() -> Readings {
+        Readings {
+            windows: true,
+            inner: crate::safety::Inner {
+                cpus: Some(2),
+                memory_total: Some(2 * GIB),
+                memory_available: Some(GIB + GIB / 2),
+                disk_free: Some(50 * GIB),
+                load1: Some(0.1),
+            },
+            host: Some(crate::host::Feed {
+                idle_secs: Some(900),
+                memory_total: Some(5 * GIB),
+                memory_available: Some(2 * GIB),
+                cpus: Some(2),
+                cpu_busy_percent: Some(8),
+                disk_available: Some(40 * GIB),
+            }),
+        }
+    }
+
+    async fn refused(launcher: &Arc<Launcher>, source: JobSource) -> LaunchError {
+        let err = launcher
+            .launch_from(job("alpine", None), source)
+            .await
+            .unwrap_err();
+        launcher.settled().await;
+        err
+    }
+
+    #[tokio::test]
+    async fn a_healthy_shared_pc_starts_jobs_and_asks_nobody() {
+        let (launcher, mock, _) = shared(2);
+        let report = launcher.safety();
+        assert!(report.applies);
+        assert_eq!(
+            (report.level, report.admission),
+            (Level::Healthy, Admission::Open)
+        );
+        started(&launcher, job("alpine", None)).await;
+        assert_eq!(mock.start_count().await, 1);
+        let live = launcher.live_status().await;
+        assert!(live.waiting_for.is_none());
+        assert!(live.safety.incidents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dedicated_server_is_not_assessed_whatever_its_readings() {
+        let (launcher, mock, _) = harness(1);
+        launcher.set_readings(Readings::default());
+        assert!(!launcher.safety().applies);
+        started(&launcher, job("alpine", None)).await;
+        assert_eq!(mock.start_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn critical_memory_blocks_every_path_stores_nothing_and_recovers_past_the_line() {
+        let (launcher, mock, _) = shared(2);
+        launcher.set_readings(with_memory(GIB));
+        for source in [JobSource::Push, JobSource::Poll] {
+            match refused(&launcher, source).await {
+                LaunchError::SafetyBlocked(found) => {
+                    assert_eq!(found[0].code, crate::safety::MEMORY_CRITICAL)
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(mock.start_count().await, 0);
+        assert_eq!(launcher.counts().unwrap().started, 0);
+        assert_eq!(launcher.slots().await.unwrap().free, 2);
+        let live = launcher.live_status().await;
+        assert!(live
+            .waiting_for
+            .as_deref()
+            .unwrap()
+            .starts_with("blocked to protect this computer: SAFETY_MEMORY_CRITICAL"));
+        // Seen once by the status loop: one incident, however often it looks.
+        launcher.live_status().await;
+        let kinds = |live: &crate::status::Live| -> Vec<String> {
+            live.safety
+                .incidents
+                .iter()
+                .map(|i| i.kind.clone())
+                .collect()
+        };
+        assert_eq!(kinds(&launcher.live_status().await), vec!["blocked"]);
+
+        // Better, and not yet past the recovery line (2.4 GiB of 16): held.
+        launcher.set_readings(with_memory(2 * GIB));
+        assert!(matches!(
+            refused(&launcher, JobSource::Push).await,
+            LaunchError::SafetyBlocked(_)
+        ));
+        launcher.set_readings(with_memory(8 * GIB));
+        started(&launcher, job("alpine", None)).await;
+        assert_eq!(mock.start_count().await, 1);
+        assert_eq!(
+            kinds(&launcher.live_status().await),
+            vec!["recovered", "blocked"]
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_cpu_a_full_disk_and_missing_readings_each_block() {
+        type Break = fn(&mut Readings);
+        let cases: Vec<(&str, Break)> = vec![
+            (crate::safety::CPU_CRITICAL, |r| r.inner.load1 = Some(40.0)),
+            (crate::safety::DISK_CRITICAL, |r| {
+                r.inner.disk_free = Some(GIB)
+            }),
+            (crate::safety::TELEMETRY_MISSING, |r| {
+                r.inner.memory_available = None
+            }),
+            (crate::safety::TELEMETRY_MISSING, |r| r.inner.load1 = None),
+            (crate::safety::TELEMETRY_MISSING, |r| {
+                r.inner.disk_free = None
+            }),
+        ];
+        for (code, change) in cases {
+            let (launcher, mock, _) = shared(1);
+            let mut readings = Readings::healthy();
+            change(&mut readings);
+            launcher.set_readings(readings);
+            match refused(&launcher, JobSource::Push).await {
+                LaunchError::SafetyBlocked(found) => assert_eq!(found[0].code, code),
+                other => panic!("{code}: {other:?}"),
+            }
+            assert_eq!(mock.start_count().await, 0, "{code}");
+            // The same machine, fine again, takes the job.
+            launcher.set_readings(Readings::healthy());
+            started(&launcher, job("alpine", None)).await;
+            assert_eq!(mock.start_count().await, 1, "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_job_needs_its_own_memory_free_not_only_the_usual() {
+        let (launcher, mock, _) = shared(2);
+        // The usual need is 1 GiB; 3 GiB are free of 16.
+        let mut readings = with_memory(3 * GIB + 300 * MIB);
+        readings.inner.memory_total = Some(16 * GIB);
+        launcher.set_readings(readings);
+        let mut big = job("alpine", None);
+        big.memory_bytes = Some((4 * GIB) as i64);
+        // With the wait off nothing is compared.
+        started(&launcher, big.clone()).await;
+        assert_eq!(mock.start_count().await, 1);
+
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let mut cfg = settings(2);
+        cfg.shared_pc = true;
+        cfg.min_free_memory = GIB;
+        let launcher = Launcher::with_clock(cfg, runtime, Arc::new(FakeClock::new(T0))).unwrap();
+        // 20% of 16 GiB is 3.2: above the warning line, under the job's 4 GiB.
+        let mut readings = with_memory(3 * GIB + 300 * MIB);
+        readings.inner.memory_total = Some(16 * GIB);
+        launcher.set_readings(readings);
+        match launcher.launch(big).await {
+            Err(LaunchError::LowResources(short)) => {
+                assert_eq!((short.resource, short.needed_bytes), ("memory", 4 * GIB))
+            }
+            other => panic!("{other:?}"),
+        }
+        // A job of the usual size still fits.
+        started(&launcher, job("alpine", None)).await;
+        assert_eq!(mock.start_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_small_pc_waits_for_its_owner_and_the_yes_is_kept_until_the_risk_changes() {
+        let (launcher, mock, clock) = shared(4);
+        launcher.set_readings(small_windows_pc());
+        // Push, poll: no path starts a job, and nothing is stored.
+        for source in [JobSource::Push, JobSource::Poll] {
+            match refused(&launcher, source).await {
+                LaunchError::AuthorizationRequired(found) => {
+                    assert_eq!(found.len(), 1);
+                    assert_eq!(found[0].code, crate::safety::SMALL_MACHINE);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(mock.start_count().await, 0);
+        assert_eq!(launcher.counts().unwrap().started, 0);
+        let live = launcher.live_status().await;
+        assert_eq!(live.safety.admission, Admission::AuthorizationRequired);
+        assert!(live
+            .waiting_for
+            .unwrap()
+            .starts_with("the owner of this computer has to authorize: SAFETY_SMALL_MACHINE"));
+
+        // The owner says yes on the page: recorded, and jobs start, one after
+        // the other, with no further question.
+        let consent = launcher.authorize("page").unwrap();
+        assert_eq!(consent.codes, vec![crate::safety::SMALL_MACHINE]);
+        assert_eq!((consent.channel.as_str(), consent.at), ("page", T0 as i64));
+        assert_eq!(consent.notice_version, crate::safety::NOTICE_VERSION);
+        started(&launcher, job("alpine", None)).await;
+        started(&launcher, job("alpine", None)).await;
+        assert_eq!(mock.start_count().await, 2);
+        let report = launcher.live_status().await.safety;
+        assert_eq!(
+            (report.level, report.admission),
+            (Level::Warning, Admission::Open)
+        );
+        assert_eq!(report.incidents[0].kind, "authorization_granted");
+        assert!(report.incidents[0]
+            .detail
+            .contains("notice v1, on the page"));
+        // A second yes with nothing new to agree to is refused as such.
+        assert_eq!(
+            launcher.authorize("page"),
+            Err(crate::safety::GrantError::NothingToAuthorize)
+        );
+
+        // A risk the owner was not shown: asked again, for that one only.
+        let mut busier = small_windows_pc();
+        busier.host.as_mut().unwrap().cpu_busy_percent = Some(80);
+        launcher.set_readings(busier);
+        match refused(&launcher, JobSource::Push).await {
+            LaunchError::AuthorizationRequired(found) => {
+                assert_eq!(found.len(), 1);
+                assert_eq!(found[0].code, crate::safety::CPU_BUSY)
+            }
+            other => panic!("{other:?}"),
+        }
+        clock.set(T0 + 60);
+        let consent = launcher.authorize("page").unwrap();
+        assert_eq!(
+            consent.codes,
+            vec![crate::safety::CPU_BUSY, crate::safety::SMALL_MACHINE]
+        );
+        started(&launcher, job("alpine", None)).await;
+
+        // The yes never lifts a block: the same PC with 600 MiB left.
+        let mut critical = small_windows_pc();
+        critical.host.as_mut().unwrap().memory_available = Some(600 * MIB);
+        launcher.set_readings(critical);
+        assert!(matches!(
+            refused(&launcher, JobSource::Push).await,
+            LaunchError::SafetyBlocked(_)
+        ));
+
+        // Withdrawn: the question is back.
+        launcher.set_readings(small_windows_pc());
+        assert!(launcher.revoke_authorization("page").unwrap());
+        assert!(matches!(
+            refused(&launcher, JobSource::Poll).await,
+            LaunchError::AuthorizationRequired(_)
+        ));
+        assert_eq!(mock.start_count().await, 3);
+        assert_eq!(
+            launcher.live_status().await.safety.incidents[0].kind,
+            "authorization_revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_yes_survives_a_restart_and_a_stale_host_feed_asks_again() {
+        let (launcher, _, _) = shared(2);
+        launcher.set_readings(small_windows_pc());
+        launcher.authorize("terminal").unwrap();
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let restarted = Launcher::with_clock(
+            launcher.settings().clone(),
+            runtime,
+            Arc::new(FakeClock::new(T0 + 5)),
+        )
+        .unwrap();
+        restarted.set_readings(small_windows_pc());
+        started(&restarted, job("alpine", None)).await;
+        assert_eq!(mock.start_count().await, 1);
+
+        // The supervisor went quiet: the PC is not known to be fine.
+        let mut silent = small_windows_pc();
+        silent.host = None;
+        restarted.set_readings(silent);
+        match refused(&restarted, JobSource::Push).await {
+            LaunchError::AuthorizationRequired(found) => {
+                assert_eq!(found[0].code, crate::safety::HOST_UNKNOWN)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_oom_is_told_from_a_plain_kill_and_three_pause_new_jobs() {
+        let (launcher, mock, clock) = shared(4);
+        // Killed from outside, exit 137, and Docker does not say OOM.
+        let plain = started(&launcher, job("alpine", None)).await;
+        mock.stop(&plain, 137).await;
+        launcher.on_exit(&plain, 137).await;
+        let killed = launcher.job(&plain, false).await.unwrap().unwrap();
+        assert!(!killed.oom_killed);
+        assert!(callback_body(&killed).get("oom_killed").is_none());
+        assert!(launcher.live_status().await.safety.incidents.is_empty());
+
+        mock.oom_on_start(true).await;
+        for n in 0..2u64 {
+            clock.set(T0 + n * 60);
+            let id = started(&launcher, job("alpine", None)).await;
+            let job = launcher.job(&id, false).await.unwrap().unwrap();
+            assert!(job.oom_killed);
+            assert_eq!(
+                (job.reason.as_deref(), job.exit_code),
+                (Some(REASON_EXITED), Some(137))
+            );
+            assert_eq!(callback_body(&job)["oom_killed"], true);
+            assert!(crate::jobs::failure_of(&job)
+                .unwrap()
+                .contains("ran out of memory"));
+        }
+        // The die event and a status request racing for the same job: once.
+        let raced = launcher.last_job().unwrap().unwrap().id;
+        tokio::join!(launcher.on_exit(&raced, 137), launcher.on_exit(&raced, 137));
+        let ooms = |live: crate::status::Live| {
+            live.safety
+                .incidents
+                .iter()
+                .filter(|i| i.kind == "oom")
+                .count()
+        };
+        assert_eq!(ooms(launcher.live_status().await), 2);
+        // Two are not a pattern yet.
+        assert_eq!(launcher.safety().admission, Admission::Open);
+        clock.set(T0 + 120);
+        let third = started(&launcher, job("alpine", None)).await;
+        launcher.job(&third, false).await.unwrap();
+        let starts = mock.start_count().await;
+
+        // Three inside half an hour: nothing new starts, on any path.
+        match refused(&launcher, JobSource::Poll).await {
+            LaunchError::SafetyBlocked(found) => {
+                assert_eq!(found[0].code, crate::safety::OOM_BREAKER)
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(mock.start_count().await, starts);
+        let live = launcher.live_status().await;
+        assert_eq!(live.safety.admission, Admission::Blocked);
+        assert_eq!(
+            live.safety
+                .incidents
+                .iter()
+                .filter(|i| i.kind == "oom")
+                .count(),
+            3
+        );
+        // The pause is bounded: fifteen minutes after the last one it is over.
+        clock.set(T0 + 120 + 899);
+        assert_eq!(launcher.safety().admission, Admission::Blocked);
+        clock.set(T0 + 120 + 900);
+        mock.oom_on_start(false).await;
+        started(&launcher, job("alpine", None)).await;
+        assert_eq!(mock.start_count().await, starts + 1);
+    }
+
+    #[tokio::test]
+    async fn a_job_held_at_its_cpu_limit_most_of_the_time_is_recorded() {
+        use crate::runtime::Throttling;
+        let (launcher, mock, _) = shared(2);
+        let busy = started(&launcher, job("alpine", None)).await;
+        mock.throttle(Some(Throttling {
+            periods: 600,
+            throttled_periods: 540,
+        }))
+        .await;
+        launcher.sample_throttling().await;
+        mock.stop(&busy, 0).await;
+        launcher.on_exit(&busy, 0).await;
+        let incidents = launcher.live_status().await.safety.incidents;
+        assert_eq!(incidents[0].kind, "cpu_throttled");
+        assert!(incidents[0].detail.contains("90% of its time"));
+        // The job itself ended well: throttling is the limit doing its work.
+        assert_eq!(
+            ended(&launcher, &busy).await,
+            (Some(REASON_EXITED.into()), Some(0))
+        );
+
+        // A short burst, or a job never sampled, records nothing.
+        let calm = started(&launcher, job("alpine", None)).await;
+        mock.throttle(Some(Throttling {
+            periods: 100,
+            throttled_periods: 90,
+        }))
+        .await;
+        launcher.sample_throttling().await;
+        mock.stop(&calm, 0).await;
+        launcher.on_exit(&calm, 0).await;
+        assert_eq!(launcher.live_status().await.safety.incidents.len(), 1);
+        assert!(!Throttling {
+            periods: 1000,
+            throttled_periods: 400
+        }
+        .significant());
+    }
+
+    #[tokio::test]
+    async fn docker_failing_under_a_shared_pc_fails_the_request_and_not_the_worker() {
+        let (launcher, mock, _) = shared(1);
+        mock.fail_lists(true).await;
+        assert!(matches!(
+            refused(&launcher, JobSource::Push).await,
+            LaunchError::Unavailable(_)
+        ));
+        let live = launcher.live_status().await;
+        assert!(live.docker_error.is_some());
+        mock.fail_lists(false).await;
+        started(&launcher, job("alpine", None)).await;
+        assert_eq!(mock.start_count().await, 1);
     }
 }

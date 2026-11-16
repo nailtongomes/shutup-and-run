@@ -78,6 +78,7 @@ const CALLBACK_EXAMPLES: &[(&str, &str)] = &[
     example!("callback.timeout.json"),
     example!("callback.start-failed.json"),
     example!("callback.interrupted.json"),
+    example!("callback.oom.json"),
 ];
 
 /// A Draft 2020-12 validator for one published schema, or for a `$defs`
@@ -1193,4 +1194,51 @@ fn the_config_schema_matches_the_keys_and_the_validation() {
         assert!(!validator.is_valid(&Value::Object(map.clone())), "{key}");
         assert!(Settings::from_json_map(&map).is_err(), "{key}");
     }
+}
+
+/// A job Docker says was killed for memory: the callback and the JobResult
+/// gain `oom_killed`, and both are still what the schema describes. A plain
+/// kill with the same exit code does not carry the key.
+#[tokio::test]
+async fn a_job_killed_for_memory_says_so_and_matches_the_schema() {
+    let callback = schema("job-result.schema.json#/$defs/callback");
+    let m = machine(2, "", &[]);
+    m.mock.oom_on_start(true).await;
+    let (status, accepted) = push(&m.app, r#"{"image":"alpine","job_key":"oom-1"}"#).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    m.launcher.settled().await;
+    let id = accepted["id"].as_str().unwrap();
+    let job = m.launcher.job(id, false).await.unwrap().unwrap();
+    let body = crate::launcher::callback_body(&job);
+    assert_eq!(body["oom_killed"], true);
+    assert_eq!(
+        (&body["reason"], &body["exit_code"]),
+        (&json!("exited"), &json!(137))
+    );
+    assert_valid(&callback, &body, "oom callback");
+
+    m.mock.oom_on_start(false).await;
+    let killed = m.launcher.launch(crate::launcher::LaunchRequest {
+        image: "alpine".into(),
+        env: Default::default(),
+        timeout_secs: None,
+        cpu: None,
+        memory_bytes: None,
+        shm_bytes: None,
+        command: None,
+        job_key: None,
+        callback_url: None,
+    });
+    let id = match killed.await.unwrap() {
+        crate::launcher::LaunchOutcome::Created(job) => job.id,
+        other => panic!("{other:?}"),
+    };
+    m.launcher.settled().await;
+    m.mock.stop(&id, 137).await;
+    m.launcher.on_exit(&id, 137).await;
+    let job = m.launcher.job(&id, false).await.unwrap().unwrap();
+    let body = crate::launcher::callback_body(&job);
+    assert!(body.get("oom_killed").is_none());
+    assert_valid(&callback, &body, "plain kill callback");
+    assert!(!callback.is_valid(&json!({"oom_killed": false})));
 }

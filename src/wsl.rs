@@ -2496,12 +2496,19 @@ fn run_service(log: &Logger) -> WslResult<Option<i32>> {
     // What only Windows knows goes down the service's stdin: one line every
     // ten seconds. The thread ends when the service does and the pipe breaks.
     if let Some(mut stdin) = child.stdin.take() {
-        std::thread::spawn(move || loop {
-            let line = crate::host::line(&host_feed());
-            if stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err() {
-                break;
+        std::thread::spawn(move || {
+            // CPU use is the difference between two readings of the totals.
+            let mut before = host_cpu_times();
+            loop {
+                let now = host_cpu_times();
+                let busy = before.zip(now).and_then(|(a, b)| busy_percent(a, b));
+                before = now;
+                let line = crate::host::line(&host_feed(busy));
+                if stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(crate::host::FEED_EVERY);
             }
-            std::thread::sleep(crate::host::FEED_EVERY);
         });
     }
     let a = log.clone();
@@ -2643,14 +2650,92 @@ fn session_is_ending() {
 }
 
 /// The PC's side of the feed. A reading Windows does not give is left out.
-fn host_feed() -> crate::host::Feed {
+fn host_feed(cpu_busy_percent: Option<u64>) -> crate::host::Feed {
     let memory = host_memory();
     crate::host::Feed {
         idle_secs: user_idle_secs(),
         memory_total: memory.map(|(total, _)| total),
         memory_available: memory.map(|(_, available)| available),
         cpus: Some(host_cpus()),
+        cpu_busy_percent,
+        disk_available: host_disk_available(),
     }
+}
+
+/// Processor time of the whole PC since boot, in 100 ns units: idle, and
+/// everything (kernel, which includes idle, plus user).
+#[cfg(windows)]
+fn host_cpu_times() -> Option<(u64, u64)> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    extern "system" {
+        fn GetSystemTimes(idle: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
+    }
+    let value = |t: &FileTime| (u64::from(t.high) << 32) | u64::from(t.low);
+    let (mut idle, mut kernel, mut user) = (
+        FileTime::default(),
+        FileTime::default(),
+        FileTime::default(),
+    );
+    // SAFETY: three FILETIME structs of our own, each two u32 as documented,
+    // written by the call and read only when it succeeded.
+    let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) != 0 };
+    ok.then(|| (value(&idle), value(&kernel).wrapping_add(value(&user))))
+}
+
+#[cfg(not(windows))]
+fn host_cpu_times() -> Option<(u64, u64)> {
+    None
+}
+
+/// From two `(idle, total)` readings: the share of the time between them
+/// that the processors were not idle. None when no time passed.
+pub(crate) fn busy_percent(before: (u64, u64), now: (u64, u64)) -> Option<u64> {
+    let total = now.1.checked_sub(before.1).filter(|total| *total > 0)?;
+    let idle = now.0.checked_sub(before.0)?.min(total);
+    Some((total - idle) * 100 / total)
+}
+
+/// Free bytes, for this user, on the drive that holds the worker's data and
+/// its WSL2 disk.
+#[cfg(windows)]
+fn host_disk_available() -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            free: *mut u64,
+        ) -> i32;
+    }
+    let dir = data_dir();
+    let path: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut available = 0u64;
+    // SAFETY: a NUL-terminated path and one u64 to fill; the two totals are
+    // optional and passed as null. Read only when the call succeeded.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            path.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) != 0
+    };
+    ok.then_some(available)
+}
+
+#[cfg(not(windows))]
+fn host_disk_available() -> Option<u64> {
+    None
 }
 
 /// Seconds since the last keyboard or mouse input of this session.
@@ -3669,18 +3754,22 @@ mod tests {
         if !cfg!(target_os = "linux") || !have("pgrep") || !have("pkill") {
             return;
         }
-        // A stand-in for the old service: `sleep` under a name of its own,
-        // short enough for the 15 characters `pgrep -x` compares.
+        // A stand-in for the old service: a script under a name of its own,
+        // short enough for the 15 characters `pgrep -x` compares. The kernel
+        // names the process after the script. Not a copy of `sleep`: where
+        // coreutils is one multi-call binary, a copy under another name
+        // refuses to run.
         let name = format!("sar-old-{}", std::process::id() % 100_000);
         let dir = std::env::temp_dir().join(format!("{name}-dir"));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join(&name);
-        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
-            .iter()
-            .find(|p| Path::new(p).exists())
-            .unwrap();
-        std::fs::copy(sleep, &fake).unwrap();
-        let mut old = Command::new(&fake).arg("300").spawn().unwrap();
+        std::fs::write(&fake, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut old = Command::new(&fake).spawn().unwrap();
         let pid = old.id().to_string();
         // Reaped as it dies, as init does in the distribution. Unreaped, it
         // would stay in the process table and the script would wait for it.
@@ -3711,5 +3800,20 @@ mod tests {
             assert!(out.ok());
             assert_eq!(out.text(), "piped");
         }
+    }
+
+    #[test]
+    fn cpu_use_is_the_share_of_time_not_idle_between_two_readings() {
+        // (idle, total) in any unit. 1000 passed, 250 of them idle.
+        assert_eq!(busy_percent((100, 1_000), (350, 2_000)), Some(75));
+        assert_eq!(busy_percent((0, 0), (1_000, 1_000)), Some(0));
+        assert_eq!(busy_percent((0, 0), (0, 1_000)), Some(100));
+        // No time passed, a counter that went back, or idle above total.
+        assert_eq!(busy_percent((5, 10), (5, 10)), None);
+        assert_eq!(busy_percent((5, 10), (4, 9)), None);
+        assert_eq!(busy_percent((0, 0), (2_000, 1_000)), Some(0));
+        let feed = host_feed(Some(42));
+        assert_eq!(feed.cpu_busy_percent, Some(42));
+        assert!(feed.cpus.is_some());
     }
 }

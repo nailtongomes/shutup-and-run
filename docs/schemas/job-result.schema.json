@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/docs/schemas/job-result.schema.json",
   "title": "JobResult",
-  "description": "A job as the runner reports it: the body of 202 and 200 from POST /v1/jobs, of GET /v1/jobs/{id}, and of the POST to callback_url. The callback is the stricter form in $defs/callback. All nine keys are always present; 'logs' is added only by GET /v1/jobs/{id}?logs=true. It says what happened to a container, not whether the work inside it succeeded.",
+  "description": "A job as the runner reports it: the body of 202 and 200 from POST /v1/jobs, of GET /v1/jobs/{id}, and of the POST to callback_url. The callback is the stricter form in $defs/callback. All nine keys are always present; 'logs' is added only by GET /v1/jobs/{id}?logs=true, and 'oom_killed' only when it is true. It says what happened to a container, not whether the work inside it succeeded.",
   "type": "object",
   "required": [
     "id",
@@ -78,6 +78,10 @@
     "logs": {
       "description": "Only from GET /v1/jobs/{id}?logs=true. Never in a callback.",
       "type": "string"
+    },
+    "oom_killed": {
+      "description": "Present, and true, only when Docker recorded that the kernel killed a process of the container for memory (State.OOMKilled): the job reached its memory limit. Absent for every other end, a plain SIGKILL with exit_code 137 included. Sending the same work again with the same memory will most likely end the same way.",
+      "const": true
     }
   },
   "$defs": {

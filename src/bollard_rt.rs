@@ -14,7 +14,7 @@ use bollard::models::{
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, EventsOptionsBuilder,
     InspectContainerOptions, KillContainerOptionsBuilder, ListContainersOptionsBuilder,
-    RemoveContainerOptionsBuilder, StartContainerOptions,
+    RemoveContainerOptionsBuilder, StartContainerOptions, StatsOptionsBuilder,
 };
 use bollard::Docker;
 use futures_util::StreamExt;
@@ -194,6 +194,46 @@ impl Runtime for BollardRuntime {
             Ok(info) => Ok(map_state(info.state)),
             Err(err) if is_status(&err, 404) => Ok(Inspected::NotFound),
             Err(err) => Err(docker_err(err)),
+        }
+    }
+
+    async fn oom_killed(&self, id: &str) -> Result<bool, RuntimeError> {
+        match self
+            .docker
+            .inspect_container(&container_ref(id), None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) => Ok(info.state.and_then(|s| s.oom_killed).unwrap_or(false)),
+            Err(err) if is_status(&err, 404) => Ok(false),
+            Err(err) => Err(docker_err(err)),
+        }
+    }
+
+    async fn cpu_throttling(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::runtime::Throttling>, RuntimeError> {
+        // One reading, not a stream: the counters are totals since the start.
+        let options = StatsOptionsBuilder::default()
+            .stream(false)
+            .one_shot(true)
+            .build();
+        let mut stats = self.docker.stats(&container_ref(id), Some(options));
+        let read = tokio::time::timeout(Duration::from_secs(5), stats.next()).await;
+        match read {
+            Ok(Some(Ok(stats))) => Ok(stats
+                .cpu_stats
+                .and_then(|cpu| cpu.throttling_data)
+                .and_then(|data| {
+                    Some(crate::runtime::Throttling {
+                        periods: data.periods?,
+                        throttled_periods: data.throttled_periods?,
+                    })
+                })),
+            Ok(Some(Err(err))) if is_status(&err, 404) => Ok(None),
+            Ok(Some(Err(err))) => Err(docker_err(err)),
+            Ok(None) => Ok(None),
+            Err(_) => Err(RuntimeError::new("docker stats did not answer in 5 s")),
         }
     }
 

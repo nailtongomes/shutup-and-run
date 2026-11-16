@@ -207,6 +207,22 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
                 "needed_secs": active.needed_secs,
             })),
         ),
+        // Both are "not now, on this machine": 503, like the other waits. The
+        // caller cannot lift either; the second needs a person at the machine.
+        Err(LaunchError::SafetyBlocked(reasons)) => error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "blocked for safety",
+            Some(json!({"code": "SAFETY_BLOCKED", "reasons": reasons})),
+        ),
+        Err(LaunchError::AuthorizationRequired(reasons)) => error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authorization required",
+            Some(json!({
+                "code": crate::safety::AUTHORIZATION_REQUIRED,
+                "notice_version": crate::safety::NOTICE_VERSION,
+                "reasons": reasons,
+            })),
+        ),
         Err(LaunchError::Unavailable(msg)) => error_body(StatusCode::BAD_GATEWAY, &msg, None),
     }
 }
@@ -256,6 +272,9 @@ fn job_json(job: &JobRecord, with_logs: bool) -> Value {
         "reason": job.reason,
         "duration_secs": job.duration_secs(),
     });
+    if job.oom_killed {
+        body["oom_killed"] = Value::Bool(true);
+    }
     if with_logs {
         body["logs"] = Value::String(job.logs.clone().unwrap_or_default());
     }
@@ -1236,6 +1255,196 @@ mod tests {
             !response.status().is_success(),
             "a remote caller reached the certificate page: {}",
             response.status()
+        );
+    }
+
+    /// The two answers a caller gets when the computer's owner comes first,
+    /// and the page where that owner, and nobody through the API, says yes.
+    #[tokio::test]
+    async fn an_unsafe_or_unauthorized_machine_answers_503_and_only_the_page_authorizes() {
+        use crate::safety::Readings;
+        const LO: [u8; 4] = [127, 0, 0, 1];
+        const HOST: &str = "127.0.0.1:8787";
+        const ORIGIN: &str = "http://127.0.0.1:8787";
+        let mut cfg = settings_extra(2, "status_page = true");
+        cfg.shared_pc = true;
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let launcher = Launcher::new(cfg, runtime).unwrap();
+        let app = router(launcher.clone());
+        let mut small = Readings::healthy();
+        small.inner.memory_total = Some(5 << 30);
+        small.inner.memory_available = Some(3 << 30);
+        small.inner.cpus = Some(2);
+        launcher.set_readings(small);
+
+        let push = || async {
+            json_of(
+                app.clone()
+                    .oneshot(post(ALPINE, Some(TOKEN)))
+                    .await
+                    .unwrap(),
+            )
+            .await
+        };
+        let (status, body) = push().await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "authorization required");
+        assert_eq!(body["code"], "AUTHORIZATION_REQUIRED");
+        assert_eq!(body["notice_version"], crate::safety::NOTICE_VERSION);
+        assert_eq!(body["reasons"][0]["code"], "SAFETY_SMALL_MACHINE");
+        assert_eq!(body["reasons"][0]["level"], "warning");
+        assert_eq!(mock.start_count().await, 0);
+        // No field of a request, and no route with the token, says yes.
+        let (status, _) = json_of(
+            app.clone()
+                .oneshot(post(r#"{"image":"alpine","authorize":true}"#, Some(TOKEN)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let page = |method: &'static str,
+                    uri: &'static str,
+                    ip: [u8; 4],
+                    origin: Option<&'static str>,
+                    body: &'static str| {
+            let app = app.clone();
+            async move {
+                let mut builder = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("host", HOST)
+                    .header("content-type", "application/x-www-form-urlencoded");
+                if let Some(origin) = origin {
+                    builder = builder.header("origin", origin);
+                }
+                let response = app
+                    .oneshot(stamp(builder.body(Body::from(body)).unwrap(), ip))
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, String::from_utf8_lossy(&bytes).to_string())
+            }
+        };
+        // The status page says why nothing runs, and links to the question.
+        let (status, home) = page("GET", "/", LO, None, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(home.contains("WAITING FOR YOUR AUTHORIZATION"), "{home}");
+        assert!(home.contains("href=\"/local/safety\"") && home.contains("small computer"));
+        let (status, asked) = page("GET", "/local/safety", LO, None, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(asked.contains("These safeguards reduce the risk. They do not remove it."));
+        assert!(asked.contains("by law or by contract"));
+        assert!(asked.contains("name=\"confirm\" required") && asked.contains("5.0 GiB"));
+
+        // Not from another machine, not from another site, not without the box.
+        let yes = "action=authorize&confirm=on";
+        let (status, _) = page("POST", "/local/safety", [203, 0, 113, 9], Some(ORIGIN), yes).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = page(
+            "POST",
+            "/local/safety",
+            LO,
+            Some("https://evil.example"),
+            yes,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = page("POST", "/local/safety", LO, None, yes).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, refused) = page(
+            "POST",
+            "/local/safety",
+            LO,
+            Some(ORIGIN),
+            "action=authorize",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(refused.contains("tick the box"));
+        assert_eq!(push().await.0, StatusCode::SERVICE_UNAVAILABLE);
+
+        // The owner, at the machine, ticks the box.
+        let (status, done) = page("POST", "/local/safety", LO, Some(ORIGIN), yes).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(done.contains("Authorized.") && done.contains("Withdraw the authorization"));
+        assert_eq!(push().await.0, StatusCode::ACCEPTED);
+        launcher.settled().await;
+        assert_eq!(mock.start_count().await, 1);
+        let (_, home) = page("GET", "/", LO, None, "").await;
+        assert!(home.contains("RUNNING") && !home.contains("WAITING FOR YOUR"));
+
+        // A critical reading: 503 with its own body, and the yes changes nothing.
+        let mut critical = small;
+        critical.inner.memory_available = Some(300 << 20);
+        launcher.set_readings(critical);
+        let (status, body) = push().await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "blocked for safety");
+        assert_eq!(body["code"], "SAFETY_BLOCKED");
+        assert_eq!(body["reasons"][0]["code"], "SAFETY_MEMORY_CRITICAL");
+        let (_, home) = page("GET", "/", LO, None, "").await;
+        assert!(home.contains("NEW JOBS BLOCKED FOR SAFETY"));
+        let (_, blocked) = page("GET", "/local/safety", LO, None, "").await;
+        assert!(blocked.contains("no authorization lifts it"));
+
+        // Withdrawn on the page, in Portuguese when the page is.
+        launcher.set_readings(small);
+        let (status, _) = page("POST", "/local/safety", LO, Some(ORIGIN), "action=revoke").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(push().await.0, StatusCode::SERVICE_UNAVAILABLE);
+        let request = stamp(
+            Request::builder()
+                .uri("/local/safety")
+                .header("host", HOST)
+                .header("cookie", "lang=pt")
+                .body(Body::empty())
+                .unwrap(),
+            LO,
+        );
+        let bytes = app
+            .clone()
+            .oneshot(request)
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let portuguese = String::from_utf8_lossy(&bytes);
+        assert!(portuguese.contains("não o eliminam") && portuguese.contains("Autorizar"));
+        assert!(!portuguese.contains("Authorize"));
+
+        // status.json carries the same, for a program.
+        let live = launcher.live_status().await;
+        let file: Value =
+            serde_json::from_slice(&crate::status::document(&live, 1_700_000_000, false, None))
+                .unwrap();
+        assert_eq!(file["safety"]["admission"], "authorization_required");
+        assert_eq!(file["safety"]["level"], "warning");
+        assert_eq!(
+            file["safety"]["needs_authorization"][0],
+            "SAFETY_SMALL_MACHINE"
+        );
+        assert!(file["safety"]["authorization"].is_null());
+        let kinds: Vec<&str> = file["safety"]["incidents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "recovered",
+                "authorization_revoked",
+                "blocked",
+                "authorization_granted"
+            ]
         );
     }
 }
