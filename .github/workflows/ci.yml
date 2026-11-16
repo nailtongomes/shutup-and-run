@@ -145,6 +145,11 @@ jobs:
       - name: poll cycle against the mock
         timeout-minutes: 10
         run: sudo bash tests/poll-mock/cycle.sh "${GITHUB_WORKSPACE}/target/release/shutup-and-run"
+      # One harmless task from the poll to its callback, under the job_key the
+      # contract documents, and the same task offered twice.
+      - name: one task from the poll to its callback
+        timeout-minutes: 8
+        run: sudo bash tests/poll-mock/cycle.sh "${GITHUB_WORKSPACE}/target/release/shutup-and-run" one
       # The heavy test job: build the Selenium probe image and run it through
       # the same cycle. Its screenshot is kept as an artifact.
       - name: selenium probe image

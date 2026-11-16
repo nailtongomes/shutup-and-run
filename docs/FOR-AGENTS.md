@@ -206,7 +206,7 @@ None of this guarantees a responsive PC. The memory check reads the VM, not Wind
 
 ```
 shutup-and-run status --json     # state: idle | active | draining | failed | stopped; last_poll_at, last_poll_status
-shutup-and-run doctor --json     # checks[], each with status ok|warn|fail, detail, hint
+shutup-and-run doctor --json     # worker_ready, poll_endpoint_ok, and checks[], each with status ok|warn|fail, detail, hint
 shutup-and-run jobs --json       # the last 20 jobs and how each ended
 ```
 
@@ -222,6 +222,16 @@ shutup-and-run jobs --json       # the last 20 jobs and how each ended
 ```
 
 `status` is `running`, `ok` (exit 0), `failed` (another exit code, or the container never started), `timeout` (it ran past its time limit), `killed` (exit 137: out of memory, or stopped) or `interrupted` (the PC, WSL or Docker stopped under it, or the worker was not running when it ended; it is not run again, the service that sent it decides). `failure` says why in one sentence, and is null for `ok` and `running`. The history keeps the last 500 finished jobs at most, for `history_days`. It never holds or prints a job's env, command, payload or logs. The result of a job is not here either: the container sends it to the service itself.
+
+"Is the machine broken, or is it the server?" is two fields of `doctor --json` (and of `config check --json`), since 0.2.12:
+
+| Field | Value | Meaning |
+| --- | --- | --- |
+| `worker_ready` | `true` / `false` | No check other than `poll` failed: the config, Docker and the service are fine, and this machine can run a job. A warning (`warn`) does not make it false. |
+| `poll_endpoint_ok` | `true` / `false` / `null` | Did the poll URL answer as a poll endpoint? `null` means nobody asked it: see `poll_endpoint`. |
+| `poll_endpoint` | `ok`, `error`, `disabled`, `not_checked` | `disabled`: no `poll_url` is set. `not_checked`: the checks stopped before the poll URL (no config, or on Windows no WSL, distribution or Docker). `error`: the `poll` check's `code` says which (`POLL_HTTP_ERROR`, `POLL_UNREACHABLE`, `POLL_NOT_APPROVED`, `POLL_RATE_LIMITED`, `POLL_ERROR`). |
+
+`ok`, the exit code and every check `code` are what they were. A worker that runs while its poll URL answers 404 is `"ok": false`, exit 1, `"worker_ready": true`, `"poll_endpoint_ok": false`, with `POLL_HTTP_ERROR` on the `poll` check: nothing on the machine needs fixing, the URL or the server behind it does. The text output ends with "the worker is ready to run jobs, but the poll URL did not answer as expected".
 
 Healthy is: `status` exits 0, `doctor` exits 0, and `poll_error` is null. A new machine shows `poll` as `warn` with "has not approved this machine" until the owner approves it at the poll URL. That is expected, and nothing on the machine fixes it.
 

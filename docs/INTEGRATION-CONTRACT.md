@@ -434,6 +434,25 @@ The body is the [JobResult](#jobresult) of a job that has ended: the same nine k
 
 **A new attempt needs a new key.** Derive it from the work and the attempt: `case-0001-attempt-2`.
 
+### Correlating a task with its result
+
+The flow is: your API records a task and offers it in a poll answer, the worker runs the container, your API gets the callback. `job_key` is the one value that goes all the way round, so make it from your own task id.
+
+| Step | Where the key is |
+| --- | --- |
+| Your API has task `1042`, first attempt | It derives `job_key` = `task-1042-attempt-1`. Any string of the allowed characters works; keep the task id readable in it. |
+| Poll answer | `{"task": {"image": "hello-world", "job_key": "task-1042-attempt-1", "callback_url": "https://api.example.com/callback"}}` |
+| Callback, at the end | `{"id": "5f47...", "job_key": "task-1042-attempt-1", "status": "exited", "exit_code": 0, "reason": "exited", ...}` |
+| `GET /v1/jobs/{id}` and the `200`/`202` of a push | The same `job_key` field, in the same JobResult. |
+
+Match the callback to the task by `job_key`. `id` is the worker's own name for the job: it is new on every machine and your API never chose it. Use it only to ignore a callback you already handled.
+
+**If the API offers the same task again** (same `job_key`, same machine): the worker finds the key in its history, starts no container, and sends no callback for the repeat. Its log says `poll task already recorded`. This holds while the first job runs, after it ended, and after it failed. So offering a task until its callback arrives is safe on that machine, and a task whose callback was lost is not recovered by offering it again ([limit 3](#9-limits-of-the-current-contract)).
+
+**This idempotency is per worker and lives in that worker's local history.** It is one SQLite file on the machine. Another worker runs the same key as new work. The same worker forgets a key when its row leaves the history (`history_days`, 30 by default, and at most 500 finished jobs) or when the history file is gone: a reinstall on Linux that removes `/var/lib/shutup-and-run`, an uninstall of the Windows distribution. After that the key runs again. The queue, and the record of which task went to which machine, stay with your API.
+
+`tests/poll-mock` runs exactly this with the key `task-1042-attempt-1`: one task, its callback, and the second offer that starts nothing. See [its README](../tests/poll-mock/README.md#one-task-from-the-poll-to-its-callback).
+
 **The first request with a key wins.** A later request with the same key and a different image or `env` returns the first job. The differences are ignored without an error.
 
 **A poll answer is an offer, not an acceptance.** The worker may drop it: the slot was taken in the meantime, the machine is paused, the task is invalid, the manifest did not load. The worker does not say so, and it does not say when it accepts either. The first thing the server hears about an offered job is its callback, at the end. So the server keeps offering the same `job_key` **to the same machine** until the callback arrives or its own deadline passes. On that machine the repeat is harmless.

@@ -819,6 +819,16 @@ pub fn diagnostic_report(
         build["api_version"].as_str().unwrap_or("?"),
         if healthy { "healthy" } else { "unhealthy" }
     );
+    let ready = readiness(checks);
+    text.push_str(&format!(
+        "worker ready: {}\npoll endpoint: {}\n",
+        if ready["worker_ready"] == true {
+            "yes"
+        } else {
+            "no"
+        },
+        ready["poll_endpoint"].as_str().unwrap_or("?")
+    ));
     // What a person triaging an issue looks for first, before the raw JSON.
     let failing: Vec<String> = checks.iter().filter(|c| !c.ok).map(|c| c.code()).collect();
     if !failing.is_empty() {
@@ -902,6 +912,37 @@ fn percent(text: &str) -> String {
     out
 }
 
+/// Two answers a program reads without walking the checks: can this machine
+/// run a job, and did the poll URL answer as a poll endpoint? The second is
+/// about the service out there, so it never decides the first.
+///
+/// `poll_endpoint` is `ok`, `error`, `disabled` (no poll URL is set) or
+/// `not_checked` (the checks stopped before the poll URL); `poll_endpoint_ok`
+/// is the same as true, false, or null for the last two.
+pub fn readiness(checks: &[Check]) -> Value {
+    let worker_ready = checks.iter().all(|c| c.ok || c.soft || c.name == "poll");
+    let (state, ok) = match checks.iter().find(|c| c.name == "poll") {
+        None => ("not_checked", None),
+        Some(c) if c.code == "POLL_URL_UNSET" => ("disabled", None),
+        Some(c) if c.ok => ("ok", Some(true)),
+        Some(_) => ("error", Some(false)),
+    };
+    json!({"worker_ready": worker_ready, "poll_endpoint": state, "poll_endpoint_ok": ok})
+}
+
+/// The closing line when the only hard failure is the poll URL: the machine
+/// itself is fine, and saying "something is wrong" would send its owner
+/// looking for a fault that is not on it.
+fn integration_only(checks: &[Check]) -> bool {
+    let failed = |c: &&Check| !c.ok && !c.soft;
+    checks.iter().any(|c| failed(&c) && c.name == "poll")
+        && !checks.iter().any(|c| failed(&c) && c.name != "poll")
+}
+
+const POLL_ONLY_TEXT: &str =
+    "the worker is ready to run jobs, but the poll URL did not answer as expected: \
+     the fault is at the poll URL, not on this machine. Follow the `hint:` under `poll`.";
+
 /// What `doctor` prints, from the checks and what the report needs.
 pub fn doctor_out(
     platform: &str,
@@ -928,6 +969,8 @@ pub fn doctor_out(
     let mut text = lines;
     text.push_str(if healthy {
         "the worker is ready"
+    } else if integration_only(checks) {
+        POLL_ONLY_TEXT
     } else {
         "something is wrong: follow the `hint:` under each FAIL, then run the doctor again.\n\
          Still failing? `shutup-and-run doctor --report` prints a report and an issue link."
@@ -937,16 +980,20 @@ pub fn doctor_out(
             "{text}\n\n---- report (no secrets) ----\n{full}\n---- open an issue with it ----\n{url}"
         );
     }
+    let mut json = json!({
+        "ok": healthy,
+        "checks": checks_json(checks),
+        "config": config,
+        "status": status,
+        "report": full,
+        "issue_url": url,
+    });
+    if let (Some(obj), Value::Object(more)) = (json.as_object_mut(), readiness(checks)) {
+        obj.extend(more);
+    }
     Out {
         code: if healthy { 0 } else { EXIT_FAILED },
-        json: json!({
-            "ok": healthy,
-            "checks": checks_json(checks),
-            "config": config,
-            "status": status,
-            "report": full,
-            "issue_url": url,
-        }),
+        json,
         text,
     }
 }
@@ -1318,6 +1365,86 @@ pub(crate) async fn reach(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A running worker whose poll URL answers 404: the doctor still exits 1
+    /// with the same code, and says in both outputs that the machine is fine.
+    #[test]
+    fn a_worker_that_runs_with_a_poll_url_that_answers_404_is_told_apart() {
+        let base = vec![
+            check("config", true, "/etc/shutup-and-run/config.json"),
+            check("docker", true, "answers"),
+            check(
+                "service",
+                true,
+                "running (idle), listening on 127.0.0.1:8787",
+            ),
+        ];
+        let doctor =
+            |checks: &[Check]| doctor_out("linux x86_64", checks, None, None, &[], &[], false);
+
+        let mut broken_poll = base.clone();
+        // What the doctor builds from the service's "poll returned 404 Not Found".
+        let status = http_status_in("poll returned 404 Not Found").unwrap();
+        broken_poll.push(poll_answer_check(
+            "https://jobs.example/poll",
+            status,
+            false,
+        ));
+        let out = doctor(&broken_poll);
+        assert_eq!((out.code, &out.json["ok"]), (EXIT_FAILED, &json!(false)));
+        assert_eq!(out.json["worker_ready"], true);
+        assert_eq!(out.json["poll_endpoint_ok"], false);
+        assert_eq!(out.json["poll_endpoint"], "error");
+        assert_eq!(out.json["checks"][3]["code"], "POLL_HTTP_ERROR");
+        assert!(
+            out.text.contains("the worker is ready to run jobs"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("something is wrong"));
+        assert!(out.json["report"]
+            .as_str()
+            .unwrap()
+            .contains("worker ready: yes\npoll endpoint: error"));
+
+        let mut healthy = base.clone();
+        healthy.push(check(
+            "poll",
+            true,
+            "https://jobs.example/poll answers the service",
+        ));
+        let out = doctor(&healthy);
+        assert_eq!(out.code, 0);
+        assert_eq!(
+            (&out.json["worker_ready"], &out.json["poll_endpoint_ok"]),
+            (&json!(true), &json!(true))
+        );
+
+        // No poll URL, and a doctor that stopped before it: null, with the word for why.
+        let mut unset = base.clone();
+        unset.push(soft("poll", false, "no poll URL: the worker is idle").coded("POLL_URL_UNSET"));
+        let out = doctor(&unset);
+        assert_eq!(out.code, 0);
+        assert_eq!(out.json["poll_endpoint"], "disabled");
+        assert!(out.json["poll_endpoint_ok"].is_null());
+
+        let stopped = vec![check("docker", false, "no answer").coded("DOCKER_UNAVAILABLE")];
+        let out = doctor(&stopped);
+        assert_eq!(out.json["worker_ready"], false);
+        assert_eq!(out.json["poll_endpoint"], "not_checked");
+        assert!(out.json["poll_endpoint_ok"].is_null());
+        assert!(out.text.contains("something is wrong"));
+
+        // A warning about the endpoint (not approved yet) is not a broken machine either.
+        let mut waiting = base;
+        waiting
+            .push(soft("poll", false, "has not approved this machine").coded("POLL_NOT_APPROVED"));
+        let out = doctor(&waiting);
+        assert_eq!(
+            (out.code, &out.json["poll_endpoint_ok"]),
+            (0, &json!(false))
+        );
+    }
 
     fn temp(name: &str) -> std::path::PathBuf {
         let dir =

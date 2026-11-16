@@ -3,6 +3,7 @@
 
     python3 tests/poll-mock/poll_mock.py                       # one hello-world task
     python3 tests/poll-mock/poll_mock.py --tasks 20 --image ghcr.io/nailtongomes/shutup-and-run-selenium-probe --timeout 180 --shm 1g
+    python3 tests/poll-mock/poll_mock.py --job-key task-1042-attempt-1 --deadline 240 --redeliver
 
 It speaks the worker's poll contract and nothing more:
 
@@ -14,6 +15,13 @@ It queues --tasks equal tasks, hands one per poll, and when every task has
 called back it prints a summary and exits: 0 when the number of failures is
 --expect-failures (default 0), 1 otherwise. Everything is also written under
 --out: events.jsonl, summary.txt, and one KEY.png per upload.
+
+--deadline SECS makes the wait finite: when a callback is still missing after
+that long, or one arrives for a job_key this run did not hand out, it says
+which and exits 1. --job-key names the one task, the way an API derives the key
+from its own task id. --redeliver offers that task once more after its
+callback, as an API does when it is not sure the first offer arrived: the
+worker must run nothing, and a callback with a new job id fails the run.
 
 The address the worker used for /poll is the address put in callback_url and
 PROBE_UPLOAD_URL, so use one that containers can reach too: the host's LAN
@@ -51,12 +59,20 @@ def parse_args():
     p.add_argument("--hang", type=int, default=0, help="this many tasks get PROBE_HANG=1")
     p.add_argument("--hang-command", default="", help="and this command instead")
     p.add_argument("--expect-failures", type=int, default=0)
+    p.add_argument("--job-key", help="the job_key of the task (needs --tasks 1), e.g. task-1042-attempt-1")
+    p.add_argument("--deadline", type=int, metavar="SECS",
+                   help="exit 1 when a callback is missing after this long, or one comes for an unknown job_key")
+    p.add_argument("--redeliver", action="store_true",
+                   help="offer the first task again after its callback; it must not run twice")
     p.add_argument("--require-approval", action="store_true",
                    help="serve only a token whose hash is in approved.txt")
     p.add_argument("--approved-file", default="approved.txt")
     p.add_argument("--keep-serving", action="store_true", help="do not exit after the summary")
     p.add_argument("--out", default="poll-mock-results")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.job_key and args.tasks != 1:
+        p.error("--job-key names one task: use it with --tasks 1")
+    return args
 
 
 class Mock:
@@ -71,6 +87,8 @@ class Mock:
         self.started = None
         self.finished = None
         self.exit_code = 0
+        self.problem = None  # why the run failed whatever the tasks' own results
+        self.redelivery = "wanted" if args.redeliver else None  # then "offered", then "seen"
         os.makedirs(args.out, exist_ok=True)
         self.events = open(os.path.join(args.out, "events.jsonl"), "a", encoding="utf-8")
         env = dict(item.split("=", 1) for item in args.env)
@@ -82,7 +100,7 @@ class Mock:
                 task_env["PROBE_HANG"] = "1"
             command = args.hang_command if hang and args.hang_command else args.command
             self.tasks.append({
-                "n": n, "key": f"mock-{self.run}-{n}", "state": "queued", "hang": hang,
+                "n": n, "key": args.job_key or f"mock-{self.run}-{n}", "state": "queued", "hang": hang,
                 "env": task_env, "command": shlex.split(command),
             })
 
@@ -114,12 +132,23 @@ class Mock:
                 self.finish(t, {"reason": "lost", "status": "lost", "exit_code": None, "duration_secs": None})
         task = next((t for t in self.tasks if t["state"] == "queued"), None)
         if task is None:
-            return None
-        task["state"] = "running"
-        task["handed"] = now
-        self.started = self.started or now
-        running = sum(1 for t in self.tasks if t["state"] == "running")
-        self.peak_running = max(self.peak_running, running)
+            if self.redelivery is None or any(t["state"] != "done" for t in self.tasks):
+                return None
+            if self.redelivery != "wanted":
+                # The poll after the repeat: had the worker started it, that
+                # job would be holding a slot or would have called back.
+                self.redelivery = "seen"
+                self.summary()
+                return None
+            self.redelivery = "offered"
+            task = self.tasks[0]
+            self.say(f"AGAIN     {task['key']} is offered a second time: nothing may run")
+        else:
+            task["state"] = "running"
+            task["handed"] = now
+            self.started = self.started or now
+            running = sum(1 for t in self.tasks if t["state"] == "running")
+            self.peak_running = max(self.peak_running, running)
         env = dict(task["env"])
         env["PROBE_UPLOAD_URL"] = f"{base}/upload/{task['key']}"
         body = {"image": self.args.image, "timeout_secs": self.args.timeout, "job_key": task["key"],
@@ -134,6 +163,11 @@ class Mock:
     def finish(self, task, result):
         """Record how a task ended. Call with the lock held."""
         if task["state"] == "done":
+            # The same job told twice is a callback retry. Another job id
+            # under the same key is the task having run twice.
+            first = task["result"].get("id")
+            if result.get("id") != first:
+                self.fail(f"job_key {task['key']} ran twice: callbacks from job {first} and job {result.get('id')}")
             return
         task["state"] = "done"
         task["result"] = result
@@ -144,8 +178,27 @@ class Mock:
         word = "ok  " if task["ok"] else "FAIL"
         self.say(f"{word} {count}/{len(self.tasks)}  {task['key']}  reason={result.get('reason')} "
                  f"exit={result.get('exit_code')} {result.get('duration_secs')}s")
-        if count == len(self.tasks):
+        if count == len(self.tasks) and self.redelivery is None:
             self.summary()
+
+    def fail(self, why):
+        """End the run now, failed, saying why. Call with the lock held."""
+        self.problem = why
+        self.say(f"FAIL: {why}")
+        self.log("fail", why=why)
+        self.exit_code = 1
+        self.done.set()
+
+    def overdue(self):
+        """--deadline passed: name what is still missing. Call with the lock held."""
+        missing = [t["key"] for t in self.tasks if t["state"] != "done"]
+        if missing:
+            never = [t["key"] for t in self.tasks if t["state"] == "queued"]
+            self.fail(f"no callback for job_key {', '.join(missing)} within {self.args.deadline} s"
+                      + (f" ({', '.join(never)} was never asked for: did the worker poll?)" if never else ""))
+        else:
+            self.fail(f"the worker did not poll again within {self.args.deadline} s, "
+                      "so the second offer of the task was not tried")
 
     def summary(self):
         tasks = self.tasks
@@ -184,7 +237,8 @@ class Mock:
         with open(os.path.join(self.args.out, "summary.txt"), "w", encoding="utf-8") as f:
             f.write(text.strip() + "\n")
         self.log("summary", ok=len(tasks) - len(failed), failed=len(failed), reasons=reasons)
-        self.exit_code = 0 if len(failed) == self.args.expect_failures else 1
+        if self.problem is None:
+            self.exit_code = 0 if len(failed) == self.args.expect_failures else 1
         self.done.set()
 
 
@@ -268,6 +322,10 @@ def handler_for(mock):
                 task = mock.by_key(str(result.get("job_key")))
                 if task is None:
                     mock.say(f"CALLBACK  for an unknown job from {ip}: {raw.decode(errors='replace')}")
+                    if mock.args.deadline:
+                        expected = ", ".join(t["key"] for t in mock.tasks)
+                        mock.fail(f"a callback arrived with job_key {result.get('job_key')!r}, "
+                                  f"and this run handed out {expected}")
                 else:
                     mock.finish(task, result)
             self.answer(200, {})
@@ -305,9 +363,13 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     mock.say(f"poll URL: http://<this machine's address>:{args.port}/poll   "
              f"{args.tasks} task(s) of {args.image}, results in {os.path.abspath(args.out)}")
+    start = time.time()
     try:
         while not mock.done.wait(1):
-            pass
+            if args.deadline and time.time() - start > args.deadline:
+                with mock.lock:
+                    if not mock.done.is_set():
+                        mock.overdue()
         while args.keep_serving:
             time.sleep(1)
         time.sleep(1)  # let the last answer leave

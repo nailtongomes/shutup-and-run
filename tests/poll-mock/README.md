@@ -10,13 +10,39 @@ It is the worker's existing poll contract. Nothing was added to the worker for t
 | --- | --- |
 | `POST /poll` | The worker asks, with `Authorization: Bearer <token>` and `{"worker","os","arch","version","max_slots","free_slots","cpus","memory_bytes"}`. The answer is `{"task": {...}}` or `204`. One task per poll. |
 | the task | The same JSON as `POST /v1/jobs`: `image`, `env`, `command`, `timeout_secs`, `cpu`, `memory`, `shm`, `job_key`, `callback_url`. |
-| `POST /callback` | The worker reports the end of a job: `id`, `job_key`, `image`, `status`, `exit_code`, `reason` (`exited`, `timeout_kill`, `start_failed`), `started_at`, `ended_at`, `duration_secs`. |
+| `POST /callback` | The worker reports the end of a job: `id`, `job_key`, `image`, `status`, `exit_code`, `reason` (`exited`, `timeout_kill`, `start_failed`, `interrupted`), `started_at`, `ended_at`, `duration_secs`. |
 
 **What the contract cannot return.** The callback carries the exit code and the reason. It does not carry the job's output or any file, and a task cannot mount a volume, by design. The last log lines exist only on the worker, behind its own token (`GET /v1/jobs/{id}?logs=true`).
 
 So a result that is a file is sent **by the container itself**, to a URL it is given in its `env`. That is how the product is meant to be used ("the container writes its own result wherever it already does"), and it needs no change. The mock gives every task `PROBE_UPLOAD_URL=http://<mock>/upload/<job_key>` and stores what arrives.
 
 **Proposed, not implemented:** if you want a failed job's output at the orchestrator without asking the machine, the smallest addition would be an optional `logs` field in the callback body, holding the same clipped tail the worker already stores (`log_lines`). It would send container output off the machine, so it should be opt-in per task. Say so and it is a small PR.
+
+## One task, from the poll to its callback
+
+One command, on a Linux machine with Docker. It starts the mock and a worker of its own (a temporary config and history, no token of yours, nothing installed is touched), and removes both when it ends:
+
+```
+cargo build --release --locked
+sudo bash tests/poll-mock/cycle.sh target/release/shutup-and-run one
+```
+
+The mock offers one `hello-world` task with `job_key` `task-1042-attempt-1`, the key an API would derive from its task 1042 ([contract, section 6](../../docs/INTEGRATION-CONTRACT.md#6-idempotency-and-delivery)). The run passes only when:
+
+- the callback with that `job_key` arrives and says `status` `exited`, `exit_code` 0;
+- the same task, offered a second time, starts nothing: no second job id calls back, and the worker logs `poll task already recorded`.
+
+It takes about a minute and a half, because the worker polls every 30 seconds and that is not shortened for a test. The mock gives up after 240 seconds. It fails, with the reason on one `FAIL:` line, when:
+
+| | |
+| --- | --- |
+| no callback came | `FAIL: no callback for job_key task-1042-attempt-1 within 240 s` |
+| a callback came for another key | `FAIL: a callback arrived with job_key 'task-9999-attempt-1', and this run handed out task-1042-attempt-1` |
+| the task ran twice | `FAIL: job_key task-1042-attempt-1 ran twice: callbacks from job <id> and job <id>` |
+
+The script provokes the first two itself before the real run, so a mock that stopped noticing them fails too.
+
+The same check against a worker that is already installed, by hand: `python3 tests/poll-mock/poll_mock.py --job-key task-1042-attempt-1 --deadline 240 --redeliver`, with the worker's `poll_url` pointing at the mock. A `job_key` is remembered by the worker, so a second run against the same worker needs a new key (`task-1042-attempt-2`): the old one would start nothing and call back nothing.
 
 ## Run it
 
@@ -76,7 +102,7 @@ SUMMARY
 
 Raise `--max-slots` (run `wsl install` again with the new value) and repeat until the durations climb or jobs start failing. `RAM per job` and `CPU per job` are what each container's own cgroup recorded, reported by the probe with its upload; they are per job, not the whole machine, and only the probe image sends them. The `worker` line is what the machine said about itself in the poll.
 
-`--hang 1` makes one task hang (`PROBE_HANG=1`): the worker kills it at `--timeout`, the summary counts it as `timeout_kill`, and the other tasks still run. `--env PROBE_FAIL=1` makes every task exit 3. `--expect-failures N` makes the mock exit 0 when exactly N failed.
+`--hang 1` makes one task hang (`PROBE_HANG=1`): the worker kills it at `--timeout`, the summary counts it as `timeout_kill`, and the other tasks still run. `--env PROBE_FAIL=1` makes every task exit 3. `--expect-failures N` makes the mock exit 0 when exactly N failed. `--deadline SECS` makes it exit 1 when a callback is still missing after that long, or when one arrives for a `job_key` it did not hand out; without it the mock waits.
 
 ## Enrollment
 
@@ -84,7 +110,7 @@ Raise `--max-slots` (run `wsl install` again with the new value) and repeat unti
 
 ## In CI
 
-`tests/poll-mock/cycle.sh` runs on Linux with Docker: the mock, a worker, three `alpine` tasks of which one hangs, and checks that `status.json` went `active` and back to `idle`, that the hung task was a `timeout_kill`, and that the worker lived. A second run builds the probe image and requires its screenshot, which CI keeps as the artifact `probe-screenshot`.
+`tests/poll-mock/cycle.sh` runs on Linux with Docker: the mock, a worker, three `alpine` tasks of which one hangs, and checks that `status.json` went `active` and back to `idle`, that the hung task was a `timeout_kill`, and that the worker lived. A second run builds the probe image and requires its screenshot, which CI keeps as the artifact `probe-screenshot`. A third is the one task above (`one`).
 
 ```
 sudo bash tests/poll-mock/cycle.sh target/release/shutup-and-run
