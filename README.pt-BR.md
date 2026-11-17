@@ -391,6 +391,7 @@ O download é conferido com o `SHA256SUMS` da mesma release. Rodar de novo atual
 | Comando | |
 | --- | --- |
 | `wsl install [--poll-url URL] [--max-slots N] [--worker-name NOME] [--wsl-memory 4GB] [--wsl-processors 2]` | Instala ou atualiza. Mantém a configuração; muda só as opções informadas. |
+| `wsl update` | Depois de um `.exe` novo: o binário Linux da mesma versão, e o worker reiniciado. O `install.ps1` roda isso. [Atualizar e corrigir](docs/WINDOWS.md#update-and-repair). |
 | `wsl doctor`, `doctor` | Confere tudo, com a correção de cada problema. |
 | `wsl limits [--apply]` | Quanto do PC o WSL2 pode usar. |
 | `wsl start`, `wsl stop`, `wsl logs` | A tarefa de logon e o log do supervisor. |

@@ -24,6 +24,8 @@ The first line downloads `shutup-and-run.exe`, checks its SHA-256 and puts it on
 
 If it says WSL is missing: `wsl --install --no-distribution` as administrator, reboot, run the install again.
 
+To update, run the first line again: it stops the worker, swaps the `.exe`, and runs `shutup-and-run wsl update`, which puts the Linux binary of the same version in the distribution and keeps the config, token and history. On a failure it puts the previous version back. The doctor's `version` line (`VERSION_MISMATCH`) says when the two halves differ. A failed update, the files it can leave, and a recovery a person can follow one command at a time: [WINDOWS.md, Update and repair](WINDOWS.md#update-and-repair).
+
 ## Linux: install
 
 ```bash
@@ -162,6 +164,7 @@ The JSON also carries `fix`. It is the same sentence under the name 0.2.8 used; 
 | `DISTRIBUTION_FAILED` | Run `shutup-and-run wsl reset` to rebuild the distribution; the config is kept. | Rode `shutup-and-run wsl reset` para reconstruir a distribuição; a config é mantida. |
 | `BINARY_FAILED` | Run `shutup-and-run wsl install` again: it puts the right binary in the distribution. | Rode `shutup-and-run wsl install` de novo: ele coloca o binário certo na distribuição. |
 | `TASK_NOT_REGISTERED` | Run `shutup-and-run wsl task register` so the worker starts at logon. | Rode `shutup-and-run wsl task register` para o worker iniciar no logon. |
+| `VERSION_MISMATCH` | Run `shutup-and-run wsl update` to put the Linux binary of this .exe's version in the distribution. | Rode `shutup-and-run wsl update` para colocar na distribuição o binário Linux da mesma versão deste .exe. |
 | `TASK_WARNING` | Run `shutup-and-run wsl task register` so the worker starts at logon. | Rode `shutup-and-run wsl task register` para o worker iniciar no logon. |
 | `WSL_LIMITS_WARNING` | Run `shutup-and-run wsl limits` to see what WSL2 may take; `shutup-and-run wsl limits --apply` sets the budget. | Rode `shutup-and-run wsl limits` para ver quanto o WSL2 pode usar; `shutup-and-run wsl limits --apply` define o limite. |
 | `WSL_LIMITS_ABOVE_BUDGET` | Run `shutup-and-run wsl limits --apply` (it keeps every other line of .wslconfig), then restart WSL yourself: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`. | Rode `shutup-and-run wsl limits --apply` (mantém as outras linhas do .wslconfig) e reinicie o WSL você mesmo: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`. |

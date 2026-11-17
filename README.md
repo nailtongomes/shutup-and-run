@@ -391,6 +391,7 @@ The download is checked against `SHA256SUMS` of the same release. Running it aga
 | Command | |
 | --- | --- |
 | `wsl install [--poll-url URL] [--max-slots N] [--worker-name NAME] [--wsl-memory 4GB] [--wsl-processors 2]` | Install or upgrade. Keeps the config; changes only the options given. |
+| `wsl update` | After a new `.exe`: the Linux binary of the same version, and the worker restarted. `install.ps1` runs it. [Update and repair](docs/WINDOWS.md#update-and-repair). |
 | `wsl doctor`, `doctor` | Check everything, with a fix for each problem. |
 | `wsl limits [--apply]` | What WSL2 may take of the PC. |
 | `wsl start`, `wsl stop`, `wsl logs` | The logon task and the supervisor log. |

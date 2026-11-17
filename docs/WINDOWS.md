@@ -238,7 +238,7 @@ shutup-and-run doctor
 
 When the machine itself broke (a power cut, a damaged distribution), `shutup-and-run wsl reset` deletes the distribution and installs it again, keeping the config and the machine's poll token. `--factory` forgets those too.
 
-To upgrade, run `install.ps1` or `wsl install` again. It replaces the `.exe` and the Linux binary and keeps the distribution, its job history and the whole config, the poll token included. Only the options you pass change. An install from 0.2.4 or earlier has its `config.toml` and env file carried over into `config.json`. A worker that was paused resumes.
+To update to a new release, see [Update and repair](#update-and-repair). `wsl install` run again is a re-install: it keeps the distribution, its job history and the whole config, the poll token included, and changes only the options you pass. An install from 0.2.4 or earlier has its `config.toml` and env file carried over into `config.json`. A worker that was paused resumes.
 
 A re-install replaces the running worker, and checks that it did:
 
@@ -248,6 +248,76 @@ A re-install replaces the running worker, and checks that it did:
 - It lifts a ban on `127.0.0.1` that an install before this fix may have left.
 
 Jobs that are running when you re-install are ended: the distribution is restarted. Their callbacks are sent when the service comes back, with a non-zero or missing `exit_code`. Pause the worker from its status page and wait for it to be idle first, if that matters.
+
+## Update and repair
+
+### Update
+
+The install line, in PowerShell, as the user who installed. No administrator.
+
+```powershell
+irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
+```
+
+Over an installed worker this is the update:
+
+1. It downloads the `.exe` of the latest release and `SHA256SUMS`, and checks the hash. A wrong hash changes nothing.
+2. It stops the worker with `shutup-and-run wsl stop`: the task ends, each running job gets SIGTERM and 10 seconds (its callback then reports how it ended), and the distribution stops. A process still running `C:\ProgramData\shutup-and-run\shutup-and-run.exe` after that is ended, with a 30 second wait. No other process is touched.
+3. It moves the old `.exe` aside to `shutup-and-run.exe.old` and puts the new one in its place.
+4. It runs `shutup-and-run wsl update`: the Linux binary of the same version goes into the distribution, the task starts again, and the update waits up to a minute for the service to write its status with the new version. Then it prints the doctor. Only the binary changes. No apt, and the config, the poll token, the job history, a pause and the owner's safety authorization stay as they are.
+5. It removes `.old`, the download and `SHA256SUMS`.
+
+If any step fails, the previous `.exe` is put back and its task started again, nothing downloaded is left in the folder, and the last line is a `hint:`. If the new Linux binary does not start, `wsl update` puts the previous one back first. With `SHUTUP_AND_RUN_POLL_URL` set in that terminal the script runs `wsl install --poll-url` instead of `wsl update`, which takes a few minutes longer (apt runs).
+
+If a running job matters, pause the worker on the local page first and wait until it is idle.
+
+### Which version runs
+
+| Where | Command | What it says |
+| --- | --- | --- |
+| The `.exe` | `shutup-and-run version --json` | `"version"` |
+| The service in the distribution | `shutup-and-run status --json`, or `C:\ProgramData\shutup-and-run\status.json` | `"version"`, written by the running service; `"state"` should be `idle` or `active` |
+| Both | `shutup-and-run doctor` | the `version` line: `<version> on Windows and in shutup-and-run`, or `VERSION_MISMATCH` |
+
+### When it goes wrong
+
+| What you see | What to do |
+| --- | --- |
+| `Move-Item` fails with `IOException`, "Cannot create a file when that file already exists" ("Não é possível criar um arquivo já existente"). An `install.ps1` from before this section stopped only the task, and the supervisor kept the `.exe` open. | [By hand](#by-hand), below. |
+| `shutup-and-run-x86_64-pc-windows-msvc.exe.tmp`, `SHA256SUMS` or `shutup-and-run.exe.old` left in `C:\ProgramData\shutup-and-run` | Run the install line again; it replaces or removes them. To finish by hand instead, see [By hand](#by-hand). |
+| The doctor says `VERSION_MISMATCH`, or `status.json` has an older `version` than `version --json` | `shutup-and-run wsl update` |
+| After the update the worker does not come back: `status.json` says `stopped` or `failed`, or its `updated_at` is more than a minute old | `shutup-and-run wsl logs`, then `shutup-and-run wsl start`. If it still does not answer, `shutup-and-run wsl install` with no options: it keeps the config. Then `shutup-and-run doctor`. |
+| After the update the page says "WAITING FOR YOUR AUTHORIZATION", or `safety` says `AUTHORIZATION_REQUIRED` | From 0.2.13 a PC with under 8 GiB of memory or 2 processors or fewer starts work only after its owner said yes. The person at the PC opens `http://127.0.0.1:8787/`, then "Safety of this computer", reads it and confirms; or types `shutup-and-run safety authorize` in a terminal. An AI agent or a script must not do this for them. See [Sharing the PC](#sharing-the-pc). |
+
+### By hand
+
+For a person following instructions, one command at a time, in PowerShell as the user who installed. Each step says what to look for.
+
+1. See what runs from the install folder:
+
+   ```powershell
+   Get-CimInstance Win32_Process -Filter "Name='shutup-and-run.exe'" | Select-Object ProcessId, ExecutablePath, CommandLine
+   ```
+
+   The worker's supervisor is the line with `C:\ProgramData\shutup-and-run\shutup-and-run.exe` and `wsl serve --background`.
+2. Stop it the clean way: `shutup-and-run wsl stop`. Run step 1 again. If that line is still there, end only that process, with the number from the `ProcessId` column: `Stop-Process -Id 1234 -Force`.
+3. Check the download that was left. Both commands print a hash; they must be the same (upper or lower case does not matter):
+
+   ```powershell
+   (Get-FileHash "$env:ProgramData\shutup-and-run\shutup-and-run-x86_64-pc-windows-msvc.exe.tmp").Hash
+   Select-String -Path "$env:ProgramData\shutup-and-run\SHA256SUMS" -Pattern "windows-msvc.exe"
+   ```
+
+   If they differ, or either file is missing: delete both (`Remove-Item`), run the install line again, and stop here.
+4. Put it in place and remove the list:
+
+   ```powershell
+   Move-Item -Force "$env:ProgramData\shutup-and-run\shutup-and-run-x86_64-pc-windows-msvc.exe.tmp" "$env:ProgramData\shutup-and-run\shutup-and-run.exe"
+   Remove-Item "$env:ProgramData\shutup-and-run\SHA256SUMS"
+   ```
+
+5. Bring the distribution to the same version and start the worker: `shutup-and-run wsl update`. If it prints the list of `wsl` commands instead, the `.exe` is older than that command: run `shutup-and-run wsl install`, with no options; it keeps the config and takes a few minutes.
+6. Check: `shutup-and-run version --json` and `Get-Content "$env:ProgramData\shutup-and-run\status.json"` show the same `version`, `state` is `idle` or `active`, and `shutup-and-run doctor` has no `VERSION_MISMATCH`.
 
 ## What the poll URL gets
 

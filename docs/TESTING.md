@@ -235,6 +235,17 @@ A Windows 11 VM with 2 vCPU and 5 GB of RAM, nested virtualization on. Nothing b
 
 What to report: the table, which of the boxes failed, and whether steps 4 and 5 blocked and recovered at the figures Task Manager showed. If the idle PC already sits under 1 GB available, or the VM feels slow with one job at the default limits, this PC should not lend its resources, whatever its owner authorizes.
 
+### Update over a running worker
+
+CI runs the `.exe` half without WSL. This is the half with the distribution, on a PC that runs an older release with a job.
+
+- [ ] With a five-minute job running, run the install line. It prints `stopping the worker`, then the `wsl update` steps, and ends with `updated to`. The job's callback arrives with how it ended (stopped, not `ok`).
+- [ ] `shutup-and-run version --json` and `status.json` show the same new `version`; `state` is `idle`; the doctor's `version` line is ok.
+- [ ] `C:\ProgramData\shutup-and-run` has no `*.tmp`, `SHA256SUMS` or `shutup-and-run.exe.old`.
+- [ ] `shutup-and-run config show` is what it was before (poll URL, slots, worker name), and the mock sees the same token.
+- [ ] A worker paused before the update is still paused; a PC whose owner had authorized is still authorized.
+- [ ] Put the old binary back by hand (`wsl -d shutup-and-run -u root -- cp ...`): the doctor says `VERSION_MISMATCH` with the hint `shutup-and-run wsl update`, and that command clears it.
+
 ### Certificate passthrough and the demos
 
 Not run on Windows yet. On the Windows PC, with a test `.pfx` (never a real one for this) in a folder whose name has a space and an accent:
