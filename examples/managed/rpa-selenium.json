@@ -1,0 +1,25 @@
+{
+  "name": "rpa-selenium",
+  "image": "ghcr.io/nailtongomes/rpa-worker-selenium:latest",
+  "env": {
+    "SCRIPT_URL": "https://www.example.com/files/my_script.py",
+    "USE_XVFB": "1",
+    "USE_OPENBOX": "1",
+    "USE_PJEOFFICE": "1",
+    "DISPLAY": ":99",
+    "USE_NOVNC": "0",
+    "USE_VNC": "0",
+    "USE_SCREEN_RECORDING": "0"
+  },
+  "secret_env": {
+    "API_TOKEN": null,
+    "CERTIFICATE_ID": null
+  },
+  "cpu": 1,
+  "memory": "2g",
+  "shm": "2g",
+  "timeout_secs": 1800,
+  "policy": "interval",
+  "interval_secs": 900,
+  "enabled": true
+}

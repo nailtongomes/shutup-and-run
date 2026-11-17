@@ -29,12 +29,16 @@ async fn main() -> ExitCode {
     // distribution, so these run there. `status` reads the host's copy.
     if cfg!(windows) {
         match args.first().map(String::as_str) {
+            Some("managed") if rest.iter().any(|a| a == "--help" || a == "-h") => {
+                println!("{}", shutup_and_run::managed::usage());
+                return ExitCode::SUCCESS;
+            }
             Some("config" | "bans" | "pause" | "resume" | "jobs" | "safety") => {
                 return shutup_and_run::wsl::forward(&args)
             }
             // These need a file or a result to cross between Windows and
             // the distribution, so the supervisor carries it.
-            Some("job" | "demo" | "certificate") => {
+            Some("job" | "demo" | "certificate" | "managed") => {
                 return shutup_and_run::wsl::forward_with_files(&args)
             }
             Some("doctor") => {
@@ -61,6 +65,7 @@ async fn main() -> ExitCode {
         Some("config") => shutup_and_run::cli::config_cli(rest),
         Some("status") => shutup_and_run::cli::status_cli(rest),
         Some("jobs") => shutup_and_run::jobs::jobs_cli(rest),
+        Some("managed") => shutup_and_run::managed::managed_cli(rest),
         Some("doctor") => shutup_and_run::cli::doctor_cli(rest).await,
         Some("safety") => shutup_and_run::cli::safety_cli(rest),
         Some("pause") => shutup_and_run::cli::pause_cli(true, rest),
@@ -93,6 +98,10 @@ shutup-and-run pause | resume
 shutup-and-run jobs [--limit N]
     for an agent or a script: no questions, --json, stable exit codes.
     `shutup-and-run config --help` documents all of them.
+
+shutup-and-run managed [list|mode|apply|show|secret|enable|disable|start|stop|remove]
+    containers this machine starts by itself, once, on an interval or always,
+    with no poll URL and no push. `shutup-and-run managed --help`.
 
 shutup-and-run safety [status|authorize|revoke]
     is it safe for this computer's owner to start a job, and the owner's
@@ -286,6 +295,7 @@ async fn serve() -> ExitCode {
     spawn_exit_watcher(docker, launcher.clone());
     spawn_maintenance(launcher.clone());
     spawn_poller(launcher.clone());
+    shutup_and_run::managed::spawn(launcher.clone());
 
     let app =
         shutup_and_run::api::router(launcher).into_make_service_with_connect_info::<SocketAddr>();

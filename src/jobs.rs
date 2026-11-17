@@ -190,6 +190,7 @@ mod tests {
                     job_key: Some(format!("key-{id}")),
                     started_at: at,
                     callback_url: Some("https://api.example/result?secret=callback-secret".into()),
+                    managed: None,
                 })
                 .unwrap();
         };

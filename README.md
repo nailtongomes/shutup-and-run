@@ -14,7 +14,8 @@ It is also built to be run by the customer's own **AI agent**. Every command is 
 
 | It does | It does not |
 | --- | --- |
-| Start an allowlisted container image with the env, command, timeout and limits a task names | Queue, schedule, retry or chain tasks. Your orchestrator does that |
+| Start an allowlisted container image with the env, command, timeout and limits a task names | Queue, retry or chain tasks. Your orchestrator does that |
+| Or, in [managed mode](#managed-containers), run containers defined on the machine: once, on an interval, or always | Replace Compose, Kubernetes or a workflow engine. A managed container is one image and when to run it |
 | Take work two ways: **push** (`POST /v1/jobs`) and **pull** (the worker polls a URL of yours) | Coordinate machines. Each worker knows only itself |
 | Cap concurrency (`max_slots`), time (`timeout_secs`, then SIGKILL), CPU and memory per job | Sandbox the job. A container has Docker's default privileges and network |
 | Refuse work when full, draining, or short of memory or disk | Mount host folders, publish ports, or run privileged. There are no such fields |
@@ -147,6 +148,7 @@ With `status_page = true` (the Windows install turns it on; a Linux install does
 | `/` | Running, paused or Docker down. Whether the PC can be turned off. Jobs now, the last job, whether the queue answers, the machine's name. A button to pause or resume taking jobs. Reloads every 10 seconds | none |
 | Settings (`/local/config`) | Poll URL, poll interval, jobs at once, machine name | none |
 | Advanced settings (`/local/advanced`) | Allowed images, any-image, time limits, the resource limits, both tokens, the admin login | `admin` / `admin` until changed |
+| Managed containers (`/local/managed`) | [Managed containers](#managed-containers): the list with state and last run; Start, Stop, Enable, Disable | none for the buttons; the same login for the editor, removing, and the mode |
 | Certificate (`/local/certificate`) | Optional [certificate passthrough](#certificate-passthrough-optional): import a `.pfx` and its password, validate it, test PDF signing, turn it off. The password is never shown | the same login, and a confirmation |
 
 - The page edits the same `config.json` as the CLI, through the same validation. A saved change restarts the service on the new file; running containers are left alone. An invalid value is refused and nothing is written.
@@ -155,7 +157,35 @@ With `status_page = true` (the Windows install turns it on; a Linux install does
 - The remaining keys are CLI only. `shutup-and-run config keys` says where each key can be edited.
 - It is in English or Portuguese, one at a time; a link switches and the choice is remembered.
 
-Security of the page, plainly. It needs no token, so it answers only a loopback connection that names a loopback host, and accepts a form only from its own origin. It never shows a token, a job's env or logs. The admin login keeps a curious person out and is **not** a security boundary: whoever uses the PC can read the config file. Nothing on it is reachable from the network, and it is not meant to be put behind a proxy. On a machine set up with `config.toml` the page shows status only.
+Security of the page, plainly. It needs no token, so it answers only a loopback connection that names a loopback host, and accepts a form only from its own origin. It never shows a token, a job's env or logs; the editor of a managed container, behind the admin login, shows that container's plain env and never a secret's value. The admin login keeps a curious person out and is **not** a security boundary: whoever uses the PC can read the config file. Nothing on it is reachable from the network, and it is not meant to be put behind a proxy. On a machine set up with `config.toml` the page shows status only.
+
+## Managed containers
+
+For work that recurs and needs no orchestrator, such as a Selenium RPA that runs every fifteen minutes, the worker can start containers by itself from definitions kept on the machine. It is not a second Compose or Kubernetes: a definition is the same request a job is (image, command, env, CPU, memory, shm, time limit), plus when to run it.
+
+| Policy | When it runs |
+| --- | --- |
+| `once` | Only when someone presses Start (or `managed start NAME`) |
+| `interval` | Again every `interval_secs` (60 or more), counted from start to start. Never two at a time: a run still going when the next is due is followed by it. After the service was down, one run, not one per missed interval. A failed run is not retried early |
+| `always` | Started again whenever it ends. The wait is 30 s, and doubles up to 15 min while its runs last under a minute; a run that lasted a minute clears it. With no `timeout_secs` it gets `max_timeout_secs`, and is started again after that |
+
+**One way of working at a time.** Managed containers run only in **managed mode**. In managed mode the worker does not poll, and `POST /v1/jobs` answers `409` `{"error":"managed mode","code":"MANAGED_MODE"}`. Outside it, no managed container starts. The mode changes only while nothing is running or starting; otherwise the change is refused (`MANAGED_BUSY`) and nothing is interrupted. It is kept across restarts.
+
+```bash
+sudo shutup-and-run managed apply examples/managed/rpa-selenium.json
+printf '%s' "$API_TOKEN" | sudo shutup-and-run managed secret rpa-selenium API_TOKEN
+printf '%s' "$CERTIFICATE_ID" | sudo shutup-and-run managed secret rpa-selenium CERTIFICATE_ID
+sudo shutup-and-run managed mode on
+sudo shutup-and-run managed list
+```
+
+Or on the local page: **Managed containers** lists them with state, policy, last run and Start, Stop, Enable and Disable; the editor and the mode switch ask for the admin login.
+
+- **Every run is an ordinary job.** It needs an allowlisted image, takes one of the `max_slots`, gets the machine's CPU and memory limits, obeys a pause, the free-memory and disk checks, `min_idle_secs` and the owner's safety checks, has its time limit, and appears in `shutup-and-run jobs`. When the machine refuses, the start **waits** and is tried again 30 seconds later; that is never counted as a failure of the container.
+- **Secrets.** `secret_env` values are stored in the worker's history file (mode 600) and reach only the container's env. No command, page, log or status file prints them. In a file, `"API_TOKEN": null` means "the value this machine already has", so a definition can live in a repository. A container with a secret that has no value does not start.
+- **Stop and disable.** Stop kills the container now, and it stays stopped until someone starts it. Disable starts nothing new and lets a run in progress finish.
+- **Restarts.** A running container is found again by its job row, so a restarted worker starts no second one. A container that ended while the worker or Docker was down is recorded as `interrupted` and the policy decides what follows.
+- A definition cannot mount, publish ports or run privileged, like a job. An edit applies to the next run.
 
 ## Certificate passthrough (optional)
 
@@ -319,7 +349,7 @@ Only `image` is required. Unknown fields are refused. `job_key` makes a retry sa
 **Pull.** With `poll_url` set, the machine POSTs to it every `poll_interval_secs` (30 seconds, and never less), only when it has a free slot, is not paused and is not short of memory or disk:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.13", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.14", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 The answer is nothing (`204`), a task, `{"task": {...}}`, or `{"manifest_url": "https://..."}`, which is fetched once and must be a task. `401` or `403` means "not approved yet": the worker starts nothing and keeps asking, backing off to five minutes. The server decides which machines get work; the worker's token is its identity.
@@ -393,7 +423,9 @@ The image needs `sh` and `sleep`; the default is `ghcr.io/nailtongomes/shutup-an
 - On Linux, stopping the service does not stop containers, and while it is stopped nothing enforces timeouts.
 - A timeout is SIGKILL, with no grace period.
 - `job_key` is per machine. Another machine does not know it.
-- No cancel call, no queue, no retry of a job that failed.
+- No cancel call, no queue, no retry of a job that failed. A managed container has no cron expression, no dependencies and no output capture; an `always` one that keeps failing is retried every 15 minutes until someone stops or disables it.
+- Managed mode and push/pull are exclusive on a machine. A machine that should do both needs two machines.
+- Managed definitions, their secrets and the mode are in the job history file. On Windows `shutup-and-run wsl reset` rebuilds the distribution and that file with it: keep the definition files (`managed show NAME` prints one) and apply them again.
 - In pull mode the server is never told that a task was refused or dropped; the worker's own log is. See [the contract's limits](docs/INTEGRATION-CONTRACT.md#9-limits-of-the-current-contract).
 - Resource protection is admission control and container limits, not a guarantee. See [Protecting the PC](#protecting-the-pc).
 - Windows runs the Linux service inside WSL2, pull mode only, while the installing user is logged on. Stopping it, signing out or shutting down ends the containers. macOS is planned: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md).

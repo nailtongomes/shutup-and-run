@@ -2142,6 +2142,29 @@ pub fn forward_with_files(args: &[String]) -> ExitCode {
                 }
             }));
         }
+        ["managed", "apply", file, ..] if file != "-" && !file.starts_with("--") => {
+            match std::fs::read(file) {
+                Ok(bytes) => stdin = Some(bytes),
+                Err(e) => return fail(format!("{file}: {e}")),
+            }
+            inner.extend(args.iter().map(|a| {
+                if a == file {
+                    "-".to_string()
+                } else {
+                    a.clone()
+                }
+            }));
+        }
+        // The value of a secret is read here and crosses on stdin only.
+        ["managed", "secret", ..] if !args.iter().any(|a| a == "--unset") => {
+            use std::io::Read;
+            let mut value = Vec::new();
+            if let Err(e) = std::io::stdin().take(64 * 1024).read_to_end(&mut value) {
+                return fail(format!("could not read the secret from stdin: {e}"));
+            }
+            stdin = Some(value);
+            inner.extend(args.iter().cloned());
+        }
         ["demo", "sign", ..] if !args.iter().any(|a| a == "--help" || a == "-h") => {
             pdf_out =
                 Some(PathBuf::from(value_of("--out").unwrap_or_else(|| {

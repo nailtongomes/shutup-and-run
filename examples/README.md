@@ -34,5 +34,6 @@ The n8n files were run against a local n8n and a local runner. The Kestra files 
 | `n8n-dispatch.json`, `kestra-dispatch.yml` | Push to the first of two machines with a free slot. |
 | `n8n-poll.json`, `kestra-poll.yml` | The smallest poll URL: one task, then nothing. |
 | `kestra-e2e.yml`, `kestra-e2e-callback.yml` | The five steps above. |
+| `managed/rpa-selenium.json` | A [managed container](../README.md#managed-containers): the Selenium RPA worker every 15 minutes, with no orchestrator. `shutup-and-run managed apply` takes it; its two secrets are set on the machine. |
 | `smoke-image/` | The small image `scripts/smoke.sh` runs. |
 | `selenium-probe/` | A browser job that reports its own peak memory, for sizing. |

@@ -4,7 +4,9 @@ use crate::clock::{Clock, SystemClock};
 use crate::config::Settings;
 use crate::runtime::{Inspected, Runtime, RuntimeError, StartSpec};
 use crate::store::{JobRecord, NewJob, Store, StoreError};
-use crate::{REASON_EXITED, REASON_INTERRUPTED, REASON_START_FAILED, REASON_TIMEOUT};
+use crate::{
+    REASON_EXITED, REASON_INTERRUPTED, REASON_LAUNCHER, REASON_START_FAILED, REASON_TIMEOUT,
+};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +40,9 @@ pub struct Slots {
 pub enum JobSource {
     Push,
     Poll,
+    /// A run of a managed container definition, started by the worker
+    /// itself. Checked like a push: the allowlist always applies.
+    Managed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +75,15 @@ pub enum LaunchError {
     /// to. Only a person at the machine can; nothing was stored.
     #[error("the owner of this computer has to authorize: {}", codes_of(.0))]
     AuthorizationRequired(Vec<crate::safety::Finding>),
+    /// The machine runs managed containers and takes no job from outside.
+    #[error("managed mode: this machine runs its own managed containers and takes no job")]
+    ManagedMode,
+    /// A managed container was asked to start while the machine takes jobs.
+    #[error("managed mode is off")]
+    JobsMode,
+    /// This managed container already has a run that has not ended.
+    #[error("already running")]
+    AlreadyRunning,
     #[error("{0}")]
     Unavailable(String),
 }
@@ -125,6 +139,12 @@ pub struct Launcher {
     /// Ids the reaper has decided to SIGKILL. The die event and the reaper
     /// share this so the stored reason is timeout_kill rather than exited.
     timeouts: Mutex<HashSet<String>>,
+    /// Ids a person asked to stop, so the stored reason is launcher_kill.
+    stops: Mutex<HashSet<String>>,
+    /// One pass over the managed containers at a time.
+    pub(crate) managed_pass: Mutex<()>,
+    /// Told when a person changed something about a managed container.
+    pub(crate) managed_changed: tokio::sync::Notify,
     /// Jobs answered with 202 whose image is still being pulled. They hold a
     /// slot. This set is memory only: after a restart such a row has no
     /// container and reconcile closes it.
@@ -196,6 +216,9 @@ impl Launcher {
             store,
             slots: Mutex::new(()),
             timeouts: Mutex::new(HashSet::new()),
+            stops: Mutex::new(HashSet::new()),
+            managed_pass: Mutex::new(()),
+            managed_changed: tokio::sync::Notify::new(),
             starting: Mutex::new(HashSet::new()),
             poll_error: std::sync::Mutex::new(None),
             last_poll: std::sync::Mutex::new(None),
@@ -209,6 +232,32 @@ impl Launcher {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    pub(crate) fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
+    pub(crate) fn now(&self) -> i64 {
+        self.clock.now_unix() as i64
+    }
+
+    /// True while the machine runs managed containers and takes no job.
+    /// Read from the history every time: the CLI changes it there.
+    pub fn managed_mode(&self) -> Result<bool, LaunchError> {
+        self.store.managed_mode().map_err(store_err)
+    }
+
+    /// Changes the mode, only while nothing runs or is starting. Under the
+    /// slot lock, so no admission is half way through. `Ok(false)`: busy.
+    pub async fn set_managed_mode(&self, managed: bool) -> Result<bool, LaunchError> {
+        let _guard = self.slots.lock().await;
+        let changed = self.store.set_managed_mode(managed).map_err(store_err)?;
+        if changed {
+            tracing::info!(managed, "mode");
+            self.managed_changed.notify_one();
+        }
+        Ok(changed)
     }
 
     pub fn token_matches(&self, provided: &str) -> bool {
@@ -467,6 +516,8 @@ impl Launcher {
             (None, Some(job)) => crate::status::job_error(job),
             _ => None,
         };
+        let (managed_mode, managed) =
+            crate::managed::views(&self.store, self.now()).unwrap_or_default();
         crate::status::Live {
             slots_used: slots.map(|s| s.used as u64),
             slots_total: slots.map(|s| s.total as u64),
@@ -485,6 +536,8 @@ impl Launcher {
             safety,
             limits: crate::status::Limits::of(&self.settings),
             config_warning: self.settings.config_warning.clone(),
+            managed_mode,
+            managed,
         }
     }
 
@@ -508,6 +561,32 @@ impl Launcher {
         req: LaunchRequest,
         source: JobSource,
     ) -> Result<LaunchOutcome, LaunchError> {
+        if source == JobSource::Managed {
+            return Err(LaunchError::BadRequest(
+                "a managed run names its definition".into(),
+            ));
+        }
+        self.admit(req, source, None).await
+    }
+
+    /// One run of the managed container `name`. Every check a pushed job
+    /// passes, this passes too, and it takes a slot like one.
+    pub async fn launch_managed(
+        self: &Arc<Self>,
+        name: &str,
+        req: LaunchRequest,
+    ) -> Result<JobRecord, LaunchError> {
+        match self.admit(req, JobSource::Managed, Some(name)).await? {
+            LaunchOutcome::Created(job) | LaunchOutcome::Existing(job) => Ok(job),
+        }
+    }
+
+    async fn admit(
+        self: &Arc<Self>,
+        req: LaunchRequest,
+        source: JobSource,
+        managed: Option<&str>,
+    ) -> Result<LaunchOutcome, LaunchError> {
         let Checked {
             spec,
             timeout,
@@ -516,6 +595,23 @@ impl Launcher {
         } = check_request(req, &self.settings, source)?;
 
         let guard = self.slots.lock().await;
+        // The two ways of working never mix: in managed mode nothing from
+        // outside is admitted, and outside it no managed container starts.
+        match (self.managed_mode()?, managed.is_some()) {
+            (true, false) => return Err(LaunchError::ManagedMode),
+            (false, true) => return Err(LaunchError::JobsMode),
+            _ => {}
+        }
+        if let Some(name) = managed {
+            if self
+                .store
+                .managed_running(name)
+                .map_err(store_err)?
+                .is_some()
+            {
+                return Err(LaunchError::AlreadyRunning);
+            }
+        }
         if self.draining()? {
             return Err(LaunchError::Draining);
         }
@@ -562,9 +658,13 @@ impl Launcher {
             job_key: job_key.clone(),
             started_at: self.clock.now_unix() as i64,
             callback_url,
+            managed: managed.map(str::to_string),
         };
         match self.store.insert_running(&record) {
             Ok(()) => {}
+            // Another process changed the mode since the check above.
+            Err(StoreError::Mode) if managed.is_some() => return Err(LaunchError::JobsMode),
+            Err(StoreError::Mode) => return Err(LaunchError::ManagedMode),
             Err(StoreError::Conflict) => {
                 // Another process won the job_key.
                 if let Some(key) = &job_key {
@@ -593,7 +693,10 @@ impl Launcher {
     async fn pull_and_start(&self, id: String, mut spec: StartSpec, timeout: u64) {
         // A pull that hangs would hold the slot forever, so it gets the job's own time limit.
         let limit = std::time::Duration::from_secs(timeout);
-        let failure = match tokio::time::timeout(limit, self.runtime.pull(&spec.image)).await {
+        let pulled = tokio::time::timeout(limit, self.runtime.pull(&spec.image)).await;
+        let stopped = self.stops.lock().await.remove(&id);
+        let failure = match pulled {
+            _ if stopped => Some("stopped before it started"),
             Err(_) => Some("image pull timed out"),
             Ok(Err(err)) => {
                 tracing::warn!(%id, image = %spec.image, error = %err, "pull failed");
@@ -628,16 +731,51 @@ impl Launcher {
             // Close the row before the slot is released, so a status request
             // cannot find the id neither starting nor recorded as failed.
             let ended = self.clock.now_unix() as i64;
-            match self
-                .store
-                .finish(&id, ended, None, REASON_START_FAILED, message)
-            {
+            let reason = if stopped {
+                REASON_LAUNCHER
+            } else {
+                REASON_START_FAILED
+            };
+            match self.store.finish(&id, ended, None, reason, message) {
                 Ok(Some(job)) => self.fire_callback(&job),
                 Ok(None) => {}
                 Err(err) => tracing::warn!(%id, error = %err, "could not record start failure"),
             }
         }
         self.starting.lock().await.remove(&id);
+        // A stop asked between the pull and the start.
+        if failure.is_none() && self.stops.lock().await.contains(&id) {
+            let _ = self.stop(&id).await;
+        }
+    }
+
+    /// Stops a job on a person's word: SIGKILL, and the row says
+    /// `launcher_kill`. A job still pulling its image ends before it starts.
+    /// `Ok(false)` when there is no such unfinished job.
+    pub async fn stop(&self, id: &str) -> Result<bool, LaunchError> {
+        match self.store.get(id).map_err(store_err)? {
+            Some(job) if !job.is_finished() => {}
+            _ => return Ok(false),
+        }
+        self.stops.lock().await.insert(id.to_string());
+        if self.starting.lock().await.contains(id) {
+            return Ok(true);
+        }
+        let code = match self.runtime.kill(id).await {
+            Ok(()) => Some(137),
+            // It may have ended by itself a moment ago.
+            Err(err) => match self.runtime.inspect(id).await.map_err(unavailable)? {
+                Inspected::Exited { exit_code } => Some(exit_code),
+                Inspected::NotFound => None,
+                Inspected::Running => {
+                    self.stops.lock().await.remove(id);
+                    return Err(unavailable(err));
+                }
+            },
+        };
+        self.complete(id, code, true).await;
+        tracing::info!(%id, "stopped on request");
+        Ok(true)
     }
 
     /// Running containers plus jobs accepted and not started yet.
@@ -710,7 +848,11 @@ impl Launcher {
             return;
         }
         let timed_out = self.timeouts.lock().await.contains(id);
-        let reason = end_reason(timed_out, exit_code, witnessed);
+        let reason = if !timed_out && self.stops.lock().await.contains(id) {
+            REASON_LAUNCHER
+        } else {
+            end_reason(timed_out, exit_code, witnessed)
+        };
         // Asked while the container still exists, and written on the row
         // before it is closed, so the callback is built with it.
         let oom = exit_code.is_some() && self.runtime.oom_killed(id).await.unwrap_or(false);
@@ -733,8 +875,10 @@ impl Launcher {
                 // status request can both get here for the same job.
                 self.note_resource_incidents(&job);
                 self.timeouts.lock().await.remove(id);
+                self.stops.lock().await.remove(id);
                 let _ = self.runtime.remove(id).await;
                 self.fire_callback(&job);
+                self.managed_changed.notify_one();
                 // A job that never started does not wake the poller: a task
                 // whose image cannot be pulled must not be asked for in a loop.
                 self.job_ended.notify_one();
