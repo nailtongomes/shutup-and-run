@@ -857,6 +857,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_local_page_lists_job_logs_and_serves_them_only_to_this_machine() {
+        const LO: [u8; 4] = [127, 0, 0, 1];
+        const HOST: &str = "127.0.0.1:8787";
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let clock = Arc::new(FakeClock::new(1_700_000_000));
+        let cfg = settings_extra(1, "status_page = true");
+        let launcher = Launcher::with_clock(cfg, runtime, clock).unwrap();
+        let app = router(launcher.clone());
+        let id = match launcher
+            .launch(crate::launcher::LaunchRequest {
+                image: "alpine".into(),
+                env: HashMap::new(),
+                timeout_secs: None,
+                cpu: None,
+                memory_bytes: None,
+                shm_bytes: None,
+                command: None,
+                job_key: None,
+                callback_url: None,
+            })
+            .await
+            .unwrap()
+        {
+            crate::launcher::LaunchOutcome::Created(job)
+            | crate::launcher::LaunchOutcome::Existing(job) => job.id,
+        };
+        launcher.settled().await;
+        mock.set_output(&id, "line one\nresult: 42\n").await;
+        mock.stop(&id, 0).await;
+        launcher.on_exit(&id, 0).await;
+
+        let get = |uri: String, ip: [u8; 4]| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(local("GET", &uri, ip, HOST, None))
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let disposition = response
+                    .headers()
+                    .get("content-disposition")
+                    .map(|v| v.to_str().unwrap().to_string());
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (
+                    status,
+                    disposition,
+                    String::from_utf8_lossy(&bytes).to_string(),
+                )
+            }
+        };
+        let (status, _, home) = get("/".into(), LO).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(home.contains("/local/logs"));
+        let (status, _, list) = get("/local/logs".into(), LO).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            list.contains(&format!("/local/logs/{id}?download=1")),
+            "{list}"
+        );
+        assert!(list.contains("alpine") && list.contains("ok"));
+        let (status, disposition, text) = get(format!("/local/logs/{id}"), LO).await;
+        assert_eq!(
+            (status, disposition.as_deref()),
+            (StatusCode::OK, Some("inline"))
+        );
+        assert_eq!(text, "line one\nresult: 42\n");
+        let (_, disposition, _) = get(format!("/local/logs/{id}?download=1"), LO).await;
+        assert!(disposition.unwrap().starts_with("attachment;"));
+        // Not from the network, and only a job id names a file.
+        let (status, _, _) = get(format!("/local/logs/{id}"), [203, 0, 113, 9]).await;
+        assert_ne!(status, StatusCode::OK);
+        let (status, _, _) = get("/local/logs/..%2F..%2Fjobs.sqlite".into(), LO).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = get("/local/logs/abc123".into(), LO).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn status_page_is_off_by_default_and_local_only_when_on() {
         const LO: [u8; 4] = [127, 0, 0, 1];
         const HOST: &str = "127.0.0.1:8787";

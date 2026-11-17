@@ -126,6 +126,11 @@ The JSON also carries `fix`. It is the same sentence under the name 0.2.8 used; 
 | `JOB_INVALID_JSON` | Fix the JSON of the job file and run `shutup-and-run job validate FILE` again. | Corrija o JSON do arquivo da tarefa e rode `shutup-and-run job validate ARQUIVO` de novo. |
 | `JOB_INVALID_FIELD` | Fix the field named in the error; docs/INTEGRATION-CONTRACT.md lists the fields of a job. | Corrija o campo citado no erro; docs/INTEGRATION-CONTRACT.md lista os campos de uma tarefa. |
 | `JOB_IMAGE_NOT_ALLOWED` | Add the image: `shutup-and-run config set allowlist IMAGE --apply`, or validate as a polled task with `--poll`. | Adicione a imagem: `shutup-and-run config set allowlist IMAGEM --apply`, ou valide como tarefa da poll URL com `--poll`. |
+| `JOB_NOT_FOUND` | Run `shutup-and-run jobs` to see the ids of this machine's jobs. | Rode `shutup-and-run jobs` para ver os ids dos jobs desta máquina. |
+| `JOB_ID_AMBIGUOUS` | Give more characters of the id; `shutup-and-run jobs` lists them. | Informe mais caracteres do id; `shutup-and-run jobs` lista todos. |
+| `JOB_LOG_MISSING` | Run `shutup-and-run jobs` to see how that job ended: a job that never started has no log, and a log is kept for 7 days. | Rode `shutup-and-run jobs` para ver como esse job terminou: um job que não iniciou não tem log, e um log fica guardado por 7 dias. |
+| `LAST_JOB_FAILED` | Read what it printed: `shutup-and-run jobs logs {}`. | Leia o que ele imprimiu: `shutup-and-run jobs logs {}`. |
+| `LAST_JOB_FAILED_NO_LOG` | Run `shutup-and-run jobs` to see why it ended; it left no output to read. | Rode `shutup-and-run jobs` para ver por que ele terminou; ele não deixou saída para ler. |
 | `DEMO_IMAGE_NOT_ALLOWED` | Name an allowed image with `--image`, or allow this one: `shutup-and-run config set allowlist {} --apply`. | Indique uma imagem permitida com `--image`, ou permita esta: `shutup-and-run config set allowlist {} --apply`. |
 | `DEMO_JOB_INVALID` | Run `shutup-and-run config check` and fix what it reports. | Rode `shutup-and-run config check` e corrija o que ele apontar. |
 | `JOB_FAILED` | Run `shutup-and-run config check` and fix what it reports. | Rode `shutup-and-run config check` e corrija o que ele apontar. |
@@ -282,11 +287,24 @@ shutup-and-run jobs --json       # the last 20 jobs and how each ended
 ```json
 {"ok": true, "limit": 20, "jobs": [
   {"id": "9f2c...", "image": "registry.example/protocol:1", "started_at": "2026-11-14T12:00:00Z",
-   "ended_at": "2026-11-14T12:00:42Z", "duration_secs": 42, "exit_code": 0, "status": "ok", "failure": null, "oom_killed": false}
+   "ended_at": "2026-11-14T12:00:42Z", "duration_secs": 42, "exit_code": 0, "status": "ok", "failure": null, "oom_killed": false,
+   "log": {"path": "/var/lib/shutup-and-run/logs/9f2c....log", "bytes": 1834, "command": "shutup-and-run jobs logs 9f2c..."}}
 ]}
 ```
 
-`status` is `running`, `ok` (exit 0), `failed` (another exit code, or the container never started), `timeout` (it ran past its time limit), `killed` (exit 137: stopped from outside; `oom_killed` is true when Docker confirmed it was for memory) or `interrupted` (the PC, WSL or Docker stopped under it, or the worker was not running when it ended; it is not run again, the service that sent it decides). `failure` says why in one sentence, and is null for `ok` and `running`. The history keeps the last 500 finished jobs at most, for `history_days`. It never holds or prints a job's env, command, payload or logs. The result of a job is not here either: the container sends it to the service itself.
+`status` is `running`, `ok` (exit 0), `failed` (another exit code, or the container never started), `timeout` (it ran past its time limit), `killed` (exit 137: stopped from outside; `oom_killed` is true when Docker confirmed it was for memory) or `interrupted` (the PC, WSL or Docker stopped under it, or the worker was not running when it ended; it is not run again, the service that sent it decides). `failure` says why in one sentence, and is null for `ok` and `running`. The history keeps the last 500 finished jobs at most, for `history_days`. It never holds or prints a job's env, command or payload. The result of a job is not here either: the container sends it to the service itself. `log` is null when the job has no log: it still runs, it never started a container, or its log is older than 7 days.
+
+### What a job printed: `jobs logs`
+
+Every job that ran a container leaves its output on the machine: the last 256 KiB of stdout and stderr together, in `logs/<job id>.log` next to the history (`/var/lib/shutup-and-run/logs/` on Linux and inside the WSL distribution on Windows). It is written when the job ends, however it ends (ok, failed, timeout, out of memory, stopped), in push, pull and managed mode alike. Files older than 7 days are deleted. Nothing is masked: what the job printed is there as it printed it.
+
+```bash
+shutup-and-run jobs logs 9f2c            # the start of an id is enough
+shutup-and-run jobs logs --last --tail 50
+shutup-and-run jobs logs 9f2c --json     # {"id", "path", "bytes", "written_at", "image", "status", "exit_code", "log"}
+```
+
+On Windows the same commands run in PowerShell; the `.exe` forwards them into the distribution. An id that matches nothing is `JOB_NOT_FOUND`, one that matches several is `JOB_ID_AMBIGUOUS`, and a job with no log is `JOB_LOG_MISSING`; each exits 1 with its hint. When the last job did not end well, the doctor warns with `LAST_JOB_FAILED` and its hint is the exact `jobs logs` command for that job. The person at the PC has the same files on the local page: `http://127.0.0.1:8787/local/logs`, to open or download.
 
 "Is the machine broken, or is it the server?" is two fields of `doctor --json` (and of `config check --json`), since 0.2.12:
 

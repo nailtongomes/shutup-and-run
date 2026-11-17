@@ -874,6 +874,8 @@ impl Launcher {
                 // Only the call that closed the row: the die event and a
                 // status request can both get here for the same job.
                 self.note_resource_incidents(&job);
+                // Before the container goes, with its output.
+                self.save_output(id).await;
                 self.timeouts.lock().await.remove(id);
                 self.stops.lock().await.remove(id);
                 let _ = self.runtime.remove(id).await;
@@ -888,6 +890,26 @@ impl Launcher {
             }
             Err(err) => tracing::warn!(%id, error = %err, "could not finish job"),
         }
+    }
+
+    /// The job's log file. A failure is a warning: the job has ended either
+    /// way, and the worker goes on.
+    async fn save_output(&self, id: &str) {
+        let output = match self.runtime.output(id, crate::joblogs::MAX_BYTES).await {
+            Ok(output) => output,
+            Err(err) => {
+                tracing::warn!(%id, error = %err, "job log: could not read the output");
+                return;
+            }
+        };
+        if let Err(err) = crate::joblogs::save(&self.settings.history_path, id, &output) {
+            tracing::warn!(%id, error = %err, "job log: could not write it");
+        }
+    }
+
+    /// Recent jobs, newest first, for the local page.
+    pub fn recent_jobs(&self, limit: usize) -> Result<Vec<JobRecord>, LaunchError> {
+        self.store.recent(limit).map_err(store_err)
     }
 
     /// What Docker and the kernel said about how a job used its limits,
@@ -954,6 +976,10 @@ impl Launcher {
                 .map_err(store_err)?;
         if removed > 0 {
             tracing::info!(removed, "purged old jobs");
+        }
+        let logs = crate::joblogs::purge(&self.settings.history_path, std::time::SystemTime::now());
+        if logs > 0 {
+            tracing::info!(logs, "deleted job logs older than 7 days");
         }
         Ok(removed)
     }
@@ -1637,6 +1663,87 @@ mod tests {
         };
         launcher.settled().await;
         id
+    }
+
+    #[tokio::test]
+    async fn every_job_that_ran_leaves_its_output_in_a_log_file_and_the_doctor_names_it() {
+        let (launcher, mock, _clock) = harness(3);
+        let history = launcher.settings().history_path.clone();
+
+        let ok = started(&launcher, job("alpine", None)).await;
+        mock.set_output(&ok, "hello from the job\n").await;
+        mock.stop(&ok, 0).await;
+        launcher.on_exit(&ok, 0).await;
+        let saved = crate::joblogs::path(&history, &ok);
+        assert_eq!(
+            std::fs::read_to_string(&saved).unwrap(),
+            "hello from the job\n"
+        );
+        assert!(crate::cli::last_job_check(&history).is_none());
+
+        let bad = started(&launcher, job("alpine", None)).await;
+        mock.set_output(&bad, "step 1\nTraceback: boom\n").await;
+        mock.stop(&bad, 3).await;
+        launcher.on_exit(&bad, 3).await;
+        // By the start of its id, and --last, with --tail.
+        let out = crate::jobs::logs_out(&history, Some(&bad[..8]), None);
+        assert_eq!(out.code, 0, "{}", out.json);
+        assert_eq!(out.json["status"], "failed");
+        assert_eq!(out.json["exit_code"], 3);
+        assert!(out.text.contains("Traceback: boom"));
+        let last = crate::jobs::logs_out(&history, None, Some(1));
+        assert_eq!(last.json["id"], bad.as_str());
+        assert_eq!(last.text, "Traceback: boom");
+        // `jobs --json` says where, and the doctor which command reads it.
+        let listed = crate::jobs::jobs_out(&history, 5);
+        assert_eq!(
+            listed.json["jobs"][0]["log"]["command"],
+            format!("shutup-and-run jobs logs {bad}")
+        );
+        assert!(listed
+            .text
+            .contains(&format!("log: shutup-and-run jobs logs {bad}")));
+        let check = crate::cli::last_job_check(&history).unwrap();
+        assert!(check.soft && !check.ok);
+        assert_eq!(check.code(), "LAST_JOB_FAILED");
+        assert_eq!(
+            check.hint(),
+            format!("Read what it printed: `shutup-and-run jobs logs {bad}`.")
+        );
+
+        // A person's stop and a timeout keep theirs too.
+        let stopped = started(&launcher, job("alpine", None)).await;
+        assert!(launcher.stop(&stopped).await.unwrap());
+        assert!(crate::joblogs::info(&history, &stopped).is_some());
+
+        // Not there: an unknown id, a job that never started a container.
+        let unknown = crate::jobs::logs_out(&history, Some("nope"), None);
+        assert_eq!(
+            (unknown.code, unknown.json["code"].as_str()),
+            (1, Some("JOB_NOT_FOUND"))
+        );
+        mock.fail_start(true).await;
+        let never = started(&launcher, job("alpine", None)).await;
+        mock.fail_start(false).await;
+        let missing = crate::jobs::logs_out(&history, Some(&never), None);
+        assert_eq!(missing.json["code"], "JOB_LOG_MISSING");
+        assert!(missing.text.contains("never started"));
+        assert_eq!(
+            crate::cli::last_job_check(&history).unwrap().code(),
+            "LAST_JOB_FAILED_NO_LOG"
+        );
+
+        // A log that cannot be written is a warning, not a failed worker.
+        std::fs::remove_dir_all(crate::joblogs::dir(&history)).unwrap();
+        std::fs::write(crate::joblogs::dir(&history), b"in the way").unwrap();
+        let unlucky = started(&launcher, job("alpine", None)).await;
+        mock.stop(&unlucky, 0).await;
+        launcher.on_exit(&unlucky, 0).await;
+        assert_eq!(
+            ended(&launcher, &unlucky).await,
+            (Some(crate::REASON_EXITED.into()), Some(0))
+        );
+        started(&launcher, job("alpine", None)).await;
     }
 
     async fn ended(launcher: &Launcher, id: &str) -> (Option<String>, Option<i64>) {

@@ -455,3 +455,16 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** An update ends running jobs, as a re-install did. The rollback of the `.exe` and of the binary are two steps in two places; a power cut between them leaves a `VERSION_MISMATCH`, which the doctor names and `wsl update` fixes. CI installs the latest release in WSL2 on the Windows runner, updates it with this build and rolls back from an `.exe` that does not start. Until a release differs from the build, the two versions there are the same, so the swap is real but the numbers do not change; a PC with jobs, pause and authorization is still a hand test.
 
+## A job's output is kept on the machine, unmasked, for 7 days
+
+**Context.** The container is removed when a job ends, and with it what the job printed. A managed job on a Windows PC ended with exit 0 and left nothing to read: `docker ps -a` was empty, and `wsl logs` has only the worker's own lines. The history row kept the last `log_lines` lines for `GET /v1/jobs/{id}?logs=true`, which neither the owner nor an agent at the PC uses. The rule until now was that `jobs` and the local page never show a job's output; the owner asked for it.
+
+**Decision.**
+
+- Just before the container is removed, the last 256 KiB of stdout and stderr go to `logs/<job id>.log` next to the history: mode 600, the folder 700, written through a temporary file. The cut drops the partial first line. One place, `Launcher::complete`, in the branch that closed the row, so every mode and every ending goes through it. A job that never started a container has no file. A failure to read or write is a warning; the job and the worker go on.
+- Files older than 7 days go at each purge pass. Size and age are constants, not settings.
+- `jobs logs ID|--last [--tail N] [--json]` reads them with no service running, like `jobs`. `jobs --json` gives each job's `log` (path, size, command). The doctor warns about a last job that did not end well, with the exact command. The local page lists them and serves one as text, to open or download; the id must be a worker id, so no other file can be named.
+- Nothing is masked: masking that is not complete is worse than none, and the owner asked for the output as it was.
+
+**Cost.** Up to 256 KiB per job for 7 days on disk: with `max_slots` 1 and a job a minute, about 2.5 GiB at most. A job that prints a secret leaves it in a file readable by root, and on a client's PC by whoever uses it, as the rule about Windows machines already assumes; the local page shows it to anyone at the PC. Output is read once at the end, all of it streamed from Docker and only the end held: a job that printed gigabytes costs that read. There is no live view. stdout and stderr are in the order Docker read them, which is not always the order the job wrote them.
+

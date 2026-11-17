@@ -330,6 +330,30 @@ impl Runtime for BollardRuntime {
         Ok(buf)
     }
 
+    async fn output(&self, id: &str, max_bytes: usize) -> Result<Vec<u8>, RuntimeError> {
+        // All of it is read, and only the end is held: twice the limit at
+        // most, trimmed as it grows.
+        let options = bollard::query_parameters::LogsOptionsBuilder::new()
+            .stdout(true)
+            .stderr(true)
+            .build();
+        let mut stream = self.docker.logs(&container_ref(id), Some(options));
+        let mut kept: Vec<u8> = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    kept.extend_from_slice(&chunk.into_bytes());
+                    if kept.len() > 2 * max_bytes {
+                        kept.drain(..kept.len() - max_bytes);
+                    }
+                }
+                Err(err) if is_status(&err, 404) => break,
+                Err(err) => return Err(docker_err(err)),
+            }
+        }
+        Ok(crate::joblogs::clip(&kept, max_bytes).to_vec())
+    }
+
     async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
         let options = RemoveContainerOptionsBuilder::new().force(true).build();
         match self

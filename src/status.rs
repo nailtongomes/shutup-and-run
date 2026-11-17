@@ -45,6 +45,8 @@ pub fn router(launcher: Arc<Launcher>) -> Router {
         )
         .route("/local/managed", get(managed_page).post(managed_save))
         .route("/local/managed/edit", get(managed_edit))
+        .route("/local/logs", get(logs_page))
+        .route("/local/logs/{id}", get(log_file))
         .layer(from_fn(local_only))
         .with_state(launcher)
 }
@@ -448,6 +450,109 @@ async fn safety_save(
     )
 }
 
+/// The logs of the last jobs: one row each, with a link that opens the
+/// file in the browser and one that saves it.
+async fn logs_page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Response {
+    let lang = lang_of(&headers, &launcher.settings().language);
+    let history = launcher.settings().history_path.clone();
+    let jobs: HashMap<String, JobRecord> = launcher
+        .recent_jobs(crate::launcher::MAX_HISTORY_ROWS)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|job| (job.id.clone(), job))
+        .collect();
+    let mut logs: Vec<crate::joblogs::Info> = crate::joblogs::ids(&history)
+        .iter()
+        .filter_map(|id| crate::joblogs::info(&history, id))
+        .collect();
+    logs.sort_by_key(|info| std::cmp::Reverse(info.written_at));
+    let rows: String = logs
+        .iter()
+        .take(100)
+        .map(|info| {
+            let id = info
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let job = jobs.get(&id);
+            format!(
+                "<tr><td><code>{short}</code></td><td>{image}</td><td>{status}</td><td>{at}</td><td>{size}</td>\
+                 <td><a href=\"/local/logs/{id}\">{open}</a> &middot; \
+                 <a href=\"/local/logs/{id}?download=1\">{save}</a></td></tr>",
+                short = escape(&id[..id.len().min(12)]),
+                image = escape(job.map(|j| j.image.as_str()).unwrap_or("?")),
+                status = job.map(crate::jobs::status_of).unwrap_or("?"),
+                at = escape(&unix_to_iso(info.written_at)),
+                size = crate::resources::human(info.bytes),
+                id = escape(&id),
+                open = lang.t("open", "abrir"),
+                save = lang.t("download", "baixar"),
+            )
+        })
+        .collect();
+    let table = if rows.is_empty() {
+        format!(
+            "<p>{}</p>",
+            lang.t("No job has left a log yet.", "Nenhum job deixou log ainda.")
+        )
+    } else {
+        format!(
+            "<table><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th></th></tr>{rows}</table>",
+            lang.t("Job", "Job"),
+            lang.t("Image", "Imagem"),
+            lang.t("Status", "Status"),
+            lang.t("Written at (UTC)", "Gravado em (UTC)"),
+            lang.t("Size", "Tamanho"),
+        )
+    };
+    let body = format!(
+        "<h2>{title}</h2><p>{note}</p>{table}<p><a href=\"/\">{back}</a></p>",
+        title = lang.t("Job output (logs)", "Saída dos jobs (logs)"),
+        note = lang.t(
+            "What each job printed: the last 256 KiB, kept on this computer for 7 days. Nothing in it is masked.",
+            "O que cada job imprimiu: os últimos 256 KiB, guardados neste computador por 7 dias. Nada é mascarado."
+        ),
+        back = lang.t("Back to the status", "Voltar ao status"),
+    );
+    html(StatusCode::OK, shell(lang, "/local/logs", None, &body))
+}
+
+/// One log, as text: shown in the browser, or saved with `?download=1`.
+async fn log_file(
+    State(launcher): State<Arc<Launcher>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    // The id names a file: worker ids are hex, and nothing else is let through.
+    if !crate::launcher::valid_container_id(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = crate::joblogs::path(&launcher.settings().history_path, &id);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let disposition = if query.contains_key("download") {
+        format!("attachment; filename=\"shutup-and-run-{id}.log\"")
+    } else {
+        "inline".to_string()
+    };
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/plain; charset=utf-8".to_string(),
+            ),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 fn html(status: StatusCode, body: String) -> Response {
     (status, [(header::CACHE_CONTROL, "no-store")], Html(body)).into_response()
 }
@@ -640,7 +745,8 @@ pub(crate) fn render(view: &View) -> String {
          <tr><td>{t_machine}</td><td>{worker} ({os})</td></tr>\
          </table>\
          <form method=\"post\" action=\"{action}\"><p><button>{label}</button></p></form>\
-         {settings}{computer}<p><small>{note}</small></p>",
+         {settings}<p><a href=\"/local/logs\">{t_logs}</a></p>{computer}<p><small>{note}</small></p>",
+        t_logs = lang.t("Job output (logs)", "Saída dos jobs (logs)"),
         computer = computer_section(view),
         managed = match view.managed {
             None => String::new(),

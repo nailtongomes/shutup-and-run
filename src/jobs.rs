@@ -1,6 +1,7 @@
 //! `shutup-and-run jobs`: the last jobs of this machine, from the history
 //! file. What ran, when, for how long and how it ended. Never the env, the
-//! command, the logs or anything else a job was given.
+//! command or anything else a job was given. `jobs logs` prints what a job
+//! printed, from its log file (`src/joblogs.rs`).
 
 use crate::cli::{emit, Out, EXIT_FAILED, EXIT_USAGE};
 use crate::store::{JobRecord, Store};
@@ -19,9 +20,17 @@ shutup-and-run jobs [--limit N] [--json]
     id, image, start, end, duration, exit code, status and, when it did not
     end well, why. Status is running, ok, failed, timeout, killed or
     interrupted (the PC, WSL or Docker stopped under the job). A job that
-    Docker confirmed was killed for memory says so (oom_killed). The
-    history holds at most the last 500 finished jobs, and never a job's env,
-    command, payload or logs."
+    Docker confirmed was killed for memory says so (oom_killed). `log` is
+    where its output is kept, and the command that prints it. The history
+    holds at most the last 500 finished jobs, and never a job's env,
+    command or payload.
+
+shutup-and-run jobs logs ID|--last [--tail N] [--json]
+    what a job printed (stdout and stderr): its last 256 KiB, kept for 7
+    days in the logs folder next to the history. ID may be the start of an
+    id. --last is the most recent job that ended. --tail N prints only the
+    last N lines. Exit 1 with JOB_NOT_FOUND, JOB_ID_AMBIGUOUS or
+    JOB_LOG_MISSING."
 }
 
 /// `running`, `ok`, `failed`, `timeout`, `killed` or `interrupted`.
@@ -95,6 +104,24 @@ pub fn job_json(job: &JobRecord) -> Value {
     })
 }
 
+/// The command that prints the log of job `id`.
+pub fn log_command(id: &str) -> String {
+    format!("shutup-and-run jobs logs {id}")
+}
+
+/// Where a job's log is, or null when it has none (it never started a
+/// container, it still runs, or its log was deleted after 7 days).
+pub fn log_json(history: &Path, id: &str) -> Value {
+    match crate::joblogs::info(history, id) {
+        Some(info) => json!({
+            "path": info.path.display().to_string(),
+            "bytes": info.bytes,
+            "command": log_command(id),
+        }),
+        None => Value::Null,
+    }
+}
+
 pub fn jobs_out(history: &Path, limit: usize) -> Out {
     if !history.exists() {
         return Out::ok(
@@ -108,8 +135,9 @@ pub fn jobs_out(history: &Path, limit: usize) -> Out {
     };
     let mut text = String::new();
     for job in &jobs {
+        let has_log = crate::joblogs::info(history, &job.id).is_some();
         text.push_str(&format!(
-            "{}  {:<8} {:>6}  exit {:<4} {}  {}{}\n",
+            "{}  {:<8} {:>6}  exit {:<4} {}  {}{}{}\n",
             utc(job.started_at),
             status_of(job),
             job.duration_secs()
@@ -123,17 +151,183 @@ pub fn jobs_out(history: &Path, limit: usize) -> Out {
             failure_of(job)
                 .map(|why| format!("\n    why: {why}"))
                 .unwrap_or_default(),
+            if has_log && failure_of(job).is_some() {
+                format!("\n    log: {}", log_command(&job.id))
+            } else {
+                String::new()
+            },
         ));
     }
     if jobs.is_empty() {
         text.push_str("no jobs yet");
     }
-    let list: Vec<Value> = jobs.iter().map(job_json).collect();
+    let list: Vec<Value> = jobs
+        .iter()
+        .map(|job| {
+            let mut value = job_json(job);
+            value["log"] = log_json(history, &job.id);
+            value
+        })
+        .collect();
     Out::ok(json!({"jobs": list, "limit": limit}), text.trim_end())
+}
+
+/// Which job `wanted` names: a whole id or the start of one, among the
+/// jobs of the history and the logs on disk. `None` is `--last`.
+fn resolve(history: &Path, store: Option<&Store>, wanted: Option<&str>) -> Result<String, Out> {
+    let known: Vec<JobRecord> = store
+        .and_then(|s| s.recent(crate::launcher::MAX_HISTORY_ROWS).ok())
+        .unwrap_or_default();
+    let Some(wanted) = wanted else {
+        return known
+            .iter()
+            .find(|job| job.is_finished())
+            .map(|job| job.id.clone())
+            .ok_or_else(|| {
+                coded(
+                    "JOB_NOT_FOUND",
+                    "no job has ended on this machine yet".into(),
+                )
+            });
+    };
+    let mut ids: Vec<String> = known.into_iter().map(|job| job.id).collect();
+    ids.extend(crate::joblogs::ids(history));
+    ids.sort();
+    ids.dedup();
+    if ids.iter().any(|id| id == wanted) {
+        return Ok(wanted.to_string());
+    }
+    let matches: Vec<&String> = ids.iter().filter(|id| id.starts_with(wanted)).collect();
+    match matches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err(coded(
+            "JOB_NOT_FOUND",
+            format!("no job {wanted} on this machine"),
+        )),
+        many => Err(coded(
+            "JOB_ID_AMBIGUOUS",
+            format!(
+                "{wanted} is the start of {} jobs: {}",
+                many.len(),
+                many.iter()
+                    .take(5)
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
+}
+
+fn coded(code: &str, error: String) -> Out {
+    let mut out = Out::fail(EXIT_FAILED, error);
+    out.json["code"] = json!(code);
+    out
+}
+
+/// `jobs logs ID|--last [--tail N]`.
+pub fn logs_out(history: &Path, wanted: Option<&str>, tail: Option<usize>) -> Out {
+    let store = if history.exists() {
+        Store::open(history).ok()
+    } else {
+        None
+    };
+    let id = match resolve(history, store.as_ref(), wanted) {
+        Ok(id) => id,
+        Err(out) => return out,
+    };
+    let job = store.as_ref().and_then(|s| s.get(&id).ok().flatten());
+    let Some(info) = crate::joblogs::info(history, &id) else {
+        let why = match &job {
+            Some(job) if !job.is_finished() => {
+                "it is still running; its log is written when it ends"
+            }
+            Some(job) if job.reason.as_deref() == Some(REASON_START_FAILED) => {
+                "it never started a container, so it printed nothing"
+            }
+            _ => "it was deleted after 7 days, or the job printed nothing the worker could read",
+        };
+        return coded("JOB_LOG_MISSING", format!("job {id} has no log: {why}"));
+    };
+    let bytes = match std::fs::read(&info.path) {
+        Ok(bytes) => bytes,
+        Err(err) => return Out::fail(EXIT_FAILED, format!("{}: {err}", info.path.display())),
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let shown = match tail {
+        Some(n) => crate::joblogs::tail_lines(&text, n),
+        None => &text,
+    };
+    let mut value = json!({
+        "id": id,
+        "path": info.path.display().to_string(),
+        "bytes": info.bytes,
+        "written_at": utc(info.written_at),
+        "log": shown,
+    });
+    if let Some(job) = &job {
+        value["image"] = json!(job.image);
+        value["status"] = json!(status_of(job));
+        value["exit_code"] = json!(job.exit_code);
+    }
+    Out::ok(value, shown.strip_suffix('\n').unwrap_or(shown))
+}
+
+fn logs_cli(args: &[String], as_json: bool) -> ExitCode {
+    let mut wanted: Option<&str> = None;
+    let mut last = false;
+    let mut tail = None;
+    let mut words = args.iter().filter(|a| *a != "--json");
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--last" => last = true,
+            "--tail" => match words.next().and_then(|n| n.parse::<usize>().ok()) {
+                Some(n) if n >= 1 => tail = Some(n),
+                _ => {
+                    return emit(
+                        Out::fail(EXIT_USAGE, "--tail takes a number of lines, 1 or more"),
+                        as_json,
+                    )
+                }
+            },
+            "-h" | "--help" => {
+                println!("{}", usage());
+                return ExitCode::SUCCESS;
+            }
+            other if !other.starts_with('-') && wanted.is_none() => wanted = Some(other),
+            other => {
+                return emit(
+                    Out::fail(EXIT_USAGE, format!("unknown option {other}. {}", usage())),
+                    as_json,
+                )
+            }
+        }
+    }
+    if last == wanted.is_some() {
+        return emit(
+            Out::fail(
+                EXIT_USAGE,
+                "name one job: `jobs logs ID` or `jobs logs --last`",
+            ),
+            as_json,
+        );
+    }
+    let out = match crate::config::Settings::history_path() {
+        Ok(path) => logs_out(&path, wanted, tail),
+        Err(err) => Out::fail(EXIT_FAILED, err.0),
+    };
+    emit(out, as_json)
 }
 
 pub fn jobs_cli(args: &[String]) -> ExitCode {
     let as_json = args.iter().any(|a| a == "--json");
+    if let Some(at) = args.iter().position(|a| a != "--json") {
+        if args[at] == "logs" {
+            let mut rest = args.to_vec();
+            rest.remove(at);
+            return logs_cli(&rest, as_json);
+        }
+    }
     let mut limit = DEFAULT_LIMIT;
     let mut words = args.iter().filter(|a| *a != "--json");
     while let Some(word) = words.next() {
@@ -254,7 +448,8 @@ mod tests {
         assert!(jobs[0]["ended_at"].is_null() && jobs[0]["duration_secs"].is_null());
         assert!(jobs[3]["failure"].as_str().unwrap().contains("time limit"));
 
-        // Exactly these fields: no env, command, key, callback or logs.
+        // Exactly these fields: no env, command, key, callback, and no
+        // output (only where its log is, null here: nothing was saved).
         let mut fields: Vec<&str> = ok.as_object().unwrap().keys().map(String::as_str).collect();
         fields.sort_unstable();
         assert_eq!(
@@ -266,6 +461,7 @@ mod tests {
                 "failure",
                 "id",
                 "image",
+                "log",
                 "oom_killed",
                 "started_at",
                 "status"

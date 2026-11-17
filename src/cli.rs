@@ -139,12 +139,15 @@ impl Out {
 }
 
 pub(crate) fn emit(mut out: Out, as_json: bool) -> ExitCode {
+    use std::io::Write;
     crate::hints::attach(&mut out.json, out.code);
+    // Written, not printed: a reader that stops early (`| head`) is not an
+    // error of this program.
     if as_json {
-        println!("{}", out.json);
+        let _ = writeln!(std::io::stdout(), "{}", out.json);
     } else if out.code == 0 {
         if !out.text.is_empty() {
-            println!("{}", out.text);
+            let _ = writeln!(std::io::stdout(), "{}", out.text);
         }
     } else {
         eprintln!("shutup-and-run: {}", out.text);
@@ -1359,6 +1362,29 @@ pub async fn base_checks() -> (Found, Option<Settings>) {
 
 /// What only a running service can answer: its state, a pause, bans, the
 /// poll URL as the service last saw it.
+/// The last job that ended, when it did not end well: a warning that names
+/// the command printing its output.
+pub fn last_job_check(history: &Path) -> Option<Check> {
+    if !history.exists() {
+        return None;
+    }
+    let store = crate::store::Store::open(history).ok()?;
+    let job = store
+        .recent(20)
+        .ok()?
+        .into_iter()
+        .find(|j| j.is_finished())?;
+    let why = crate::jobs::failure_of(&job)?;
+    let detail = format!("job {} ({}): {why}", job.id, job.image);
+    Some(if crate::joblogs::info(history, &job.id).is_some() {
+        soft("last-job", false, detail)
+            .coded("LAST_JOB_FAILED")
+            .with(job.id)
+    } else {
+        soft("last-job", false, detail).coded("LAST_JOB_FAILED_NO_LOG")
+    })
+}
+
 async fn service_checks(found: &mut Found, settings: &Settings) {
     let mut checks = std::mem::take(&mut found.checks);
     let status = read_status(&crate::status::status_path(&settings.history_path));
@@ -1409,6 +1435,9 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
         checks.push(
             soft("paused", false, "the worker is paused and takes no work").coded("WORKER_PAUSED"),
         );
+    }
+    if let Some(check) = last_job_check(&settings.history_path) {
+        checks.push(check);
     }
 
     if settings.history_path.exists() {

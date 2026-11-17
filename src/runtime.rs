@@ -69,6 +69,12 @@ pub trait Runtime: Send + Sync {
     async fn cpu_throttling(&self, _id: &str) -> Result<Option<Throttling>, RuntimeError> {
         Ok(None)
     }
+    /// The end of a container's stdout and stderr, at most `max_bytes`, for
+    /// the job's log file. A runtime that streams overrides this.
+    async fn output(&self, id: &str, max_bytes: usize) -> Result<Vec<u8>, RuntimeError> {
+        let text = self.tail_logs(id, 100_000).await?;
+        Ok(crate::joblogs::clip(text.as_bytes(), max_bytes).to_vec())
+    }
 }
 
 /// Counted by the kernel since the container started.
