@@ -349,7 +349,7 @@ Só `image` é obrigatório. Campos desconhecidos são recusados. `job_key` torn
 **Pull.** Com `poll_url` definida, a máquina faz POST nela a cada `poll_interval_secs` (30 segundos, e nunca menos), só quando tem um slot livre, não está pausada e não está com pouca memória ou disco:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.14", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.15", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 A resposta é nada (`204`), uma tarefa, `{"task": {...}}`, ou `{"manifest_url": "https://..."}`, que é buscado uma vez e precisa ser uma tarefa. `401` ou `403` quer dizer "ainda não aprovada": o worker não inicia nada e continua perguntando, espaçando até cinco minutos. O servidor decide quais máquinas recebem trabalho; o token do worker é a identidade dele.
@@ -391,6 +391,7 @@ O download é conferido com o `SHA256SUMS` da mesma release. Rodar de novo atual
 | Comando | |
 | --- | --- |
 | `wsl install [--poll-url URL] [--max-slots N] [--worker-name NOME] [--wsl-memory 4GB] [--wsl-processors 2]` | Instala ou atualiza. Mantém a configuração; muda só as opções informadas. |
+| `wsl update` | Depois de um `.exe` novo: o binário Linux da mesma versão, e o worker reiniciado. O `install.ps1` roda isso. [Atualizar e corrigir](docs/WINDOWS.md#update-and-repair). |
 | `wsl doctor`, `doctor` | Confere tudo, com a correção de cada problema. |
 | `wsl limits [--apply]` | Quanto do PC o WSL2 pode usar. |
 | `wsl start`, `wsl stop`, `wsl logs` | A tarefa de logon e o log do supervisor. |

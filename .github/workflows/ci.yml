@@ -19,8 +19,9 @@ jobs:
       - name: windows fallback launcher shape
         run: python3 scripts/windows/check-sar-launcher.py
 
-  # The Windows .exe is the WSL supervisor. The GitHub-hosted runner has no
-  # usable WSL2, so the doctor must stop at its first check and exit 1.
+  # The Windows .exe is the WSL supervisor. Before anything is installed the
+  # runner has no shutup-and-run distribution, so the doctor must stop early
+  # and exit 1. The runner does have WSL2: the windows-update job installs.
   windows:
     runs-on: windows-latest
     steps:
@@ -108,6 +109,8 @@ jobs:
           if ($LASTEXITCODE -eq 0) { throw "install.ps1 accepted a wrong checksum" }
           $got = (Get-FileHash -Algorithm SHA256 $installed).Hash.ToLower()
           if ($got -ne $want) { throw "a refused install changed the .exe" }
+          $left = @(Get-ChildItem (Split-Path $installed) -Name | Where-Object { $_ -like "*.tmp" -or $_ -eq "SHA256SUMS" })
+          if ($left.Count -gt 0) { throw "a refused install left behind: $($left -join ', ')" }
           Stop-Process -Id $server.Id -Force
 
           # Step 7 of the install, alone: register, look, remove.
@@ -129,6 +132,99 @@ jobs:
           name: shutup-and-run-windows-exe
           path: target/release/shutup-and-run.exe
           retention-days: 7
+
+  # The update that failed on a real PC. The Windows runner has WSL2, so this
+  # is the whole thing: the latest release installed in its own distribution,
+  # its task running (the supervisor holds the .exe), then install.ps1 of this
+  # build over it, which must leave the .exe and the binary in the
+  # distribution both on this build's version. Then a new .exe that does not
+  # start, which must leave the previous one installed and running.
+  windows-update:
+    runs-on: windows-latest
+    needs: [windows, musl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: shutup-and-run-windows-exe
+          path: build
+      - uses: actions/download-artifact@v4
+        with:
+          name: shutup-and-run-musl
+          path: build
+      - name: install.ps1 over a running older release, and a rollback
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = "Stop"
+          $asset = "shutup-and-run-x86_64-pc-windows-msvc.exe"
+          $dir = Join-Path $env:ProgramData "shutup-and-run"
+          $installed = Join-Path $dir "shutup-and-run.exe"
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          function Running { @(Get-Process -Name shutup-and-run -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $installed }) }
+          function Leftovers {
+            $left = @(Get-ChildItem $dir -Name | Where-Object { $_ -like "*.tmp" -or $_ -eq "SHA256SUMS" -or $_ -like "*.old" -or $_ -like "*.failed" })
+            if ($left.Count -gt 0) { throw "install.ps1 left behind: $($left -join ', ')" }
+          }
+          function Versions {
+            $doctor = (& $installed wsl doctor --json) -join "`n" | ConvertFrom-Json
+            $line = $doctor.checks | Where-Object { $_.name -eq "version" }
+            $inner = (wsl.exe -d shutup-and-run -u root -- /usr/local/bin/shutup-and-run version --json) -join "" | ConvertFrom-Json
+            Write-Host "exe $((& $installed version --json | ConvertFrom-Json).version), distribution $($inner.version), doctor: $($line.detail)"
+            if ($line.status -ne "ok") { throw "the doctor's version line is $($line.status): $($line.detail)" }
+            if ($inner.version -ne $version) { throw "the binary in the distribution is $($inner.version), expected $version" }
+          }
+          # N-1: the latest release from GitHub, installed in WSL, its task running.
+          $env:SHUTUP_AND_RUN_EXE_URL = ""
+          $env:SHUTUP_AND_RUN_POLL_URL = ""
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 of the latest release exited $LASTEXITCODE" }
+          $before = (& $installed version --json | ConvertFrom-Json).version
+          Write-Host "latest release: $before, this build: $version"
+          & $installed wsl install
+          if ($LASTEXITCODE -ne 0) { throw "wsl install of the latest release exited $LASTEXITCODE" }
+          $old = @(Running)
+          if ($old.Count -lt 1) { throw "the older release is not running from $installed" }
+
+          # N: this build, over it.
+          $rel = Join-Path $env:RUNNER_TEMP "release-n"
+          New-Item -ItemType Directory -Force -Path $rel | Out-Null
+          $musl = "shutup-and-run-x86_64-unknown-linux-musl"
+          Copy-Item build\shutup-and-run.exe (Join-Path $rel $asset)
+          Copy-Item build\shutup-and-run (Join-Path $rel $musl)
+          $want = (Get-FileHash -Algorithm SHA256 (Join-Path $rel $asset)).Hash.ToLower()
+          $linux = (Get-FileHash -Algorithm SHA256 (Join-Path $rel $musl)).Hash.ToLower()
+          Set-Content -Encoding ascii -Path (Join-Path $rel "SHA256SUMS") -Value "$want  $asset", "$linux  $musl"
+          $server = Start-Process python -ArgumentList "-m", "http.server", "8098", "--bind", "127.0.0.1", "--directory", $rel -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 3
+          $env:SHUTUP_AND_RUN_EXE_URL = "http://127.0.0.1:8098/$asset"
+          # `wsl update` fetches the Linux binary from here, not from a release.
+          $env:SHUTUP_AND_RUN_URL = "http://127.0.0.1:8098/$musl"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 over a running worker exited $LASTEXITCODE" }
+          $got = (Get-FileHash -Algorithm SHA256 $installed).Hash.ToLower()
+          if ($got -ne $want) { throw "the update installed $got, expected $want" }
+          Leftovers
+          foreach ($p in $old) { if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { throw "the older supervisor (pid $($p.Id)) is still running" } }
+          if ((Running).Count -lt 1) { throw "the task did not start the new .exe" }
+          Versions
+
+          # A new .exe that cannot start: the one before stays, and runs.
+          Set-Content -Encoding ascii -Path (Join-Path $rel $asset) -Value "not a program"
+          $bad = (Get-FileHash -Algorithm SHA256 (Join-Path $rel $asset)).Hash.ToLower()
+          Set-Content -Encoding ascii -Path (Join-Path $rel "SHA256SUMS") -Value "$bad  $asset"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1
+          if ($LASTEXITCODE -eq 0) { throw "install.ps1 accepted an .exe that does not start" }
+          $got = (Get-FileHash -Algorithm SHA256 $installed).Hash.ToLower()
+          if ($got -ne $want) { throw "the rollback left $got, expected $want" }
+          Leftovers
+          Start-Sleep -Seconds 10
+          if ((Running).Count -lt 1) { throw "the rollback did not start the previous .exe again" }
+          Versions
+
+          Stop-Process -Id $server.Id -Force
+          & $installed wsl uninstall --purge
+          exit 0
 
   accept:
     runs-on: ubuntu-latest
@@ -182,6 +278,13 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      # For the Windows update job: the Linux binary of this build's version,
+      # which no release has yet.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shutup-and-run-musl
+          path: target/x86_64-unknown-linux-musl/release/shutup-and-run
+          retention-days: 7
       - name: binary is static
         run: |
           bin=target/x86_64-unknown-linux-musl/release/shutup-and-run

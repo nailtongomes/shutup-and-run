@@ -441,3 +441,17 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - Start, stop, enable and disable are open on the local page, like the pause. What a container is, removing it and the mode are behind the admin login. There is no API route for any of it: the bearer token is the orchestrator's, and this is the feature for machines without one.
 
 **Cost.** The runner now has a scheduler, a small one: no cron expressions, no dependencies, no catch-up. A machine cannot serve a queue and run managed containers at once. The CLI's start and stop take up to 10 seconds to happen and say so. An `always` container that can never work is retried every 15 minutes forever and shows its count of failures. Secrets are plain text in a root-only file, as the tokens in `config.json` are; on a Windows PC its user can read them, as the rule about Windows machines already says. `demo` runs on a history of its own and so still runs in managed mode. On Windows `wsl reset` deletes the history, and with it the definitions, secrets and mode; only `config.json` has a copy on the host. Each pass inspects each running managed container once (one local Docker call per container per 10 s).
+
+## An update replaces both halves, or neither (Windows, 0.2.15)
+
+**Context.** On a client's PC `install.ps1` over a running worker failed at `Move-Item`: `schtasks /End` showed the task as ready while `wsl serve --background` still ran under its console host and held the `.exe`. The script left the download and `SHA256SUMS` in the folder. Once the `.exe` was swapped by hand, the Linux binary in the distribution was still the old release until `wsl install` ran again.
+
+**Decision.**
+
+- `install.ps1` over an installed `.exe` stops the worker with `wsl stop` (the jobs get SIGTERM, as a stop always gave them), then ends a process still running that one path, and only that path. It renames the old `.exe` instead of overwriting it, which Windows allows even while it runs, so a process that refuses to die does not stop the update.
+- The Linux half is `wsl update`, not `wsl install`: only the binary changes, so no apt, no `wsl.conf`, no config written. It keeps the old binary until the new service has written a status with the new version, and puts it back otherwise. The script keeps the old `.exe` until `wsl update` succeeds, and puts it back otherwise. Download, `SHA256SUMS` and `.old` are removed on every path.
+- The doctor fails on a `.exe` and a distribution of different versions (`VERSION_MISMATCH`). They are one release; the host feed and the commands the `.exe` forwards assume so.
+- With no WSL or no distribution, `wsl update` has nothing to update and exits 0, so a PC with only the `.exe` updates too.
+
+**Cost.** An update ends running jobs, as a re-install did. The rollback of the `.exe` and of the binary are two steps in two places; a power cut between them leaves a `VERSION_MISMATCH`, which the doctor names and `wsl update` fixes. CI installs the latest release in WSL2 on the Windows runner, updates it with this build and rolls back from an `.exe` that does not start. Until a release differs from the build, the two versions there are the same, so the swap is real but the numbers do not change; a PC with jobs, pause and authorization is still a hand test.
+

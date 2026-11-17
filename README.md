@@ -349,7 +349,7 @@ Only `image` is required. Unknown fields are refused. `job_key` makes a retry sa
 **Pull.** With `poll_url` set, the machine POSTs to it every `poll_interval_secs` (30 seconds, and never less), only when it has a free slot, is not paused and is not short of memory or disk:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.14", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.15", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 The answer is nothing (`204`), a task, `{"task": {...}}`, or `{"manifest_url": "https://..."}`, which is fetched once and must be a task. `401` or `403` means "not approved yet": the worker starts nothing and keeps asking, backing off to five minutes. The server decides which machines get work; the worker's token is its identity.
@@ -391,6 +391,7 @@ The download is checked against `SHA256SUMS` of the same release. Running it aga
 | Command | |
 | --- | --- |
 | `wsl install [--poll-url URL] [--max-slots N] [--worker-name NAME] [--wsl-memory 4GB] [--wsl-processors 2]` | Install or upgrade. Keeps the config; changes only the options given. |
+| `wsl update` | After a new `.exe`: the Linux binary of the same version, and the worker restarted. `install.ps1` runs it. [Update and repair](docs/WINDOWS.md#update-and-repair). |
 | `wsl doctor`, `doctor` | Check everything, with a fix for each problem. |
 | `wsl limits [--apply]` | What WSL2 may take of the PC. |
 | `wsl start`, `wsl stop`, `wsl logs` | The logon task and the supervisor log. |

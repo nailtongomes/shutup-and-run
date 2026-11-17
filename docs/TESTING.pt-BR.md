@@ -235,6 +235,17 @@ Uma VM Windows 11 com 2 vCPU e 5 GB de RAM, com virtualização aninhada. Nada a
 
 O que relatar: a tabela, quais caixas falharam, e se os passos 4 e 5 bloquearam e se recuperaram nos valores que o Gerenciador de Tarefas mostrou. Se o PC ocioso já fica abaixo de 1 GB disponível, ou a VM fica lenta com uma tarefa nos limites padrão, este PC não deve emprestar recursos, autorize o dono o que autorizar.
 
+### 0.2.15: atualizar por cima de um worker rodando
+
+O CI instala a última release no WSL2 do runner Windows e a atualiza, sem job, pausa ou autorização. Isto é o resto, num PC que roda uma release anterior com um job.
+
+- [ ] Com um job de cinco minutos rodando, rode a linha de instalação. Ela mostra `stopping the worker`, depois os passos do `wsl update`, e termina com `updated to`. O callback do job chega dizendo como ele terminou (parado, não `ok`).
+- [ ] `shutup-and-run version --json` e o `status.json` mostram a mesma `version` nova; `state` é `idle`; a linha `version` do doctor está ok.
+- [ ] `C:\ProgramData\shutup-and-run` não tem `*.tmp`, `SHA256SUMS` nem `shutup-and-run.exe.old`.
+- [ ] `shutup-and-run config show` está como antes (URL de poll, slots, nome do worker), e o mock vê o mesmo token.
+- [ ] Um worker pausado antes do update continua pausado; um PC cujo dono tinha autorizado continua autorizado.
+- [ ] Coloque o binário antigo de volta à mão (`wsl -d shutup-and-run -u root -- cp ...`): o doctor diz `VERSION_MISMATCH` com a dica `shutup-and-run wsl update`, e esse comando resolve.
+
 ### Repasse de certificado e as demos
 
 Ainda não rodou no Windows. No PC Windows, com um `.pfx` de teste (nunca um real para isto) numa pasta com espaço e acento no nome:

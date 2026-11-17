@@ -164,6 +164,13 @@ shutup-and-run wsl install [--poll-url URL] [options]
                                  that has other WSL distributions: see `wsl limits`.
       --no-task                  do not register the scheduled task
 
+shutup-and-run wsl update [--bin PATH]
+    after a new .exe: put the Linux binary of the same version in the
+    distribution and restart the service on it. The config, the poll token,
+    the job history and Docker are not touched. A binary that does not start
+    is put back, and the command exits 1. install.ps1 runs this when it
+    updates a machine. With no distribution there is nothing to update.
+
 shutup-and-run wsl reset [--factory] [install options]
     factory reset for a machine that broke: delete the distribution with its
     containers, images and job history, and install it again. The config
@@ -210,6 +217,7 @@ pub async fn cli(args: &[String]) -> ExitCode {
     let result = match sub {
         "doctor" => doctor_cli(rest),
         "install" => install_cli(rest).await,
+        "update" => update_cli(rest).await,
         "reset" => reset_cli(rest).await,
         "serve" => serve_cli(rest),
         "start" => start_cli(),
@@ -1419,6 +1427,12 @@ fn doctor(
             format!("{INNER_BIN}: {}", bin.one_line())
         },
     ));
+    if bin.ok() {
+        checks.push(version_check(
+            env!("CARGO_PKG_VERSION"),
+            inner_version(INNER_BIN).as_deref(),
+        ));
+    }
 
     // Right after an install the task has just started and the service is
     // still waiting for dockerd, so its first status file gets some seconds.
@@ -1879,6 +1893,201 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     println!("page: http://{listen}/   config: shutup-and-run config show");
     println!("logs: shutup-and-run wsl logs");
     Ok(ExitCode::SUCCESS)
+}
+
+/// The version the Linux binary at `path` in the distribution says it is.
+fn inner_version(path: &str) -> Option<String> {
+    let out = in_distro(&[path, "version", "--json"], None, DISTRO_START).ok()?;
+    let answer: serde_json::Value = serde_json::from_str(out.text().trim()).ok()?;
+    answer["version"].as_str().map(str::to_string)
+}
+
+/// The .exe and the binary in the distribution are one release. A new .exe
+/// over an old distribution is what an update that stopped halfway leaves.
+pub(crate) fn version_check(exe: &str, inner: Option<&str>) -> Check {
+    match inner {
+        Some(v) if v == exe => check("version", true, format!("{exe} on Windows and in {DISTRO}")),
+        Some(v) => check(
+            "version",
+            false,
+            format!("this .exe is {exe}; the binary in {DISTRO} is {v}"),
+        )
+        .coded("VERSION_MISMATCH"),
+        None => check(
+            "version",
+            false,
+            format!("this .exe is {exe}; the binary in {DISTRO} did not say its version"),
+        )
+        .coded("VERSION_MISMATCH"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// update
+
+/// `wsl update`: the Linux half of an update, after `install.ps1` put the new
+/// .exe in place. Only the binary changes, so the config, the poll token, the
+/// history and Docker stay as they are, and no apt runs. The old binary is
+/// kept until the new service has written its status; a failure puts it back
+/// and starts the worker again on it.
+async fn update_cli(args: &[String]) -> WslResult<ExitCode> {
+    let flags = parse_flags(args, &["--bin"], &[])?;
+    let version = env!("CARGO_PKG_VERSION");
+    let task =
+        run("schtasks.exe", &["/Query", "/TN", TASK_NAME], None, SHORT).is_ok_and(|out| out.ok());
+    // A broken WSL lists no distribution, so it is asked first.
+    let wsl = match wsl_status() {
+        Ok(out) if out.ok() => our_distro().map_err(|e| e.to_string()),
+        Ok(out) => Err(out.one_line()),
+        Err(e) => Err(e.to_string()),
+    };
+    match wsl {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            println!("no {DISTRO} distribution here: the .exe is {version} and there is nothing else to update.");
+            println!("to install the worker: shutup-and-run wsl install");
+            restart_task(task);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Err(e) => {
+            println!("WSL does not answer ({e}): only the .exe is {version}.");
+            println!("when WSL works again: shutup-and-run wsl update");
+            // The logon task, if there is one, runs the new .exe from now on.
+            restart_task(task);
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    let data = data_dir();
+    std::fs::create_dir_all(&data).map_err(|e| err(format!("{}: {e}", data.display())))?;
+
+    println!("[1/4] stopping the worker");
+    let _ = run("schtasks.exe", &["/End", "/TN", TASK_NAME], None, SHORT);
+    let lock = wait_for_lock(
+        &data.join(SUPERVISOR_LOCK),
+        LOCK_TRIES,
+        Duration::from_secs(1),
+        kill_other_supervisors,
+    )
+    .map_err(|e| {
+        err(format!(
+            "a `shutup-and-run wsl serve` is still running and could not be ended ({e}). \
+             Sign out and in again, and run this update again."
+        ))
+    })?;
+    // Running jobs get SIGTERM and 10 seconds, as with `wsl stop`.
+    let _ = sh_in_distro(&graceful_stop_script(10), None, DISTRO_START);
+    let stop = stop_service_script(SERVICE_PROCESS);
+    match sh_in_distro(&stop, None, DISTRO_START) {
+        Ok(out) if out.ok() => {}
+        other => {
+            drop(lock);
+            restart_task(task);
+            return Err(match other {
+                Ok(out) => step_failed("stopping the service", &stop, &out),
+                Err(e) => e,
+            });
+        }
+    }
+
+    println!("[2/4] the Linux binary {version}");
+    let new = format!("{INNER_BIN}.new");
+    let staged = async {
+        let musl = obtain_musl(&http_client()?, &flags).await?;
+        let bytes = std::fs::read(&musl).map_err(|e| err(format!("{}: {e}", musl.display())))?;
+        put_file(&new, "755", bytes)?;
+        match inner_version(&new) {
+            Some(v) if v == version => Ok(()),
+            other => Err(err(format!(
+                "the downloaded binary says it is {}, not {version}",
+                other.as_deref().unwrap_or("nothing")
+            ))),
+        }
+    }
+    .await;
+    if let Err(e) = staged {
+        let _ = sh_in_distro(&format!("rm -f {new}"), None, SHORT);
+        drop(lock);
+        restart_task(task);
+        return Err(err(format!(
+            "{e}. Nothing was changed; the worker runs as before."
+        )));
+    }
+    // The status file goes too, so the one read below is the new service's.
+    let swap = format!(
+        "cp -p {INNER_BIN} {INNER_BIN}.old && mv -f {new} {INNER_BIN} && rm -f {INNER_STATUS}"
+    );
+    match sh_in_distro(&swap, None, SHORT) {
+        Ok(out) if out.ok() => {}
+        other => {
+            drop(lock);
+            restart_task(task);
+            return Err(match other {
+                Ok(out) => step_failed("replacing the binary", &swap, &out),
+                Err(e) => e,
+            });
+        }
+    }
+    println!("    {INNER_BIN} (the previous one is kept until the service is up)");
+
+    println!("[3/4] starting the worker");
+    let exe = install_exe_copy(&data);
+    drop(lock);
+    if !task {
+        let _ = sh_in_distro(&format!("rm -f {INNER_BIN}.old"), None, SHORT);
+        println!("    no logon task, so nothing was started. Run: shutup-and-run wsl serve");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let started = exe.and_then(|exe| {
+        // Registered again, so a task an older install made runs this .exe.
+        register_task(&exe)?;
+        let wait = format!(
+            "i=0; until [ -s {INNER_STATUS} ]; do i=$((i + 1)); \
+             [ $i -ge {INSTALL_SERVICE_WAIT_SECS} ] && exit 1; sleep 1; done; cat {INNER_STATUS}"
+        );
+        let running = sh_in_distro(&wait, None, DISTRO_START)
+            .ok()
+            .filter(|out| out.ok())
+            .and_then(|out| serde_json::from_str::<serde_json::Value>(out.text().trim()).ok())
+            .and_then(|status| status["version"].as_str().map(str::to_string));
+        if running.as_deref() == Some(version) {
+            Ok(())
+        } else {
+            Err(err(format!(
+                "the service did not start on {version} within {INSTALL_SERVICE_WAIT_SECS}s"
+            )))
+        }
+    });
+    if let Err(e) = started {
+        let _ = run("schtasks.exe", &["/End", "/TN", TASK_NAME], None, SHORT);
+        let back = format!(
+            "{}; mv -f {INNER_BIN}.old {INNER_BIN}",
+            stop_service_script(SERVICE_PROCESS)
+        );
+        let _ = sh_in_distro(&back, None, DISTRO_START);
+        restart_task(true);
+        return Err(err(format!(
+            "{e}, so the previous binary was put back and started. See `shutup-and-run wsl logs`."
+        )));
+    }
+    let _ = sh_in_distro(&format!("rm -f {INNER_BIN}.old"), None, SHORT);
+    println!("    the service runs {version}");
+
+    // Information only: the update is done, and a problem here (the poll
+    // URL, a safety warning) is not one the old version would fix.
+    println!("[4/4] doctor");
+    let (checks, _) = doctor(DEFAULT_SMOKE_IMAGE, SERVICE_WAIT_SECS)?;
+    let (text, _) = report(&checks);
+    print!("{text}");
+    println!();
+    println!("updated to {version}. The config, the poll token and the job history were kept.");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Start the logon task again after an update that stopped it and failed.
+fn restart_task(registered: bool) {
+    if registered {
+        let _ = run("schtasks.exe", &["/Run", "/TN", TASK_NAME], None, SHORT);
+    }
 }
 
 /// What makes an install fail. The poll URL is someone else's server: one
@@ -3765,6 +3974,22 @@ mod tests {
     /// The first defect: the old service kept running, on the old config,
     /// after the install wrote a new one. The stop script returns only when
     /// no process of that name is left.
+    #[test]
+    fn the_exe_and_the_binary_in_the_distribution_must_be_one_release() {
+        let same = version_check("0.2.15", Some("0.2.15"));
+        assert!(same.ok);
+        assert!(same.code.is_empty());
+        let old = version_check("0.2.15", Some("0.2.11"));
+        assert!(!old.ok && !old.soft);
+        assert_eq!(old.code, "VERSION_MISMATCH");
+        assert!(old.detail.contains("0.2.11") && old.detail.contains("0.2.15"));
+        let silent = version_check("0.2.15", None);
+        assert_eq!(silent.code, "VERSION_MISMATCH");
+        // The doctor's line points at the command that aligns them.
+        assert!(crate::hints::hint("VERSION_MISMATCH").contains("wsl update"));
+        assert!(usage().contains("wsl update"));
+    }
+
     #[test]
     fn the_stop_script_returns_only_when_the_old_service_is_gone() {
         let script = stop_service_script(SERVICE_PROCESS);
