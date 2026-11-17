@@ -168,6 +168,23 @@ The JSON also carries `fix`. It is the same sentence under the name 0.2.8 used; 
 | `WSL_LIMITS_NOT_IN_EFFECT` | The limits apply when WSL restarts: `shutup-and-run wsl stop`, `wsl --shutdown` (it stops every WSL distribution of this user), `shutup-and-run wsl start`. | Os limites valem quando o WSL reinicia: `shutup-and-run wsl stop`, `wsl --shutdown` (para todas as distribuições WSL deste usuário), `shutup-and-run wsl start`. |
 | any other | Run `shutup-and-run doctor --report` and open the issue link it prints. | Rode `shutup-and-run doctor --report` e abra o link de issue que ele imprime. |
 
+## Managed containers (work with no poll URL)
+
+When the owner wants a container to run on this machine by itself (every N seconds, or always), not from a queue:
+
+```bash
+shutup-and-run managed apply definition.json --json   # checked like a job; exit 3 and MANAGED_INVALID say what is wrong
+printf '%s' "$VALUE" | shutup-and-run managed secret NAME KEY --json   # for each key of secret_env that is null in the file
+shutup-and-run managed mode on --json                  # only while nothing runs; MANAGED_BUSY otherwise
+shutup-and-run managed list --json
+```
+
+- A definition: `name`, `image` (in the allowlist), `policy` (`once`, `interval`, `always`), and optionally `command`, `env`, `secret_env`, `cpu`, `memory`, `shm`, `timeout_secs`, `interval_secs` (for `interval`, 60 or more), `enabled`. `examples/managed/rpa-selenium.json` is one to copy. Unknown fields are refused.
+- `mode on` stops the worker from polling and from accepting `POST /v1/jobs` (`409` `MANAGED_MODE`). Say so to the owner before turning it on. `mode off` gives that back. Neither interrupts anything: stop the running containers first (`managed stop NAME`), or wait.
+- In `list --json` each container has a `state`: `running`, `starting`, `scheduled`, `backoff` (an `always` container that keeps ending early; `failures` counts them), `waiting` (`note` says what the machine refused; it is retried), `needs_secret`, `stopped` (by a person; only `managed start` lifts it), `idle`, `disabled`, `off` (managed mode is off).
+- `start` and `stop` are requests the running service acts on within 10 seconds. Read `list` again; do not repeat them in a loop.
+- Never put a secret's value in a file, a command line or your answer. `managed secret` reads it from stdin, and nothing prints it back.
+
 ## Certificate passthrough (only when the owner asks)
 
 Off by default, and it stays off unless the **owner of the machine** asks for it. Turning it on gives every container the owner's certificate and its password, and a container can copy the private key. Do not enable it on your own judgment, and do not pass `--accept-risk` unless the person told you they accept that. Say it to them in those words first.

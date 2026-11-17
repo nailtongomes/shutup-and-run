@@ -319,3 +319,22 @@ journalctl -u shutup-and-run -n 200 --no-pager
 ```
 
 Neither log contains a token.
+
+### Managed containers
+
+Automated on Linux (`cargo test managed`, on the mock runtime and a fake clock): validation of a definition, persistence, the interval (start to start, no overlap, one run after missed intervals), the `always` backoff over a simulated hour, manual start and stop, disable, a restarted worker, a container that vanished, a failed start, Docker not answering, low memory, a pause, full slots, the safety block, the two modes and the busy refusal, the page and its logins, and that a secret is in nothing shown.
+
+Against a real Docker, by hand, about four minutes:
+
+```bash
+cargo build --release --locked
+sudo bash tests/managed/linux.sh target/release/shutup-and-run
+```
+
+It runs the same cases with real containers: a worker killed with SIGKILL, a container killed from outside, a container that exits 3 forever, and the secret looked for in every output, the log and `status.json`. Stopping and starting `dockerd` under a running `always` container was done once by hand: the worker stayed up and one new container followed.
+
+Not exercised: anything on Windows. There the commands are forwarded into the WSL2 distribution like `config` and `jobs`; `managed apply FILE` and `managed secret` cross on stdin. On a Windows 11 PC, check by hand:
+
+- [ ] `shutup-and-run managed apply C:\path\rpa-selenium.json`, then `managed secret rpa-selenium API_TOKEN` with the value piped in, then `managed mode on`: `managed list` shows it `running` and the page at `http://127.0.0.1:8787/local/managed` agrees.
+- [ ] With it running, sign out of Windows: the shutdown screen names `shutup-and-run`, as for any job.
+- [ ] `managed mode off` while it runs is refused with `MANAGED_BUSY`; after `managed stop`, it is accepted and the worker polls again.

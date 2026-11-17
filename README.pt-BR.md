@@ -14,7 +14,8 @@ Também foi feito para ser operado pelo **agente de IA** do próprio cliente. To
 
 | Faz | Não faz |
 | --- | --- |
-| Inicia uma imagem da allowlist com o env, o comando, o timeout e os limites que a tarefa informa | Fila, agendamento, retry ou encadeamento de tarefas. Isso é do seu orquestrador |
+| Inicia uma imagem da allowlist com o env, o comando, o timeout e os limites que a tarefa informa | Fila, retry ou encadeamento de tarefas. Isso é do seu orquestrador |
+| Ou, no [modo gerenciado](#containers-gerenciados), roda containers definidos na própria máquina: uma vez, em intervalo, ou sempre | Substitui Compose, Kubernetes ou um motor de workflow. Um container gerenciado é uma imagem e quando rodar |
 | Recebe trabalho de dois jeitos: **push** (`POST /v1/jobs`) e **pull** (o worker consulta uma URL sua) | Coordena máquinas. Cada worker só conhece a si mesmo |
 | Limita concorrência (`max_slots`), tempo (`timeout_secs`, depois SIGKILL), CPU e memória por job | Isola o job como sandbox. O container tem os privilégios e a rede padrão do Docker |
 | Recusa trabalho quando está cheio, em drenagem, ou com pouca memória ou disco | Monta pastas do host, publica portas ou roda privilegiado. Esses campos não existem |
@@ -147,6 +148,7 @@ Com `status_page = true` (a instalação no Windows liga; a do Linux não), o se
 | `/` | Rodando, pausado ou Docker parado. Se o PC pode ser desligado. Tarefas agora, a última tarefa, se a fila responde, o nome da máquina. Um botão para pausar ou voltar a aceitar tarefas. Recarrega a cada 10 segundos | nenhum |
 | Configuração (`/local/config`) | URL de poll, intervalo de poll, tarefas ao mesmo tempo, nome da máquina | nenhum |
 | Configuração avançada (`/local/advanced`) | Imagens permitidas, qualquer imagem, limites de tempo, os limites de recursos, os dois tokens, o login de admin | `admin` / `admin` até ser trocado |
+| Containers gerenciados (`/local/managed`) | [Containers gerenciados](#containers-gerenciados): a lista com estado e última execução; Iniciar, Parar, Ativar, Desativar | nenhum para os botões; o mesmo login para o editor, remover e o modo |
 | Certificado (`/local/certificate`) | [Repasse de certificado](#repasse-de-certificado-opcional), opcional: importar um `.pfx` e a senha, validar, testar assinatura de PDF, desligar. A senha nunca é mostrada | o mesmo login, e uma confirmação |
 
 - A página edita o mesmo `config.json` que o CLI, pela mesma validação. Uma mudança salva reinicia o serviço com o arquivo novo; os containers em execução não são tocados. Um valor inválido é recusado e nada é gravado.
@@ -156,6 +158,34 @@ Com `status_page = true` (a instalação no Windows liga; a do Linux não), o se
 - Ela fica em inglês ou em português, um idioma por vez; um link troca e a escolha é lembrada.
 
 A segurança da página, sem rodeios. Ela não pede token, então só responde a uma conexão de loopback que nomeia um host de loopback, e só aceita um formulário da própria origem. Nunca mostra token, env de job nem logs. O login de admin afasta um curioso e **não** é uma barreira de segurança: quem usa o PC consegue ler o arquivo de configuração. Nada nela é acessível pela rede, e ela não foi feita para ficar atrás de um proxy. Numa máquina configurada com `config.toml` a página só mostra o status.
+
+## Containers gerenciados
+
+Para trabalho recorrente que não precisa de orquestrador, como um RPA em Selenium que roda a cada quinze minutos, o worker pode iniciar containers sozinho, a partir de definições guardadas na máquina. Não é um segundo Compose ou Kubernetes: a definição é o mesmo pedido de um job (imagem, comando, env, CPU, memória, shm, tempo limite), mais quando rodar.
+
+| Política | Quando roda |
+| --- | --- |
+| `once` | Só quando alguém aperta Iniciar (ou `managed start NOME`) |
+| `interval` | De novo a cada `interval_secs` (60 ou mais), contado de início a início. Nunca dois ao mesmo tempo: se a execução ainda não acabou quando chega a hora, a próxima vem depois dela. Depois de o serviço ficar parado, uma execução, não uma por intervalo perdido. Uma execução que falhou não é repetida antes da hora |
+| `always` | Iniciado de novo sempre que termina. A espera é de 30 s e dobra até 15 min enquanto as execuções durarem menos de um minuto; uma execução que durou um minuto zera a contagem. Sem `timeout_secs` recebe `max_timeout_secs`, e é iniciado de novo depois disso |
+
+**Um modo de trabalho por vez.** Containers gerenciados só rodam no **modo gerenciado**. Nesse modo o worker não faz poll, e `POST /v1/jobs` responde `409` `{"error":"managed mode","code":"MANAGED_MODE"}`. Fora dele, nenhum container gerenciado inicia. O modo só muda quando nada está rodando ou iniciando; senão a troca é recusada (`MANAGED_BUSY`) e nada é interrompido. O modo sobrevive a reinícios.
+
+```bash
+sudo shutup-and-run managed apply examples/managed/rpa-selenium.json
+printf '%s' "$API_TOKEN" | sudo shutup-and-run managed secret rpa-selenium API_TOKEN
+printf '%s' "$CERTIFICATE_ID" | sudo shutup-and-run managed secret rpa-selenium CERTIFICATE_ID
+sudo shutup-and-run managed mode on
+sudo shutup-and-run managed list
+```
+
+Ou na página local: **Containers gerenciados** lista cada um com estado, política, última execução e os botões Iniciar, Parar, Ativar e Desativar; o editor e a troca de modo pedem o login de administrador.
+
+- **Cada execução é um job comum.** Precisa de imagem na allowlist, ocupa um dos `max_slots`, recebe os limites de CPU e memória da máquina, obedece à pausa, às checagens de memória e disco livres, ao `min_idle_secs` e às checagens de segurança do dono, tem tempo limite e aparece em `shutup-and-run jobs`. Quando a máquina recusa, o início **espera** e é tentado de novo 30 segundos depois; isso nunca conta como falha do container.
+- **Segredos.** Os valores de `secret_env` ficam no arquivo de histórico do worker (modo 600) e só chegam ao env do container. Nenhum comando, página, log ou arquivo de status os imprime. Em um arquivo, `"API_TOKEN": null` significa "o valor que esta máquina já tem", então a definição pode ficar em um repositório. Um container com segredo sem valor não inicia.
+- **Parar e desativar.** Parar encerra o container agora, e ele fica parado até alguém iniciar. Desativar não inicia mais nada e deixa a execução em andamento terminar.
+- **Reinícios.** O container em execução é reencontrado pela linha do job, então um worker reiniciado não inicia um segundo. Um container que terminou com o worker ou o Docker parados fica registrado como `interrupted`, e a política decide o que vem depois.
+- A definição não monta pastas, não publica portas e não roda privilegiada, como um job. Uma edição vale para a próxima execução.
 
 ## Repasse de certificado (opcional)
 
@@ -393,7 +423,9 @@ A imagem precisa de `sh` e `sleep`; a padrão é `ghcr.io/nailtongomes/shutup-an
 - No Linux, parar o serviço não para os containers, e enquanto ele está parado ninguém aplica os timeouts.
 - Timeout é SIGKILL, sem período de tolerância.
 - `job_key` vale por máquina. Outra máquina não a conhece.
-- Sem cancelamento, sem fila, sem retry de job que falhou.
+- Sem cancelamento, sem fila, sem retry de job que falhou. Um container gerenciado não tem expressão cron, dependências nem captura de saída; um `always` que continua falhando é tentado a cada 15 minutos até alguém parar ou desativar.
+- Modo gerenciado e push/pull são exclusivos em uma máquina. Para os dois, use duas máquinas.
+- As definições gerenciadas, seus segredos e o modo ficam no arquivo de histórico dos jobs. No Windows, `shutup-and-run wsl reset` reconstrói a distribuição e esse arquivo junto: guarde os arquivos de definição (`managed show NOME` imprime um) e aplique de novo.
 - No modo pull o servidor nunca fica sabendo que uma tarefa foi recusada ou descartada; o log do próprio worker fica. Veja [os limites do contrato](docs/INTEGRATION-CONTRACT.md#9-limits-of-the-current-contract).
 - A proteção de recursos é controle de admissão e limites de container, não uma garantia. Veja [Protegendo o PC](#protegendo-o-pc).
 - O Windows roda o serviço Linux dentro do WSL2, só em modo pull, enquanto o usuário que instalou está logado. Parar o serviço, sair da sessão ou desligar encerra os containers. macOS está planejado: [docs/ROADMAP-windows-macos.md](docs/ROADMAP-windows-macos.md).

@@ -319,3 +319,20 @@ journalctl -u shutup-and-run -n 200 --no-pager
 ```
 
 Nenhum dos dois logs contém token.
+
+### Containers gerenciados
+
+Automatizado no Linux (`cargo test managed`, com runtime simulado e relógio falso): validação da definição, persistência, intervalo (de início a início, sem sobreposição, uma execução depois de intervalos perdidos), o backoff do `always` em uma hora simulada, iniciar e parar à mão, desativar, worker reiniciado, container que sumiu, falha ao iniciar, Docker sem responder, pouca memória, pausa, slots cheios, bloqueio de segurança, os dois modos e a recusa quando ocupado, a página e seus logins, e que um segredo não aparece em nada do que é mostrado.
+
+Contra um Docker real, à mão, cerca de quatro minutos:
+
+```bash
+cargo build --release --locked
+sudo bash tests/managed/linux.sh target/release/shutup-and-run
+```
+
+Não exercitado: nada no Windows. Lá os comandos são encaminhados para a distribuição WSL2, como `config` e `jobs`. Em um PC com Windows 11, confira à mão:
+
+- [ ] `shutup-and-run managed apply C:\caminho\rpa-selenium.json`, depois `managed secret rpa-selenium API_TOKEN` com o valor por pipe, depois `managed mode on`: `managed list` mostra `running` e a página `http://127.0.0.1:8787/local/managed` concorda.
+- [ ] Com ele rodando, saia da sessão do Windows: a tela de desligamento cita `shutup-and-run`, como em qualquer job.
+- [ ] `managed mode off` com ele rodando é recusado com `MANAGED_BUSY`; depois de `managed stop`, é aceito e o worker volta a fazer poll.

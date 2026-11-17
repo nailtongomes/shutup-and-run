@@ -116,8 +116,9 @@ Content-Type: application/json
 | `503` | `{"error":"authorization required","code":"AUTHORIZATION_REQUIRED","notice_version":1,"reasons":[{"code":"SAFETY_SMALL_MACHINE","level":"warning","detail":"this PC: 2 processors, 5.0 GiB of memory"}]}` | A shared PC where running a job is a risk for its owner, and the owner has not agreed to it. Nothing was stored. Only a person at that computer can agree, on its local page or in a terminal; no request field, token, config key or route does. | Try the next machine. Do not retry in a loop: it stays until a person acts. Tell whoever is responsible for that PC. |
 | `502` | `{"error":"docker is unavailable"}` | The Docker daemon did not answer. | Try the next machine. Tell a person. |
 | `502` | `{"error":"job history is unavailable"}` | The SQLite file could not be read or written. | Same. |
+| `409` | `{"error":"managed mode","code":"MANAGED_MODE"}` | The machine is in managed mode: it runs containers defined on it and takes no job from outside, by push or by poll. Nothing was stored, the `job_key` included. It stays until a person at the machine turns managed mode off. | Try the next machine. Do not retry this one in a loop. |
 
-A request is checked in this order, and the first failure answers: ban, token, body size, JSON shape, `image` name, allowlist, `timeout_secs`, `env`, `command`, `job_key`, `callback_url`, `cpu`, `memory`, drain, `job_key` lookup, slots, safety block, owner's authorization, free memory and disk, idle time. Two consequences: a draining machine answers `503` even for a `job_key` it already holds, and a repeat of a known `job_key` with an invalid body is a `400`.
+A request is checked in this order, and the first failure answers: ban, token, body size, JSON shape, `image` name, allowlist, `timeout_secs`, `env`, `command`, `job_key`, `callback_url`, `cpu`, `memory`, managed mode, drain, `job_key` lookup, slots, safety block, owner's authorization, free memory and disk, idle time. Two consequences: a draining machine answers `503` even for a `job_key` it already holds, and a repeat of a known `job_key` with an invalid body is a `400`.
 
 The `400` messages: `invalid image name`, `timeout_secs must be greater than zero`, `timeout_secs <n> is above the maximum <max>`, `env accepts at most 128 variables`, `invalid environment variable: <name>`, `invalid value for <name>`, `command accepts at most 32 arguments`, `invalid command argument`, `job_key must be 1-200 characters of letters, digits, '.', '_', ':' or '-'`, `callback_url is invalid`, `callback_url must be http or https`, `cpu must be a number between 0 and 128`, `cpu is invalid`, `cpu <n> is above this machine's limit of <max> per job`, `memory <bytes> is above this machine's limit of <max> bytes per job`. Match on the status, not on the text.
 
@@ -487,7 +488,7 @@ Every route needs `Authorization: Bearer <runner-token>`, `/health` and `/metric
 | Route | |
 | --- | --- |
 | `GET /v1/jobs/{id}` | A [JobResult](#jobresult). `?logs=true` adds `logs`. `404` `{"id":"...","status":"not_found"}`. |
-| `GET /health` | `200` `{"status":"ok","draining":false,"slots_total":2,"slots_used":1,"slots_free":1}`. `status` is `draining` while draining. `503` `{"error":"docker is unavailable","draining":false}`. |
+| `GET /health` | `200` `{"status":"ok","draining":false,"slots_total":2,"slots_used":1,"slots_free":1,"mode":"jobs"}`. `status` is `draining` while draining. `mode` is `managed` while the machine runs its own managed containers and answers every push with `409`; do not send it work then, whatever `slots_free` says. `503` `{"error":"docker is unavailable","draining":false}`. |
 | `GET /metrics` | Prometheus text. |
 | `POST /v1/drain` | Body `{"draining": true}` or `{"draining": false}`. Answers the same object. The flag survives a restart. |
 
@@ -545,8 +546,9 @@ One constant in the source, `launcher_kill`, is a `reason` that no code path emi
 
 What an orchestrator may rely on, and what `src/contract.rs` fails on if it changes:
 
-- The nine keys of a JobResult, the eight keys of the poll body, and the five keys of `/health`. `oom_killed` (0.2.13) is a tenth key that exists only when it is `true`; a reader that ignores unknown keys needs no change, and one that validates against the schema needs the new schema.
+- The nine keys of a JobResult, the eight keys of the poll body, and the keys of `/health` (five until `mode` was added as a sixth). `oom_killed` (0.2.13) is a tenth key that exists only when it is `true`; a reader that ignores unknown keys needs no change, and one that validates against the schema needs the new schema.
 - The status codes and error bodies in [section 2](#2-push-post-v1jobs). `503` `insufficient resources` and the two `above this machine's limit` messages were added in 0.2.6; a caller that already routes on `400` and `503` needs no change. `503` `user active` and the `reason` `interrupted` were added in 0.2.11: until then such a job was `exited` with a `null` or non-zero `exit_code`, so a caller that treats every reason it does not know as "not succeeded" needs no change either.
+- `409` `managed mode` and the `mode` key of `/health` come with managed containers. A machine is in managed mode only when a person at it turned that on, so a fleet that never does sees neither. A worker in managed mode sends no poll at all.
 - `503` `blocked for safety` and `503` `authorization required` were added in 0.2.13, on machines with the `shared-pc` profile only. Both are one more "not now, on this machine", and a caller that routes on `503` needs no change.
 - Every poll answer form in [section 3](#3-poll), the bare task and the empty forms included.
 - Unknown fields rejected in a JobRequest, a poll answer and a manifest.
