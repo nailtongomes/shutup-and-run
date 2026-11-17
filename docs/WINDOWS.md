@@ -324,7 +324,7 @@ For a person following instructions, one command at a time, in PowerShell as the
 Each poll is a `POST` with the token and this body:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.14", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.15", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
 ```
 
 `cpus` and `memory_bytes` are what the WSL2 VM has, which is what the machine lends. The body has no address, because the worker only knows the VM's private one and could claim any other. The server takes the public address from the connection.

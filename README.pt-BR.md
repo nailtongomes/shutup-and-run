@@ -349,7 +349,7 @@ Só `image` é obrigatório. Campos desconhecidos são recusados. `job_key` torn
 **Pull.** Com `poll_url` definida, a máquina faz POST nela a cada `poll_interval_secs` (30 segundos, e nunca menos), só quando tem um slot livre, não está pausada e não está com pouca memória ou disco:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.14", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.15", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 A resposta é nada (`204`), uma tarefa, `{"task": {...}}`, ou `{"manifest_url": "https://..."}`, que é buscado uma vez e precisa ser uma tarefa. `401` ou `403` quer dizer "ainda não aprovada": o worker não inicia nada e continua perguntando, espaçando até cinco minutos. O servidor decide quais máquinas recebem trabalho; o token do worker é a identidade dele.

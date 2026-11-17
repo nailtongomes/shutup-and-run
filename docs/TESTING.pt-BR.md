@@ -235,7 +235,7 @@ Uma VM Windows 11 com 2 vCPU e 5 GB de RAM, com virtualização aninhada. Nada a
 
 O que relatar: a tabela, quais caixas falharam, e se os passos 4 e 5 bloquearam e se recuperaram nos valores que o Gerenciador de Tarefas mostrou. Se o PC ocioso já fica abaixo de 1 GB disponível, ou a VM fica lenta com uma tarefa nos limites padrão, este PC não deve emprestar recursos, autorize o dono o que autorizar.
 
-### Atualizar por cima de um worker rodando
+### 0.2.15: atualizar por cima de um worker rodando
 
 O CI instala a última release no WSL2 do runner Windows e a atualiza, sem job, pausa ou autorização. Isto é o resto, num PC que roda uma release anterior com um job.
 

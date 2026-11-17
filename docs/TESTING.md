@@ -235,7 +235,7 @@ A Windows 11 VM with 2 vCPU and 5 GB of RAM, nested virtualization on. Nothing b
 
 What to report: the table, which of the boxes failed, and whether steps 4 and 5 blocked and recovered at the figures Task Manager showed. If the idle PC already sits under 1 GB available, or the VM feels slow with one job at the default limits, this PC should not lend its resources, whatever its owner authorizes.
 
-### Update over a running worker
+### 0.2.15: update over a running worker
 
 CI installs the latest release in WSL2 on the Windows runner and updates it, with no job, pause or authorization. This is the rest, on a PC that runs an older release with a job.
 

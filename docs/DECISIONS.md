@@ -442,7 +442,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** The runner now has a scheduler, a small one: no cron expressions, no dependencies, no catch-up. A machine cannot serve a queue and run managed containers at once. The CLI's start and stop take up to 10 seconds to happen and say so. An `always` container that can never work is retried every 15 minutes forever and shows its count of failures. Secrets are plain text in a root-only file, as the tokens in `config.json` are; on a Windows PC its user can read them, as the rule about Windows machines already says. `demo` runs on a history of its own and so still runs in managed mode. On Windows `wsl reset` deletes the history, and with it the definitions, secrets and mode; only `config.json` has a copy on the host. Each pass inspects each running managed container once (one local Docker call per container per 10 s).
 
-## An update replaces both halves, or neither (Windows)
+## An update replaces both halves, or neither (Windows, 0.2.15)
 
 **Context.** On a client's PC `install.ps1` over a running worker failed at `Move-Item`: `schtasks /End` showed the task as ready while `wsl serve --background` still ran under its console host and held the `.exe`. The script left the download and `SHA256SUMS` in the folder. Once the `.exe` was swapped by hand, the Linux binary in the distribution was still the old release until `wsl install` ran again.
 
