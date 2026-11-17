@@ -237,7 +237,7 @@ O que relatar: a tabela, quais caixas falharam, e se os passos 4 e 5 bloquearam 
 
 ### Atualizar por cima de um worker rodando
 
-O CI roda a metade do `.exe`, sem WSL. Esta é a metade com a distribuição, num PC que roda uma release anterior com um job.
+O CI instala a última release no WSL2 do runner Windows e a atualiza, sem job, pausa ou autorização. Isto é o resto, num PC que roda uma release anterior com um job.
 
 - [ ] Com um job de cinco minutos rodando, rode a linha de instalação. Ela mostra `stopping the worker`, depois os passos do `wsl update`, e termina com `updated to`. O callback do job chega dizendo como ele terminou (parado, não `ok`).
 - [ ] `shutup-and-run version --json` e o `status.json` mostram a mesma `version` nova; `state` é `idle`; a linha `version` do doctor está ok.

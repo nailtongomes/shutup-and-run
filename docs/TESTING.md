@@ -237,7 +237,7 @@ What to report: the table, which of the boxes failed, and whether steps 4 and 5 
 
 ### Update over a running worker
 
-CI runs the `.exe` half without WSL. This is the half with the distribution, on a PC that runs an older release with a job.
+CI installs the latest release in WSL2 on the Windows runner and updates it, with no job, pause or authorization. This is the rest, on a PC that runs an older release with a job.
 
 - [ ] With a five-minute job running, run the install line. It prints `stopping the worker`, then the `wsl update` steps, and ends with `updated to`. The job's callback arrives with how it ended (stopped, not `ok`).
 - [ ] `shutup-and-run version --json` and `status.json` show the same new `version`; `state` is `idle`; the doctor's `version` line is ok.

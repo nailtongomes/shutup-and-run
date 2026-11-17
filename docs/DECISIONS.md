@@ -453,5 +453,5 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - The doctor fails on a `.exe` and a distribution of different versions (`VERSION_MISMATCH`). They are one release; the host feed and the commands the `.exe` forwards assume so.
 - With no WSL or no distribution, `wsl update` has nothing to update and exits 0, so a PC with only the `.exe` updates too.
 
-**Cost.** An update ends running jobs, as a re-install did. The rollback of the `.exe` and of the binary are two steps in two places; a power cut between them leaves a `VERSION_MISMATCH`, which the doctor names and `wsl update` fixes. CI has no WSL, so it tests the `.exe` half (an older release running, the swap, the rollback); the binary half is checked by hand on a PC.
+**Cost.** An update ends running jobs, as a re-install did. The rollback of the `.exe` and of the binary are two steps in two places; a power cut between them leaves a `VERSION_MISMATCH`, which the doctor names and `wsl update` fixes. CI installs the latest release in WSL2 on the Windows runner, updates it with this build and rolls back from an `.exe` that does not start. Until a release differs from the build, the two versions there are the same, so the swap is real but the numbers do not change; a PC with jobs, pause and authorization is still a hand test.
 
