@@ -424,7 +424,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** A Windows PC with under 8 GiB or two processors stops taking work after the update until its owner authorizes on the page; that is the point, and it is also a fleet that goes quiet until people click. A PC that crosses a warning line for a minute, with an owner who never authorized, reports `authorization_required` for that minute. A determined program on the machine can imitate the page or a terminal; the record says which channel was used, and nothing more is claimed. The Windows readings are compiled and unit tested for their arithmetic and have not run on a Windows PC. The thresholds are chosen, not measured. The one-task-in-flight CPU sample is a small loop where there was none. Throttling of a job shorter than 30 seconds is never seen. Host readings are ten seconds old at worst, and a job is not stopped when the PC gets busy after it started.
 
-## Managed containers: the worker starts its own work, in a mode of its own
+## Managed containers: the worker starts its own work, in a mode of its own (0.2.14)
 
 **Context.** A recurring RPA (a Selenium worker every fifteen minutes on a client's PC) needed Kestra or n8n and a poll URL only to say "run this again". The rule until now was "no scheduler, and no automatic restart of a container that exits", and the owner asked for both, small.
 
