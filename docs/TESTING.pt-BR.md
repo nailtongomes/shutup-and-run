@@ -8,7 +8,7 @@ Uma VPS Linux (sua, confiável) e um PC com Windows 11 (tratado como PC de clien
 
 As instalações de uma linha baixam da última release do GitHub.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a versão do `Cargo.toml` (`v0.2.13` quando isto foi escrito) ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a versão do `Cargo.toml` (`v0.2.14` quando isto foi escrito) ou posterior e tem três arquivos: `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS`.
 
 Se não estiver lá: o workflow `release` roda sozinho quando o `main` recebe uma versão do `Cargo.toml` que ainda não tem release, cria a tag e publica. Veja a última execução em Actions; "Run workflow" no `main` repete uma que falhou. Ninguém cria tag à mão.
 
@@ -319,3 +319,20 @@ journalctl -u shutup-and-run -n 200 --no-pager
 ```
 
 Nenhum dos dois logs contém token.
+
+### 0.2.14: containers gerenciados
+
+Automatizado no Linux (`cargo test managed`, com runtime simulado e relógio falso): validação da definição, persistência, intervalo (de início a início, sem sobreposição, uma execução depois de intervalos perdidos), o backoff do `always` em uma hora simulada, iniciar e parar à mão, desativar, worker reiniciado, container que sumiu, falha ao iniciar, Docker sem responder, pouca memória, pausa, slots cheios, bloqueio de segurança, os dois modos e a recusa quando ocupado, a página e seus logins, e que um segredo não aparece em nada do que é mostrado.
+
+Contra um Docker real, à mão, cerca de quatro minutos:
+
+```bash
+cargo build --release --locked
+sudo bash tests/managed/linux.sh target/release/shutup-and-run
+```
+
+Não exercitado: nada no Windows. Lá os comandos são encaminhados para a distribuição WSL2, como `config` e `jobs`. Em um PC com Windows 11, confira à mão:
+
+- [ ] `shutup-and-run managed apply C:\caminho\rpa-selenium.json`, depois `managed secret rpa-selenium API_TOKEN` com o valor por pipe, depois `managed mode on`: `managed list` mostra `running` e a página `http://127.0.0.1:8787/local/managed` concorda.
+- [ ] Com ele rodando, saia da sessão do Windows: a tela de desligamento cita `shutup-and-run`, como em qualquer job.
+- [ ] `managed mode off` com ele rodando é recusado com `MANAGED_BUSY`; depois de `managed stop`, é aceito e o worker volta a fazer poll.

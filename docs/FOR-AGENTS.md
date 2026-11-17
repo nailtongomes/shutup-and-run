@@ -113,6 +113,14 @@ The JSON also carries `fix`. It is the same sentence under the name 0.2.8 used; 
 | `POLL_HTTP_ERROR` | The poll URL answered with an error. Check the path and the query: `shutup-and-run config get poll_url --reveal`; fix with `shutup-and-run config set poll_url URL --apply`. | A poll URL respondeu com erro. Confira o caminho e os parâmetros: `shutup-and-run config get poll_url --reveal`; corrija com `shutup-and-run config set poll_url URL --apply`. |
 | `POLL_RATE_LIMITED` | The poll URL asked this machine to slow down (429). Wait: the worker backs off by itself. | A poll URL pediu para esta máquina ir mais devagar (429). Aguarde: o worker reduz o ritmo sozinho. |
 | `POLL_ERROR` | Check the URL and its query with `shutup-and-run config get poll_url --reveal`, then `shutup-and-run status`. | Confira a URL e seus parâmetros com `shutup-and-run config get poll_url --reveal` e depois `shutup-and-run status`. |
+| `MANAGED_INVALID` | Nothing was saved. Fix what the error names; `shutup-and-run managed --help` lists the fields and examples/managed/ has a file to copy. | Nada foi salvo. Corrija o que o erro aponta; `shutup-and-run managed --help` lista os campos e examples/managed/ tem um arquivo para copiar. |
+| `MANAGED_NOT_FOUND` | Run `shutup-and-run managed list` and use one of the names it prints. | Rode `shutup-and-run managed list` e use um dos nomes que ele imprime. |
+| `MANAGED_BUSY` | Wait for the running containers (`shutup-and-run jobs`), or stop the managed ones with `shutup-and-run managed stop NAME`, then change the mode again. | Aguarde os containers em execução (`shutup-and-run jobs`), ou pare os gerenciados com `shutup-and-run managed stop NOME`, e mude o modo de novo. |
+| `MANAGED_MODE` | This machine runs its own managed containers and takes no job. Send the job to another machine, or run `shutup-and-run managed mode off` on this one while it is idle. | Esta máquina roda seus próprios containers gerenciados e não aceita tarefas. Envie a tarefa para outra máquina, ou rode `shutup-and-run managed mode off` nesta enquanto estiver ociosa. |
+| `MANAGED_MODE_OFF` | Run `shutup-and-run managed mode on` while nothing is running; the worker then stops taking jobs from outside. | Rode `shutup-and-run managed mode on` quando nada estiver rodando; o worker então para de pegar tarefas de fora. |
+| `MANAGED_DISABLED` | Run `shutup-and-run managed enable NAME`, then start it again. | Rode `shutup-and-run managed enable NOME` e inicie de novo. |
+| `MANAGED_RUNNING` | Run `shutup-and-run managed stop NAME`, wait a few seconds, then remove it again. | Rode `shutup-and-run managed stop NOME`, aguarde alguns segundos e remova de novo. |
+| `MANAGED_FAILED` | Run the command as root (Linux: `sudo`), with the same config as the service; then `shutup-and-run doctor`. | Rode o comando como root (Linux: `sudo`), com a mesma config do serviço; depois `shutup-and-run doctor`. |
 | `JOB_INVALID_JSON` | Fix the JSON of the job file and run `shutup-and-run job validate FILE` again. | Corrija o JSON do arquivo da tarefa e rode `shutup-and-run job validate ARQUIVO` de novo. |
 | `JOB_INVALID_FIELD` | Fix the field named in the error; docs/INTEGRATION-CONTRACT.md lists the fields of a job. | Corrija o campo citado no erro; docs/INTEGRATION-CONTRACT.md lista os campos de uma tarefa. |
 | `JOB_IMAGE_NOT_ALLOWED` | Add the image: `shutup-and-run config set allowlist IMAGE --apply`, or validate as a polled task with `--poll`. | Adicione a imagem: `shutup-and-run config set allowlist IMAGEM --apply`, ou valide como tarefa da poll URL com `--poll`. |
@@ -159,6 +167,23 @@ The JSON also carries `fix`. It is the same sentence under the name 0.2.8 used; 
 | `WSL_LIMITS_ABOVE_BUDGET` | Run `shutup-and-run wsl limits --apply` (it keeps every other line of .wslconfig), then restart WSL yourself: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`. | Rode `shutup-and-run wsl limits --apply` (mantém as outras linhas do .wslconfig) e reinicie o WSL você mesmo: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`. |
 | `WSL_LIMITS_NOT_IN_EFFECT` | The limits apply when WSL restarts: `shutup-and-run wsl stop`, `wsl --shutdown` (it stops every WSL distribution of this user), `shutup-and-run wsl start`. | Os limites valem quando o WSL reinicia: `shutup-and-run wsl stop`, `wsl --shutdown` (para todas as distribuições WSL deste usuário), `shutup-and-run wsl start`. |
 | any other | Run `shutup-and-run doctor --report` and open the issue link it prints. | Rode `shutup-and-run doctor --report` e abra o link de issue que ele imprime. |
+
+## Managed containers (work with no poll URL)
+
+When the owner wants a container to run on this machine by itself (every N seconds, or always), not from a queue:
+
+```bash
+shutup-and-run managed apply definition.json --json   # checked like a job; exit 3 and MANAGED_INVALID say what is wrong
+printf '%s' "$VALUE" | shutup-and-run managed secret NAME KEY --json   # for each key of secret_env that is null in the file
+shutup-and-run managed mode on --json                  # only while nothing runs; MANAGED_BUSY otherwise
+shutup-and-run managed list --json
+```
+
+- A definition: `name`, `image` (in the allowlist), `policy` (`once`, `interval`, `always`), and optionally `command`, `env`, `secret_env`, `cpu`, `memory`, `shm`, `timeout_secs`, `interval_secs` (for `interval`, 60 or more), `enabled`. `examples/managed/rpa-selenium.json` is one to copy. Unknown fields are refused.
+- `mode on` stops the worker from polling and from accepting `POST /v1/jobs` (`409` `MANAGED_MODE`). Say so to the owner before turning it on. `mode off` gives that back. Neither interrupts anything: stop the running containers first (`managed stop NAME`), or wait.
+- In `list --json` each container has a `state`: `running`, `starting`, `scheduled`, `backoff` (an `always` container that keeps ending early; `failures` counts them), `waiting` (`note` says what the machine refused; it is retried), `needs_secret`, `stopped` (by a person; only `managed start` lifts it), `idle`, `disabled`, `off` (managed mode is off).
+- `start` and `stop` are requests the running service acts on within 10 seconds. Read `list` again; do not repeat them in a loop.
+- Never put a secret's value in a file, a command line or your answer. `managed secret` reads it from stdin, and nothing prints it back.
 
 ## Certificate passthrough (only when the owner asks)
 

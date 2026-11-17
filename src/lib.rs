@@ -18,6 +18,7 @@ pub mod host;
 pub mod jobs;
 pub mod launcher;
 pub mod lock;
+pub mod managed;
 pub mod poll;
 pub mod registry;
 pub mod resources;

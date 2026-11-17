@@ -109,6 +109,7 @@ async fn health(State(launcher): State<Arc<Launcher>>) -> Response {
                 "slots_total": slots.total,
                 "slots_used": slots.used,
                 "slots_free": slots.free,
+                "mode": if launcher.managed_mode().unwrap_or(false) { "managed" } else { "jobs" },
             })),
         )
             .into_response(),
@@ -223,6 +224,16 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
                 "reasons": reasons,
             })),
         ),
+        // Not "later": the machine was set to run its own containers, and
+        // only a person at it changes that.
+        Err(LaunchError::ManagedMode) => error_body(
+            StatusCode::CONFLICT,
+            "managed mode",
+            Some(json!({"code": "MANAGED_MODE"})),
+        ),
+        Err(err @ (LaunchError::JobsMode | LaunchError::AlreadyRunning)) => {
+            error_body(StatusCode::BAD_GATEWAY, &err.to_string(), None)
+        }
         Err(LaunchError::Unavailable(msg)) => error_body(StatusCode::BAD_GATEWAY, &msg, None),
     }
 }
@@ -1446,5 +1457,180 @@ mod tests {
                 "authorization_granted"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn the_local_page_manages_containers_and_managed_mode_refuses_a_push() {
+        const SECRET: &str = "tok-page-never-shown";
+        const LO: [u8; 4] = [127, 0, 0, 1];
+        const HOST: &str = "127.0.0.1:8787";
+        const ORIGIN: &str = "http://127.0.0.1:8787";
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let clock = Arc::new(FakeClock::new(1_700_000_000));
+        let cfg = settings_extra(2, "auth_failures = 30\nstatus_page = true");
+        let launcher = Launcher::with_clock(cfg, runtime, clock).unwrap();
+        let app = router(launcher.clone());
+        let send = |method: &'static str, uri: &'static str, login: bool, body: String| {
+            let app = app.clone();
+            async move {
+                use base64::Engine;
+                let mut builder = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("host", HOST)
+                    .header("origin", ORIGIN)
+                    .header("content-type", "application/x-www-form-urlencoded");
+                if login {
+                    builder = builder.header(
+                        "authorization",
+                        format!(
+                            "Basic {}",
+                            base64::engine::general_purpose::STANDARD.encode("admin:admin")
+                        ),
+                    );
+                }
+                let response = app
+                    .oneshot(stamp(builder.body(Body::from(body)).unwrap(), LO))
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, String::from_utf8_lossy(&bytes).to_string())
+            }
+        };
+        let definition = |image: &str| {
+            format!(
+                "action=save&name=rpa&image={image}&policy=always&enabled=on&cpu=1&memory=1g\
+                 &env=USE_XVFB%3D1&secrets=API_TOKEN%3D{SECRET}%0ACERT_ID"
+            )
+        };
+
+        let (status, page) = send("GET", "/local/managed", false, String::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains("Managed mode is OFF"), "{page}");
+        let (_, home) = send("GET", "/", false, String::new()).await;
+        assert!(home.contains("href=\"/local/managed\""));
+
+        // What a container is, and the mode, are the admin's.
+        for body in [
+            definition("alpine"),
+            "action=mode_on".into(),
+            "action=delete&name=rpa".into(),
+        ] {
+            assert_eq!(
+                send("POST", "/local/managed", false, body).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            send("GET", "/local/managed/edit", false, String::new())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        // A form on another site cannot press a button here.
+        let cross = Request::builder()
+            .method("POST")
+            .uri("/local/managed")
+            .header("host", HOST)
+            .header("origin", "https://evil.example")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("action=start&name=rpa"))
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(stamp(cross, LO))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Invalid: nothing saved, the reason shown, the typed secret not echoed.
+        let (status, page) = send("POST", "/local/managed", true, definition("evil%2Fimage")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            page.contains("allowlist") && page.contains("API_TOKEN"),
+            "{page}"
+        );
+        assert!(!page.contains(SECRET));
+        assert!(launcher.store().managed_rows().unwrap().is_empty());
+
+        let (status, _) = send("POST", "/local/managed", true, definition("alpine")).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let (status, editor) =
+            send("GET", "/local/managed/edit?name=rpa", true, String::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(editor.contains("USE_XVFB=1") && editor.contains("API_TOKEN"));
+        assert!(!editor.contains(SECRET));
+
+        // Managed mode on: a push is refused with a reason of its own.
+        let (status, _) = send("POST", "/local/managed", true, "action=mode_on".into()).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let response = app
+            .clone()
+            .oneshot(post(r#"{"image":"alpine"}"#, Some("test-token-value-ok")))
+            .await
+            .unwrap();
+        let (status, body) = json_of(response).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            (body["error"].as_str(), body["code"].as_str()),
+            (Some("managed mode"), Some("MANAGED_MODE"))
+        );
+        let health = app
+            .clone()
+            .oneshot(get_from(
+                "/health",
+                Some("test-token-value-ok"),
+                [203, 0, 113, 10],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(json_of(health).await.1["mode"], "managed");
+
+        // CERT_ID has no value yet, so it waits; with it, it runs.
+        crate::managed::pass(&launcher).await;
+        assert_eq!(mock.start_count().await, 0);
+        let edit = format!("{}%3Dabc", definition("alpine"));
+        assert_eq!(
+            send("POST", "/local/managed", true, edit).await.0,
+            StatusCode::SEE_OTHER
+        );
+        crate::managed::pass(&launcher).await;
+        launcher.settled().await;
+        assert_eq!(mock.start_count().await, 1);
+        let env = &mock.specs().await[0].env;
+        assert!(
+            env.contains(&format!("API_TOKEN={SECRET}")) && env.contains(&"CERT_ID=abc".into())
+        );
+        let (_, page) = send("GET", "/local/managed", false, String::new()).await;
+        assert!(page.contains("Managed mode is ON") && page.contains("value=\"stop\""));
+        assert!(!page.contains(SECRET) && !page.contains("USE_XVFB"));
+
+        // Busy: the mode stays, and the page says what to do.
+        let (status, page) = send("POST", "/local/managed", true, "action=mode_off".into()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            page.contains("the worker is busy") && page.contains("managed stop"),
+            "{page}"
+        );
+        assert!(launcher.managed_mode().unwrap());
+
+        // Stop is for the person at the PC: no login.
+        let (status, _) = send(
+            "POST",
+            "/local/managed",
+            false,
+            "action=stop&name=rpa".into(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        crate::managed::pass(&launcher).await;
+        assert_eq!(mock.killed().await.len(), 1);
+        let (status, _) = send("POST", "/local/managed", true, "action=mode_off".into()).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(!launcher.managed_mode().unwrap());
     }
 }

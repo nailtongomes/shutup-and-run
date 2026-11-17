@@ -43,6 +43,8 @@ pub fn router(launcher: Arc<Launcher>) -> Router {
             "/local/certificate",
             get(certificate_page).post(certificate_save),
         )
+        .route("/local/managed", get(managed_page).post(managed_save))
+        .route("/local/managed/edit", get(managed_edit))
         .layer(from_fn(local_only))
         .with_state(launcher)
 }
@@ -160,7 +162,7 @@ async fn set_lang(Query(query): Query<HashMap<String, String>>) -> Response {
     let to = query
         .get("to")
         .map(String::as_str)
-        .filter(|to| matches!(*to, "/local/config" | "/local/advanced"))
+        .filter(|to| matches!(*to, "/local/config" | "/local/advanced" | "/local/managed"))
         .unwrap_or("/");
     (
         [(
@@ -198,6 +200,11 @@ async fn page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Resp
         limits: Some(&live.limits),
         waiting_for: live.waiting_for.as_deref(),
         safety: Some(&live.safety),
+        managed: Some((
+            live.managed_mode,
+            live.managed.iter().filter(|m| m.state == "running").count(),
+            live.managed.len(),
+        )),
     };
     html(StatusCode::OK, render(&view))
 }
@@ -465,6 +472,8 @@ pub(crate) struct View<'a> {
     pub waiting_for: Option<&'a str>,
     /// What stands between this computer and a new job. None leaves it out.
     pub safety: Option<&'a crate::safety::Report>,
+    /// Managed mode, and how many managed containers run, of how many.
+    pub managed: Option<(bool, usize, usize)>,
 }
 
 /// Everything around a page's body: one language, and a link to the other.
@@ -581,7 +590,14 @@ pub(crate) fn render(view: &View) -> String {
         ),
         None => lang.t("none yet", "nenhuma ainda").to_string(),
     };
+    let managed_on = view.managed.is_some_and(|(on, _, _)| on);
     let queue = match (view.polls, view.poll_error) {
+        _ if managed_on => lang
+            .t(
+                "off: managed mode takes no job from outside",
+                "desligada: o modo gerenciado não pega tarefa de fora",
+            )
+            .to_string(),
         (false, _) => lang
             .t(
                 "no poll URL: nothing to do",
@@ -620,12 +636,28 @@ pub(crate) fn render(view: &View) -> String {
          <tr><td>{t_off}</td><td><b>{off}</b></td></tr>\
          <tr><td>{t_jobs}</td><td>{slots}</td></tr>\
          <tr><td>{t_last}</td><td>{last}</td></tr>\
-         <tr><td>{t_queue}</td><td>{queue}</td></tr>\
+         <tr><td>{t_queue}</td><td>{queue}</td></tr>{managed}\
          <tr><td>{t_machine}</td><td>{worker} ({os})</td></tr>\
          </table>\
          <form method=\"post\" action=\"{action}\"><p><button>{label}</button></p></form>\
          {settings}{computer}<p><small>{note}</small></p>",
         computer = computer_section(view),
+        managed = match view.managed {
+            None => String::new(),
+            Some((on, running, total)) => format!(
+                "<tr><td><a href=\"/local/managed\">{}</a></td><td>{}</td></tr>",
+                lang.t("Managed containers", "Containers gerenciados"),
+                if on {
+                    format!(
+                        "<b>{}</b> &middot; {running} / {total} {}",
+                        lang.t("on", "ligado"),
+                        lang.t("running", "rodando"),
+                    )
+                } else {
+                    format!("{} &middot; {total}", lang.t("off", "desligado"))
+                },
+            ),
+        },
         t_off = lang.t("Turn off?", "Pode desligar?"),
         t_jobs = lang.t("Jobs now", "Tarefas agora"),
         t_last = lang.t("Last job", "Última tarefa"),
@@ -1475,6 +1507,632 @@ async fn certificate_save(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Managed containers. The list and its start, stop, enable and disable are
+// for the person at the machine, like the pause. What a container is, and
+// the mode of the machine, are behind the admin login, like the other
+// dangerous settings. A secret's value is never sent to the browser.
+
+const MANAGED_FIELDS: &[&str] = &[
+    "name",
+    "image",
+    "command",
+    "env",
+    "secrets",
+    "cpu",
+    "memory",
+    "shm",
+    "timeout_secs",
+    "policy",
+    "interval_secs",
+    "enabled",
+];
+
+fn managed_state(view: &crate::managed::View, now: i64, lang: Lang) -> String {
+    let wait = |at: Option<i64>| ago(at.unwrap_or(now).saturating_sub(now));
+    let state = match view.state {
+        "running" => lang.t("running", "rodando").to_string(),
+        "starting" => lang.t("starting", "iniciando").to_string(),
+        "scheduled" => format!(
+            "{} {}",
+            lang.t("next run in", "próxima execução em"),
+            wait(view.next_start_at)
+        ),
+        "backoff" => format!(
+            "<span class=\"bad\">{}</span>: {} {}",
+            lang.t("it keeps ending early", "está terminando cedo demais"),
+            lang.t("next try in", "nova tentativa em"),
+            wait(view.next_start_at)
+        ),
+        "waiting" => format!(
+            "<span class=\"bad\">{}</span>: {}",
+            lang.t("waiting", "esperando"),
+            escape(view.note.as_deref().unwrap_or(""))
+        ),
+        "needs_secret" => format!(
+            "<span class=\"bad\">{}</span>: {}",
+            lang.t("a secret has no value", "falta o valor de um segredo"),
+            escape(&view.secrets_missing.join(", "))
+        ),
+        "stopped" => lang
+            .t("stopped by a person", "parado por uma pessoa")
+            .to_string(),
+        "idle" => lang
+            .t("ready: runs when started", "pronto: roda ao iniciar")
+            .to_string(),
+        "disabled" => lang.t("disabled", "desativado").to_string(),
+        _ => lang
+            .t("managed mode is off", "modo gerenciado desligado")
+            .to_string(),
+    };
+    if view.failures > 0 {
+        format!(
+            "{state}<br><small>{}: {}</small>",
+            lang.t("failures in a row", "falhas seguidas"),
+            view.failures
+        )
+    } else {
+        state
+    }
+}
+
+/// The list. `note` is the answer to the last button.
+pub(crate) fn managed_view(
+    mode: bool,
+    views: &[crate::managed::View],
+    now: i64,
+    lang: Lang,
+    note: Option<(bool, &str)>,
+) -> String {
+    let button = |name: &str, action: &str, label: &str| {
+        format!(
+            "<form method=\"post\" action=\"/local/managed\" style=\"display:inline\">\
+             <input type=\"hidden\" name=\"name\" value=\"{}\">\
+             <button name=\"action\" value=\"{action}\">{label}</button></form> ",
+            escape(name)
+        )
+    };
+    let mut rows = String::new();
+    for view in views {
+        let d = &view.definition;
+        let policy = match (d.policy, d.interval_secs) {
+            (crate::managed::Policy::Interval, Some(secs)) => {
+                format!("{} {}", lang.t("every", "a cada"), ago(secs as i64))
+            }
+            (crate::managed::Policy::Always, _) => {
+                lang.t("always running", "sempre rodando").to_string()
+            }
+            _ => lang
+                .t("once, when started", "uma vez, ao iniciar")
+                .to_string(),
+        };
+        let last = match &view.last {
+            Some(job) => format!(
+                "{} &middot; {}",
+                crate::jobs::status_of(job),
+                ago(now.saturating_sub(job.ended_at.unwrap_or(job.started_at)))
+            ),
+            None => lang.t("never ran", "nunca rodou").to_string(),
+        };
+        let mut controls = String::new();
+        if view.running_job.is_some() {
+            controls += &button(&d.name, "stop", lang.t("Stop", "Parar"));
+        } else if view.enabled && mode {
+            controls += &button(&d.name, "start", lang.t("Start now", "Iniciar agora"));
+        }
+        controls += &if view.enabled {
+            button(&d.name, "disable", lang.t("Disable", "Desativar"))
+        } else {
+            button(&d.name, "enable", lang.t("Enable", "Ativar"))
+        };
+        rows += &format!(
+            "<tr><td><b>{name}</b><br><small><code>{image}</code></small></td><td>{policy}</td>\
+             <td>{state}</td><td>{last}</td><td>{controls}\
+             <a href=\"/local/managed/edit?name={name}\">{edit}</a></td></tr>",
+            name = escape(&d.name),
+            image = escape(&d.image),
+            state = managed_state(view, now, lang),
+            edit = lang.t("Edit", "Editar"),
+        );
+    }
+    let table = if views.is_empty() {
+        format!(
+            "<p>{}</p>",
+            lang.t(
+                "No managed container yet.",
+                "Nenhum container gerenciado ainda."
+            )
+        )
+    } else {
+        format!(
+            "<table><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th></th></tr>{rows}</table>",
+            lang.t("Container", "Container"),
+            lang.t("Runs", "Roda"),
+            lang.t("State", "Estado"),
+            lang.t("Last run", "Última execução"),
+        )
+    };
+    let mode_text = if mode {
+        lang.t(
+            "<b>Managed mode is ON.</b> This worker starts the containers below by itself. It takes no job from the poll URL and none from the API.",
+            "<b>O modo gerenciado está LIGADO.</b> Este worker inicia sozinho os containers abaixo. Não pega tarefa da URL de poll nem da API.",
+        )
+    } else {
+        lang.t(
+            "<b>Managed mode is OFF.</b> This worker takes jobs from the poll URL and the API, and starts none of the containers below.",
+            "<b>O modo gerenciado está DESLIGADO.</b> Este worker pega tarefas da URL de poll e da API, e não inicia nenhum dos containers abaixo.",
+        )
+    };
+    let (mode_action, mode_label) = if mode {
+        (
+            "mode_off",
+            lang.t("Turn managed mode off", "Desligar o modo gerenciado"),
+        )
+    } else {
+        (
+            "mode_on",
+            lang.t("Turn managed mode on", "Ligar o modo gerenciado"),
+        )
+    };
+    let note = note
+        .map(|(ok, text)| {
+            format!(
+                "<p class=\"{}\"><b>{}</b></p>",
+                if ok { "" } else { "bad" },
+                escape(text)
+            )
+        })
+        .unwrap_or_default();
+    let body = format!(
+        "<p><a href=\"/\">&larr; {back}</a></p><h2>{title}</h2>{note}<p>{mode_text}</p>\
+         <form method=\"post\" action=\"/local/managed\"><p>\
+         <button name=\"action\" value=\"{mode_action}\">{mode_label}</button> <small>{mode_note}</small></p></form>\
+         {table}<p><a href=\"/local/managed/edit\">{new}</a> <small>{admin}</small></p>\
+         <p><small>{rules}</small></p>",
+        back = lang.t("Status", "Status"),
+        title = lang.t("Managed containers", "Containers gerenciados"),
+        mode_note = lang.t(
+            "Admin login. Only while nothing is running.",
+            "Login de administrador. Só quando nada está rodando.",
+        ),
+        new = lang.t("New managed container", "Novo container gerenciado"),
+        admin = lang.t("(admin login)", "(login de administrador)"),
+        rules = lang.t(
+            "Stop ends the container now, and it stays stopped until someone starts it. Disable starts nothing new: a run in progress finishes. Every run obeys this machine's allowlist, slots, limits and safety checks; when the machine is short of memory or in use, a start waits.",
+            "Parar encerra o container agora, e ele fica parado até alguém iniciar. Desativar não inicia mais nada: a execução em andamento termina. Toda execução obedece à allowlist, aos slots, aos limites e às checagens de segurança desta máquina; se faltar memória ou a máquina estiver em uso, o início espera.",
+        ),
+    );
+    shell(lang, "/local/managed", Some((10, "/local/managed")), &body)
+}
+
+async fn managed_list(
+    launcher: &Launcher,
+    lang: Lang,
+    status: StatusCode,
+    note: Option<(bool, &str)>,
+) -> Response {
+    let now = launcher.now();
+    match crate::managed::views(launcher.store(), now) {
+        Ok((mode, views)) => html(status, managed_view(mode, &views, now, lang, note)),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn managed_page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Response {
+    let lang = lang_of(&headers, &launcher.settings().language);
+    managed_list(&launcher, lang, StatusCode::OK, None).await
+}
+
+fn lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|line| !line.is_empty())
+}
+
+/// The editor's fields as a definition. A secret line is `NAME=value` to
+/// set it, or `NAME` alone to keep the value this machine has.
+pub(crate) fn managed_input(
+    form: &HashMap<String, String>,
+) -> Result<crate::managed::Input, String> {
+    let field = |name: &str| form.get(name).map(|v| v.trim()).unwrap_or("");
+    let optional = |name: &str| Some(field(name).to_string()).filter(|v| !v.is_empty());
+    let number = |name: &str| -> Result<Option<u64>, String> {
+        match field(name) {
+            "" => Ok(None),
+            text => text
+                .parse()
+                .map(Some)
+                .map_err(|_| format!("{name} must be a whole number")),
+        }
+    };
+    let mut env = std::collections::BTreeMap::new();
+    for line in lines(field("env")) {
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            format!(
+                "env: `{}` is not NAME=value",
+                line.chars().take(40).collect::<String>()
+            )
+        })?;
+        env.insert(key.trim().to_string(), value.to_string());
+    }
+    let mut secret_env = std::collections::BTreeMap::new();
+    for line in lines(field("secrets")) {
+        match line.split_once('=') {
+            Some((key, value)) => {
+                secret_env.insert(key.trim().to_string(), Some(value.to_string()))
+            }
+            None => secret_env.insert(line.to_string(), None),
+        };
+    }
+    let command: Vec<String> = lines(field("command")).map(str::to_string).collect();
+    Ok(crate::managed::Input {
+        name: field("name").to_string(),
+        image: field("image").to_string(),
+        command: Some(command).filter(|c| !c.is_empty()),
+        env,
+        secret_env,
+        cpu: match field("cpu") {
+            "" => None,
+            text => Some(
+                text.replace(',', ".")
+                    .parse()
+                    .map_err(|_| "cpu must be a number".to_string())?,
+            ),
+        },
+        memory: optional("memory"),
+        shm: optional("shm"),
+        timeout_secs: number("timeout_secs")?,
+        policy: match field("policy") {
+            "once" => crate::managed::Policy::Once,
+            "interval" => crate::managed::Policy::Interval,
+            "always" => crate::managed::Policy::Always,
+            _ => return Err("policy must be once, interval or always".to_string()),
+        },
+        interval_secs: number("interval_secs")?,
+        enabled: form.contains_key("enabled"),
+    })
+}
+
+/// A stored definition as the editor's fields. Secrets by name only.
+fn managed_fields(
+    definition: &crate::managed::Definition,
+    enabled: bool,
+) -> HashMap<String, String> {
+    let text = |value: Option<String>| value.unwrap_or_default();
+    let mut fields = HashMap::from([
+        ("name".to_string(), definition.name.clone()),
+        ("image".to_string(), definition.image.clone()),
+        (
+            "command".to_string(),
+            definition.command.clone().unwrap_or_default().join("\n"),
+        ),
+        (
+            "env".to_string(),
+            definition
+                .env
+                .iter()
+                .map(|(k, v)| format!("{k}={v}\n"))
+                .collect(),
+        ),
+        ("secrets".to_string(), definition.secret_env.join("\n")),
+        (
+            "cpu".to_string(),
+            text(definition.cpu.map(|c| c.to_string())),
+        ),
+        ("memory".to_string(), text(definition.memory.clone())),
+        ("shm".to_string(), text(definition.shm.clone())),
+        (
+            "timeout_secs".to_string(),
+            text(definition.timeout_secs.map(|t| t.to_string())),
+        ),
+        ("policy".to_string(), definition.policy.name().to_string()),
+        (
+            "interval_secs".to_string(),
+            text(definition.interval_secs.map(|t| t.to_string())),
+        ),
+    ]);
+    if enabled {
+        fields.insert("enabled".to_string(), "on".to_string());
+    }
+    fields
+}
+
+/// The editor. `existing` fixes the name. On an error the fields come back
+/// as they were typed, except the secret values: those are typed again.
+pub(crate) fn managed_editor(
+    fields: &HashMap<String, String>,
+    existing: bool,
+    limits: &Limits,
+    lang: Lang,
+    error: Option<&str>,
+) -> String {
+    let value = |name: &str| escape(fields.get(name).map(String::as_str).unwrap_or(""));
+    let input = |name: &str, label: &str, hint: &str, extra: &str| {
+        format!(
+            "<label for=\"{name}\">{label}</label>\
+             <input type=\"text\" id=\"{name}\" name=\"{name}\" value=\"{}\" {extra}>\
+             <small>{hint}</small>",
+            value(name)
+        )
+    };
+    let area = |name: &str, label: &str, hint: &str, text: String| {
+        format!(
+            "<label for=\"{name}\">{label}</label>\
+             <textarea id=\"{name}\" name=\"{name}\" rows=\"4\" spellcheck=\"false\" autocomplete=\"off\">{text}</textarea>\
+             <small>{hint}</small>"
+        )
+    };
+    // Only the names go back to the browser, whatever was typed.
+    let secret_names: String = lines(fields.get("secrets").map(String::as_str).unwrap_or(""))
+        .map(|line| format!("{}\n", escape(line.split('=').next().unwrap_or("").trim())))
+        .collect();
+    let policy = fields
+        .get("policy")
+        .map(String::as_str)
+        .unwrap_or("interval");
+    let option = |name: &str, label: &str| {
+        format!(
+            "<option value=\"{name}\"{}>{label}</option>",
+            if policy == name { " selected" } else { "" }
+        )
+    };
+    let per_job = |value: Option<String>| {
+        value.unwrap_or_else(|| lang.t("no limit", "sem limite").to_string())
+    };
+    let error = error
+        .map(|e| {
+            format!(
+                "<p class=\"bad\"><b>{}</b> {}</p>",
+                lang.t("Not saved.", "Não salvo."),
+                escape(e)
+            )
+        })
+        .unwrap_or_default();
+    let delete = if existing {
+        format!(
+            "<form method=\"post\" action=\"/local/managed\"><input type=\"hidden\" name=\"name\" value=\"{}\">\
+             <p><button name=\"action\" value=\"delete\">{}</button></p></form>",
+            value("name"),
+            lang.t("Remove this container", "Remover este container"),
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "<p><a href=\"/local/managed\">&larr; {back}</a></p><h2>{title}</h2>{error}\
+         <form method=\"post\" action=\"/local/managed\">\
+         <input type=\"hidden\" name=\"action\" value=\"save\">\
+         {name}{image}{command}{env}{secrets}{cpu}{memory}{shm}{timeout}\
+         <label for=\"policy\">{t_policy}</label><select id=\"policy\" name=\"policy\">{once}{interval}{always}</select>\
+         <small>{policy_hint}</small>{interval_secs}\
+         <label><input type=\"checkbox\" name=\"enabled\"{checked}> {t_enabled}</label>\
+         <p><button>{save}</button></p></form>{delete}",
+        back = lang.t("Managed containers", "Containers gerenciados"),
+        title = if existing {
+            lang.t("Edit managed container", "Editar container gerenciado")
+        } else {
+            lang.t("New managed container", "Novo container gerenciado")
+        },
+        name = input(
+            "name",
+            lang.t("Name", "Nome"),
+            lang.t(
+                "Lowercase letters, digits, - and _. It cannot be changed later.",
+                "Letras minúsculas, dígitos, - e _. Não pode ser mudado depois.",
+            ),
+            if existing { "readonly" } else { "" },
+        ),
+        image = input(
+            "image",
+            lang.t("Image", "Imagem"),
+            lang.t(
+                "Must be in this machine's allowlist.",
+                "Precisa estar na allowlist desta máquina.",
+            ),
+            "",
+        ),
+        command = area(
+            "command",
+            lang.t("Command (optional)", "Comando (opcional)"),
+            lang.t(
+                "One argument per line. Empty: the image's own command.",
+                "Um argumento por linha. Vazio: o comando da própria imagem.",
+            ),
+            value("command"),
+        ),
+        env = area(
+            "env",
+            lang.t("Environment", "Variáveis de ambiente"),
+            lang.t(
+                "One NAME=value per line. Not for passwords or tokens: use the next box.",
+                "Um NOME=valor por linha. Não para senhas ou tokens: use a caixa seguinte.",
+            ),
+            value("env"),
+        ),
+        secrets = area(
+            "secrets",
+            lang.t("Secret environment", "Variáveis secretas"),
+            lang.t(
+                "NAME=value sets a secret. A NAME alone keeps the value this machine already has. A stored value is never shown again, here or anywhere.",
+                "NOME=valor define um segredo. Só o NOME mantém o valor que esta máquina já tem. Um valor guardado nunca é mostrado de novo, aqui ou em outro lugar.",
+            ),
+            secret_names,
+        ),
+        cpu = input(
+            "cpu",
+            lang.t("CPUs", "CPUs"),
+            &format!(
+                "{} {}",
+                lang.t("Empty: this machine's limit per job,", "Vazio: o limite desta máquina por tarefa,"),
+                per_job(limits.max_job_cpus.map(|c| c.to_string()))
+            ),
+            "",
+        ),
+        memory = input(
+            "memory",
+            lang.t("Memory", "Memória"),
+            &format!(
+                "{} {}",
+                lang.t("Like 2g. Empty: this machine's limit per job,", "Como 2g. Vazio: o limite desta máquina por tarefa,"),
+                per_job(limits.max_job_memory_bytes.map(crate::resources::human))
+            ),
+            "",
+        ),
+        shm = input(
+            "shm",
+            lang.t("Shared memory (/dev/shm)", "Memória compartilhada (/dev/shm)"),
+            lang.t(
+                "Like 2g. A browser needs it. Empty: Docker's 64 MiB.",
+                "Como 2g. Um navegador precisa. Vazio: os 64 MiB do Docker.",
+            ),
+            "",
+        ),
+        timeout = input(
+            "timeout_secs",
+            lang.t("Time limit of one run, in seconds", "Tempo limite de uma execução, em segundos"),
+            lang.t(
+                "A run that passes it is stopped. Empty: this machine's default; for \"always\", the longest this machine allows, after which the container is started again.",
+                "A execução que passa disso é encerrada. Vazio: o padrão desta máquina; para \"sempre\", o maior que esta máquina permite, e depois o container é iniciado de novo.",
+            ),
+            "inputmode=\"numeric\"",
+        ),
+        t_policy = lang.t("When it runs", "Quando roda"),
+        once = option("once", lang.t("Once, when someone starts it", "Uma vez, quando alguém inicia")),
+        interval = option("interval", lang.t("Again every interval", "De novo a cada intervalo")),
+        always = option("always", lang.t("Always running", "Sempre rodando")),
+        policy_hint = lang.t(
+            "Interval: start to start, never two at a time; a run still going when the next is due is followed by it, not joined. Always: started again whenever it ends, after a wait that grows from 30 s to 15 min while it keeps ending in under a minute.",
+            "Intervalo: de início a início, nunca dois ao mesmo tempo; se a execução ainda não acabou quando chega a hora, a próxima vem depois dela. Sempre: iniciado de novo toda vez que termina, depois de uma espera que cresce de 30 s a 15 min enquanto ele terminar em menos de um minuto.",
+        ),
+        interval_secs = input(
+            "interval_secs",
+            lang.t("Interval, in seconds", "Intervalo, em segundos"),
+            lang.t("Only for the interval. 60 or more.", "Só para o intervalo. 60 ou mais."),
+            "inputmode=\"numeric\"",
+        ),
+        checked = if fields.contains_key("enabled") { " checked" } else { "" },
+        t_enabled = lang.t(
+            "Enabled: the worker may start it (in managed mode)",
+            "Ativado: o worker pode iniciar (no modo gerenciado)",
+        ),
+        save = lang.t("Save", "Salvar"),
+    );
+    shell(lang, "/local/managed", None, &body)
+}
+
+/// The editor of a stored definition, as the admin gets it.
+#[cfg(test)]
+pub(crate) fn managed_editor_for_test(definition: &crate::managed::Definition) -> String {
+    managed_editor(
+        &managed_fields(definition, true),
+        true,
+        &Limits::default(),
+        Lang::En,
+        None,
+    )
+}
+
+async fn managed_edit(
+    State(launcher): State<Arc<Launcher>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let lang = lang_of(&headers, &launcher.settings().language);
+    if !admin(&headers, &launcher) {
+        return ask_login();
+    }
+    let limits = Limits::of(launcher.settings());
+    let stored = query
+        .get("name")
+        .and_then(|name| launcher.store().managed_row(name).ok().flatten())
+        .and_then(|row| {
+            let definition = serde_json::from_str(&row.spec).ok()?;
+            Some(managed_fields(&definition, row.enabled))
+        });
+    let fresh = HashMap::from([("policy".to_string(), "interval".to_string())]);
+    html(
+        StatusCode::OK,
+        managed_editor(
+            stored.as_ref().unwrap_or(&fresh),
+            stored.is_some(),
+            &limits,
+            lang,
+            None,
+        ),
+    )
+}
+
+async fn managed_save(
+    State(launcher): State<Arc<Launcher>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let lang = lang_of(&headers, &launcher.settings().language);
+    let store = launcher.store().clone();
+    let action = form.get("action").map(String::as_str).unwrap_or("");
+    let name = form.get("name").map(String::as_str).unwrap_or("");
+    if matches!(action, "mode_on" | "mode_off" | "save" | "delete") && !admin(&headers, &launcher) {
+        return ask_login();
+    }
+    let done: Result<(), crate::managed::Failure> = match action {
+        "start" => crate::managed::start(&store, name).map(|_| ()),
+        "stop" => crate::managed::stop(&store, name).map(|_| ()),
+        "enable" => crate::managed::set_enabled(&store, name, true),
+        "disable" => crate::managed::set_enabled(&store, name, false),
+        "delete" => crate::managed::remove(&store, name),
+        "mode_on" | "mode_off" => match launcher.set_managed_mode(action == "mode_on").await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(crate::managed::busy(
+                store.running_ids().map(|ids| ids.len()).unwrap_or(0),
+            )),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
+        "save" => {
+            let saved = managed_input(&form)
+                .map_err(|message| crate::managed::Failure {
+                    code: "MANAGED_INVALID",
+                    message,
+                })
+                .and_then(|input| crate::managed::save(&store, launcher.settings(), input));
+            if let Err(failure) = saved {
+                let existing = store.managed_row(name).ok().flatten().is_some();
+                let mut typed = form.clone();
+                typed.retain(|key, _| MANAGED_FIELDS.contains(&key.as_str()));
+                return html(
+                    StatusCode::BAD_REQUEST,
+                    managed_editor(
+                        &typed,
+                        existing,
+                        &Limits::of(launcher.settings()),
+                        lang,
+                        Some(&failure.message),
+                    ),
+                );
+            }
+            Ok(())
+        }
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    launcher.managed_changed.notify_one();
+    match done {
+        Ok(()) => Redirect::to("/local/managed").into_response(),
+        Err(failure) => {
+            let hint = crate::hints::hint_in(
+                failure.code,
+                match lang {
+                    Lang::En => crate::hints::Lang::En,
+                    Lang::Pt => crate::hints::Lang::Pt,
+                },
+            );
+            let status = if failure.code == "MANAGED_BUSY" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            let text = format!("{}. {hint}", failure.message.trim_end_matches('.'));
+            managed_list(&launcher, lang, status, Some((false, &text))).await
+        }
+    }
+}
+
 fn ago(secs: i64) -> String {
     match secs.max(0) {
         s if s < 120 => format!("{s} s"),
@@ -1524,6 +2182,10 @@ pub struct Live {
     pub config_warning: Option<String>,
     pub computer: Computer,
     pub safety: crate::safety::Report,
+    /// True while the machine runs its own managed containers and takes no
+    /// job from outside.
+    pub managed_mode: bool,
+    pub managed: Vec<crate::managed::View>,
 }
 
 /// Readings for the page's "Computer resources". On Windows `host` is the
@@ -1625,6 +2287,17 @@ impl Live {
             self.waiting_for.is_some(),
             self.computer.delivery
         ) + &self.safety.signature()
+            + &format!("|{}", self.managed_mode)
+            + &self
+                .managed
+                .iter()
+                .map(|m| {
+                    format!(
+                        "|{}:{}:{}:{}",
+                        m.definition.name, m.state, m.enabled, m.failures
+                    )
+                })
+                .collect::<String>()
     }
 
     pub fn state(&self, stopped: bool) -> &'static str {
@@ -1708,6 +2381,12 @@ struct FileBody<'a> {
     /// Whether a new job may start for the sake of this computer's owner:
     /// the level, why, the owner's authorization, and the last incidents.
     safety: &'a crate::safety::Report,
+    /// `jobs`: work comes from the poll URL and the API. `managed`: the
+    /// worker starts its own containers and takes nothing from outside.
+    mode: &'a str,
+    /// The managed containers: name, policy, state, the last run. Never
+    /// their env or secrets.
+    managed: Vec<serde_json::Value>,
     limits: &'a Limits,
     config_warning: Option<String>,
     version: &'a str,
@@ -1737,6 +2416,8 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
         waiting_for: live.waiting_for.as_deref(),
         callbacks: &live.computer.delivery,
         safety: &live.safety,
+        mode: if live.managed_mode { "managed" } else { "jobs" },
+        managed: live.managed.iter().map(crate::managed::view_json).collect(),
         limits: &live.limits,
         config_warning: live.config_warning.as_deref().map(one_line),
         version: env!("CARGO_PKG_VERSION"),
@@ -1775,6 +2456,8 @@ fn empty_live() -> Live {
         config_warning: None,
         computer: Computer::default(),
         safety: crate::safety::Report::default(),
+        managed_mode: false,
+        managed: Vec::new(),
     }
 }
 
@@ -2038,6 +2721,7 @@ mod tests {
             limits: None,
             waiting_for: None,
             safety: None,
+            managed: None,
         }
     }
 
@@ -2330,6 +3014,8 @@ mod tests {
             config_warning: None,
             computer: Computer::default(),
             safety: crate::safety::Report::default(),
+            managed_mode: false,
+            managed: Vec::new(),
         };
         let bytes = document(&live, 1_700_000_100, false, None);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

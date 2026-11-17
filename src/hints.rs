@@ -102,6 +102,15 @@ pub const CATALOG: &[(&str, &str, &str)] = &[
     ("JOB_INVALID_JSON", "Fix the JSON of the job file and run `shutup-and-run job validate FILE` again.", "Corrija o JSON do arquivo da tarefa e rode `shutup-and-run job validate ARQUIVO` de novo."),
     ("JOB_INVALID_FIELD", "Fix the field named in the error; docs/INTEGRATION-CONTRACT.md lists the fields of a job.", "Corrija o campo citado no erro; docs/INTEGRATION-CONTRACT.md lista os campos de uma tarefa."),
     ("JOB_IMAGE_NOT_ALLOWED", "Add the image: `shutup-and-run config set allowlist IMAGE --apply`, or validate as a polled task with `--poll`.", "Adicione a imagem: `shutup-and-run config set allowlist IMAGEM --apply`, ou valide como tarefa da poll URL com `--poll`."),
+    // Managed containers.
+    ("MANAGED_INVALID", "Nothing was saved. Fix what the error names; `shutup-and-run managed --help` lists the fields and examples/managed/ has a file to copy.", "Nada foi salvo. Corrija o que o erro aponta; `shutup-and-run managed --help` lista os campos e examples/managed/ tem um arquivo para copiar."),
+    ("MANAGED_NOT_FOUND", "Run `shutup-and-run managed list` and use one of the names it prints.", "Rode `shutup-and-run managed list` e use um dos nomes que ele imprime."),
+    ("MANAGED_BUSY", "Wait for the running containers (`shutup-and-run jobs`), or stop the managed ones with `shutup-and-run managed stop NAME`, then change the mode again.", "Aguarde os containers em execução (`shutup-and-run jobs`), ou pare os gerenciados com `shutup-and-run managed stop NOME`, e mude o modo de novo."),
+    ("MANAGED_MODE", "This machine runs its own managed containers and takes no job. Send the job to another machine, or run `shutup-and-run managed mode off` on this one while it is idle.", "Esta máquina roda seus próprios containers gerenciados e não aceita tarefas. Envie a tarefa para outra máquina, ou rode `shutup-and-run managed mode off` nesta enquanto estiver ociosa."),
+    ("MANAGED_MODE_OFF", "Run `shutup-and-run managed mode on` while nothing is running; the worker then stops taking jobs from outside.", "Rode `shutup-and-run managed mode on` quando nada estiver rodando; o worker então para de pegar tarefas de fora."),
+    ("MANAGED_DISABLED", "Run `shutup-and-run managed enable NAME`, then start it again.", "Rode `shutup-and-run managed enable NOME` e inicie de novo."),
+    ("MANAGED_RUNNING", "Run `shutup-and-run managed stop NAME`, wait a few seconds, then remove it again.", "Rode `shutup-and-run managed stop NOME`, aguarde alguns segundos e remova de novo."),
+    ("MANAGED_FAILED", "Run the command as root (Linux: `sudo`), with the same config as the service; then `shutup-and-run doctor`.", "Rode o comando como root (Linux: `sudo`), com a mesma config do serviço; depois `shutup-and-run doctor`."),
     // demo.
     ("DEMO_IMAGE_NOT_ALLOWED", "Name an allowed image with `--image`, or allow this one: `shutup-and-run config set allowlist {} --apply`.", "Indique uma imagem permitida com `--image`, ou permita esta: `shutup-and-run config set allowlist {} --apply`."),
     ("DEMO_JOB_INVALID", "Run `shutup-and-run config check` and fix what it reports.", "Rode `shutup-and-run config check` e corrija o que ele apontar."),
@@ -223,6 +232,11 @@ mod tests {
             include_str!("certificate.rs"),
             include_str!("jobs.rs"),
             include_str!("safety.rs"),
+            // Its tests name env variables, which have the shape of a code.
+            include_str!("managed.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or_default(),
         ];
         let mut codes: Vec<String> = sources.iter().flat_map(|s| codes_in(s)).collect();
         codes.sort();
