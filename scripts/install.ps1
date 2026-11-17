@@ -34,6 +34,7 @@ $Url = if ($env:SHUTUP_AND_RUN_EXE_URL) { $env:SHUTUP_AND_RUN_EXE_URL } else { "
 $Dir = Join-Path $env:ProgramData "shutup-and-run"
 $Exe = Join-Path $Dir "shutup-and-run.exe"
 $Old = "$Exe.old"
+$Failed = "$Exe.failed"
 $Tmp = Join-Path $Dir "$Asset.tmp"
 $Sums = Join-Path $Dir "SHA256SUMS"
 $Help = "https://github.com/$Repo/blob/main/docs/WINDOWS.md#update-and-repair"
@@ -143,14 +144,20 @@ try {
         Write-Host "or, to only check this machine (no polling, smoke test only):"
         Write-Host "  shutup-and-run wsl install"
     }
-    # A process that outlived Stop-Worker still holds it; the next run removes it.
-    Remove-Item -Force -ErrorAction SilentlyContinue $Old
+    # The old file can stay locked for a moment after its process ended.
+    for ($i = 0; ($i -lt 10) -and (Test-Path $Old); $i++) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $Old
+        if (Test-Path $Old) { Start-Sleep -Seconds 1 }
+    }
 } catch {
     $Why = $_
     if ($Stopped) {
         if ($Swapped -and (Test-Path $Old)) {
             Write-Host "putting back the previous $Exe"
             Stop-Worker
+            # Renamed aside, like the old one was: the file of a process just
+            # ended can stay locked for a moment.
+            Move-Item -Force $Exe $Failed
             Move-Item -Force $Old $Exe
         } elseif (-not (Test-Path $Exe) -and (Test-Path $Old)) {
             Move-Item -Force $Old $Exe
@@ -164,4 +171,8 @@ try {
     throw $Why
 } finally {
     Remove-Item -Force -ErrorAction SilentlyContinue $Tmp, $Sums
+    for ($i = 0; ($i -lt 10) -and (Test-Path $Failed); $i++) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $Failed
+        if (Test-Path $Failed) { Start-Sleep -Seconds 1 }
+    }
 }
