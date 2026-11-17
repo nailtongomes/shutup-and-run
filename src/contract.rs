@@ -1017,6 +1017,7 @@ async fn the_existing_surface_did_not_move() {
         keys,
         [
             "draining",
+            "mode",
             "slots_free",
             "slots_total",
             "slots_used",

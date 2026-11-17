@@ -81,6 +81,9 @@ pub struct NewJob {
     pub job_key: Option<String>,
     pub started_at: i64,
     pub callback_url: Option<String>,
+    /// The managed container definition this run belongs to. None for a
+    /// pushed or polled job.
+    pub managed: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +92,36 @@ pub enum StoreError {
     Sql(String),
     #[error("job_key already exists")]
     Conflict,
+    /// The machine is in the other mode: a managed run while it takes jobs,
+    /// or a job while it runs managed containers. Nothing was written.
+    #[error("the machine is in the other mode")]
+    Mode,
+}
+
+/// One managed container definition and what the worker knows about it.
+/// `spec` is the definition as JSON, without secret values; `secrets` is
+/// the JSON object of those values and leaves this file only as a
+/// container's env.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRow {
+    pub name: String,
+    pub spec: String,
+    pub secrets: String,
+    pub enabled: bool,
+    /// Stopped by a person: nothing starts it but a person.
+    pub held: bool,
+    pub start_requested: bool,
+    pub stop_requested: bool,
+    /// Runs in a row that did not last.
+    pub failures: i64,
+    /// The last run whose end was counted.
+    pub accounted_job: Option<String>,
+    pub last_job: Option<String>,
+    pub last_started_at: Option<i64>,
+    /// No automatic start before this.
+    pub next_attempt_at: i64,
+    /// Why the last start did not happen. Words of this program only.
+    pub note: Option<String>,
 }
 
 pub struct Store {
@@ -139,13 +172,29 @@ impl Store {
                 kind TEXT NOT NULL,
                 detail TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS managed (
+                name TEXT PRIMARY KEY,
+                spec TEXT NOT NULL,
+                secrets TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 0,
+                held INTEGER NOT NULL DEFAULT 0,
+                start_requested INTEGER NOT NULL DEFAULT 0,
+                stop_requested INTEGER NOT NULL DEFAULT 0,
+                failures INTEGER NOT NULL DEFAULT 0,
+                accounted_job TEXT,
+                last_job TEXT,
+                last_started_at INTEGER,
+                next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                note TEXT
+            );
             ",
         )
         .map_err(sql)?;
         // A history written before 0.2.11 has no such column. Its rows keep
         // NULL: their callbacks were sent, or not, by the old three tries.
-        // The same for `oom_killed`, added in 0.2.13: NULL reads as false.
-        for column in ["callback_state TEXT", "oom_killed INTEGER"] {
+        // The same for `oom_killed`, added in 0.2.13: NULL reads as false,
+        // and for `managed`: NULL is a pushed or polled job.
+        for column in ["callback_state TEXT", "oom_killed INTEGER", "managed TEXT"] {
             match conn.execute(&format!("ALTER TABLE jobs ADD COLUMN {column}"), []) {
                 Ok(_) => {}
                 Err(err) if err.to_string().contains("duplicate column") => {}
@@ -192,13 +241,32 @@ impl Store {
         .map_err(sql)
     }
 
+    /// One statement, so the mode cannot change between the check and the
+    /// row, whichever process changes it: a run of a managed container is
+    /// written only in managed mode, and any other job only outside it.
     pub fn insert_running(&self, job: &NewJob) -> Result<(), StoreError> {
         let conn = self.conn.lock().expect("sqlite");
+        let mode = if job.managed.is_some() {
+            "managed"
+        } else {
+            "jobs"
+        };
         let result = conn.execute(
-            "INSERT INTO jobs (id, image, job_key, started_at, callback_url) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![job.id, job.image, job.job_key, job.started_at, job.callback_url],
+            "INSERT INTO jobs (id, image, job_key, started_at, callback_url, managed)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6
+             WHERE COALESCE((SELECT value FROM meta WHERE key = 'mode'), 'jobs') = ?7",
+            params![
+                job.id,
+                job.image,
+                job.job_key,
+                job.started_at,
+                job.callback_url,
+                job.managed,
+                mode
+            ],
         );
         match result {
+            Ok(0) => Err(StoreError::Mode),
             Ok(_) => Ok(()),
             Err(err) if is_constraint(&err) && err.to_string().contains("job_key") => {
                 Err(StoreError::Conflict)
@@ -500,6 +568,219 @@ impl Store {
         Ok(())
     }
 
+    /// True while the machine runs managed containers and takes no job.
+    pub fn managed_mode(&self) -> Result<bool, StoreError> {
+        Ok(self.meta("mode")?.as_deref() == Some("managed"))
+    }
+
+    /// Changes the mode only while no job and no managed run is unfinished,
+    /// in one statement. `Ok(false)`: the worker is busy and nothing changed.
+    pub fn set_managed_mode(&self, managed: bool) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let changed = conn
+            .execute(
+                "INSERT INTO meta (key, value)
+                 SELECT 'mode', ?1 WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE ended_at IS NULL)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [if managed { "managed" } else { "jobs" }],
+            )
+            .map_err(sql)?;
+        Ok(changed > 0)
+    }
+
+    pub fn managed_rows(&self) -> Result<Vec<ManagedRow>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {MANAGED_COLUMNS} FROM managed ORDER BY name"
+            ))
+            .map_err(sql)?;
+        let rows = stmt.query_map([], map_managed).map_err(sql)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sql)
+    }
+
+    pub fn managed_row(&self, name: &str) -> Result<Option<ManagedRow>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.query_row(
+            &format!("SELECT {MANAGED_COLUMNS} FROM managed WHERE name = ?1"),
+            [name],
+            map_managed,
+        )
+        .optional()
+        .map_err(sql)
+    }
+
+    /// Writes the definition. A new one starts with no history; an edited
+    /// one keeps its secrets unless given, and gets a fresh count: what
+    /// failed before may be what the edit fixed.
+    pub fn save_managed(
+        &self,
+        name: &str,
+        spec: &str,
+        secrets: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute(
+            "INSERT INTO managed (name, spec, secrets, enabled) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, secrets = excluded.secrets,
+                 enabled = excluded.enabled, failures = 0, next_attempt_at = 0, note = NULL,
+                 start_requested = CASE WHEN excluded.enabled = 1 THEN start_requested ELSE 0 END",
+            params![name, spec, secrets, enabled],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Removes a definition that has no unfinished run. `Ok(false)`: it
+    /// runs, or there is no such definition.
+    pub fn delete_managed(&self, name: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let removed = conn
+            .execute(
+                "DELETE FROM managed WHERE name = ?1 AND NOT EXISTS
+                 (SELECT 1 FROM jobs WHERE managed = ?1 AND ended_at IS NULL)",
+                [name],
+            )
+            .map_err(sql)?;
+        Ok(removed > 0)
+    }
+
+    /// Some columns of a definition's state. `assignments` is this
+    /// program's own text, never input.
+    fn set_managed(
+        &self,
+        name: &str,
+        assignments: &str,
+        values: &[&dyn rusqlite::ToSql],
+    ) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut all: Vec<&dyn rusqlite::ToSql> = values.to_vec();
+        all.push(&name);
+        let changed = conn
+            .execute(
+                &format!(
+                    "UPDATE managed SET {assignments} WHERE name = ?{}",
+                    all.len()
+                ),
+                all.as_slice(),
+            )
+            .map_err(sql)?;
+        Ok(changed > 0)
+    }
+
+    /// Enabling is a fresh start: the hold and the failure count go.
+    /// Disabling drops a start that was asked for and not made.
+    pub fn set_managed_enabled(&self, name: &str, enabled: bool) -> Result<bool, StoreError> {
+        if enabled {
+            self.set_managed(
+                name,
+                "enabled = 1, held = 0, failures = 0, next_attempt_at = 0, note = NULL",
+                &[],
+            )
+        } else {
+            self.set_managed(name, "enabled = 0, start_requested = 0", &[])
+        }
+    }
+
+    /// A person asked for a start: the hold and the backoff go.
+    pub fn request_managed_start(&self, name: &str) -> Result<bool, StoreError> {
+        self.set_managed(
+            name,
+            "start_requested = 1, stop_requested = 0, held = 0, failures = 0, next_attempt_at = 0",
+            &[],
+        )
+    }
+
+    /// A person asked for a stop: held from now, whether or not it runs.
+    pub fn request_managed_stop(&self, name: &str) -> Result<bool, StoreError> {
+        self.set_managed(
+            name,
+            "stop_requested = 1, start_requested = 0, held = 1",
+            &[],
+        )
+    }
+
+    pub fn clear_managed_stop(&self, name: &str) -> Result<bool, StoreError> {
+        self.set_managed(name, "stop_requested = 0", &[])
+    }
+
+    pub fn clear_managed_start(&self, name: &str) -> Result<bool, StoreError> {
+        self.set_managed(name, "start_requested = 0", &[])
+    }
+
+    pub fn set_managed_secrets(&self, name: &str, secrets: &str) -> Result<bool, StoreError> {
+        self.set_managed(
+            name,
+            "secrets = ?1, next_attempt_at = 0, note = NULL",
+            &[&secrets],
+        )
+    }
+
+    /// A run was started.
+    pub fn note_managed_started(&self, name: &str, job: &str, at: i64) -> Result<bool, StoreError> {
+        self.set_managed(
+            name,
+            "last_job = ?1, last_started_at = ?2, start_requested = 0, held = 0, note = NULL",
+            &[&job, &at],
+        )
+    }
+
+    /// A run's end was counted: the failures in a row and when the next
+    /// automatic start may be.
+    pub fn note_managed_ended(
+        &self,
+        name: &str,
+        job: &str,
+        failures: i64,
+        next_attempt_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.set_managed(
+            name,
+            "accounted_job = ?1, failures = ?2, next_attempt_at = ?3",
+            &[&job, &failures, &next_attempt_at],
+        )
+    }
+
+    /// A start that did not happen: why, and when to try again.
+    pub fn note_managed_deferred(
+        &self,
+        name: &str,
+        note: &str,
+        next_attempt_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.set_managed(
+            name,
+            "note = ?1, next_attempt_at = ?2",
+            &[&note, &next_attempt_at],
+        )
+    }
+
+    /// The unfinished run of a definition, when there is one.
+    pub fn managed_running(&self, name: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.query_row(
+            "SELECT id FROM jobs WHERE managed = ?1 AND ended_at IS NULL LIMIT 1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql)
+    }
+
+    /// The run of a definition that started last, while the history has it.
+    pub fn managed_last(&self, name: &str) -> Result<Option<JobRecord>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.query_row(
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed
+             FROM jobs WHERE managed = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            [name],
+            map_job,
+        )
+        .optional()
+        .map_err(sql)
+    }
+
     pub fn draining(&self) -> Result<bool, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         let value: Option<String> = conn
@@ -647,6 +928,27 @@ fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
     })
 }
 
+const MANAGED_COLUMNS: &str = "name, spec, secrets, enabled, held, start_requested, \
+     stop_requested, failures, accounted_job, last_job, last_started_at, next_attempt_at, note";
+
+fn map_managed(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedRow> {
+    Ok(ManagedRow {
+        name: row.get(0)?,
+        spec: row.get(1)?,
+        secrets: row.get(2)?,
+        enabled: row.get(3)?,
+        held: row.get(4)?,
+        start_requested: row.get(5)?,
+        stop_requested: row.get(6)?,
+        failures: row.get(7)?,
+        accounted_job: row.get(8)?,
+        last_job: row.get(9)?,
+        last_started_at: row.get(10)?,
+        next_attempt_at: row.get(11)?,
+        note: row.get(12)?,
+    })
+}
+
 fn sql(err: rusqlite::Error) -> StoreError {
     StoreError::Sql(err.to_string())
 }
@@ -682,6 +984,7 @@ mod tests {
             job_key: key.map(str::to_string),
             started_at: started,
             callback_url: None,
+            managed: None,
         }
     }
 

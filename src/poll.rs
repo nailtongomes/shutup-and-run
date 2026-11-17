@@ -126,6 +126,14 @@ pub(crate) async fn poll_once(
     let Some(url) = launcher.settings().poll_url.clone() else {
         return Ok(PollOutcome::Idle);
     };
+    // In managed mode the machine takes no job, so it asks for none.
+    if launcher
+        .managed_mode()
+        .map_err(|err| PollError(err.to_string()))?
+    {
+        tracing::debug!("poll skipped: managed mode");
+        return Ok(PollOutcome::Idle);
+    }
     // The slot check only decides whether to ask. launch() checks again.
     // A refused task is not stored. An accepted one is, even when the image
     // then fails to pull, which matches POST /v1/jobs.
