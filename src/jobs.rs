@@ -113,8 +113,9 @@ pub fn job_json(job: &JobRecord) -> Value {
     })
 }
 
-/// `cpu 5.5 s, memory peak 300 MiB`, from what the readings saw. None when
-/// the job was never read (it ran under 30 seconds, or it is still running).
+/// `cpu 5.5 s, memory peak 300 MiB`, from what the readings saw; `so far`
+/// while the job runs. None when the job was never read (it ran under 30
+/// seconds, or it has run less than that).
 pub fn usage_text(job: &JobRecord) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(ms) = job.cpu_ms {
@@ -123,7 +124,12 @@ pub fn usage_text(job: &JobRecord) -> Option<String> {
     if let Some(bytes) = job.memory_peak {
         parts.push(format!("memory peak {}", memory_text(bytes)));
     }
-    (!parts.is_empty()).then(|| parts.join(", "))
+    let so_far = if job.ended_at.is_none() {
+        " so far"
+    } else {
+        ""
+    };
+    (!parts.is_empty()).then(|| format!("{}{so_far}", parts.join(", ")))
 }
 
 /// What the last finished jobs used, from the readings kept in their rows.

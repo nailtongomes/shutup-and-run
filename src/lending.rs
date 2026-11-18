@@ -92,11 +92,15 @@ pub fn hold(hours: Option<&LendHours>, feed: Option<Feed>, now_unix: i64) -> Opt
 
 /// The battery's charge while the PC runs on it and jobs still start.
 pub fn on_battery(feed: Option<Feed>) -> Option<u64> {
+    battery(feed).filter(|percent| *percent >= BATTERY_MIN_PERCENT)
+}
+
+/// The battery's charge while the PC runs on it, above or below the minimum.
+pub fn battery(feed: Option<Feed>) -> Option<u64> {
     let feed = feed?;
     (feed.on_battery == Some(true))
         .then_some(feed.battery_percent)
         .flatten()
-        .filter(|percent| *percent >= BATTERY_MIN_PERCENT)
 }
 
 /// A time of the week, on the machine's clock.
@@ -161,8 +165,19 @@ pub fn hour_at(feed: Option<Feed>, at_unix: i64) -> String {
 /// Seconds from now to the next midnight on that clock: a pause "for the
 /// rest of the day". At least a minute.
 pub fn secs_to_midnight(feed: Option<Feed>, now_unix: i64) -> u64 {
-    let local = now_unix + offset_secs(feed, now_unix);
-    (86_400 - local.rem_euclid(86_400)).max(60) as u64
+    secs_to_minute(0, offset_secs(feed, now_unix), now_unix)
+}
+
+/// Seconds from now to the next `minute` of the day (0 to 1439) on a clock
+/// `offset` seconds ahead of UTC: `pause --until 08:00`. At least a minute;
+/// the minute now is tomorrow's.
+pub fn secs_to_minute(minute: u32, offset: i64, now_unix: i64) -> u64 {
+    let local = (now_unix + offset).rem_euclid(86_400);
+    let mut secs = i64::from(minute) * 60 - local;
+    if secs <= 0 {
+        secs += 86_400;
+    }
+    secs.max(60) as u64
 }
 
 /// `UTC-03:00`.

@@ -544,10 +544,27 @@ impl Report {
                 "blocked to protect this computer: {}",
                 list(self.blocked())
             )),
-            Admission::AuthorizationRequired => Some(format!(
-                "the owner of this computer has to authorize: {}",
-                list(self.unauthorized())
-            )),
+            Admission::AuthorizationRequired => {
+                // Say what the consent already covers, so a reading a moment
+                // later with one more warning does not look like a contradiction.
+                let covered: Vec<&str> = self
+                    .reasons
+                    .iter()
+                    .filter(|f| {
+                        f.level == Level::Warning && !self.needs_authorization.contains(&f.code)
+                    })
+                    .map(|f| f.code.as_str())
+                    .collect();
+                let already = if covered.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (already authorized: {})", covered.join(", "))
+                };
+                Some(format!(
+                    "the owner of this computer has to authorize: {}{already}",
+                    list(self.unauthorized())
+                ))
+            }
         }
     }
 
@@ -934,6 +951,14 @@ mod tests {
                 .map(|f| f.code.as_str())
                 .collect::<Vec<_>>(),
             vec![CPU_BUSY]
+        );
+        let why = Report::new(&busier, Some(given.clone()))
+            .waiting_for()
+            .unwrap();
+        assert!(why.contains(CPU_BUSY), "{why}");
+        assert!(
+            why.ends_with(&format!("(already authorized: {SMALL_MACHINE})")),
+            "{why}"
         );
         // Every code there is, agreed to: a block is still a block.
         let everything = yes(

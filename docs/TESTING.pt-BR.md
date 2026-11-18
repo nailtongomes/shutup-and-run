@@ -257,6 +257,8 @@ Num notebook Windows, com o mock servindo jobs curtos (`--image alpine --command
 - [ ] Depois de um job de 90 segundos, `shutup-and-run jobs` tem `used: cpu ... s, memory peak ...`, cerca de um minuto de CPU e alguns MB; `jobs --json` tem `cpu_ms` e `memory_peak_bytes`; a tabela de tarefas da página mostra o mesmo em **CPU / memória**.
 - [ ] Num PC pequeno (ou num em que a página pede autorização), `shutup-and-run wsl uninstall` e depois `shutup-and-run wsl install --poll-url URL --owner-consent`: ele mostra `recorded the owner's consent from the contract`, a página fica **RODANDO** e nunca pergunta, e **Segurança** mostra a autorização pelo `contract`. **Retirar** na página: volta a perguntar.
 
+Resultado da rodada 3 (0.2.20, notebook na bateria, modo gerenciado): ok a bateria acima de 60% (quadro, linha **Energia**, `ON_BATTERY`, job começou com 95%) e abaixo (`BATTERY_LOW` com o Windows em 58%: a carga do `GetSystemPowerStatus` pode ficar 1% atrás do `Win32_Battery`, e vale a primeira); ok o `used:` (`cpu 173.4 s, memory peak 1.1 GiB`, igual no `jobs --json` e na página) e o `jobs logs --last`; `USER_PRESENTING` só visto no log. Ficaram para a próxima rodada: um job rodando ao cruzar 60%, voltar à tomada, Teams em tela cheia, `lend_hours` e `--owner-consent`.
+
 
 O que nenhum CI alcança num PC Windows real desde então (o relógio do Windows, a pausa por um tempo, a memória e os programas que a ocupam, o cache do WSL2) está em [WINDOWS-PENDING.md](WINDOWS-PENDING.md).
 
@@ -361,3 +363,6 @@ Não exercitado: nada no Windows. Lá os comandos são encaminhados para a distr
 - [ ] `shutup-and-run managed apply C:\caminho\rpa-selenium.json`, depois `managed secret rpa-selenium API_TOKEN` com o valor por pipe, depois `managed mode on`: `managed list` mostra `running` e a página `http://127.0.0.1:8787/local/managed` concorda.
 - [ ] Com ele rodando, saia da sessão do Windows: a tela de desligamento cita `shutup-and-run`, como em qualquer job.
 - [ ] `managed mode off` com ele rodando é recusado com `MANAGED_BUSY`; depois de `managed stop`, é aceito e o worker volta a fazer poll.
+- [ ] Um container desabilitado não começa, nem com `managed start` (é proposital). Para uma execução de um desabilitado: `managed enable NOME`, `managed start NOME`, `managed disable NOME`; a execução em curso termina.
+
+O modo gerenciado também é o jeito mais fácil de testar um PC Windows sem URL de poll: os itens de [WINDOWS-PENDING.md](WINDOWS-PENDING.md) que precisam de uma tarefa rodando aceitam um container `once` iniciado com `managed start`.

@@ -53,9 +53,23 @@ pub struct Feed {
     /// saving included: `lend_hours` follows the clock the person sees.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub utc_offset_secs: Option<i64>,
+    /// The Windows clock when the line was written, in milliseconds since
+    /// 1970 UTC. WSL2's own clock drifts after the PC sleeps; this is the
+    /// one it is set back to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix_ms: Option<i64>,
 }
 
+/// How far the clock inside WSL2 may be from Windows before the service
+/// sets it: a few seconds is the line's own trip, more is drift.
+pub const CLOCK_SKEW_MAX_MS: i64 = 5_000;
+/// The code the doctor names when the clock stays off.
+pub const CLOCK_SKEW: &str = "CLOCK_SKEW";
+
 static LAST: Mutex<Option<(Instant, Feed)>> = Mutex::new(None);
+/// How far this clock was ahead of Windows (negative: behind) at the last
+/// line, after any correction, in milliseconds.
+static SKEW: Mutex<Option<(Instant, i64)>> = Mutex::new(None);
 /// The programs that hold the most memory, sent with a feed line only while
 /// the PC's memory is tight. Kept apart from `Feed`, which is a few numbers
 /// copied everywhere; never written to a file or a log.
@@ -121,12 +135,81 @@ fn fresh(age: Duration) -> bool {
     age < FEED_STALE
 }
 
+/// How far this clock is from Windows at the last fresh line, in seconds,
+/// when it is `CLOCK_SKEW_MAX_MS` or more: the service could not set it.
+pub fn clock_skew_secs() -> Option<i64> {
+    match *SKEW.lock().expect("clock skew") {
+        Some((at, ms)) if fresh(at.elapsed()) && ms.abs() >= CLOCK_SKEW_MAX_MS => Some(ms / 1000),
+        _ => None,
+    }
+}
+
+/// This clock minus Windows', or None when the line has no time.
+pub fn skew_ms(feed: &Feed, here_ms: i64) -> Option<i64> {
+    feed.unix_ms.map(|windows| here_ms - windows)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Sets this clock (WSL2's, shared by its distributions) to Windows' time
+/// when it drifted, as `hwclock -s` would. The service runs as root in its
+/// distribution. Returns what is left of the skew.
+fn follow_windows_clock(feed: &Feed) -> Option<i64> {
+    let skew = skew_ms(feed, now_ms())?;
+    if skew.abs() < CLOCK_SKEW_MAX_MS {
+        return Some(skew);
+    }
+    let windows = feed.unix_ms?;
+    match set_clock(windows) {
+        Ok(()) => {
+            tracing::info!(
+                skew_secs = skew / 1000,
+                "set the WSL2 clock to Windows' time"
+            );
+            // Behind by the line's own trip, a few milliseconds.
+            Some(0)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, skew_secs = skew / 1000, "could not set the WSL2 clock");
+            Some(skew)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn set_clock(unix_ms: i64) -> std::io::Result<()> {
+    let ts = libc::timespec {
+        tv_sec: (unix_ms.div_euclid(1000)) as libc::time_t,
+        tv_nsec: (unix_ms.rem_euclid(1000) * 1_000_000) as libc::c_long,
+    };
+    // SAFETY: clock_settime reads the one timespec given and changes nothing
+    // else; it fails with EPERM when the process is not root.
+    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn set_clock(_unix_ms: i64) -> std::io::Result<()> {
+    Err(std::io::Error::other("no clock to set here"))
+}
+
 /// Reads the feed from stdin until it closes. On Linux nothing writes it.
 pub fn spawn_reader() {
     std::thread::spawn(|| {
         for text in std::io::stdin().lines() {
             let Ok(text) = text else { break };
             if let Some((feed, programs)) = parse_with(&text) {
+                if let Some(skew) = follow_windows_clock(&feed) {
+                    *SKEW.lock().expect("clock skew") = Some((Instant::now(), skew));
+                }
                 note(feed);
                 note_programs(programs);
             }
@@ -151,6 +234,7 @@ mod tests {
             battery_percent: Some(72),
             presenting: None,
             utc_offset_secs: Some(-10_800),
+            unix_ms: Some(1_795_026_600_250),
         };
         let text = line(&feed);
         assert!(text.starts_with("host-feed {") && text.ends_with("}\n"));
@@ -175,6 +259,20 @@ mod tests {
                 .idle_secs,
             Some(1)
         );
+    }
+
+    #[test]
+    fn the_skew_is_this_clock_minus_windows() {
+        let feed = Feed {
+            unix_ms: Some(1_000_000),
+            ..Feed::default()
+        };
+        assert_eq!(skew_ms(&feed, 1_035_000), Some(35_000));
+        assert_eq!(skew_ms(&feed, 990_000), Some(-10_000));
+        assert_eq!(skew_ms(&Feed::default(), 1), None);
+        // A line a moment old is not drift.
+        let near = skew_ms(&feed, 1_000_400).unwrap();
+        assert!(near.abs() < CLOCK_SKEW_MAX_MS);
     }
 
     #[test]

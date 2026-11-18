@@ -1065,11 +1065,20 @@ pub(crate) fn wsl_limits_check(limits: &WslLimits, vm: Option<(u64, u64)>) -> Ch
     let now = vm
         .map(|(bytes, cpus)| format!("; the VM now has {}, {cpus} processors", human(bytes)))
         .unwrap_or_default();
+    // `--apply` fixes the budget and the reclaim together, so the first line names both.
+    let reclaim = if limits.reclaim.is_none() {
+        "; no autoMemoryReclaim either"
+    } else {
+        ""
+    };
     if !limits.within() {
         return soft(
             "wsl-limits",
             false,
-            format!(".wslconfig: {}. {host}{now}", limits.problems.join("; ")),
+            format!(
+                ".wslconfig: {}{reclaim}. {host}{now}",
+                limits.problems.join("; ")
+            ),
         )
         .coded("WSL_LIMITS_ABOVE_BUDGET");
     }
@@ -3008,6 +3017,10 @@ fn host_feed(cpu_busy_percent: Option<u64>) -> crate::host::Feed {
         battery_percent: power.1,
         presenting: host_presenting(),
         utc_offset_secs: host_utc_offset_secs(),
+        unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_millis() as i64),
     }
 }
 
@@ -4043,6 +4056,12 @@ mod tests {
             (None, None),
         );
         assert!(wsl_limits_check(&limits, None).ok);
+
+        // No .wslconfig at all: the budget line also names the reclaim `--apply` adds.
+        let none = wsl_limits(Some(16 * GIB), 8, None, (None, None));
+        let check = wsl_limits_check(&none, None);
+        assert_eq!(check.code(), "WSL_LIMITS_ABOVE_BUDGET");
+        assert!(check.detail.contains("no autoMemoryReclaim either"));
     }
 
     #[test]

@@ -529,3 +529,18 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - When the last job on a Windows PC ends, the service writes `1` to `/proc/sys/vm/drop_caches` (and asks for compaction), so the VM hands the memory back to Windows at once. `wsl limits --apply` adds `autoMemoryReclaim=dropcache` under `[experimental]` when no value is set, for the rest of the VM's idle time; an owner's own value, `disabled` included, is kept. `dropcache` rather than `gradual`: it is the simpler of the two (drop the cache once the VM is idle) and matches what the service does after a job.
 
 **Cost.** The program list is a guess at what closing a program frees: shared memory is not counted, and a process of another user or of the system cannot be read. The hour map shows the last seven days, not a typical week. Dropping the cache makes the next job read its image from disk again. `autoMemoryReclaim` is an experimental WSL key; a WSL that moves or drops it ignores the line.
+
+## The WSL2 clock follows Windows, and what Windows testing found
+
+**Context.** A hand test on a Windows notebook found the clock inside WSL2 35 seconds ahead of Windows, which is a known WSL2 drift after the PC sleeps; times on the page, `lend_hours` and the end of a pause were off by that much. The page wrote its times in UTC until JavaScript changed them, so a script or an agent reading the page saw UTC under a footer that says the PC's time. The doctor said `ok, authorized` and a minute later `AUTHORIZATION_REQUIRED`, both true: another warning had come up, and nothing said which was already agreed to. A day of memory readings was enough for a `lend_hours` suggestion, since an hour never read counted as one with memory to spare.
+
+**Decision.**
+
+- The supervisor's line carries the Windows time (`unix_ms`). The service, root in its distribution, sets the VM's clock to it with `clock_settime` when they are 5 seconds or more apart, as `hwclock -s` would; the clock belongs to the WSL2 VM and is shared by its distributions, and Windows' time is the one the person sees. When it cannot, `status.json` has `lending.clock_skew_secs` and the doctor `CLOCK_SKEW`.
+- The page writes a time on the PC's clock with its zone (`2026-11-18 15:30 UTC-03:00`) from the offset on the feed; the browser still turns it into its own local time.
+- A wait for authorization names the warnings already covered.
+- `MEMORY_SHORT_HOURS` names the short hours from the first reading and suggests a `lend_hours` only once 72 hours of the week have one (`memory::MIN_SAMPLED_HOURS`).
+- `pause --for day` and `pause --until HH:MM` end on the PC's clock, read from `lending.utc_offset_secs` in `status.json`, since the CLI inside WSL2 does not get the feed.
+- A running job's readings go to its row as they come, so its CPU time and memory show while it runs (`so far`).
+
+**Cost.** The service changes a clock other distributions on the PC also read; it only ever moves it toward Windows'. A Windows clock that is wrong is now wrong inside WSL2 too. Three days of readings is a short week.

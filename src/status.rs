@@ -721,12 +721,28 @@ const LOCAL_TIME_JS: &str = "(function(){var l=document.documentElement.lang;\
 document.querySelectorAll('time[datetime]').forEach(function(t){var d=new Date(t.getAttribute('datetime'));\
 if(!isNaN(d))t.textContent=d.toLocaleString(l,{dateStyle:'short',timeStyle:'short'})})})();";
 
-/// A moment as `<time>`: UTC in the markup, local time once the page loads.
+/// A moment as `<time>`: on the PC's clock in the markup (the Windows zone
+/// the supervisor sends), so a reader without JavaScript sees the same hour
+/// as the taskbar; the browser's own local time once the page loads.
 fn when(unix: i64) -> String {
+    let offset = crate::lending::offset_secs(crate::host::current(), unix);
+    when_at(unix, offset)
+}
+
+fn when_at(unix: i64, offset: i64) -> String {
     let iso = unix_to_iso(unix);
-    let text = iso.replacen('T', " ", 1).trim_end_matches('Z').to_string();
+    let local = unix_to_iso(unix + offset);
+    let text = local
+        .replacen('T', " ", 1)
+        .trim_end_matches('Z')
+        .to_string();
+    let zone = if offset == 0 {
+        "UTC".to_string()
+    } else {
+        crate::lending::zone(offset)
+    };
     format!(
-        "<time datetime=\"{iso}\">{} UTC</time>",
+        "<time datetime=\"{iso}\">{} {zone}</time>",
         &text[..text.len().min(16)]
     )
 }
@@ -1482,8 +1498,18 @@ fn computer_section(view: &View) -> String {
         },
     ));
     if !view.programs.is_empty() {
+        // The list comes while the PC's memory is tight (under 20%), which may
+        // not stop a job: then there is no "Memory is short" box to explain it.
+        let short = view.memory.is_some_and(|m| m.need.is_some());
         rows.push((
-            lang.t("Using the most memory", "Usando mais memória"),
+            if short {
+                lang.t("Using the most memory", "Usando mais memória")
+            } else {
+                lang.t(
+                    "Memory is tight, jobs still start; using the most",
+                    "Memória apertada, as tarefas ainda começam; usando mais",
+                )
+            },
             escape(&crate::memory::programs_in(
                 view.programs,
                 lang.t("processes", "processos"),
@@ -3328,6 +3354,9 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
             "clock": live.computer.clock,
             "hold": live.computer.hold,
             "on_battery_percent": crate::lending::on_battery(live.computer.host),
+            "battery_percent": crate::lending::battery(live.computer.host),
+            "clock_skew_secs": crate::host::clock_skew_secs(),
+            "utc_offset_secs": crate::lending::offset_secs(live.computer.host, now_unix),
         }),
         memory: memory_json(&live.memory),
         callbacks: &live.computer.delivery,
@@ -3681,6 +3710,20 @@ mod tests {
     }
 
     #[test]
+    fn a_moment_is_written_on_the_pcs_clock_before_any_javascript() {
+        // 2026-11-18 18:30 UTC.
+        let at = 1_795_026_600;
+        assert_eq!(
+            when_at(at, 0),
+            "<time datetime=\"2026-11-18T18:30:00Z\">2026-11-18 18:30 UTC</time>"
+        );
+        assert_eq!(
+            when_at(at, -3 * 3600),
+            "<time datetime=\"2026-11-18T18:30:00Z\">2026-11-18 15:30 UTC-03:00</time>"
+        );
+    }
+
+    #[test]
     fn the_page_says_the_state_and_whether_the_pc_can_be_turned_off() {
         let idle = render(&view(Lang::Pt, Some((0, 2)), false));
         assert!(idle.contains("RODANDO"));
@@ -3853,6 +3896,15 @@ mod tests {
         ] {
             assert!(page.contains(text), "{text}\n{page}");
         }
+        // Tight, but a job may still start: no box, and the row says why it is there.
+        let tight = crate::memory::View {
+            need: None,
+            ..memory.clone()
+        };
+        short.memory = Some(&tight);
+        let page = render(&short);
+        assert!(!page.contains("<h2>Falta memória</h2>"));
+        assert!(page.contains("<td>Memória apertada, as tarefas ainda começam; usando mais</td>"));
         computer.hold = None;
         computer.host = None;
         computer.lend_hours = None;

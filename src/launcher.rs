@@ -488,7 +488,9 @@ impl Launcher {
     }
 
     /// One reading of each running job's counters, kept until the job ends.
-    /// A job that ends before its first reading has none.
+    /// A job that ends before its first reading has none. What it used so
+    /// far also goes into its row, so the page and `jobs` show it while it
+    /// runs; the end writes the last numbers over it.
     pub async fn sample_throttling(&self) {
         let ids = self.store.running_ids().unwrap_or_default();
         for id in ids {
@@ -496,12 +498,14 @@ impl Launcher {
                 continue;
             }
             if let Ok(Some(read)) = self.runtime.stats(&id).await {
-                self.samples
-                    .lock()
-                    .expect("samples")
-                    .entry(id)
-                    .or_default()
-                    .add(read);
+                let sampled = {
+                    let mut samples = self.samples.lock().expect("samples");
+                    let sampled = samples.entry(id.clone()).or_default();
+                    sampled.add(read);
+                    *sampled
+                };
+                let cpu_ms = sampled.cpu_ns.map(|ns| ns / 1_000_000);
+                let _ = self.store.set_usage(&id, cpu_ms, sampled.memory_peak);
             }
         }
     }
@@ -2472,10 +2476,10 @@ mod tests {
         let live = launcher.live_status().await;
         assert_eq!(live.memory.waited_today_secs, 90);
         assert_eq!(live.memory.waited_week_secs, 90);
-        // The hour ran short, so a lend_hours that leaves it out is offered.
+        // The hour ran short and is said; with one hour read, no lend_hours
+        // is offered yet (`memory::MIN_SAMPLED_HOURS`).
         let hours = live.memory.short_hours.unwrap();
-        let suggested = hours.suggested_lend_hours.unwrap();
-        assert!(crate::lending::LendHours::parse(&suggested).is_ok());
+        assert_eq!(hours.suggested_lend_hours, None);
 
         launcher.set_readings(Readings::healthy());
         clock.set(T0 + 100);
@@ -2912,6 +2916,16 @@ mod tests {
         };
         mock.set_stats(Some(read(2_000_000_000, 300 << 20))).await;
         launcher.sample_throttling().await;
+        // Already in the row while it runs, for the page and `jobs`.
+        let row = launcher.store.get(&id).unwrap().unwrap();
+        assert_eq!(
+            (row.cpu_ms, row.memory_peak),
+            (Some(2_000), Some(300 << 20))
+        );
+        assert_eq!(
+            crate::jobs::usage_text(&row).as_deref(),
+            Some("cpu 2.0 s, memory peak 300 MiB so far")
+        );
         // The peak is the most any reading saw; the CPU time, the last.
         mock.set_stats(Some(read(5_500_000_000, 120 << 20))).await;
         launcher.sample_throttling().await;
