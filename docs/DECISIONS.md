@@ -482,7 +482,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** About 43 KB more in the binary. The page is longer on a phone, where tables become stacked rows. The screenshots in `docs/screenshots/local-page/` show it at 0.2.16 data and will age; the README's own come from `scripts/screenshots.sh`, which makes them again.
 
-## The first host-feed line waits a second for the CPU reading
+## The first host-feed line waits a second for the CPU reading (0.2.18)
 
 **Context.** The PC's CPU use is the difference between two readings of the totals `GetSystemTimes` keeps. The supervisor took both readings back to back for its first line, so that line never had a CPU figure. The safety assessment reads a missing figure as "Windows did not report CPU use" (`SAFETY_HOST_UNKNOWN`), a warning, and every install, update and restart asked the owner for an authorization for about ten seconds, until the next line. The doctor that closes an install showed it on every Windows CI run.
 
