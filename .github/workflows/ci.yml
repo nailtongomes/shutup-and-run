@@ -172,6 +172,10 @@ jobs:
             $inner = (wsl.exe -d shutup-and-run -u root -- /usr/local/bin/shutup-and-run version --json) -join "" | ConvertFrom-Json
             Write-Host "exe $((& $installed version --json | ConvertFrom-Json).version), distribution $($inner.version), doctor: $($line.detail)"
             if ($line.status -ne "ok") { throw "the doctor's version line is $($line.status): $($line.detail)" }
+            # The first host-feed line carries the PC's CPU use: no "Windows did not report" warning.
+            $safety = $doctor.checks | Where-Object { $_.name -eq "safety" }
+            Write-Host "safety: $($safety.status) $($safety.detail)"
+            if ("$($safety.detail)" -match "SAFETY_HOST_UNKNOWN") { throw "the safety check says Windows did not report: $($safety.detail)" }
             if ($inner.version -ne $version) { throw "the binary in the distribution is $($inner.version), expected $version" }
           }
           # N-1: the latest release from GitHub, installed in WSL, its task running.

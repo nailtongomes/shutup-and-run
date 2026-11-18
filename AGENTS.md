@@ -52,7 +52,7 @@ SMOKE_URL=https://127.0.0.1:8787 SMOKE_TOKEN=... bash scripts/smoke.sh
 sudo SMOKE_LOCAL=1 bash scripts/smoke.sh
 ```
 
-The scratch image is the Dockerfile with the musl binary copied to `./shutup-and-run` first. `scripts/size.sh` measures the launcher's RAM and CPU. It is not part of CI. The numbers and the reservation to make for the process are in [docs/SIZING.md](docs/SIZING.md).
+The scratch image is the Dockerfile with the musl binary copied to `./shutup-and-run` first. `scripts/size.sh` measures the launcher's RAM and CPU. It is not part of CI. Neither is `scripts/screenshots.sh`, which makes the README's pictures of the local page again (Docker, and node with Playwright); a change to the page runs it. The numbers and the reservation to make for the process are in [docs/SIZING.md](docs/SIZING.md).
 
 ## Keep it this shape
 

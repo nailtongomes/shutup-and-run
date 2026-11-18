@@ -2729,18 +2729,10 @@ fn run_service(log: &Logger) -> WslResult<Option<i32>> {
     // ten seconds. The thread ends when the service does and the pipe breaks.
     if let Some(mut stdin) = child.stdin.take() {
         std::thread::spawn(move || {
-            // CPU use is the difference between two readings of the totals.
-            let mut before = host_cpu_times();
-            loop {
-                let now = host_cpu_times();
-                let busy = before.zip(now).and_then(|(a, b)| busy_percent(a, b));
-                before = now;
+            feed_cpu(host_cpu_times, std::thread::sleep, |busy| {
                 let line = crate::host::line(&host_feed(busy));
-                if stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err() {
-                    break;
-                }
-                std::thread::sleep(crate::host::FEED_EVERY);
-            }
+                stdin.write_all(line.as_bytes()).is_ok() && stdin.flush().is_ok()
+            });
         });
     }
     let a = log.clone();
@@ -2926,6 +2918,32 @@ fn host_cpu_times() -> Option<(u64, u64)> {
 
 /// From two `(idle, total)` readings: the share of the time between them
 /// that the processors were not idle. None when no time passed.
+/// How long apart the first two readings of the CPU totals are.
+const CPU_FIRST_SAMPLE: Duration = Duration::from_secs(1);
+
+/// The CPU use of each host-feed line. It is the difference between two
+/// readings of the totals, so the first line waits for a second reading a
+/// moment after the first: a first line without it reads as "Windows did not
+/// report CPU use" and asks the owner for an authorization nobody needs.
+/// `send` returns false when the service is gone.
+pub(crate) fn feed_cpu(
+    mut read: impl FnMut() -> Option<(u64, u64)>,
+    mut sleep: impl FnMut(Duration),
+    mut send: impl FnMut(Option<u64>) -> bool,
+) {
+    let mut before = read();
+    sleep(CPU_FIRST_SAMPLE);
+    loop {
+        let now = read();
+        let busy = before.zip(now).and_then(|(a, b)| busy_percent(a, b));
+        before = now;
+        if !send(busy) {
+            break;
+        }
+        sleep(crate::host::FEED_EVERY);
+    }
+}
+
 pub(crate) fn busy_percent(before: (u64, u64), now: (u64, u64)) -> Option<u64> {
     let total = now.1.checked_sub(before.1).filter(|total| *total > 0)?;
     let idle = now.0.checked_sub(before.0)?.min(total);
@@ -3974,6 +3992,27 @@ mod tests {
     /// The first defect: the old service kept running, on the old config,
     /// after the install wrote a new one. The stop script returns only when
     /// no process of that name is left.
+    #[test]
+    fn the_first_host_feed_line_already_has_the_cpu_use() {
+        // (idle, total) as GetSystemTimes counts them.
+        let mut readings = vec![Some((0, 0)), Some((50, 100)), Some((80, 200)), None].into_iter();
+        let mut slept = Vec::new();
+        let mut sent = Vec::new();
+        feed_cpu(
+            || readings.next().flatten(),
+            |d| slept.push(d),
+            |busy| {
+                sent.push(busy);
+                sent.len() < 3
+            },
+        );
+        // 50 of 100 idle, then 30 of 100: the first line is not empty.
+        assert_eq!(sent, vec![Some(50), Some(70), None]);
+        assert_eq!(slept[0], CPU_FIRST_SAMPLE);
+        assert!(slept[1..].iter().all(|d| *d == crate::host::FEED_EVERY));
+        assert!(CPU_FIRST_SAMPLE < crate::host::FEED_EVERY);
+    }
+
     #[test]
     fn the_exe_and_the_binary_in_the_distribution_must_be_one_release() {
         let same = version_check("0.2.15", Some("0.2.15"));

@@ -415,7 +415,7 @@ Only `image` is required. Unknown fields are refused. `job_key` makes a retry sa
 **Pull.** With `poll_url` set, the machine POSTs to it every `poll_interval_secs` (30 seconds, and never less), only when it has a free slot, is not paused and is not short of memory or disk:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.17", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.18", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 The answer is nothing (`204`), a task, `{"task": {...}}`, or `{"manifest_url": "https://..."}`, which is fetched once and must be a task. `401` or `403` means "not approved yet": the worker starts nothing and keeps asking, backing off to five minutes. The server decides which machines get work; the worker's token is its identity.
@@ -526,6 +526,8 @@ The static binary that releases ship:
 ```bash
 rustup target add x86_64-unknown-linux-musl && sudo apt-get install -y musl-tools build-essential && CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked --target x86_64-unknown-linux-musl
 ```
+
+The pictures of the local page in this README come from `bash scripts/screenshots.sh`: a demo worker on its own history, three jobs against Docker, and Playwright in both languages, light, dark and on a phone. Run it again after a change to the page.
 
 A release is a `v*` tag pushed from `main`. It attaches the Linux binary, the Windows `.exe` and `SHA256SUMS`, publishes the image, then runs the one-line install and the smoke test on a fresh runner.
 

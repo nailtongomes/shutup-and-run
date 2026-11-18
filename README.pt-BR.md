@@ -415,7 +415,7 @@ Só `image` é obrigatório. Campos desconhecidos são recusados. `job_key` torn
 **Pull.** Com `poll_url` definida, a máquina faz POST nela a cada `poll_interval_secs` (30 segundos, e nunca menos), só quando tem um slot livre, não está pausada e não está com pouca memória ou disco:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.17", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.18", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 A resposta é nada (`204`), uma tarefa, `{"task": {...}}`, ou `{"manifest_url": "https://..."}`, que é buscado uma vez e precisa ser uma tarefa. `401` ou `403` quer dizer "ainda não aprovada": o worker não inicia nada e continua perguntando, espaçando até cinco minutos. O servidor decide quais máquinas recebem trabalho; o token do worker é a identidade dele.
@@ -526,6 +526,8 @@ O binário estático que as releases publicam:
 ```bash
 rustup target add x86_64-unknown-linux-musl && sudo apt-get install -y musl-tools build-essential && CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked --target x86_64-unknown-linux-musl
 ```
+
+As imagens da página local neste README saem de `bash scripts/screenshots.sh`: um worker de demonstração com histórico próprio, três tarefas no Docker e o Playwright nos dois idiomas, claro, escuro e no celular. Rode de novo depois de mudar a página.
 
 Uma release é uma tag `v*` enviada a partir do `main`. Ela anexa o binário Linux, o `.exe` do Windows e o `SHA256SUMS`, publica a imagem, e depois roda a instalação de uma linha e o smoke test num runner limpo.
 
