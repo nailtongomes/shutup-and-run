@@ -102,6 +102,11 @@ pub const CATALOG: &[(&str, &str, &str)] = &[
     ("JOB_INVALID_JSON", "Fix the JSON of the job file and run `shutup-and-run job validate FILE` again.", "Corrija o JSON do arquivo da tarefa e rode `shutup-and-run job validate ARQUIVO` de novo."),
     ("JOB_INVALID_FIELD", "Fix the field named in the error; docs/INTEGRATION-CONTRACT.md lists the fields of a job.", "Corrija o campo citado no erro; docs/INTEGRATION-CONTRACT.md lista os campos de uma tarefa."),
     ("JOB_IMAGE_NOT_ALLOWED", "Add the image: `shutup-and-run config set allowlist IMAGE --apply`, or validate as a polled task with `--poll`.", "Adicione a imagem: `shutup-and-run config set allowlist IMAGEM --apply`, ou valide como tarefa da poll URL com `--poll`."),
+    ("JOB_NOT_FOUND", "Run `shutup-and-run jobs` to see the ids of this machine's jobs.", "Rode `shutup-and-run jobs` para ver os ids dos jobs desta máquina."),
+    ("JOB_ID_AMBIGUOUS", "Give more characters of the id; `shutup-and-run jobs` lists them.", "Informe mais caracteres do id; `shutup-and-run jobs` lista todos."),
+    ("JOB_LOG_MISSING", "Run `shutup-and-run jobs` to see how that job ended: a job that never started has no log, and a log is kept for 7 days.", "Rode `shutup-and-run jobs` para ver como esse job terminou: um job que não iniciou não tem log, e um log fica guardado por 7 dias."),
+    ("LAST_JOB_FAILED", "Read what it printed: `shutup-and-run jobs logs {}`.", "Leia o que ele imprimiu: `shutup-and-run jobs logs {}`."),
+    ("LAST_JOB_FAILED_NO_LOG", "Run `shutup-and-run jobs` to see why it ended; it left no output to read.", "Rode `shutup-and-run jobs` para ver por que ele terminou; ele não deixou saída para ler."),
     // Managed containers.
     ("MANAGED_INVALID", "Nothing was saved. Fix what the error names; `shutup-and-run managed --help` lists the fields and examples/managed/ has a file to copy.", "Nada foi salvo. Corrija o que o erro aponta; `shutup-and-run managed --help` lista os campos e examples/managed/ tem um arquivo para copiar."),
     ("MANAGED_NOT_FOUND", "Run `shutup-and-run managed list` and use one of the names it prints.", "Rode `shutup-and-run managed list` e use um dos nomes que ele imprime."),

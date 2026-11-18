@@ -157,7 +157,12 @@ Com `status_page = true` (a instalação no Windows liga; a do Linux não), o se
 - As demais chaves são só pelo CLI. `shutup-and-run config keys` diz onde cada chave pode ser editada.
 - Ela fica em inglês ou em português, um idioma por vez; um link troca e a escolha é lembrada.
 
-A segurança da página, sem rodeios. Ela não pede token, então só responde a uma conexão de loopback que nomeia um host de loopback, e só aceita um formulário da própria origem. Nunca mostra token, env de job nem logs. O login de admin afasta um curioso e **não** é uma barreira de segurança: quem usa o PC consegue ler o arquivo de configuração. Nada nela é acessível pela rede, e ela não foi feita para ficar atrás de um proxy. Numa máquina configurada com `config.toml` a página só mostra o status.
+A segurança da página, sem rodeios. Ela não pede token, então só responde a uma conexão de loopback que nomeia um host de loopback, e só aceita um formulário da própria origem. Nunca mostra token nem env de job; mostra o que os jobs imprimiram (os logs, abaixo). O login de admin afasta um curioso e **não** é uma barreira de segurança: quem usa o PC consegue ler o arquivo de configuração. Nada nela é acessível pela rede, e ela não foi feita para ficar atrás de um proxy. Numa máquina configurada com `config.toml` a página só mostra o status.
+
+
+### Saída dos jobs
+
+Cada job que rodou um container deixa na máquina o que imprimiu: os últimos 256 KiB de stdout e stderr, um arquivo por job em `logs/` ao lado do histórico (`/var/lib/shutup-and-run/logs/`, dentro da distribuição WSL no Windows), apagados depois de 7 dias. Vale para push, pull e gerenciado, e para qualquer jeito de terminar. Nada é mascarado. `shutup-and-run jobs logs ID` (ou `--last`, `--tail N`, `--json`) mostra um, `jobs --json` diz quais jobs têm log, e a página local lista os últimos em `/local/logs` para abrir ou baixar. Quando o último job falha, o `doctor` mostra o comando do log dele.
 
 ## Containers gerenciados
 
@@ -349,7 +354,7 @@ Só `image` é obrigatório. Campos desconhecidos são recusados. `job_key` torn
 **Pull.** Com `poll_url` definida, a máquina faz POST nela a cada `poll_interval_secs` (30 segundos, e nunca menos), só quando tem um slot livre, não está pausada e não está com pouca memória ou disco:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.15", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.16", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 A resposta é nada (`204`), uma tarefa, `{"task": {...}}`, ou `{"manifest_url": "https://..."}`, que é buscado uma vez e precisa ser uma tarefa. `401` ou `403` quer dizer "ainda não aprovada": o worker não inicia nada e continua perguntando, espaçando até cinco minutos. O servidor decide quais máquinas recebem trabalho; o token do worker é a identidade dele.

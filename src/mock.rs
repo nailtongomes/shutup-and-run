@@ -120,6 +120,15 @@ impl MockRuntime {
         self.inner.lock().await.throttling = throttling;
     }
 
+    /// What the container printed, in place of the default line.
+    pub async fn set_output(&self, id: &str, text: &str) {
+        self.inner
+            .lock()
+            .await
+            .logs
+            .insert(id.to_string(), text.to_string());
+    }
+
     /// The container stopped with `code`, as a die event would say.
     pub async fn stop(&self, id: &str, code: i64) {
         self.stop_unseen(id, code).await

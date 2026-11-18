@@ -157,7 +157,12 @@ With `status_page = true` (the Windows install turns it on; a Linux install does
 - The remaining keys are CLI only. `shutup-and-run config keys` says where each key can be edited.
 - It is in English or Portuguese, one at a time; a link switches and the choice is remembered.
 
-Security of the page, plainly. It needs no token, so it answers only a loopback connection that names a loopback host, and accepts a form only from its own origin. It never shows a token, a job's env or logs; the editor of a managed container, behind the admin login, shows that container's plain env and never a secret's value. The admin login keeps a curious person out and is **not** a security boundary: whoever uses the PC can read the config file. Nothing on it is reachable from the network, and it is not meant to be put behind a proxy. On a machine set up with `config.toml` the page shows status only.
+Security of the page, plainly. It needs no token, so it answers only a loopback connection that names a loopback host, and accepts a form only from its own origin. It never shows a token or a job's env; it does show what jobs printed (their logs, below); the editor of a managed container, behind the admin login, shows that container's plain env and never a secret's value. The admin login keeps a curious person out and is **not** a security boundary: whoever uses the PC can read the config file. Nothing on it is reachable from the network, and it is not meant to be put behind a proxy. On a machine set up with `config.toml` the page shows status only.
+
+
+### Job output
+
+Each job that ran a container leaves what it printed on the machine: the last 256 KiB of stdout and stderr, one file per job in `logs/` next to the history (`/var/lib/shutup-and-run/logs/`, inside the WSL distribution on Windows), deleted after 7 days. Push, pull and managed jobs alike, whatever way they ended. Nothing is masked. `shutup-and-run jobs logs ID` (or `--last`, `--tail N`, `--json`) prints one, `jobs --json` says which jobs have one, and the local page lists them at `/local/logs` to open or download. When the last job failed, `doctor` names the command for its log.
 
 ## Managed containers
 
@@ -349,7 +354,7 @@ Only `image` is required. Unknown fields are refused. `job_key` makes a retry sa
 **Pull.** With `poll_url` set, the machine POSTs to it every `poll_interval_secs` (30 seconds, and never less), only when it has a free slot, is not paused and is not short of memory or disk:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.15", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.16", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 3435973836}
 ```
 
 The answer is nothing (`204`), a task, `{"task": {...}}`, or `{"manifest_url": "https://..."}`, which is fetched once and must be a task. `401` or `403` means "not approved yet": the worker starts nothing and keeps asking, backing off to five minutes. The server decides which machines get work; the worker's token is its identity.

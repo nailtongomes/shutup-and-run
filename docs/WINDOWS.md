@@ -223,6 +223,7 @@ wsl -d shutup-and-run -u root -- sh -c 'curl -s -H "Authorization: Bearer $(shut
 | `shutup-and-run wsl start` | Starts the task again. |
 | `shutup-and-run wsl uninstall` | Deletes the task and the distribution, with its images and job history. `--purge` also removes `%ProgramData%\shutup-and-run`. `%UserProfile%\.wslconfig` is left as it is: delete it, or its `memory=` and `processors=` lines, to give WSL2 back its defaults. |
 | `shutup-and-run wsl limits` | How much of the PC WSL2 may take. See [Sharing the PC](#sharing-the-pc). |
+| `shutup-and-run jobs logs --last` | What the last job printed. `jobs logs ID` for another one (the start of the id is enough), `--tail 50` for its end, `--json` for an agent. |
 | `wsl -d shutup-and-run -u root` | A root shell in the distribution. `docker ps`. |
 
 To change the config, use the CLI or the local page. Nothing is edited by hand, and nothing needs a re-install:
@@ -235,6 +236,8 @@ shutup-and-run doctor
 ```
 
 `config`, `jobs`, `pause`, `resume` and `bans` run inside the distribution; the `.exe` forwards them. The page is `http://127.0.0.1:8787/`, and the install puts a `shutup-and-run` shortcut to it on the desktop. [FOR-AGENTS.md](FOR-AGENTS.md) lists the known problems and their fixes.
+
+**What a job printed.** Docker removes a job's container when it ends, so `docker ps -a` is empty. Its output is kept instead: the last 256 KiB of stdout and stderr, one file per job, in `/var/lib/shutup-and-run/logs/` inside the distribution, for 7 days. Nothing in it is masked. `shutup-and-run jobs logs --last` prints it, and the local page lists the last ones under "Job output (logs)", each with a link to open it in the browser and one to download it.
 
 When the machine itself broke (a power cut, a damaged distribution), `shutup-and-run wsl reset` deletes the distribution and installs it again, keeping the config and the machine's poll token. `--factory` forgets those too.
 
@@ -324,7 +327,7 @@ For a person following instructions, one command at a time, in PowerShell as the
 Each poll is a `POST` with the token and this body:
 
 ```json
-{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.15", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.16", "max_slots": 1, "free_slots": 1, "cpus": 4, "memory_bytes": 4110753792}
 ```
 
 `cpus` and `memory_bytes` are what the WSL2 VM has, which is what the machine lends. The body has no address, because the worker only knows the VM's private one and could claim any other. The server takes the public address from the connection.

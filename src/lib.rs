@@ -15,6 +15,7 @@ pub mod config;
 pub mod devx;
 pub mod hints;
 pub mod host;
+pub mod joblogs;
 pub mod jobs;
 pub mod launcher;
 pub mod lock;
