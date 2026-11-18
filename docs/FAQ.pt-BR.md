@@ -41,13 +41,13 @@ Para esperar também enquanto a pessoa digita ou usa o mouse: `shutup-and-run co
 
 ### Dá para emprestar o PC só à noite?
 
-Dá, com `lend_hours`, no relógio do próprio PC:
+Dá, com `lend_hours`, no relógio do próprio PC (no Windows, o relógio que o Windows mostra, com o fuso dele):
 
 ```
 shutup-and-run config set lend_hours "mon-fri 19-07; sat,sun" --apply
 ```
 
-Isso é: noites de dias úteis e o fim de semana inteiro. Os dias são `mon` a `sun`. Uma janela cujo fim vem antes do início passa da meia-noite e pertence ao dia em que começa (`fri 19-07` termina no sábado às 7). Fora das janelas nenhuma tarefa nova começa, o worker não pede trabalho e a página diz **ESPERANDO** (`OUTSIDE_LEND_HOURS`). Uma tarefa em execução continua depois do fim da janela. `config unset lend_hours --apply` volta a emprestar a qualquer hora. A página mostra a janela e a hora agora, então um relógio errado aparece logo.
+Isso é: noites de dias úteis e o fim de semana inteiro. Os dias são `mon` a `sun`. Uma janela cujo fim vem antes do início passa da meia-noite e pertence ao dia em que começa (`fri 19-07` termina no sábado às 7). Fora das janelas nenhuma tarefa nova começa, o worker não pede trabalho e a página diz **ESPERANDO** (`OUTSIDE_LEND_HOURS`). Uma tarefa em execução continua depois do fim da janela. `config unset lend_hours --apply` volta a emprestar a qualquer hora. A página e o `shutup-and-run doctor` mostram a janela e a hora agora com o fuso (`now wed 21:00, UTC-03:00`), então um relógio errado aparece logo.
 
 ### Uma tarefa consegue ver meus arquivos?
 
@@ -113,7 +113,7 @@ A primeira linha da página diz o porquê, assim como `shutup-and-run doctor` e 
 
 | A página diz | Código | Passa |
 | --- | --- | --- |
-| PAUSADO | `WORKER_PAUSED` | quando alguém retoma, ou no próximo reinício do PC |
+| PAUSADO | `WORKER_PAUSED` | quando alguém retoma; uma pausa por um tempo, no fim dela; qualquer outra, também no próximo reinício do PC |
 | ESPERANDO A SUA AUTORIZAÇÃO | `AUTHORIZATION_REQUIRED` | quando o dono decide, veja abaixo |
 | TAREFAS NOVAS BLOQUEADAS POR SEGURANÇA | `SAFETY_*` | sozinho, quando o PC se recupera |
 | ESPERANDO | `OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING` | sozinho |
@@ -140,7 +140,9 @@ O dono ainda pode retirar na página.
 
 ### Como paro de emprestar por um tempo?
 
-O botão **Pausar** na página, ou `shutup-and-run pause`. Nenhuma tarefa nova começa; a que está rodando termina. `shutup-and-run resume`, ou o botão de novo, encerra a pausa; num PC com a página, um reinício também encerra, para uma pausa esquecida não durar para sempre. Para emprestar só em alguns horários, use `lend_hours`.
+O botão **Pausar** na página, ou `shutup-and-run pause`. Nenhuma tarefa nova começa; a que está rodando termina. `shutup-and-run resume`, ou o botão de novo, encerra a pausa; num PC com a página, um reinício também encerra, para uma pausa esquecida não durar para sempre.
+
+Por um tempo: os botões **por 1 hora**, **por 3 horas** e **pelo resto do dia** (até a meia-noite no relógio do PC), ou `shutup-and-run pause --for 2h` (`30m`, `2h`, `1d`; no máximo uma semana). O worker volta a aceitar sozinho no fim, e a página diz quando. Essa pausa sobrevive a um reinício, porque não tem como ser esquecida. Para emprestar só em alguns horários, use `lend_hours`.
 
 ## Depois
 
@@ -150,7 +152,7 @@ O botão **Pausar** na página, ou `shutup-and-run pause`. Nenhuma tarefa nova c
 
 ### Quanto uma tarefa gastou?
 
-Cada tarefa terminada registra o tempo de CPU e o máximo de memória que ocupou: `shutup-and-run jobs` (uma linha `used:`), `jobs --json` (`cpu_ms`, `memory_peak_bytes`) e a coluna **CPU / memória** na página. Os números vêm de uma leitura a cada 30 segundos enquanto ela roda, então uma tarefa mais curta que isso pode não ter nenhum, e um pico curto pode escapar. Compare com os limites para ver se o PC comporta mais, ou uma segunda vaga.
+Cada tarefa terminada registra o tempo de CPU e o máximo de memória que ocupou: `shutup-and-run jobs` (uma linha `used:`), `jobs --json` (`cpu_ms`, `memory_peak_bytes`) e a coluna **CPU / memória** na página. Os números vêm de uma leitura a cada 30 segundos enquanto ela roda, então uma tarefa mais curta que isso pode não ter nenhum, e um pico curto pode escapar. `shutup-and-run jobs --summary` resume as últimas 20 e, com cinco medidas ou mais e espaço neste PC, sugere o `max_job_memory` e o `max_slots` que caberiam mais tarefas ao mesmo tempo; o `doctor` também diz (`ROOM_FOR_MORE_SLOTS`). Nada muda sozinho.
 
 ### O que a URL de poll fica sabendo deste PC?
 

@@ -25,6 +25,13 @@ shutup-and-run jobs [--limit N] [--json]
     holds at most the last 500 finished jobs, and never a job's env,
     command or payload.
 
+shutup-and-run jobs --summary [--limit N] [--json]
+    what the last N finished jobs used (default 20): the highest and the
+    average memory peak, and how many processors they kept busy. With 5
+    jobs measured or more, and room on this machine, it names the
+    max_job_memory (twice the highest peak) and max_slots that would fit
+    more jobs at once. It changes nothing.
+
 shutup-and-run jobs logs ID|--last [--tail N] [--json]
     what a job printed (stdout and stderr): its last 256 KiB, kept for 7
     days in the logs folder next to the history. ID may be the start of an
@@ -117,6 +124,116 @@ pub fn usage_text(job: &JobRecord) -> Option<String> {
         parts.push(format!("memory peak {}", memory_text(bytes)));
     }
     (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// What the last finished jobs used, from the readings kept in their rows.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Summary {
+    /// Finished jobs looked at.
+    pub jobs: usize,
+    /// Of those, the ones with a memory reading: a job shorter than the 30
+    /// seconds between readings may have none.
+    pub measured: usize,
+    /// Processors in use on average over a job's run, as `cpu_ms` over its
+    /// duration: the mean of the jobs, and the most one used.
+    pub cpus_mean: Option<f64>,
+    pub cpus_max: Option<f64>,
+    pub memory_peak_mean: Option<u64>,
+    pub memory_peak_max: Option<u64>,
+}
+
+/// Fewer measured jobs than this make no suggestion.
+pub const MIN_MEASURED: usize = 5;
+
+pub fn summary(jobs: &[JobRecord]) -> Summary {
+    let finished: Vec<&JobRecord> = jobs.iter().filter(|j| j.is_finished()).collect();
+    let peaks: Vec<u64> = finished.iter().filter_map(|j| j.memory_peak).collect();
+    let cpus: Vec<f64> = finished
+        .iter()
+        .filter_map(|j| {
+            let secs = j.duration_secs().filter(|s| *s > 0)?;
+            Some(j.cpu_ms? as f64 / (secs as f64 * 1000.0))
+        })
+        .collect();
+    Summary {
+        jobs: finished.len(),
+        measured: peaks.len(),
+        cpus_mean: (!cpus.is_empty()).then(|| cpus.iter().sum::<f64>() / cpus.len() as f64),
+        cpus_max: cpus.iter().copied().reduce(f64::max),
+        memory_peak_mean: (!peaks.is_empty())
+            .then(|| peaks.iter().sum::<u64>() / peaks.len() as u64),
+        memory_peak_max: peaks.iter().copied().max(),
+    }
+}
+
+/// A `max_job_memory` that fits what the jobs used, and how many slots it
+/// and `max_job_cpus` leave room for on this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Capacity {
+    pub max_job_memory: u64,
+    pub max_slots: u64,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// Twice the highest peak, rounded up to 256 MiB, and never above the limit
+/// in force; the slots are what fits in the machine's memory and
+/// processors at that size. None without enough readings, without a
+/// memory limit, or when that is no more slots than there are now.
+pub fn capacity(
+    summary: &Summary,
+    max_job_memory: Option<u64>,
+    max_job_cpus: Option<f64>,
+    max_slots: usize,
+    memory_total: Option<u64>,
+    cpus: usize,
+) -> Option<Capacity> {
+    if summary.measured < MIN_MEASURED {
+        return None;
+    }
+    let limit = max_job_memory?;
+    let step = 256 * MIB;
+    let wanted = (summary.memory_peak_max? * 2).div_ceil(step).max(1) * step;
+    let memory = wanted.min(limit);
+    let mut slots = memory_total? / memory;
+    if let Some(per_job) = max_job_cpus.filter(|c| *c > 0.0) {
+        slots = slots.min((cpus as f64 / per_job).floor() as u64);
+    }
+    let slots = slots.min(256);
+    (slots > max_slots as u64).then_some(Capacity {
+        max_job_memory: memory,
+        max_slots: slots,
+    })
+}
+
+/// A size as `config set` takes it: `768m`, `2g`.
+pub fn size_value(bytes: u64) -> String {
+    let mib = bytes / MIB;
+    if mib.is_multiple_of(1024) {
+        format!("{}g", mib / 1024)
+    } else {
+        format!("{mib}m")
+    }
+}
+
+/// One line on what the jobs used: `12 jobs, 10 measured: memory peak
+/// 380 MiB at most (210 MiB on average); 0.90 of a processor at most (0.40
+/// on average)`.
+pub fn summary_text(summary: &Summary) -> String {
+    let mut text = format!("{} jobs, {} measured", summary.jobs, summary.measured);
+    if let (Some(max), Some(mean)) = (summary.memory_peak_max, summary.memory_peak_mean) {
+        text.push_str(&format!(
+            ": memory peak {} at most ({} on average)",
+            memory_text(max),
+            memory_text(mean)
+        ));
+    }
+    if let (Some(max), Some(mean)) = (summary.cpus_max, summary.cpus_mean) {
+        text.push_str(&format!(
+            "; {max:.2} of a processor at most ({mean:.2} on average)"
+        ));
+    }
+    text
 }
 
 /// A job's memory peak: `300 MiB`, `1.5 GiB`, and `< 1 MiB` for a job that
@@ -357,9 +474,11 @@ pub fn jobs_cli(args: &[String]) -> ExitCode {
         }
     }
     let mut limit = DEFAULT_LIMIT;
+    let mut summarize = false;
     let mut words = args.iter().filter(|a| *a != "--json");
     while let Some(word) = words.next() {
         match word.as_str() {
+            "--summary" => summarize = true,
             "-h" | "--help" | "help" => {
                 println!("{}", usage());
                 return ExitCode::SUCCESS;
@@ -385,16 +504,199 @@ pub fn jobs_cli(args: &[String]) -> ExitCode {
         }
     }
     let out = match crate::config::Settings::history_path() {
+        Ok(path) if summarize => {
+            let settings = crate::cli::settings_for_cli();
+            summary_out(&path, limit, settings.as_ref(), Machine::here())
+        }
         Ok(path) => jobs_out(&path, limit),
         Err(err) => Out::fail(EXIT_FAILED, err.0),
     };
     emit(out, as_json)
 }
 
+/// What a suggestion is measured against: the memory and processors this
+/// worker sees (inside WSL2, its share of the PC).
+#[derive(Debug, Clone, Copy)]
+pub struct Machine {
+    pub memory_total: Option<u64>,
+    pub cpus: usize,
+}
+
+impl Machine {
+    pub fn here() -> Self {
+        Self {
+            memory_total: crate::resources::memory_total(),
+            cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        }
+    }
+}
+
+/// The capacity the last `limit` jobs leave room for, with the settings in
+/// force. None when the settings could not be read.
+pub fn capacity_of(
+    summary: &Summary,
+    settings: &crate::config::Settings,
+    machine: Machine,
+) -> Option<Capacity> {
+    capacity(
+        summary,
+        settings.max_job_memory,
+        settings.max_job_cpus,
+        settings.max_slots,
+        machine.memory_total,
+        machine.cpus,
+    )
+}
+
+/// `jobs --summary`: what the last jobs used and, when there is room, the
+/// limits that would fit more of them. It changes nothing.
+pub fn summary_out(
+    history: &Path,
+    limit: usize,
+    settings: Option<&crate::config::Settings>,
+    machine: Machine,
+) -> Out {
+    let jobs = if history.exists() {
+        match Store::open(history).and_then(|store| store.recent(limit)) {
+            Ok(jobs) => jobs,
+            Err(err) => return Out::fail(EXIT_FAILED, format!("{}: {err}", history.display())),
+        }
+    } else {
+        Vec::new()
+    };
+    let summary = summary(&jobs);
+    let mut text = summary_text(&summary);
+    let mut value = json!({"summary": summary, "limit": limit, "suggestion": null});
+    if let Some(settings) = settings {
+        let limits = json!({
+            "max_job_memory_bytes": settings.max_job_memory,
+            "max_job_cpus": settings.max_job_cpus,
+            "max_slots": settings.max_slots,
+        });
+        text.push_str(&format!(
+            "\nlimits: {} memory, {} CPU per job, {} slot(s)",
+            settings
+                .max_job_memory
+                .map_or("no".into(), crate::resources::human),
+            settings.max_job_cpus.map_or("no".into(), |c| c.to_string()),
+            settings.max_slots
+        ));
+        value["limits"] = limits;
+        match capacity_of(&summary, settings, machine) {
+            Some(fit) => {
+                text.push_str(&format!(
+                    "\nroom for more: max_job_memory {} would fit {} slots (now {})",
+                    size_value(fit.max_job_memory),
+                    fit.max_slots,
+                    settings.max_slots
+                ));
+                value["suggestion"] = json!({
+                    "max_job_memory": size_value(fit.max_job_memory),
+                    "max_slots": fit.max_slots,
+                });
+            }
+            None if summary.measured < MIN_MEASURED => text.push_str(&format!(
+                "\nno suggestion: fewer than {MIN_MEASURED} jobs with a memory reading"
+            )),
+            None => text.push_str("\nno room for more slots at these limits"),
+        }
+    }
+    Out::ok(value, text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::NewJob;
+
+    #[test]
+    fn the_summary_suggests_a_memory_limit_and_slots_only_from_enough_readings() {
+        let dir = std::env::temp_dir().join(format!(
+            "shutup-and-run-jobs-summary-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("jobs.sqlite");
+        let store = Store::open(&path).unwrap();
+        let mib = 1024 * 1024;
+        let add = |n: i64, peak: u64| {
+            let id = format!("job-{n}");
+            store
+                .insert_running(&NewJob {
+                    id: id.clone(),
+                    image: "registry.example/protocol:1".into(),
+                    job_key: None,
+                    started_at: n * 1000,
+                    callback_url: None,
+                    managed: None,
+                })
+                .unwrap();
+            store
+                .finish(&id, n * 1000 + 100, Some(0), crate::REASON_EXITED, "")
+                .unwrap();
+            // 40 s of processor in 100 s: 0.4 of one.
+            store.set_usage(&id, Some(40_000), Some(peak)).unwrap();
+        };
+        for n in 1..=4 {
+            add(n, (100 + 70 * n as u64) * mib);
+        }
+        let mut settings =
+            crate::config::Settings::from_json_map(&crate::config::default_map()).unwrap();
+        settings.max_job_memory = Some(2048 * mib);
+        settings.max_job_cpus = Some(1.0);
+        settings.max_slots = 1;
+        let machine = Machine {
+            memory_total: Some(6 * 1024 * mib),
+            cpus: 4,
+        };
+        let out = summary_out(&path, 20, Some(&settings), machine);
+        assert_eq!(
+            out.json["suggestion"],
+            Value::Null,
+            "4 readings are too few"
+        );
+        assert!(out.text.contains("fewer than 5 jobs"), "{}", out.text);
+
+        add(5, 380 * mib);
+        let out = summary_out(&path, 20, Some(&settings), machine);
+        assert_eq!(out.json["summary"]["measured"], 5);
+        assert_eq!(out.json["summary"]["memory_peak_max"], 380 * mib);
+        assert_eq!(out.json["summary"]["cpus_max"], 0.4);
+        // Twice 380 MiB is 760, rounded up to 768; 6 GiB holds 8 of those,
+        // and 4 processors 4 jobs of 1.
+        assert_eq!(
+            out.json["suggestion"],
+            json!({"max_job_memory": "768m", "max_slots": 4})
+        );
+        assert!(
+            out.text
+                .contains("max_job_memory 768m would fit 4 slots (now 1)"),
+            "{}",
+            out.text
+        );
+        let check = crate::cli::capacity_check(&settings, &path, machine).unwrap();
+        assert_eq!(check.code(), "ROOM_FOR_MORE_SLOTS");
+        assert!(check
+            .detail
+            .contains("at max_job_memory 768m, 4 slots fit (now 1)"));
+
+        // Already as many slots as fit: nothing to say.
+        settings.max_slots = 4;
+        assert!(crate::cli::capacity_check(&settings, &path, machine).is_none());
+        // Never a limit above the one in force.
+        let summary = summary(&store.recent(20).unwrap());
+        let tight = capacity(&summary, Some(512 * mib), None, 1, Some(2048 * mib), 4);
+        assert_eq!(
+            tight,
+            Some(Capacity {
+                max_job_memory: 512 * mib,
+                max_slots: 4
+            })
+        );
+        assert_eq!(capacity(&summary, None, None, 1, Some(2048 * mib), 4), None);
+        assert_eq!(size_value(2048 * mib), "2g");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn jobs_lists_the_last_ones_with_how_each_ended_and_nothing_a_job_was_given() {

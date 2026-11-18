@@ -1048,6 +1048,26 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert!(!launcher.draining().unwrap());
 
+        // A pause for a while, and only the spans the page offers.
+        let pause_for = |span: &str| {
+            local(
+                "POST",
+                &format!("/local/pause?for={span}"),
+                LO,
+                HOST,
+                Some("http://127.0.0.1:8787"),
+            )
+        };
+        let response = app.clone().oneshot(pause_for("forever")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!launcher.draining().unwrap());
+        let response = app.clone().oneshot(pause_for("3h")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(launcher.draining().unwrap());
+        assert!(launcher.paused_until().is_some());
+        launcher.set_draining(false).unwrap();
+        assert_eq!(launcher.paused_until(), None);
+
         // The API beside it still wants the token, also from loopback, and
         // the page never counted as a failure.
         let response = app

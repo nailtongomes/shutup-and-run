@@ -318,13 +318,32 @@ impl Launcher {
     }
 
     pub fn draining(&self) -> Result<bool, LaunchError> {
-        self.store.draining().map_err(store_err)
+        self.store
+            .draining_at(self.clock.now_unix() as i64)
+            .map_err(store_err)
     }
 
     pub fn set_draining(&self, draining: bool) -> Result<bool, LaunchError> {
         self.store.set_draining(draining).map_err(store_err)?;
         tracing::info!(draining, "drain mode");
         Ok(draining)
+    }
+
+    /// A pause that ends by itself after `secs`. Returns when.
+    pub fn pause_for(&self, secs: u64) -> Result<i64, LaunchError> {
+        let until = self.clock.now_unix() as i64 + secs as i64;
+        self.store.pause_until(until).map_err(store_err)?;
+        tracing::info!(until, "paused for a while");
+        Ok(until)
+    }
+
+    /// When the pause ends by itself. None for no pause, or one until
+    /// someone resumes.
+    pub fn paused_until(&self) -> Option<i64> {
+        self.store
+            .paused_until(self.clock.now_unix() as i64)
+            .ok()
+            .flatten()
     }
 
     pub async fn slots(&self) -> Result<Slots, LaunchError> {
@@ -560,6 +579,7 @@ impl Launcher {
             slots_used: slots.map(|s| s.used as u64),
             slots_total: slots.map(|s| s.total as u64),
             draining: slots.is_some_and(|s| s.draining),
+            paused_until: self.paused_until(),
             job_ids,
             last_job_at: last
                 .as_ref()
@@ -2260,6 +2280,26 @@ mod tests {
         launcher.set_draining(false).unwrap();
         assert!(launcher.launch(job("alpine", None)).await.is_ok());
         launcher.settled().await;
+    }
+
+    #[tokio::test]
+    async fn a_pause_for_a_while_ends_by_itself() {
+        let (launcher, _, clock) = harness(1);
+        let until = launcher.pause_for(3600).unwrap();
+        assert_eq!(until, 1_700_000_000 + 3600);
+        assert!(launcher.draining().unwrap());
+        assert_eq!(launcher.paused_until(), Some(until));
+        let err = launcher.launch(job("alpine", None)).await.unwrap_err();
+        assert!(matches!(err, LaunchError::Draining));
+        clock.set(1_700_000_000 + 3600);
+        assert!(!launcher.draining().unwrap());
+        assert_eq!(launcher.paused_until(), None);
+        assert!(launcher.launch(job("alpine", None)).await.is_ok());
+        launcher.settled().await;
+        // A pause until someone resumes has no end.
+        launcher.set_draining(true).unwrap();
+        assert!(launcher.draining().unwrap());
+        assert_eq!(launcher.paused_until(), None);
     }
 
     #[tokio::test]

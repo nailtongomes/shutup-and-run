@@ -2,7 +2,8 @@
 //! (`src/resources.rs`) and whether that is safe for its owner
 //! (`src/safety.rs`):
 //!
-//! - inside `lend_hours`, when it is set (local time of the machine);
+//! - inside `lend_hours`, when it is set: on Windows the clock the person
+//!   sees (the supervisor sends its offset from UTC), else the machine's;
 //! - on Windows, not on a battery below [`BATTERY_MIN_PERCENT`]. On a battery
 //!   above it a job starts, and the page says the PC is on its battery;
 //! - on Windows, not while the person at the PC presents or has a program in
@@ -47,11 +48,16 @@ pub fn hold(hours: Option<&LendHours>, feed: Option<Feed>, now_unix: i64) -> Opt
         })
     };
     if let Some(hours) = hours {
-        let now = Local::at(now_unix);
+        let offset = offset_secs(feed, now_unix);
+        let now = Local::at(now_unix, offset);
         if !hours.allows(now) {
             return hold(
                 OUTSIDE_LEND_HOURS,
-                format!("outside lend_hours {} (now {now})", hours.text),
+                format!(
+                    "outside lend_hours {} (now {now}, {})",
+                    hours.text,
+                    zone(offset)
+                ),
             );
         }
     }
@@ -105,8 +111,9 @@ pub struct Local {
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
 impl Local {
-    pub fn at(now_unix: i64) -> Self {
-        Self::of(now_unix + utc_offset_secs(now_unix))
+    /// `offset_secs` from [`offset_secs`].
+    pub fn at(now_unix: i64, offset_secs: i64) -> Self {
+        Self::of(now_unix + offset_secs)
     }
 
     /// From seconds since 1970 already moved to local time. 1970-01-01 was
@@ -129,6 +136,40 @@ impl std::fmt::Display for Local {
             self.minute % 60
         )
     }
+}
+
+/// How far the clock `lend_hours` is read on is ahead of UTC: the Windows
+/// clock when the supervisor sent it, else this machine's own.
+pub fn offset_secs(feed: Option<Feed>, now_unix: i64) -> i64 {
+    feed.and_then(|feed| feed.utc_offset_secs)
+        .unwrap_or_else(|| utc_offset_secs(now_unix))
+}
+
+/// The time of the week now on that clock, and its zone: `wed 18:30,
+/// UTC-03:00`. Shown beside `lend_hours`, so a wrong clock is easy to see.
+pub fn clock(feed: Option<Feed>, now_unix: i64) -> String {
+    let offset = offset_secs(feed, now_unix);
+    format!("{}, {}", Local::at(now_unix, offset), zone(offset))
+}
+
+/// `15:30` on that clock, for the end of a pause.
+pub fn hour_at(feed: Option<Feed>, at_unix: i64) -> String {
+    let local = Local::at(at_unix, offset_secs(feed, at_unix));
+    format!("{:02}:{:02}", local.minute / 60, local.minute % 60)
+}
+
+/// Seconds from now to the next midnight on that clock: a pause "for the
+/// rest of the day". At least a minute.
+pub fn secs_to_midnight(feed: Option<Feed>, now_unix: i64) -> u64 {
+    let local = now_unix + offset_secs(feed, now_unix);
+    (86_400 - local.rem_euclid(86_400)).max(60) as u64
+}
+
+/// `UTC-03:00`.
+pub fn zone(offset_secs: i64) -> String {
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let minutes = offset_secs.unsigned_abs() / 60;
+    format!("UTC{sign}{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 /// What the C library says the local time is ahead of UTC: `TZ`, else
@@ -369,6 +410,35 @@ mod tests {
         assert_eq!(Local::of(0), at(3, 0, 0));
         assert_eq!(Local::of(-60), at(2, 23, 59));
         assert_eq!(at(2, 14, 5).to_string(), "wed 14:05");
+    }
+
+    #[test]
+    fn lend_hours_follow_the_windows_clock_when_the_supervisor_sends_it() {
+        // Wednesday 21:30 UTC is 18:30 in São Paulo: outside "19-07" there.
+        let now = 1_795_010_700 + 7 * 3600 + 25 * 60;
+        let hours = LendHours::parse("19-07").unwrap();
+        let sao_paulo = Feed {
+            utc_offset_secs: Some(-3 * 3600),
+            ..Feed::default()
+        };
+        let held = hold(Some(&hours), Some(sao_paulo), now).unwrap();
+        assert_eq!(held.code, OUTSIDE_LEND_HOURS);
+        assert_eq!(
+            held.detail,
+            "outside lend_hours 19-07 (now wed 18:30, UTC-03:00)"
+        );
+        let utc = Feed {
+            utc_offset_secs: Some(0),
+            ..Feed::default()
+        };
+        assert_eq!(hold(Some(&hours), Some(utc), now), None);
+        assert_eq!(offset_secs(Some(sao_paulo), now), -10_800);
+        assert_eq!(clock(Some(sao_paulo), now), "wed 18:30, UTC-03:00");
+        assert_eq!(hour_at(Some(sao_paulo), now + 3600), "19:30");
+        // 18:30 in São Paulo: five and a half hours to its midnight.
+        assert_eq!(secs_to_midnight(Some(sao_paulo), now), 5 * 3600 + 1800);
+        assert_eq!(zone(19_800), "UTC+05:30");
+        assert_eq!(zone(0), "UTC+00:00");
     }
 
     #[test]

@@ -92,8 +92,23 @@ fn same_origin(headers: &HeaderMap) -> bool {
         .is_some_and(|origin| origin == format!("http://{host}"))
 }
 
-async fn pause(State(launcher): State<Arc<Launcher>>) -> Response {
-    set_draining(&launcher, true)
+/// `?for=1h`, `3h` or `day` (to midnight on the PC's clock) pauses for a
+/// while; nothing pauses until someone resumes.
+async fn pause(
+    State(launcher): State<Arc<Launcher>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let secs = match query.get("for").map(String::as_str) {
+        None => return set_draining(&launcher, true),
+        Some("1h") => 3600,
+        Some("3h") => 3 * 3600,
+        Some("day") => crate::lending::secs_to_midnight(crate::host::current(), now_unix()),
+        Some(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    match launcher.pause_for(secs) {
+        Ok(_) => Redirect::to("/").into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 async fn resume(State(launcher): State<Arc<Launcher>>) -> Response {
@@ -197,6 +212,7 @@ async fn page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Resp
         os: &settings.worker_os,
         slots: live.slots_for_page(),
         draining: live.draining,
+        paused_until: live.paused_until,
         last: live.last.as_ref(),
         polls: settings.poll_url.is_some(),
         poll_error: live.poll_error.as_deref(),
@@ -588,6 +604,8 @@ pub(crate) struct View<'a> {
     /// Used and total. None when Docker did not answer.
     pub slots: Option<(usize, usize)>,
     pub draining: bool,
+    /// A pause for a while ends by itself then.
+    pub paused_until: Option<i64>,
     pub last: Option<&'a JobRecord>,
     pub polls: bool,
     pub poll_error: Option<&'a str>,
@@ -885,6 +903,9 @@ pub(crate) fn render(view: &View) -> String {
         None => (0, 0),
     };
     let admission = view.safety.filter(|s| s.applies).map(|s| s.admission);
+    let paused_until = view
+        .paused_until
+        .map(|until| crate::lending::hour_at(view.computer.and_then(|c| c.host), until));
     // One word for the whole state, its colour, and one sentence under it.
     let (state, tone, sub) = match worker_state(view.slots.is_none(), view.draining, used, false) {
         "failed" => (
@@ -899,11 +920,22 @@ pub(crate) fn render(view: &View) -> String {
         "draining" => (
             lang.t("PAUSED", "PAUSADO"),
             "warn",
-            lang.t(
-                "No new job starts until you resume. A job already running finishes.",
-                "Nenhuma tarefa nova começa até você retomar. Uma tarefa que já roda termina.",
-            )
-            .to_string(),
+            match &paused_until {
+                Some(at) => format!(
+                    "{} {at}. {}",
+                    lang.t("No new job starts until", "Nenhuma tarefa nova começa até"),
+                    lang.t(
+                        "Then it takes jobs again by itself. A job already running finishes.",
+                        "Depois ele volta a aceitar sozinho. Uma tarefa que já roda termina.",
+                    )
+                ),
+                None => lang
+                    .t(
+                        "No new job starts until you resume. A job already running finishes.",
+                        "Nenhuma tarefa nova começa até você retomar. Uma tarefa que já roda termina.",
+                    )
+                    .to_string(),
+            },
         ),
         _ => match admission {
             Some(Admission::AuthorizationRequired) => (
@@ -1067,10 +1099,21 @@ pub(crate) fn render(view: &View) -> String {
             format!(
                 "<p>{}</p><form method=\"post\" action=\"/local/resume\"><p>\
                  <button class=\"primary\">{}</button></p></form>",
-                lang.t(
-                    "It takes no new job. A pause ends when the PC restarts.",
-                    "Ele não pega tarefa nova. A pausa termina quando o PC reinicia.",
-                ),
+                match &paused_until {
+                    Some(at) => format!(
+                        "{} {at}.",
+                        lang.t(
+                            "It takes no new job, and takes them again by itself at",
+                            "Ele não pega tarefa nova, e volta a aceitar sozinho às",
+                        )
+                    ),
+                    None => lang
+                        .t(
+                            "It takes no new job. A pause ends when the PC restarts.",
+                            "Ele não pega tarefa nova. A pausa termina quando o PC reinicia.",
+                        )
+                        .to_string(),
+                },
                 lang.t("Resume taking jobs", "Voltar a aceitar tarefas"),
             ),
         ));
@@ -1190,10 +1233,21 @@ pub(crate) fn render(view: &View) -> String {
     let pause = if view.draining {
         String::new()
     } else {
-        format!(
+        let mut forms = format!(
             "<form method=\"post\" action=\"/local/pause\"><button>{}</button></form>",
             lang.t("Pause: take no new jobs", "Pausar: não pegar novas tarefas")
-        )
+        );
+        for (span, en, pt) in [
+            ("1h", "for 1 hour", "por 1 hora"),
+            ("3h", "for 3 hours", "por 3 horas"),
+            ("day", "for the rest of the day", "pelo resto do dia"),
+        ] {
+            forms.push_str(&format!(
+                "<form method=\"post\" action=\"/local/pause?for={span}\"><button>{}</button></form>",
+                lang.t(en, pt)
+            ));
+        }
+        forms
     };
     let settings = if view.editable {
         format!(
@@ -1228,8 +1282,8 @@ pub(crate) fn render(view: &View) -> String {
         todo = todo.concat(),
         computer = computer_section(view),
         note = lang.t(
-            "This page opens only on this computer and reloads every 10 s. A pause ends when the PC restarts. Times are in this computer's time zone.",
-            "Esta página só abre neste computador e se atualiza a cada 10 s. A pausa termina quando o PC reinicia. Os horários estão no fuso deste computador.",
+            "This page opens only on this computer and reloads every 10 s. A pause with no end ends when the PC restarts. Times are in this computer's time zone.",
+            "Esta página só abre neste computador e se atualiza a cada 10 s. Uma pausa sem prazo termina quando o PC reinicia. Os horários estão no fuso deste computador.",
         ),
     );
     shell(lang, "/", Some((10, "/")), &body)
@@ -1372,7 +1426,7 @@ fn computer_section(view: &View) -> String {
                 "<code>{}</code> &middot; {} {}",
                 escape(hours),
                 lang.t("now", "agora"),
-                crate::lending::Local::at(now_unix())
+                escape(&computer.clock)
             ),
         },
     ));
@@ -2900,6 +2954,8 @@ pub struct Live {
     pub slots_used: Option<u64>,
     pub slots_total: Option<u64>,
     pub draining: bool,
+    /// When a pause for a while ends by itself.
+    pub paused_until: Option<i64>,
     pub job_ids: Vec<String>,
     pub last_job_at: Option<i64>,
     pub last_job_error: Option<String>,
@@ -2937,6 +2993,8 @@ pub struct Computer {
     pub hold: Option<crate::lending::Hold>,
     /// `lend_hours` as written. None: at any time.
     pub lend_hours: Option<String>,
+    /// The time on the clock `lend_hours` is read on: `wed 18:30, UTC-03:00`.
+    pub clock: String,
     pub delivery: crate::store::Delivery,
 }
 
@@ -2955,6 +3013,7 @@ impl Computer {
                 .lend_hours
                 .as_ref()
                 .map(|h| h.text.clone()),
+            clock: crate::lending::clock(machine.host.or_else(crate::host::current), now_unix()),
             delivery: launcher.delivery(),
         }
     }
@@ -3120,7 +3179,11 @@ struct FileBody<'a> {
     /// `task`, `nothing`, `task_rejected`, `not_approved` or `error`.
     last_poll_status: Option<&'a str>,
     waiting_for: Option<&'a str>,
-    /// When the machine lends itself: `lend_hours`, the wait there is now
+    /// When a pause for a while ends by itself. Null for no pause, or one
+    /// until someone resumes.
+    paused_until: Option<String>,
+    /// When the machine lends itself: `lend_hours`, the time on the clock it
+    /// is read on (`wed 18:30, UTC-03:00`), the wait there is now
     /// (`OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING`), and the
     /// battery's charge while a Windows PC runs on it and jobs still start.
     lending: serde_json::Value,
@@ -3162,8 +3225,10 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
         last_poll_at: live.last_poll.map(|(at, _)| unix_to_iso(at)),
         last_poll_status: live.last_poll.map(|(_, status)| status),
         waiting_for: live.waiting_for.as_deref(),
+        paused_until: live.paused_until.map(unix_to_iso),
         lending: serde_json::json!({
             "lend_hours": live.computer.lend_hours,
+            "clock": live.computer.clock,
             "hold": live.computer.hold,
             "on_battery_percent": crate::lending::on_battery(live.computer.host),
         }),
@@ -3197,6 +3262,7 @@ fn empty_live() -> Live {
         slots_used: None,
         slots_total: None,
         draining: false,
+        paused_until: None,
         job_ids: Vec::new(),
         last_job_at: None,
         last_job_error: None,
@@ -3464,6 +3530,7 @@ mod tests {
             os: "windows",
             slots,
             draining,
+            paused_until: None,
             last: None,
             polls: true,
             poll_error: None,
@@ -3527,6 +3594,14 @@ mod tests {
         assert!(busy.contains("PAUSADO"));
         assert!(busy.contains("NÃO agora"));
         assert!(busy.contains("action=\"/local/resume\""));
+        assert!(busy.contains("A pausa termina quando o PC reinicia"));
+        assert!(idle.contains("action=\"/local/pause?for=3h\""));
+        assert!(idle.contains("pelo resto do dia"));
+        let mut timed = view(Lang::Pt, Some((0, 2)), true);
+        timed.paused_until = Some(now_unix() + 3600);
+        let timed = render(&timed);
+        assert!(timed.contains("volta a aceitar sozinho às"), "{timed}");
+        assert!(!timed.contains("tarefa nova. A pausa termina quando o PC reinicia"));
 
         let down = render(&view(Lang::En, None, false));
         assert!(down.contains("DOCKER IS DOWN"));
@@ -3572,6 +3647,7 @@ mod tests {
             user_active: true,
             hold: None,
             lend_hours: None,
+            clock: "wed 18:30, UTC-03:00".into(),
             delivery: crate::store::Delivery {
                 interrupted: 2,
                 interrupted_unnotified: 1,
@@ -3638,7 +3714,7 @@ mod tests {
             "<h1 class=\"state\">WAITING</h1>",
             "<h2>This PC is on its battery</h2>",
             "<td>Power</td><td>on the battery, 72% (below 60% no new job starts)</td>",
-            "<td>Lends itself</td><td><code>mon-fri 19-07</code> &middot; now ",
+            "<td>Lends itself</td><td><code>mon-fri 19-07</code> &middot; now wed 18:30, UTC-03:00</td>",
             "waiting: Outside the hours this machine lends itself (lend_hours)",
         ] {
             assert!(page.contains(text), "{text}\n{page}");
@@ -3820,6 +3896,7 @@ mod tests {
             slots_used: Some(1),
             slots_total: Some(2),
             draining: false,
+            paused_until: None,
             job_ids: vec!["abc".into(), "def".into()],
             last_job_at: Some(1_700_000_000),
             last_job_error: None,

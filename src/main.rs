@@ -94,7 +94,7 @@ shutup-and-run serve
 shutup-and-run config show|get|set|unset|validate|apply|reset|keys
 shutup-and-run status
 shutup-and-run doctor [--report]
-shutup-and-run pause | resume
+shutup-and-run pause [--for 2h] | resume
 shutup-and-run jobs [--limit N]
     for an agent or a script: no questions, --json, stable exit codes.
     `shutup-and-run config --help` documents all of them.
@@ -277,9 +277,13 @@ async fn serve() -> ExitCode {
     };
     // Where a person at the machine can pause the worker, a pause does not
     // outlive a restart: one forgotten before a reboot or a re-install would
-    // leave the machine lending nothing. A server without the page keeps its
-    // drain flag, as `POST /v1/drain` documents.
-    if launcher.settings().status_page && launcher.draining().unwrap_or(false) {
+    // leave the machine lending nothing. A pause for a while keeps its end,
+    // which cannot be forgotten. A server without the page keeps its drain
+    // flag, as `POST /v1/drain` documents.
+    if launcher.settings().status_page
+        && launcher.draining().unwrap_or(false)
+        && launcher.paused_until().is_none()
+    {
         let _ = launcher.set_draining(false);
         tracing::info!("resumed: a pause does not outlive a restart where the local page is on");
     }

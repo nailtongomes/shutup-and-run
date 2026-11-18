@@ -814,23 +814,55 @@ impl Store {
         .map_err(sql)
     }
 
+    /// Paused now: until someone resumes (`1`), or until a time (seconds
+    /// since 1970) that has not come yet. A pause whose time passed is over
+    /// by itself; nothing has to clear it.
+    pub fn draining_at(&self, now: i64) -> Result<bool, StoreError> {
+        Ok(match self.drain_value()?.as_deref() {
+            Some("1") => true,
+            Some(value) => value.parse::<i64>().is_ok_and(|until| until > now),
+            None => false,
+        })
+    }
+
     pub fn draining(&self) -> Result<bool, StoreError> {
+        self.draining_at(crate::status::now_unix())
+    }
+
+    /// When a pause for a while ends. None for a pause until someone
+    /// resumes, and when there is no pause.
+    pub fn paused_until(&self, now: i64) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .drain_value()?
+            .filter(|value| value != "1")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|until| *until > now))
+    }
+
+    fn drain_value(&self) -> Result<Option<String>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
-        let value: Option<String> = conn
-            .query_row("SELECT value FROM meta WHERE key = 'draining'", [], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(sql)?;
-        Ok(value.as_deref() == Some("1"))
+        conn.query_row("SELECT value FROM meta WHERE key = 'draining'", [], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(sql)
     }
 
     pub fn set_draining(&self, draining: bool) -> Result<(), StoreError> {
+        self.write_drain(if draining { "1" } else { "0" })
+    }
+
+    /// A pause that ends by itself at `until`.
+    pub fn pause_until(&self, until: i64) -> Result<(), StoreError> {
+        self.write_drain(&until.to_string())
+    }
+
+    fn write_drain(&self, value: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('draining', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [if draining { "1" } else { "0" }],
+            [value],
         )
         .map_err(sql)?;
         Ok(())
