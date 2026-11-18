@@ -2,13 +2,21 @@
 
 [English](README.md)
 
-Um runner de jobs Docker pequeno e auto-hospedado, em Rust, para a capacidade ociosa de computadores que as pessoas já têm.
+[![CI](https://github.com/nailtongomes/shutup-and-run/actions/workflows/ci.yml/badge.svg)](https://github.com/nailtongomes/shutup-and-run/actions/workflows/ci.yml)
+[![Última release](https://img.shields.io/github/v/release/nailtongomes/shutup-and-run)](https://github.com/nailtongomes/shutup-and-run/releases/latest)
 
-Um cliente tem PCs que passam a maior parte do tempo parados. As automações dele (RPA, Selenium, scripts em container) precisam de um lugar para rodar. O shutup-and-run transforma esse PC, Windows 11 ou Linux, num worker: um orquestrador que você já usa, como n8n ou Kestra, decide o que roda e onde; este programa inicia o container na máquina do próprio cliente, limita, aplica o timeout e informa como terminou.
+**Rode os containers das suas automações nos PCs ociosos que seus clientes já têm, sem atrapalhar quem está usando.**
 
-Ele foi feito para um **PC compartilhado**. Alguém pode estar trabalhando na máquina enquanto um job roda, e o trabalho dessa pessoa vem primeiro: um job por vez, limite de CPU e de memória em todo container, e nenhum job novo enquanto faltar memória ou disco.
+Um runner de jobs Docker pequeno e auto-hospedado, em Rust. Um orquestrador que você já usa (n8n, Kestra, sua própria API) entrega uma tarefa; ele inicia esse container na máquina Windows 11 ou Linux do cliente, mantém dentro dos limites, para no tempo limite e avisa você de como terminou.
 
-Também foi feito para ser operado pelo **agente de IA** do próprio cliente. Todo comando é não interativo, imprime JSON e tem código de saída fixo. A configuração é um arquivo só, que nunca se edita à mão. Um doctor aponta cada problema com o comando que resolve.
+![A página local de um worker rodando uma tarefa: o estado no topo, os dados, as últimas tarefas com os logs](docs/screenshots/pt-status.png)
+
+- **Feito para um PC compartilhado.** Alguém pode estar trabalhando na máquina enquanto um job roda, e o trabalho dessa pessoa vem primeiro: limite de CPU e de memória em todo container, um job por vez por padrão, nenhum job novo enquanto faltar memória ou disco e, num PC pequeno, nada roda até o dono dizer sim.
+- **Nada para abrir no PC do cliente.** Um worker Windows pede trabalho a uma URL sua. Nenhuma porta de entrada, sem Docker Desktop, sem administrador depois de habilitar o WSL2, e sem janela.
+- **Feito para ser operado por um agente de IA.** Todo comando é não interativo, imprime JSON e tem código de saída fixo. A configuração é um arquivo só, que nunca se edita à mão. Um doctor aponta cada problema com o comando que resolve.
+- **Pequeno.** Um binário estático, um histórico em SQLite, uma página local em `127.0.0.1` para a pessoa no PC, e o que cada job imprimiu guardado na máquina por 7 dias.
+
+**Conteúdo:** [Como funciona](#como-funciona) · [Início rápido](#início-rápido) · [A página local](#a-página-local) · [Protegendo o PC](#protegendo-o-pc) · [Containers gerenciados](#containers-gerenciados) · [Para um agente de IA](#para-um-agente-de-ia) · [A API](#push-pull-e-a-api) · [Segurança](#segurança) · [Limites](#limites)
 
 ## O que é, e o que não é
 
@@ -19,7 +27,7 @@ Também foi feito para ser operado pelo **agente de IA** do próprio cliente. To
 | Recebe trabalho de dois jeitos: **push** (`POST /v1/jobs`) e **pull** (o worker consulta uma URL sua) | Coordena máquinas. Cada worker só conhece a si mesmo |
 | Limita concorrência (`max_slots`), tempo (`timeout_secs`, depois SIGKILL), CPU e memória por job | Isola o job como sandbox. O container tem os privilégios e a rede padrão do Docker |
 | Recusa trabalho quando está cheio, em drenagem, ou com pouca memória ou disco | Monta pastas do host, publica portas ou roda privilegiado. Esses campos não existem |
-| Guarda o histórico dos jobs em SQLite e chama um webhook quando o job termina | Devolve a saída do job. O job informa um código de saída; os dados, o próprio container envia |
+| Guarda o histórico dos jobs em SQLite e chama um webhook quando o job termina | Devolve a saída do job para você. O job informa um código de saída e os dados, o próprio container envia; o que ele imprimiu fica na máquina por 7 dias |
 | Mostra uma página local com status e configuração, só na própria máquina | Oferece dashboard, ou qualquer página acessível pela rede |
 
 ## Como funciona
@@ -45,6 +53,24 @@ Também foi feito para ser operado pelo **agente de IA** do próprio cliente. To
 - **Windows 11** roda o mesmo binário Linux dentro de uma distribuição WSL2 própria, só em modo pull. Nenhuma porta é aberta no PC e nada é enviado para ele. O `.exe` é um supervisor: instala a distribuição, mantém o serviço rodando enquanto o usuário está logado, e nunca mostra janela. Detalhes: [docs/WINDOWS.md](docs/WINDOWS.md).
 - **Um job** é um container. `202` quer dizer que a máquina aceitou e reservou um slot; a imagem é baixada depois. Quando termina, sozinho, pelo timeout, ou porque não conseguiu iniciar, o resultado vai por POST para a `callback_url` da tarefa.
 - **O contrato** para um orquestrador, com JSON Schemas, é [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md). Um exemplo completo em n8n, com aprovação de workers, está em [examples/n8n](examples/n8n/README.md).
+
+A vida de uma tarefa no modo pull, o jeito do Windows:
+
+```mermaid
+sequenceDiagram
+    participant O as Seu orquestrador
+    participant W as shutup-and-run no PC
+    participant D as Docker
+    W->>O: POST poll_url: quem sou, vagas livres, CPUs, memória
+    O-->>W: uma tarefa: imagem, env, timeout, callback_url, job_key
+    Note over W: allowlist, vaga livre, memória e disco,<br/>o consentimento do dono num PC pequeno
+    W->>D: inicia o container, com limite de CPU e memória
+    D-->>W: ele termina, ou é morto no tempo limite
+    Note over W: guarda os últimos 256 KiB que ele imprimiu, 7 dias
+    W->>O: POST callback_url: status, código de saída, job_key
+```
+
+No modo push os dois primeiros passos são um `POST /v1/jobs` do seu orquestrador para o worker, respondido com `202`.
 
 ## Início rápido
 
@@ -143,9 +169,25 @@ shutup-and-run wsl limits             # Windows: o PC, o orçamento, o que o .ws
 
 Com `status_page = true` (a instalação no Windows liga; a do Linux não), o serviço responde a um navegador **na própria máquina** em `http://127.0.0.1:8787/`, o endereço de `listen`. No Windows a instalação põe um atalho `shutup-and-run` para ela na área de trabalho.
 
+A página de status está no [topo deste arquivo](#shutup-and-run). As outras:
+
+| Esperando o dono | Tarefas e logs |
+| --- | --- |
+| ![Um PC pequeno espera a autorização do dono; o risco e o botão para decidir ficam no topo](docs/screenshots/pt-authorization.png) | ![Tarefas e logs: cada tarefa com status, início, duração, código de saída e log](docs/screenshots/pt-jobs.png) |
+| **Configuração avançada** | **Tema escuro** |
+| ![Configuração avançada: agrupada, cada campo com a ajuda, campos protegidos marcados](docs/screenshots/pt-advanced.png) | ![A página de status no tema escuro](docs/screenshots/pt-dark.png) |
+
+<img src="docs/screenshots/pt-phone.png" alt="A página de status num celular" width="260" align="right">
+
+Ela segue o tema claro ou escuro do sistema e funciona no celular, sem rede: um CSS só dentro do binário, sem fonte, sem framework. Os horários aparecem no fuso do próprio computador.
+
+<br clear="right">
+
 | Página | O que tem | Login |
 | --- | --- | --- |
-| `/` | Rodando, pausado ou Docker parado. Se o PC pode ser desligado. Tarefas agora, a última tarefa, se a fila responde, o nome da máquina. Um botão para pausar ou voltar a aceitar tarefas. Recarrega a cada 10 segundos | nenhum |
+| `/` | O estado numa palavra e numa cor: rodando e livre, trabalhando, pausado, esperando a sua autorização, bloqueado, Docker parado. Logo abaixo, o que precisa de uma pessoa, cada coisa com o seu botão: autorizar, retomar, dar o segredo a um container gerenciado. Depois, se o PC pode ser desligado, tarefas agora, a última tarefa, a fila, as últimas tarefas com os logs e os recursos do computador. Recarrega a cada 10 segundos | nenhum |
+| Tarefas e logs (`/local/logs`) | As últimas 100 tarefas: status, imagem, início no horário local, duração, código de saída, e o que cada uma imprimiu, para abrir ou baixar | nenhum |
+| Segurança (`/local/safety`) | Se este computador está saudável, em alerta ou bloqueado, e por quê. Onde o dono lê os riscos e autoriza, ou retira uma autorização | nenhum: a decisão é do dono |
 | Configuração (`/local/config`) | URL de poll, intervalo de poll, tarefas ao mesmo tempo, nome da máquina | nenhum |
 | Configuração avançada (`/local/advanced`) | Imagens permitidas, qualquer imagem, limites de tempo, os limites de recursos, os dois tokens, o login de admin | `admin` / `admin` até ser trocado |
 | Containers gerenciados (`/local/managed`) | [Containers gerenciados](#containers-gerenciados): a lista com estado e última execução; Iniciar, Parar, Ativar, Desativar | nenhum para os botões; o mesmo login para o editor, remover e o modo |
@@ -288,7 +330,26 @@ As chaves são as mesmas nos dois. Chave desconhecida é recusada.
 
 ## Para um agente de IA
 
-[docs/FOR-AGENTS.md](docs/FOR-AGENTS.md) é o guia: instalação, os problemas conhecidos e as correções. O ciclo inteiro num PC Windows, sem nenhuma pergunta e sem editar nada à mão:
+[docs/FOR-AGENTS.md](docs/FOR-AGENTS.md) é o guia: instalação, os problemas conhecidos e as correções. O que o doctor responde numa máquina com `language` em `pt` cuja última tarefa falhou (no Windows, as mesmas linhas vêm depois das checagens do WSL e do Docker). As dicas saem no idioma configurado; o detalhe de cada linha fica em inglês:
+
+```text
+$ shutup-and-run doctor
+ok   config                 /etc/shutup-and-run/config.json
+ok   docker                 answers
+ok   service                running (active), listening on 127.0.0.1:8787
+ok   resources              profile shared-pc; per job: cpu 1, memory 2.0 GiB; a new job needs free memory 2.0 GiB, free disk 5.0 GiB; free now: memory 15.1 GiB, disk 5.2 GiB
+ok   safety                 healthy: nothing in the way of a new job
+--   last-job               job c914c6e4bfec26c1e58959f054a3d01c (alpine): the container exited with code 3
+                            hint: Leia o que ele imprimiu: `shutup-and-run jobs logs c914c6e4bfec26c1e58959f054a3d01c`.
+ok   poll                   https://queue.example/poll?user=*** answers the service
+the worker is ready
+
+$ shutup-and-run jobs logs c914 --tail 2
+abrindo o portal
+Traceback: timeout waiting for login
+```
+
+O ciclo inteiro num PC Windows, sem nenhuma pergunta e sem editar nada à mão:
 
 ```powershell
 # 1. Instalar. Sai com 0 só quando o worker está rodando.
