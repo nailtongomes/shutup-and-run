@@ -182,10 +182,15 @@ async fn set_lang(Query(query): Query<HashMap<String, String>>) -> Response {
 async fn page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Response {
     let settings = launcher.settings();
     let live = launcher.live_status().await;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let recent: Vec<(JobRecord, Option<u64>)> = launcher
+        .recent_jobs(5)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|job| {
+            let bytes = crate::joblogs::info(&settings.history_path, &job.id).map(|i| i.bytes);
+            (job, bytes)
+        })
+        .collect();
     let view = View {
         lang: lang_of(&headers, &settings.language),
         worker: &settings.worker_name,
@@ -193,7 +198,6 @@ async fn page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Resp
         slots: live.slots_for_page(),
         draining: live.draining,
         last: live.last.as_ref(),
-        now,
         polls: settings.poll_url.is_some(),
         poll_error: live.poll_error.as_deref(),
         warning: live.config_warning.as_deref(),
@@ -207,6 +211,14 @@ async fn page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Resp
             live.managed.iter().filter(|m| m.state == "running").count(),
             live.managed.len(),
         )),
+        last_poll: live.last_poll,
+        recent: &recent,
+        needs_secret: live
+            .managed
+            .iter()
+            .filter(|m| !m.secrets_missing.is_empty())
+            .map(|m| (m.definition.name.clone(), m.secrets_missing.join(", ")))
+            .collect(),
     };
     html(StatusCode::OK, render(&view))
 }
@@ -239,19 +251,19 @@ pub(crate) fn safety_view(
     let note = note
         .map(|(ok, text)| {
             format!(
-                "<p{}><b>{}</b></p>",
-                if ok { "" } else { " class=\"bad\"" },
+                "<p class=\"callout tone-{}\"><b>{}</b></p>",
+                if ok { "ok" } else { "bad" },
                 escape(text)
             )
         })
         .unwrap_or_default();
     let back = format!(
-        "<p><a href=\"/\">{}</a></p>",
+        "<p class=\"note\"><a href=\"/\">{}</a></p>",
         lang.t("Back to the status", "Voltar ao status")
     );
     if !report.applies {
         return format!(
-            "<h2>{}</h2>{note}<p>{}</p>{back}",
+            "<h1>{}</h1>{note}<p>{}</p>{back}",
             lang.t("Safety of this computer", "Segurança deste computador"),
             lang.t(
                 "This machine is dedicated to jobs (resource_profile = none), so it is not assessed.",
@@ -302,10 +314,10 @@ pub(crate) fn safety_view(
     } else {
         format!(
             "<h2>{t_risks}</h2><ul>{risks}</ul>{notice}\
-             <form method=\"post\" action=\"/local/safety\">\
-             <label><input type=\"checkbox\" name=\"confirm\" required> {t_confirm}</label>\
-             <p><button name=\"action\" value=\"authorize\">{t_yes}</button></p></form>\
-             <p><small>{t_no}</small></p>",
+             <form method=\"post\" action=\"/local/safety\" class=\"callout tone-warn\">\
+             <label class=\"check\"><input type=\"checkbox\" name=\"confirm\" required> {t_confirm}</label>\
+             <p><button class=\"primary\" name=\"action\" value=\"authorize\">{t_yes}</button></p>\
+             <p><small>{t_no}</small></p></form>",
             t_risks = lang.t(
                 "Risks that need your authorization",
                 "Riscos que precisam da sua autorização"
@@ -333,7 +345,7 @@ pub(crate) fn safety_view(
              <button name=\"action\" value=\"revoke\">{}</button></p></form>",
             lang.t("Your authorization", "Sua autorização"),
             lang.t("Given on", "Dada em"),
-            escape(&unix_to_iso(consent.at)),
+            when(consent.at),
             lang.t("notice", "aviso"),
             consent.notice_version,
             consent
@@ -359,22 +371,28 @@ pub(crate) fn safety_view(
         String::new()
     } else {
         format!(
-            "<h2>{}</h2><table>{}</table>",
+            "<h2>{}</h2><div class=\"scroll\"><table>{}</table></div>",
             lang.t("Last incidents", "Últimos incidentes"),
             report
                 .incidents
                 .iter()
                 .map(|i| format!(
                     "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    escape(&unix_to_iso(i.at)),
+                    when(i.at),
                     escape(&i.kind),
                     escape(&i.detail)
                 ))
                 .collect::<String>()
         )
     };
+    let tone = match report.admission {
+        Admission::Open if report.reasons.is_empty() => "ok",
+        Admission::Open | Admission::AuthorizationRequired => "warn",
+        Admission::Blocked => "bad",
+    };
     format!(
-        "<h2>{title}</h2>{note}<p><b>{state}</b></p>{blocked}{form}{authorization}{incidents}{back}",
+        "<h1>{title}</h1>{note}<section class=\"hero tone-{tone}\"><p class=\"sub\"><b>{state}</b></p></section>\
+         {blocked}{form}{authorization}{incidents}{back}",
         title = lang.t("Safety of this computer", "Segurança deste computador"),
     )
 }
@@ -461,59 +479,57 @@ async fn logs_page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) ->
         .into_iter()
         .map(|job| (job.id.clone(), job))
         .collect();
-    let mut logs: Vec<crate::joblogs::Info> = crate::joblogs::ids(&history)
-        .iter()
-        .filter_map(|id| crate::joblogs::info(&history, id))
-        .collect();
-    logs.sort_by_key(|info| std::cmp::Reverse(info.written_at));
-    let rows: String = logs
+    // The jobs of the history, newest first, then any log whose job the
+    // history no longer has. Every log on disk is listed.
+    let mut recent: Vec<&JobRecord> = jobs.values().collect();
+    recent.sort_by_key(|job| std::cmp::Reverse(job.started_at));
+    let mut rows: Vec<JobRow> = recent
         .iter()
         .take(100)
-        .map(|info| {
-            let id = info
+        .map(|job| JobRow {
+            id: job.id.clone(),
+            job: Some(job),
+            log_bytes: crate::joblogs::info(&history, &job.id).map(|i| i.bytes),
+            log_written_at: None,
+        })
+        .collect();
+    let mut orphans: Vec<crate::joblogs::Info> = crate::joblogs::ids(&history)
+        .iter()
+        .filter(|id| !jobs.contains_key(*id))
+        .filter_map(|id| crate::joblogs::info(&history, id))
+        .collect();
+    orphans.sort_by_key(|info| std::cmp::Reverse(info.written_at));
+    rows.extend(orphans.iter().take(100).map(|info| {
+        JobRow {
+            id: info
                 .path
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let job = jobs.get(&id);
-            format!(
-                "<tr><td><code>{short}</code></td><td>{image}</td><td>{status}</td><td>{at}</td><td>{size}</td>\
-                 <td><a href=\"/local/logs/{id}\">{open}</a> &middot; \
-                 <a href=\"/local/logs/{id}?download=1\">{save}</a></td></tr>",
-                short = escape(&id[..id.len().min(12)]),
-                image = escape(job.map(|j| j.image.as_str()).unwrap_or("?")),
-                status = job.map(crate::jobs::status_of).unwrap_or("?"),
-                at = escape(&unix_to_iso(info.written_at)),
-                size = crate::resources::human(info.bytes),
-                id = escape(&id),
-                open = lang.t("open", "abrir"),
-                save = lang.t("download", "baixar"),
-            )
-        })
-        .collect();
+                .unwrap_or_default(),
+            job: None,
+            log_bytes: Some(info.bytes),
+            log_written_at: Some(info.written_at),
+        }
+    }));
     let table = if rows.is_empty() {
         format!(
             "<p>{}</p>",
-            lang.t("No job has left a log yet.", "Nenhum job deixou log ainda.")
+            lang.t("No job has run yet.", "Nenhuma tarefa rodou ainda.")
         )
     } else {
-        format!(
-            "<table><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th></th></tr>{rows}</table>",
-            lang.t("Job", "Job"),
-            lang.t("Image", "Imagem"),
-            lang.t("Status", "Status"),
-            lang.t("Written at (UTC)", "Gravado em (UTC)"),
-            lang.t("Size", "Tamanho"),
-        )
+        jobs_table(&rows, lang)
     };
     let body = format!(
-        "<h2>{title}</h2><p>{note}</p>{table}<p><a href=\"/\">{back}</a></p>",
-        title = lang.t("Job output (logs)", "Saída dos jobs (logs)"),
+        "<h1>{title}</h1><p>{note}</p>{table}<p class=\"note\">{cli}</p>",
+        title = lang.t("Jobs and logs", "Tarefas e logs"),
         note = lang.t(
-            "What each job printed: the last 256 KiB, kept on this computer for 7 days. Nothing in it is masked.",
-            "O que cada job imprimiu: os últimos 256 KiB, guardados neste computador por 7 dias. Nada é mascarado."
+            "What each job printed is kept on this computer for 7 days: its last 256 KiB. Nothing in it is masked. Open shows it here; download saves the file.",
+            "O que cada tarefa imprimiu fica guardado neste computador por 7 dias: os últimos 256 KiB. Nada é mascarado. Abrir mostra aqui; baixar salva o arquivo.",
         ),
-        back = lang.t("Back to the status", "Voltar ao status"),
+        cli = lang.t(
+            "In a terminal: <code>shutup-and-run jobs</code> and <code>shutup-and-run jobs logs --last</code>.",
+            "Num terminal: <code>shutup-and-run jobs</code> e <code>shutup-and-run jobs logs --last</code>.",
+        ),
     );
     html(StatusCode::OK, shell(lang, "/local/logs", None, &body))
 }
@@ -565,7 +581,6 @@ pub(crate) struct View<'a> {
     pub slots: Option<(usize, usize)>,
     pub draining: bool,
     pub last: Option<&'a JobRecord>,
-    pub now: i64,
     pub polls: bool,
     pub poll_error: Option<&'a str>,
     pub warning: Option<&'a str>,
@@ -579,6 +594,208 @@ pub(crate) struct View<'a> {
     pub safety: Option<&'a crate::safety::Report>,
     /// Managed mode, and how many managed containers run, of how many.
     pub managed: Option<(bool, usize, usize)>,
+    /// When the poll URL was last asked, and how it answered.
+    pub last_poll: Option<(i64, &'static str)>,
+    /// The last jobs, newest first, and the size of each one's log.
+    pub recent: &'a [(JobRecord, Option<u64>)],
+    /// Managed containers that cannot start: a secret has no value.
+    pub needs_secret: Vec<(String, String)>,
+}
+
+/// The one stylesheet of the local page. Embedded, no font, no script of
+/// its own: the page works with no network. Colours follow the system's
+/// light or dark theme. A surface is set apart by a step in tone; lines are
+/// only where a table or a field needs them.
+const PAGE_CSS: &str = "\
+:root{color-scheme:light dark;--bg:#f3f3f1;--surface:#fff;--sunk:#e6e6e3;--ink:#16181b;--muted:#4b5058;\
+--line:#d3d3cf;--btn:#16181b;--btn-ink:#fff;--focus:#0a5bb0;\
+--ok:#0d6a33;--ok-bg:#dff1e5;--busy:#0a5bb0;--busy-bg:#dfebf8;--warn:#7a4f00;--warn-bg:#fbedcf;--bad:#a5121d;--bad-bg:#fbe2e2}\
+@media (prefers-color-scheme:dark){:root{--bg:#111316;--surface:#1a1d21;--sunk:#262a30;--ink:#eceef1;--muted:#b3b8bf;\
+--line:#383d44;--btn:#eceef1;--btn-ink:#111316;--focus:#8ec3f6;\
+--ok:#82d9a3;--ok-bg:#15301f;--busy:#8ec3f6;--busy-bg:#142739;--warn:#f0c46c;--warn-bg:#352811;--bad:#ff9d9d;--bad-bg:#3b1619}}\
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}\
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 system-ui,-apple-system,\"Segoe UI\",Roboto,\"Noto Sans\",sans-serif}\
+a{color:inherit;text-underline-offset:.18em}\
+:focus-visible{outline:3px solid var(--focus);outline-offset:2px}\
+.bar{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem 1.4rem;padding:.8rem max(1.25rem,calc((100% - 64rem)/2));background:var(--surface)}\
+.brand{font-weight:750;font-size:1.05rem;text-decoration:none;margin-right:auto}\
+.brand span{font-weight:400;color:var(--muted);margin-left:.35em}\
+.bar nav{display:flex;flex-wrap:wrap;gap:.2rem 1.1rem}@media (max-width:40rem){.brand{width:100%}}\
+.bar nav a{text-decoration:none;padding:.2rem 0;border-bottom:2px solid transparent}\
+.bar nav a:hover{border-bottom-color:var(--line)}\
+.bar nav a[aria-current]{border-bottom-color:currentColor;font-weight:650}\
+main{max-width:64rem;margin:0 auto;padding:1.75rem 1.25rem 3rem}\
+h1{font-size:1.9rem;line-height:1.15;letter-spacing:-.015em;margin:0 0 1rem}\
+h2{font-size:1.25rem;line-height:1.25;margin:2.5rem 0 .8rem}\
+h3{font-size:1.05rem;margin:1.5rem 0 .4rem}\
+p{margin:.6rem 0}ul{margin:.5rem 0;padding-left:1.25rem}li{margin:.25rem 0}\
+small,.muted{color:var(--muted)}small{font-size:.875rem}\
+.bad{color:var(--bad)}\
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.875em;overflow-wrap:anywhere}\
+pre{white-space:pre-wrap;background:var(--surface);padding:1rem;overflow-x:auto}\
+.tone-ok{--tone:var(--ok);--tone-bg:var(--ok-bg)}.tone-busy{--tone:var(--busy);--tone-bg:var(--busy-bg)}\
+.tone-warn{--tone:var(--warn);--tone-bg:var(--warn-bg)}.tone-bad{--tone:var(--bad);--tone-bg:var(--bad-bg)}\
+.hero{background:var(--tone-bg);padding:1.6rem 1.6rem 1.3rem;margin:0 0 1rem}\
+.hero .state{color:var(--tone);font-size:2.4rem;font-weight:800;line-height:1.05;letter-spacing:-.02em;margin:0}\
+.hero .sub{font-size:1.15rem;margin:.6rem 0 .2rem}.hero .sub:first-child{margin-top:0}.hero .meta{color:var(--muted);margin:.2rem 0 0}\
+.callout{background:var(--tone-bg);padding:1.1rem 1.3rem;margin:0 0 1rem}\
+.callout h2{color:var(--tone);margin:0 0 .4rem;font-size:1.2rem}\
+.callout p:last-child,.callout form:last-child p{margin-bottom:0}\
+.facts{display:grid;grid-template-columns:repeat(auto-fill,minmax(17rem,1fr));gap:.5rem;margin:1rem 0}\
+.facts div{background:var(--surface);padding:.8rem 1rem}\
+.facts dt{color:var(--muted);font-size:.875rem}.facts dd{margin:.15rem 0 0;font-weight:600;overflow-wrap:anywhere}\
+.actions{display:flex;flex-wrap:wrap;gap:.6rem;align-items:center;margin:1rem 0}\
+.actions form,.actions p,form.inline{display:inline;margin:0}\
+button,.button{display:inline-block;font:inherit;font-weight:600;line-height:1.3;padding:.6rem 1rem;border:0;border-radius:2px;\
+background:var(--sunk);color:var(--ink);cursor:pointer;text-decoration:none;margin:.1rem 0}\
+button:hover,.button:hover{background:var(--line)}\
+button.primary,.button.primary{background:var(--btn);color:var(--btn-ink)}\
+button.primary:hover,.button.primary:hover{opacity:.88}\
+table{border-collapse:collapse;width:100%;background:var(--surface)}\
+th,td{text-align:left;vertical-align:top;padding:.6rem .8rem;border-bottom:1px solid var(--line)}\
+th{font-size:.875rem;font-weight:600;color:var(--muted)}\
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}\
+.scroll{overflow-x:auto;margin:.5rem 0}\
+.kv td:first-child{color:var(--muted);width:40%}\
+.pill{display:inline-block;padding:.1rem .55rem;border-radius:999px;font-size:.875rem;font-weight:650;\
+background:var(--tone-bg);color:var(--tone);white-space:nowrap}\
+fieldset{border:0;margin:0 0 1rem;padding:1.1rem 1.3rem;background:var(--surface)}\
+legend{float:left;width:100%;padding:0;margin:0 0 .2rem;font-weight:700;font-size:1.1rem}\
+legend+*{clear:both}\
+.field{margin:1rem 0}.field:last-child{margin-bottom:.2rem}\
+.field.locked{padding-left:.9rem;border-left:4px solid var(--warn)}\
+.field label{display:block;font-weight:600;margin:0 0 .3rem}\
+.help{color:var(--muted);font-size:.875rem;margin:.3rem 0 0}\
+.tag{display:inline-block;margin-left:.5rem;padding:0 .45rem;font-size:.8rem;font-weight:650;color:var(--warn);background:var(--warn-bg)}\
+input[type=text],input[type=number],input[type=password],input[type=file],textarea,select{font:inherit;width:100%;padding:.55rem .65rem;\
+border:1px solid var(--line);border-radius:2px;background:var(--bg);color:var(--ink)}\
+label{display:block;margin:.8rem 0 .3rem}\
+label.check{display:flex;gap:.6rem;align-items:flex-start;font-weight:400}\
+label.check input{margin-top:.3rem;width:1.1rem;height:1.1rem;flex:none}\
+details{background:var(--surface);padding:.8rem 1rem;margin:1rem 0}summary{cursor:pointer;font-weight:600}\
+.note{margin-top:2.5rem;color:var(--muted);font-size:.875rem}\
+@media (max-width:40rem){main{padding:1.1rem 1rem 2.5rem}.hero{padding:1.2rem 1rem}.hero .state{font-size:1.85rem}\
+h1{font-size:1.6rem}.kv td{display:block;width:auto;border:0;padding:.05rem .9rem}\
+.kv td:first-child{width:auto;padding-top:.65rem;font-size:.875rem}.kv tr{display:block;border-bottom:1px solid var(--line);padding-bottom:.6rem}\
+.jobs tr:first-child{display:none}.jobs tr{display:block;padding:.6rem .9rem;border-bottom:1px solid var(--line)}\
+.jobs td{display:flex;gap:.75rem;border:0;padding:.15rem 0;text-align:left}\
+.jobs td::before{content:attr(data-label);color:var(--muted);font-size:.875rem;min-width:5.5rem;padding-top:.1rem}\
+fieldset{padding:1rem}}";
+
+/// Turns each `<time datetime>` into the browser's local date and time.
+/// Without it the page still reads: the text is UTC.
+const LOCAL_TIME_JS: &str = "(function(){var l=document.documentElement.lang;\
+document.querySelectorAll('time[datetime]').forEach(function(t){var d=new Date(t.getAttribute('datetime'));\
+if(!isNaN(d))t.textContent=d.toLocaleString(l,{dateStyle:'short',timeStyle:'short'})})})();";
+
+/// A moment as `<time>`: UTC in the markup, local time once the page loads.
+fn when(unix: i64) -> String {
+    let iso = unix_to_iso(unix);
+    let text = iso.replacen('T', " ", 1).trim_end_matches('Z').to_string();
+    format!(
+        "<time datetime=\"{iso}\">{} UTC</time>",
+        &text[..text.len().min(16)]
+    )
+}
+
+/// The colour of a job's status, and the word for it.
+fn job_status(job: &JobRecord, lang: Lang) -> String {
+    let status = crate::jobs::status_of(job);
+    let (tone, word) = match status {
+        "ok" => ("ok", "ok"),
+        "running" => ("busy", lang.t("running", "rodando")),
+        "interrupted" => ("warn", lang.t("interrupted", "interrompida")),
+        "timeout" => ("bad", lang.t("timeout", "tempo esgotado")),
+        "killed" if job.oom_killed => ("bad", lang.t("out of memory", "sem memória")),
+        "killed" => ("bad", lang.t("killed", "encerrada")),
+        _ => ("bad", lang.t("failed", "falhou")),
+    };
+    format!("<span class=\"pill tone-{tone}\">{word}</span>")
+}
+
+/// A log's size in the unit that keeps it readable: 812 B, 14 KiB, 2.1 MiB.
+fn log_size(bytes: u64) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} B"),
+        b if b < 1024 * 1024 => format!("{} KiB", b.div_ceil(1024)),
+        b => format!("{:.1} MiB", b as f64 / 1048576.0),
+    }
+}
+
+/// `registry.example/team/worker:tag` as `worker:tag`; the whole name is
+/// in the title.
+fn short_image(image: &str) -> String {
+    let short = image.rsplit('/').next().unwrap_or(image);
+    format!("<span title=\"{}\">{}</span>", escape(image), escape(short))
+}
+
+/// A table of jobs, newest first, with the links to each one's log.
+/// One row of [`jobs_table`]: the job, when the history still has it, and
+/// its log, when there is one.
+pub(crate) struct JobRow<'a> {
+    pub id: String,
+    pub job: Option<&'a JobRecord>,
+    pub log_bytes: Option<u64>,
+    pub log_written_at: Option<i64>,
+}
+
+fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
+    let (l_status, l_image, l_started, l_duration, l_exit, l_log) = (
+        lang.t("Status", "Status"),
+        lang.t("Image", "Imagem"),
+        lang.t("Started", "Início"),
+        lang.t("Duration", "Duração"),
+        lang.t("Exit", "Saída"),
+        lang.t("Log", "Log"),
+    );
+    let body: String = rows
+        .iter()
+        .map(|row| {
+            let (job, id) = (row.job, &row.id);
+            let links = match row.log_bytes {
+                Some(bytes) => format!(
+                    "<a href=\"/local/logs/{id}\">{open}</a> &middot; \
+                     <a href=\"/local/logs/{id}?download=1\" download>{save}</a> <small>{size}</small>",
+                    id = escape(id),
+                    open = lang.t("open", "abrir"),
+                    save = lang.t("download", "baixar"),
+                    size = log_size(bytes),
+                ),
+                None => "<span class=\"muted\">&ndash;</span>".to_string(),
+            };
+            match job {
+                Some(job) => format!(
+                    "<tr><td data-label=\"{l_status}\">{status}</td><td data-label=\"{l_image}\"><span>{image}<br><small><code>{short}</code></small></span></td>\
+                     <td data-label=\"{l_started}\">{started}</td><td class=\"num\" data-label=\"{l_duration}\">{duration}</td>\
+                     <td class=\"num\" data-label=\"{l_exit}\">{exit}</td><td data-label=\"{l_log}\"><span>{links}</span></td></tr>",
+                    status = job_status(job, lang),
+                    image = short_image(&job.image),
+                    short = escape(&id[..id.len().min(12)]),
+                    started = when(job.started_at),
+                    duration = job
+                        .duration_secs()
+                        .map(ago)
+                        .unwrap_or_else(|| "&ndash;".to_string()),
+                    exit = job
+                        .exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "&ndash;".to_string()),
+                ),
+                None => format!(
+                    "<tr><td data-label=\"{l_status}\"><span class=\"pill tone-warn\">?</span></td>\
+                     <td data-label=\"{l_image}\"><small><code>{short}</code></small></td>\
+                     <td data-label=\"{l_started}\">{written}</td><td class=\"num\" data-label=\"{l_duration}\">&ndash;</td>\
+                     <td class=\"num\" data-label=\"{l_exit}\">&ndash;</td><td data-label=\"{l_log}\"><span>{links}</span></td></tr>",
+                    short = escape(&id[..id.len().min(12)]),
+                    written = row.log_written_at.map(when).unwrap_or_default(),
+                ),
+            }
+        })
+        .collect();
+    format!(
+        "<div class=\"scroll\"><table class=\"jobs\"><tr><th>{l_status}</th><th>{l_image}</th><th>{l_started}</th>\
+         <th class=\"num\">{l_duration}</th><th class=\"num\">{l_exit}</th><th>{l_log}</th></tr>{body}</table></div>"
+    )
 }
 
 /// Everything around a page's body: one language, and a link to the other.
@@ -590,112 +807,273 @@ fn shell(lang: Lang, here: &str, refresh: Option<(u32, &str)>, body: &str) -> St
         Lang::En => ("pt", "Português"),
         Lang::Pt => ("en", "English"),
     };
+    let nav: String = [
+        ("/", lang.t("Status", "Status")),
+        ("/local/logs", lang.t("Jobs and logs", "Tarefas e logs")),
+        ("/local/safety", lang.t("Safety", "Segurança")),
+        ("/local/managed", lang.t("Managed", "Gerenciados")),
+    ]
+    .iter()
+    .map(|(path, name)| {
+        let current = if *path == here || (here.starts_with(path) && *path != "/") {
+            " aria-current=\"page\""
+        } else {
+            ""
+        };
+        format!("<a{current} href=\"{path}\">{name}</a>")
+    })
+    .collect();
     format!(
         "<!doctype html><html lang=\"{code}\"><head><meta charset=\"utf-8\">{refresh}\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>shutup-and-run</title>\
-         <style>body{{font:16px/1.5 system-ui,sans-serif;max-width:44em;margin:2em auto;padding:0 1em}}\
-         h1{{font-size:1.1em}}h2{{font-size:1em;margin-top:2em}}\
-         .state{{font-size:1.6em;font-weight:700}}.bad{{color:#b00020}}.top{{float:right}}\
-         td{{padding:.2em 1em .2em 0;vertical-align:top}}button{{font:inherit;padding:.4em 1em}}\
-         label{{display:block;margin:.8em 0 .2em}}input[type=text],input[type=number],input[type=password],textarea\
-         {{font:inherit;width:100%;box-sizing:border-box;padding:.3em}}code{{word-break:break-all}}</style>\
-         </head><body><p class=\"top\"><a href=\"/local/lang?set={other}&amp;to={here}\">{other_name}</a></p>\
-         <h1>shutup-and-run {version}</h1>{body}</body></html>",
+         <title>shutup-and-run</title><style>{css}</style></head><body>\
+         <header class=\"bar\"><a class=\"brand\" href=\"/\">shutup-and-run<span>{version}</span></a>\
+         <nav aria-label=\"{t_nav}\">{nav}</nav>\
+         <a lang=\"{other_code}\" href=\"/local/lang?set={other}&amp;to={here}\">{other_name}</a></header>\
+         <main>{body}</main><script>{js}</script></body></html>",
         code = lang.t("en", "pt-BR"),
+        other_code = lang.t("pt-BR", "en"),
         version = env!("CARGO_PKG_VERSION"),
+        css = PAGE_CSS,
+        js = LOCAL_TIME_JS,
+        t_nav = lang.t("Pages", "Páginas"),
     )
 }
 
 pub(crate) fn render(view: &View) -> String {
+    use crate::safety::Admission;
     let lang = view.lang;
-    let (state, color) = match worker_state(
-        view.slots.is_none(),
-        view.draining,
-        view.slots.map(|(used, _)| used).unwrap_or(0),
-        false,
-    ) {
-        "failed" => (lang.t("DOCKER IS DOWN", "DOCKER PAROU"), "#b00020"),
-        "draining" => (lang.t("PAUSED", "PAUSADO"), "#8a6d00"),
-        _ => match view.safety.map(|s| s.admission) {
-            Some(crate::safety::Admission::AuthorizationRequired) => (
+    let (used, total) = match view.slots {
+        Some((used, total)) => (used, total),
+        None => (0, 0),
+    };
+    let admission = view.safety.filter(|s| s.applies).map(|s| s.admission);
+    // One word for the whole state, its colour, and one sentence under it.
+    let (state, tone, sub) = match worker_state(view.slots.is_none(), view.draining, used, false) {
+        "failed" => (
+            lang.t("DOCKER IS DOWN", "DOCKER PAROU"),
+            "bad",
+            lang.t(
+                "Docker is not answering, so no job can start.",
+                "O Docker não está respondendo, então nenhuma tarefa pode começar.",
+            )
+            .to_string(),
+        ),
+        "draining" => (
+            lang.t("PAUSED", "PAUSADO"),
+            "warn",
+            lang.t(
+                "No new job starts until you resume. A job already running finishes.",
+                "Nenhuma tarefa nova começa até você retomar. Uma tarefa que já roda termina.",
+            )
+            .to_string(),
+        ),
+        _ => match admission {
+            Some(Admission::AuthorizationRequired) => (
                 lang.t(
                     "WAITING FOR YOUR AUTHORIZATION",
                     "ESPERANDO A SUA AUTORIZAÇÃO",
                 ),
-                "#8a6d00",
+                "warn",
+                lang.t(
+                    "No job starts until the owner of this computer decides.",
+                    "Nenhuma tarefa começa até o dono deste computador decidir.",
+                )
+                .to_string(),
             ),
-            Some(crate::safety::Admission::Blocked) => (
+            Some(Admission::Blocked) => (
                 lang.t(
                     "NEW JOBS BLOCKED FOR SAFETY",
                     "TAREFAS NOVAS BLOQUEADAS POR SEGURANÇA",
                 ),
-                "#8a6d00",
+                "bad",
+                lang.t(
+                    "To protect this computer. It clears by itself.",
+                    "Para proteger este computador. Passa sozinho.",
+                )
+                .to_string(),
             ),
-            _ => (lang.t("RUNNING", "RODANDO"), "#0a7a2f"),
+            _ if used > 0 => (
+                lang.t("RUNNING", "RODANDO"),
+                "busy",
+                format!(
+                    "{} {used} / {total}",
+                    lang.t("Working now: jobs", "Trabalhando agora: tarefas")
+                ),
+            ),
+            _ => (
+                lang.t("RUNNING", "RODANDO"),
+                "ok",
+                lang.t(
+                    "Idle and ready: no job is running.",
+                    "Livre e pronto: nenhuma tarefa rodando.",
+                )
+                .to_string(),
+            ),
         },
     };
-    let safety = match view.safety.filter(|s| s.applies) {
-        None => String::new(),
-        Some(report) => {
-            use crate::safety::Admission;
-            let link = format!(
-                "<a href=\"/local/safety\">{}</a>",
-                lang.t("Safety of this computer", "Segurança deste computador")
-            );
-            match report.admission {
-                Admission::Open => format!("<p>{link}</p>"),
-                Admission::AuthorizationRequired => format!(
-                    "<p class=\"bad\">{}</p><ul>{}</ul><p><b>{link}: {}</b></p>",
+    let managed_on = view.managed.is_some_and(|(on, _, _)| on);
+    let poll_line = match (view.polls, view.last_poll) {
+        _ if managed_on => String::new(),
+        (false, _) => lang.t("no poll URL", "sem URL de poll").to_string(),
+        (true, None) => lang
+            .t("not asked for work yet", "ainda não pediu trabalho")
+            .to_string(),
+        (true, Some((at, how))) => format!(
+            "{} {} &middot; {}",
+            lang.t("last poll", "último poll"),
+            when(at),
+            match how {
+                "task" => lang.t("got a job", "recebeu tarefa"),
+                "nothing" => lang.t("no job waiting", "nenhuma tarefa esperando"),
+                "task_rejected" => lang.t("refused a task", "recusou uma tarefa"),
+                "not_approved" => lang.t("machine not approved yet", "máquina ainda não aprovada"),
+                _ => lang.t("error", "erro"),
+            }
+        ),
+    };
+    let meta = [
+        format!("{} ({})", escape(view.worker), escape(view.os)),
+        poll_line,
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" &middot; ");
+    let hero = format!(
+        "<section class=\"hero tone-{tone}\"><h1 class=\"state\">{state}</h1>\
+         <p class=\"sub\">{sub}</p><p class=\"meta\">{meta}</p></section>"
+    );
+
+    // What needs a person, first, each with its one next step.
+    let mut todo: Vec<String> = Vec::new();
+    let callout = |tone: &str, title: &str, body: String| {
+        format!("<section class=\"callout tone-{tone}\"><h2>{title}</h2>{body}</section>")
+    };
+    if view.slots.is_none() {
+        todo.push(callout(
+            "bad",
+            lang.t("Docker is not answering", "O Docker não está respondendo"),
+            format!(
+                "<p>{} <code>shutup-and-run doctor</code></p>",
+                lang.t(
+                    "In a terminal on this computer, run this; each line that failed says what to do:",
+                    "Num terminal deste computador, rode isto; cada linha que falhou diz o que fazer:",
+                )
+            ),
+        ));
+    }
+    if let Some(report) = view.safety.filter(|s| s.applies) {
+        match report.admission {
+            Admission::AuthorizationRequired => todo.push(callout(
+                "warn",
+                lang.t("Your authorization is needed", "A sua autorização é necessária"),
+                format!(
+                    "<p>{}</p><ul>{}</ul><p><a class=\"button primary\" href=\"/local/safety\">{}</a></p>",
                     lang.t(
                         "No job starts until you decide. Running jobs on this computer now has a risk:",
                         "Nenhuma tarefa começa até você decidir. Rodar tarefas neste computador agora tem um risco:",
                     ),
                     findings_list(&report.unauthorized(), lang),
-                    lang.t("read and decide", "leia e decida"),
+                    lang.t("Read the risks and decide", "Ler os riscos e decidir"),
                 ),
-                Admission::Blocked => format!(
-                    "<p class=\"bad\">{}</p><ul>{}</ul><p>{link}</p>",
+            )),
+            Admission::Blocked => todo.push(callout(
+                "bad",
+                lang.t("New jobs are blocked", "Tarefas novas estão bloqueadas"),
+                format!(
+                    "<p>{}</p><ul>{}</ul><p><a href=\"/local/safety\">{}</a></p>",
                     lang.t(
                         "No new job starts now, to protect this computer. It clears by itself:",
                         "Nenhuma tarefa nova começa agora, para proteger este computador. Passa sozinho:",
                     ),
                     findings_list(&report.blocked(), lang),
+                    lang.t("Safety of this computer", "Segurança deste computador"),
                 ),
-            }
+            )),
+            Admission::Open => {}
         }
-    };
-    let (slots, off) = match view.slots {
-        Some((used, total)) => (
-            format!("{used} / {total}"),
-            if used == 0 {
-                lang.t("YES, the PC can be turned off.", "SIM, pode desligar o PC.")
-            } else {
+    }
+    if view.draining {
+        todo.push(callout(
+            "warn",
+            lang.t("The worker is paused", "O worker está pausado"),
+            format!(
+                "<p>{}</p><form method=\"post\" action=\"/local/resume\"><p>\
+                 <button class=\"primary\">{}</button></p></form>",
                 lang.t(
-                    "NOT now: a job is running.",
-                    "NÃO agora: há tarefa rodando.",
-                )
-            },
+                    "It takes no new job. A pause ends when the PC restarts.",
+                    "Ele não pega tarefa nova. A pausa termina quando o PC reinicia.",
+                ),
+                lang.t("Resume taking jobs", "Voltar a aceitar tarefas"),
+            ),
+        ));
+    }
+    for (name, missing) in &view.needs_secret {
+        todo.push(callout(
+            "warn",
+            lang.t("A managed container needs a secret", "Um container gerenciado precisa de um segredo"),
+            format!(
+                "<p><b>{name}</b>: {} <code>{missing}</code></p><p>{}</p>\
+                 <p><a class=\"button primary\" href=\"/local/managed/edit?name={name}\">{}</a></p>",
+                lang.t("no value for", "sem valor para"),
+                lang.t(
+                    "It does not start until each secret has a value. The value is typed once and never shown again.",
+                    "Ele não começa até cada segredo ter um valor. O valor é digitado uma vez e nunca mais aparece.",
+                ),
+                lang.t("Give it the value", "Informar o valor"),
+                name = escape(name),
+                missing = escape(missing),
+            ),
+        ));
+    }
+    if let Some(warning) = view.warning {
+        todo.push(callout(
+            "bad",
+            lang.t(
+                "The config file has a problem",
+                "O arquivo de configuração tem um problema",
+            ),
+            format!("<p>{}</p>", escape(warning)),
+        ));
+    }
+    if let (true, false, Some(error)) = (view.polls, managed_on, view.poll_error) {
+        todo.push(callout(
+            "warn",
+            lang.t("The poll URL did not answer well", "A URL de poll não respondeu bem"),
+            format!(
+                "<p><span class=\"bad\">{}</span></p><p>{}</p>",
+                escape(error),
+                lang.t(
+                    "The worker keeps trying by itself. If this stays, check the poll URL in the settings or with whoever runs it.",
+                    "O worker continua tentando sozinho. Se isso continuar, confira a URL de poll na configuração ou com quem a mantém.",
+                ),
+            ),
+        ));
+    }
+
+    let off = match view.slots {
+        Some((0, _)) => lang.t("YES, the PC can be turned off.", "SIM, pode desligar o PC."),
+        Some(_) => lang.t(
+            "NOT now: a job is running.",
+            "NÃO agora: há tarefa rodando.",
         ),
-        None => ("?".to_string(), "?"),
+        None => "?",
+    };
+    let slots = match view.slots {
+        Some((used, total)) => format!("{used} / {total}"),
+        None => "?".to_string(),
     };
     let last = match view.last {
         Some(job) => format!(
-            "{} &middot; {}{}{} &middot; {}",
-            escape(&job.image),
-            job.status(),
-            job.reason
-                .as_deref()
-                .map(|r| format!(" ({})", escape(r)))
-                .unwrap_or_default(),
-            job.exit_code
-                .map(|c| format!(", exit {c}"))
-                .unwrap_or_default(),
-            ago(view.now.saturating_sub(job.started_at)),
+            "{} {} <small>{} {}</small>",
+            job_status(job, lang),
+            short_image(&job.image),
+            lang.t("started", "início"),
+            when(job.started_at),
         ),
         None => lang.t("none yet", "nenhuma ainda").to_string(),
     };
-    let managed_on = view.managed.is_some_and(|(on, _, _)| on);
     let queue = match (view.polls, view.poll_error) {
         _ if managed_on => lang
             .t(
@@ -710,70 +1088,82 @@ pub(crate) fn render(view: &View) -> String {
             )
             .to_string(),
         (true, None) => lang.t("answering", "respondendo").to_string(),
-        (true, Some(error)) => format!("<span class=\"bad\">{}</span>", escape(error)),
+        (true, Some(_)) => format!(
+            "<span class=\"bad\">{}</span>",
+            lang.t("not answering well", "não está respondendo bem")
+        ),
     };
-    let (action, label) = if view.draining {
-        (
-            "/local/resume",
-            lang.t("Resume taking jobs", "Voltar a aceitar tarefas"),
-        )
+    let managed = match view.managed {
+        None => String::new(),
+        Some((on, running, total)) => format!(
+            "<div><dt><a href=\"/local/managed\">{}</a></dt><dd>{}</dd></div>",
+            lang.t("Managed containers", "Containers gerenciados"),
+            if on {
+                format!(
+                    "{} &middot; {running} / {total} {}",
+                    lang.t("on", "ligado"),
+                    lang.t("running", "rodando"),
+                )
+            } else {
+                format!("{} &middot; {total}", lang.t("off", "desligado"))
+            },
+        ),
+    };
+    let fact = |name: &str, value: &str| format!("<div><dt>{name}</dt><dd>{value}</dd></div>");
+    let facts = format!(
+        "<dl class=\"facts\">{}{}{}{}{managed}{}</dl>",
+        fact(lang.t("Turn off?", "Pode desligar?"), off),
+        fact(lang.t("Jobs now", "Tarefas agora"), &slots),
+        fact(lang.t("Last job", "Última tarefa"), &last),
+        fact(lang.t("Job queue", "Fila de tarefas"), &queue),
+        fact(
+            lang.t("Machine", "Máquina"),
+            &format!("{} ({})", escape(view.worker), escape(view.os))
+        ),
+    );
+    let pause = if view.draining {
+        String::new()
     } else {
-        (
-            "/local/pause",
-            lang.t("Pause: take no new jobs", "Pausar: não pegar novas tarefas"),
+        format!(
+            "<form method=\"post\" action=\"/local/pause\"><button>{}</button></form>",
+            lang.t("Pause: take no new jobs", "Pausar: não pegar novas tarefas")
         )
     };
-    let warning = view
-        .warning
-        .map(|w| format!("<p class=\"bad\">{}</p>", escape(w)))
-        .unwrap_or_default();
     let settings = if view.editable {
         format!(
-            "<p><a href=\"/local/config\">{}</a></p>",
+            "<a class=\"button\" href=\"/local/config\">{}</a>",
             lang.t("Settings", "Configuração")
         )
     } else {
         String::new()
     };
+    let recent = if view.recent.is_empty() {
+        String::new()
+    } else {
+        let rows: Vec<JobRow> = view
+            .recent
+            .iter()
+            .map(|(job, log_bytes)| JobRow {
+                id: job.id.clone(),
+                job: Some(job),
+                log_bytes: *log_bytes,
+                log_written_at: None,
+            })
+            .collect();
+        format!(
+            "<h2>{}</h2>{}<p><a href=\"/local/logs\">{}</a></p>",
+            lang.t("Last jobs", "Últimas tarefas"),
+            jobs_table(&rows, lang),
+            lang.t("All jobs and their logs", "Todas as tarefas e os logs"),
+        )
+    };
     let body = format!(
-        "<p class=\"state\" style=\"color:{color}\">{state}</p>{warning}{safety}\
-         <table>\
-         <tr><td>{t_off}</td><td><b>{off}</b></td></tr>\
-         <tr><td>{t_jobs}</td><td>{slots}</td></tr>\
-         <tr><td>{t_last}</td><td>{last}</td></tr>\
-         <tr><td>{t_queue}</td><td>{queue}</td></tr>{managed}\
-         <tr><td>{t_machine}</td><td>{worker} ({os})</td></tr>\
-         </table>\
-         <form method=\"post\" action=\"{action}\"><p><button>{label}</button></p></form>\
-         {settings}<p><a href=\"/local/logs\">{t_logs}</a></p>{computer}<p><small>{note}</small></p>",
-        t_logs = lang.t("Job output (logs)", "Saída dos jobs (logs)"),
+        "{hero}{todo}{facts}<div class=\"actions\">{pause}{settings}</div>{recent}{computer}<p class=\"note\">{note}</p>",
+        todo = todo.concat(),
         computer = computer_section(view),
-        managed = match view.managed {
-            None => String::new(),
-            Some((on, running, total)) => format!(
-                "<tr><td><a href=\"/local/managed\">{}</a></td><td>{}</td></tr>",
-                lang.t("Managed containers", "Containers gerenciados"),
-                if on {
-                    format!(
-                        "<b>{}</b> &middot; {running} / {total} {}",
-                        lang.t("on", "ligado"),
-                        lang.t("running", "rodando"),
-                    )
-                } else {
-                    format!("{} &middot; {total}", lang.t("off", "desligado"))
-                },
-            ),
-        },
-        t_off = lang.t("Turn off?", "Pode desligar?"),
-        t_jobs = lang.t("Jobs now", "Tarefas agora"),
-        t_last = lang.t("Last job", "Última tarefa"),
-        t_queue = lang.t("Job queue", "Fila de tarefas"),
-        t_machine = lang.t("Machine", "Máquina"),
-        worker = escape(view.worker),
-        os = escape(view.os),
         note = lang.t(
-            "This page opens only on this computer and reloads every 10 s. A pause ends when the PC restarts.",
-            "Esta página só abre neste computador e se atualiza a cada 10 s. A pausa termina quando o PC reinicia.",
+            "This page opens only on this computer and reloads every 10 s. A pause ends when the PC restarts. Times are in this computer's time zone.",
+            "Esta página só abre neste computador e se atualiza a cada 10 s. A pausa termina quando o PC reinicia. Os horários estão no fuso deste computador.",
         ),
     );
     shell(lang, "/", Some((10, "/")), &body)
@@ -964,7 +1354,7 @@ fn computer_section(view: &View) -> String {
         .map(|(name, value)| format!("<tr><td>{name}</td><td>{value}</td></tr>"))
         .collect();
     format!(
-        "<h2>{}</h2><table>{rows}</table>",
+        "<h2>{}</h2><table class=\"kv\">{rows}</table>",
         lang.t("Computer resources", "Recursos do computador")
     )
 }
@@ -973,70 +1363,135 @@ fn computer_section(view: &View) -> String {
 // The config editor. config.json is the source; these pages read it and
 // write it through the same validation as the CLI.
 
-fn label(name: &str, lang: Lang) -> &'static str {
+/// A key's name on the page, and one short line of help under its field.
+fn field_text(name: &str, lang: Lang) -> (&'static str, &'static str) {
     match name {
-        "poll_url" => lang.t(
-            "Poll URL (with its ?user= filter)",
-            "URL de poll (com o filtro ?user=)",
+        "poll_url" => (
+            lang.t("Poll URL", "URL de poll"),
+            lang.t(
+                "Where this computer asks for work, with its ?user= filter. The values of the filter are hidden here and kept when saved unchanged.",
+                "Onde este computador pede trabalho, com o filtro ?user=. Os valores do filtro ficam ocultos aqui e são mantidos se salvos sem mudança.",
+            ),
         ),
-        "poll_interval_secs" => lang.t(
-            "Poll interval, seconds (30 or more)",
-            "Intervalo de poll, segundos (30 ou mais)",
+        "poll_interval_secs" => (
+            lang.t("Poll interval, seconds", "Intervalo de poll, segundos"),
+            lang.t("How often it asks for work: 30 or more.", "De quanto em quanto tempo pede trabalho: 30 ou mais."),
         ),
-        "resource_profile" => lang.t(
-            "Resource profile: shared-pc or none",
-            "Perfil de recursos: shared-pc ou none",
+        "worker_name" => (
+            lang.t("Machine name", "Nome da máquina"),
+            lang.t("How this computer is named to the poll URL.", "Como este computador é chamado na URL de poll."),
         ),
-        "max_job_cpus" => lang.t(
-            "Most CPUs one job gets (blank: the profile's default, shown in grey)",
-            "Máximo de CPUs por tarefa (vazio: o padrão do perfil, em cinza)",
+        "max_slots" => (
+            lang.t("Containers at once", "Containers ao mesmo tempo"),
+            lang.t("How many jobs may run at the same time.", "Quantas tarefas podem rodar ao mesmo tempo."),
         ),
-        "max_job_memory" => lang.t(
-            "Most memory one job gets, like 2g or 512m",
-            "Máximo de memória por tarefa, como 2g ou 512m",
+        "min_idle_secs" => (
+            lang.t("Wait for the PC to be idle, seconds", "Esperar o PC ficar sem uso, segundos"),
+            lang.t(
+                "Windows: start a job only after nobody used the PC for this long. 0: at any time.",
+                "Windows: só começar uma tarefa depois de o PC ficar sem uso por esse tempo. 0: a qualquer hora.",
+            ),
         ),
-        "min_free_memory" => lang.t(
-            "Free memory a new job needs, like 2g (0: not checked)",
-            "Memória livre que uma tarefa nova exige, como 2g (0: não confere)",
+        "allowlist" => (
+            lang.t("Allowed images", "Imagens permitidas"),
+            lang.t("One per line. A job with any other image is refused.", "Uma por linha. Uma tarefa com outra imagem é recusada."),
         ),
-        "min_free_disk" => lang.t(
-            "Free disk a new job needs, like 5g (0: not checked)",
-            "Disco livre que uma tarefa nova exige, como 5g (0: não confere)",
+        "poll_any_image" => (
+            lang.t("Run any image the poll URL sends", "Rodar qualquer imagem que a URL de poll mandar"),
+            lang.t(
+                "Skips the list above for jobs from the poll URL. Only for a poll URL you trust.",
+                "Ignora a lista acima para tarefas da URL de poll. Só para uma URL de poll em que você confia.",
+            ),
         ),
-        "min_idle_secs" => lang.t(
-            "Windows: start a job only after the PC was not used for this many seconds (0: any time)",
-            "Windows: só começar uma tarefa depois de o PC ficar sem uso por estes segundos (0: a qualquer hora)",
+        "default_timeout_secs" => (
+            lang.t("Job time limit, seconds", "Tempo limite da tarefa, segundos"),
+            lang.t("Used when a job does not say how long it may run.", "Usado quando a tarefa não diz quanto tempo pode rodar."),
         ),
-        "max_slots" => lang.t("Containers at once", "Containers ao mesmo tempo"),
-        "worker_name" => lang.t("Machine name", "Nome da máquina"),
-        "allowlist" => lang.t(
-            "Allowed images, one per line",
-            "Imagens permitidas, uma por linha",
+        "max_timeout_secs" => (
+            lang.t("Longest time limit, seconds", "Maior tempo limite, segundos"),
+            lang.t("The most a job may ask for.", "O máximo que uma tarefa pode pedir."),
         ),
-        "poll_any_image" => lang.t(
-            "Run any image the poll URL sends",
-            "Rodar qualquer imagem que a URL de poll mandar",
+        "resource_profile" => (
+            lang.t("Resource profile", "Perfil de recursos"),
+            lang.t(
+                "shared-pc protects the person using this computer; none gives jobs the whole machine.",
+                "shared-pc protege quem usa este computador; none dá a máquina inteira às tarefas.",
+            ),
         ),
-        "default_timeout_secs" => lang.t(
-            "Job time limit, seconds",
-            "Tempo limite da tarefa, segundos",
+        "max_job_cpus" => (
+            lang.t("CPUs per job", "CPUs por tarefa"),
+            lang.t("Blank: the profile's default, shown in grey.", "Vazio: o padrão do perfil, em cinza."),
         ),
-        "max_timeout_secs" => lang.t(
-            "Longest time limit a job may ask for, seconds",
-            "Maior tempo limite que uma tarefa pode pedir, segundos",
+        "max_job_memory" => (
+            lang.t("Memory per job", "Memória por tarefa"),
+            lang.t("Like 2g or 512m.", "Como 2g ou 512m."),
         ),
-        "token" => lang.t("API token (blank keeps it)", "Token da API (vazio mantém)"),
-        "poll_token" => lang.t(
-            "Poll token: who this machine is to the poll URL (blank keeps it)",
-            "Token de poll: quem esta máquina é para a URL de poll (vazio mantém)",
+        "min_free_memory" => (
+            lang.t("Free memory a new job needs", "Memória livre que uma tarefa nova exige"),
+            lang.t("Like 2g. 0: not checked.", "Como 2g. 0: não confere."),
         ),
-        "admin_user" => lang.t("Admin user", "Usuário admin"),
-        "admin_password" => lang.t(
-            "Admin password (blank keeps it)",
-            "Senha admin (vazio mantém)",
+        "min_free_disk" => (
+            lang.t("Free disk a new job needs", "Disco livre que uma tarefa nova exige"),
+            lang.t("Like 5g. 0: not checked.", "Como 5g. 0: não confere."),
         ),
-        _ => "",
+        "token" => (
+            lang.t("API token", "Token da API"),
+            lang.t("Blank keeps the one in use.", "Vazio mantém o atual."),
+        ),
+        "poll_token" => (
+            lang.t("Poll token", "Token de poll"),
+            lang.t(
+                "Who this machine is to the poll URL. Blank keeps it.",
+                "Quem esta máquina é para a URL de poll. Vazio mantém.",
+            ),
+        ),
+        "admin_user" => (lang.t("Admin user", "Usuário admin"), ""),
+        "admin_password" => (
+            lang.t("Admin password", "Senha admin"),
+            lang.t("Blank keeps it.", "Vazio mantém."),
+        ),
+        _ => ("", ""),
     }
+}
+
+/// The sections of the settings forms, in order. A key in none of them
+/// goes in the last one, so nothing a group has is left out.
+fn field_groups(lang: Lang) -> [(&'static str, &'static [&'static str]); 6] {
+    [
+        (
+            lang.t("Where the work comes from", "De onde vem o trabalho"),
+            &["poll_url", "poll_interval_secs", "worker_name"],
+        ),
+        (
+            lang.t(
+                "How much this computer lends",
+                "Quanto este computador empresta",
+            ),
+            &["max_slots", "min_idle_secs"],
+        ),
+        (
+            lang.t("Which images may run", "Quais imagens podem rodar"),
+            &["allowlist", "poll_any_image"],
+        ),
+        (
+            lang.t("Time limits", "Limites de tempo"),
+            &["default_timeout_secs", "max_timeout_secs"],
+        ),
+        (
+            lang.t("Resources of each job", "Recursos de cada tarefa"),
+            &[
+                "resource_profile",
+                "max_job_cpus",
+                "max_job_memory",
+                "min_free_memory",
+                "min_free_disk",
+            ],
+        ),
+        (
+            lang.t("Tokens and the admin login", "Tokens e o login admin"),
+            &["token", "poll_token", "admin_user", "admin_password"],
+        ),
+    ]
 }
 
 /// The form for the keys of one group, filled from the file.
@@ -1064,15 +1519,28 @@ pub(crate) fn in_force(name: &str, settings: &config::Settings) -> String {
 }
 
 fn form(map: &JsonMap, group: OnPage, action: &str, lang: Lang) -> String {
-    let mut fields = String::new();
     let running = config::Settings::from_json_map(map).ok();
-    for key in config::KEYS.iter().filter(|k| k.page == group) {
+    let locked = group == OnPage::Locked;
+    let field = |key: &config::Key| -> String {
         let name = key.name;
-        let text = label(name, lang);
+        let (text, help) = field_text(name, lang);
         let value = map.get(name);
-        fields.push_str(&match key.kind {
+        let tag = if locked {
+            format!(
+                "<span class=\"tag\">{}</span>",
+                lang.t("protected", "protegido")
+            )
+        } else {
+            String::new()
+        };
+        let help = if help.is_empty() {
+            String::new()
+        } else {
+            format!("<p class=\"help\" id=\"{name}-help\">{help}</p>")
+        };
+        let control = match key.kind {
             Kind::Bool => format!(
-                "<label><input type=\"checkbox\" name=\"{name}\"{}> {text}</label>",
+                "<label class=\"check\"><input type=\"checkbox\" name=\"{name}\"{}> <span>{text}{tag}</span></label>",
                 if value.and_then(|v| v.as_bool()).unwrap_or(false) {
                     " checked"
                 } else {
@@ -1080,7 +1548,7 @@ fn form(map: &JsonMap, group: OnPage, action: &str, lang: Lang) -> String {
                 }
             ),
             Kind::List => format!(
-                "<label for=\"{name}\">{text}</label><textarea id=\"{name}\" name=\"{name}\" rows=\"4\">{}</textarea>",
+                "<label for=\"{name}\">{text}{tag}</label><textarea id=\"{name}\" name=\"{name}\" rows=\"4\" aria-describedby=\"{name}-help\">{}</textarea>",
                 escape(
                     &value
                         .and_then(|v| v.as_array())
@@ -1093,10 +1561,10 @@ fn form(map: &JsonMap, group: OnPage, action: &str, lang: Lang) -> String {
                 )
             ),
             _ if key.secret => format!(
-                "<label for=\"{name}\">{text}</label><input type=\"password\" id=\"{name}\" name=\"{name}\" autocomplete=\"new-password\">"
+                "<label for=\"{name}\">{text}{tag}</label><input type=\"password\" id=\"{name}\" name=\"{name}\" autocomplete=\"new-password\" aria-describedby=\"{name}-help\">"
             ),
             kind => format!(
-                "<label for=\"{name}\">{text}</label><input type=\"{}\" id=\"{name}\" name=\"{name}\" placeholder=\"{}\"{} value=\"{}\">",
+                "<label for=\"{name}\">{text}{tag}</label><input type=\"{}\" id=\"{name}\" name=\"{name}\" placeholder=\"{}\"{} value=\"{}\" aria-describedby=\"{name}-help\">",
                 if kind == Kind::Int { "number" } else { "text" },
                 escape(&running.as_ref().map(|s| in_force(name, s)).unwrap_or_default()),
                 if name == "poll_interval_secs" {
@@ -1115,10 +1583,41 @@ fn form(map: &JsonMap, group: OnPage, action: &str, lang: Lang) -> String {
                     None => String::new(),
                 })
             ),
-        });
+        };
+        format!(
+            "<div class=\"field{}\">{control}{help}</div>",
+            if locked { " locked" } else { "" }
+        )
+    };
+    let keys: Vec<&config::Key> = config::KEYS.iter().filter(|k| k.page == group).collect();
+    let mut placed: Vec<&str> = Vec::new();
+    let mut sections = String::new();
+    for (title, names) in field_groups(lang) {
+        let fields: String = names
+            .iter()
+            .filter_map(|n| keys.iter().find(|k| k.name == *n))
+            .map(|k| {
+                placed.push(k.name);
+                field(k)
+            })
+            .collect();
+        if !fields.is_empty() {
+            sections += &format!("<fieldset><legend>{title}</legend>{fields}</fieldset>");
+        }
+    }
+    let rest: String = keys
+        .iter()
+        .filter(|k| !placed.contains(&k.name))
+        .map(|k| field(k))
+        .collect();
+    if !rest.is_empty() {
+        sections += &format!(
+            "<fieldset><legend>{}</legend>{rest}</fieldset>",
+            lang.t("Other", "Outros")
+        );
     }
     format!(
-        "<form method=\"post\" action=\"{action}\">{fields}<p><button>{}</button></p></form>",
+        "<form method=\"post\" action=\"{action}\">{sections}<p><button class=\"primary\">{}</button></p></form>",
         lang.t("Save and apply", "Salvar e aplicar")
     )
 }
@@ -1148,19 +1647,30 @@ fn editor(path: &Path, group: OnPage, lang: Lang, error: Option<&str>) -> String
     let error = error
         .map(|e| {
             format!(
-                "<p class=\"bad\"><b>{}</b> {}</p>",
+                "<section class=\"callout tone-bad\"><h2>{}</h2><p>{}</p></section>",
                 lang.t("Not saved.", "Não foi salvo."),
                 escape(e)
             )
         })
         .unwrap_or_default();
+    let intro = if group == OnPage::Locked {
+        format!(
+            "<section class=\"callout tone-warn\"><p>{}</p></section>",
+            lang.t(
+                "These settings decide what this computer accepts and how much of it a job takes. A wrong value can let in an image nobody chose, or slow the PC down. Change one only when you know why.",
+                "Estas configurações decidem o que este computador aceita e quanto dele uma tarefa usa. Um valor errado pode deixar entrar uma imagem que ninguém escolheu, ou deixar o PC lento. Mude só quando souber o porquê.",
+            )
+        )
+    } else {
+        String::new()
+    };
     let body = match config::read_json(path) {
         Ok(map) => {
             let rows: String = config::masked(&map)
                 .iter()
                 .map(|(k, v)| {
                     format!(
-                        "<tr><td>{}</td><td><code>{}</code></td></tr>",
+                        "<tr><td><code>{}</code></td><td><code>{}</code></td></tr>",
                         escape(k),
                         escape(&v.to_string())
                     )
@@ -1168,7 +1678,7 @@ fn editor(path: &Path, group: OnPage, lang: Lang, error: Option<&str>) -> String
                 .collect();
             let more = if group == OnPage::Locked {
                 format!(
-                    "<p><a href=\"/local/certificate\">{}</a></p>",
+                    "<p><a class=\"button\" href=\"/local/certificate\">{}</a></p>",
                     lang.t(
                         "Certificate (advanced, optional)",
                         "Certificado (avançado, opcional)"
@@ -1178,9 +1688,13 @@ fn editor(path: &Path, group: OnPage, lang: Lang, error: Option<&str>) -> String
                 String::new()
             };
             format!(
-                "{}{more}<h2>{}</h2><table>{rows}</table><p><small>{}</small></p>",
+                "{}{more}<details><summary>{}</summary><div class=\"scroll\"><table class=\"kv\">{rows}</table></div></details>\
+                 <p class=\"note\">{}</p>",
                 form(&map, group, here, lang),
-                lang.t("The whole config file", "O arquivo de configuração inteiro"),
+                lang.t(
+                    "The whole config file, secrets hidden",
+                    "O arquivo de configuração inteiro, sem os segredos"
+                ),
                 lang.t(
                     "Saving restarts the service; running jobs are not stopped. An empty field goes back to its default. The other keys change with <code>shutup-and-run config set KEY VALUE</code>.",
                     "Salvar reinicia o serviço; as tarefas em execução não param. Campo vazio volta ao padrão. As outras chaves mudam com <code>shutup-and-run config set CHAVE VALOR</code>.",
@@ -1201,7 +1715,7 @@ fn editor(path: &Path, group: OnPage, lang: Lang, error: Option<&str>) -> String
         here,
         None,
         &format!(
-            "<h2>{title}</h2>{error}{body}<p><a href=\"/\">{}</a> &middot; {other}</p>",
+            "<h1>{title}</h1>{error}{intro}{body}<p><a href=\"/\">{}</a> &middot; {other}</p>",
             lang.t("Back to status", "Voltar ao status")
         ),
     )
@@ -1364,8 +1878,8 @@ fn save_page(
             "/",
             Some((4, "/")),
             lang.t(
-                "<p class=\"state\">Saved.</p><p>The service is restarting on the new settings. This page goes back to the status in a few seconds.</p>",
-                "<p class=\"state\">Salvo.</p><p>O serviço está reiniciando com a nova configuração. Esta página volta ao status em alguns segundos.</p>",
+                "<section class=\"hero tone-ok\"><h1 class=\"state\">Saved.</h1><p class=\"sub\">The service is restarting on the new settings. This page goes back to the status in a few seconds.</p></section>",
+                "<section class=\"hero tone-ok\"><h1 class=\"state\">Salvo.</h1><p class=\"sub\">O serviço está reiniciando com a nova configuração. Esta página volta ao status em alguns segundos.</p></section>",
             ),
         ),
     )
@@ -1415,15 +1929,16 @@ pub(crate) fn certificate_view(path: &Path, lang: Lang, note: Option<(bool, &str
         .map(|n| format!(" (<code>{}</code>)", escape(n)))
         .unwrap_or_default();
     let body = format!(
-        "<h2>{title}</h2>{note}<p><b>{state}</b>{name}</p><p class=\"bad\">{risk}</p>\
+        "<h1>{title}</h1>{note}<section class=\"hero tone-{tone}\"><p class=\"sub\"><b>{state}</b>{name}</p></section>\
+         <section class=\"callout tone-bad\"><p>{risk}</p></section>\
          <form method=\"post\" action=\"/local/certificate\" id=\"cert\">\
          <label for=\"file\">{t_file}</label><input type=\"file\" id=\"file\" accept=\".pfx,.p12\">\
          <input type=\"hidden\" name=\"pfx_base64\" id=\"pfx_base64\">\
          <input type=\"hidden\" name=\"file_name\" id=\"file_name\">\
          <label for=\"password\">{t_password}</label>\
          <input type=\"password\" id=\"password\" name=\"password\" autocomplete=\"new-password\">\
-         <label><input type=\"checkbox\" name=\"confirm\"> {t_confirm}</label>\
-         <p><button name=\"action\" value=\"save\">{t_save}</button></p>\
+         <label class=\"check\"><input type=\"checkbox\" name=\"confirm\"> {t_confirm}</label>\
+         <p><button class=\"primary\" name=\"action\" value=\"save\">{t_save}</button></p>\
          <p><button name=\"action\" value=\"validate\">{t_validate}</button> \
          <button name=\"action\" value=\"sign\">{t_sign}</button></p>\
          <p><button name=\"action\" value=\"disable\">{t_disable}</button> \
@@ -1435,6 +1950,7 @@ pub(crate) fn certificate_view(path: &Path, lang: Lang, note: Option<(bool, &str
          <p><small>{t_where} <code>{cert}</code>, <code>{pw}</code>. {t_note}</small></p>\
          <p><a href=\"/local/advanced\">{t_back}</a> &middot; <a href=\"/\">{t_status}</a></p>",
         title = lang.t("Certificate (advanced, optional)", "Certificado (avançado, opcional)"),
+        tone = if enabled { "warn" } else { "ok" },
         risk = risk(lang),
         t_file = lang.t(
             "Certificate file (.pfx or .p12). It is copied into the worker; the original is only read.",
@@ -1604,8 +2120,8 @@ async fn certificate_save(
                     "/",
                     Some((4, "/local/certificate")),
                     lang.t(
-                        "<p class=\"state\">Saved.</p><p>The service is restarting. Running jobs keep what they had; the next ones get the new setting.</p>",
-                        "<p class=\"state\">Salvo.</p><p>O serviço está reiniciando. As tarefas em execução ficam com o que tinham; as próximas recebem a nova configuração.</p>",
+                        "<section class=\"hero tone-ok\"><h1 class=\"state\">Saved.</h1><p class=\"sub\">The service is restarting. Running jobs keep what they had; the next ones get the new setting.</p></section>",
+                        "<section class=\"hero tone-ok\"><h1 class=\"state\">Salvo.</h1><p class=\"sub\">O serviço está reiniciando. As tarefas em execução ficam com o que tinham; as próximas recebem a nova configuração.</p></section>",
                     ),
                 ),
             )
@@ -1692,7 +2208,7 @@ pub(crate) fn managed_view(
 ) -> String {
     let button = |name: &str, action: &str, label: &str| {
         format!(
-            "<form method=\"post\" action=\"/local/managed\" style=\"display:inline\">\
+            "<form method=\"post\" action=\"/local/managed\" class=\"inline\">\
              <input type=\"hidden\" name=\"name\" value=\"{}\">\
              <button name=\"action\" value=\"{action}\">{label}</button></form> ",
             escape(name)
@@ -1751,7 +2267,7 @@ pub(crate) fn managed_view(
         )
     } else {
         format!(
-            "<table><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th></th></tr>{rows}</table>",
+            "<div class=\"scroll\"><table><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th></th></tr>{rows}</table></div>",
             lang.t("Container", "Container"),
             lang.t("Runs", "Roda"),
             lang.t("State", "Estado"),
@@ -1783,18 +2299,19 @@ pub(crate) fn managed_view(
     let note = note
         .map(|(ok, text)| {
             format!(
-                "<p class=\"{}\"><b>{}</b></p>",
-                if ok { "" } else { "bad" },
+                "<p class=\"callout tone-{}\"><b>{}</b></p>",
+                if ok { "ok" } else { "bad" },
                 escape(text)
             )
         })
         .unwrap_or_default();
     let body = format!(
-        "<p><a href=\"/\">&larr; {back}</a></p><h2>{title}</h2>{note}<p>{mode_text}</p>\
+        "<h1>{title}</h1>{note}<section class=\"hero tone-{mode_tone}\"><p class=\"sub\">{mode_text}</p>\
          <form method=\"post\" action=\"/local/managed\"><p>\
-         <button name=\"action\" value=\"{mode_action}\">{mode_label}</button> <small>{mode_note}</small></p></form>\
-         {table}<p><a href=\"/local/managed/edit\">{new}</a> <small>{admin}</small></p>\
-         <p><small>{rules}</small></p>",
+         <button name=\"action\" value=\"{mode_action}\">{mode_label}</button> <small>{mode_note}</small></p></form></section>\
+         {table}<p><a class=\"button\" href=\"/local/managed/edit\">{new}</a> <small>{admin}</small></p>\
+         <p class=\"note\">{rules} <a href=\"/\">{back}</a></p>",
+        mode_tone = if mode { "busy" } else { "ok" },
         back = lang.t("Status", "Status"),
         title = lang.t("Managed containers", "Containers gerenciados"),
         mode_note = lang.t(
@@ -2003,14 +2520,14 @@ pub(crate) fn managed_editor(
         String::new()
     };
     let body = format!(
-        "<p><a href=\"/local/managed\">&larr; {back}</a></p><h2>{title}</h2>{error}\
+        "<p><a href=\"/local/managed\">&larr; {back}</a></p><h1>{title}</h1>{error}\
          <form method=\"post\" action=\"/local/managed\">\
          <input type=\"hidden\" name=\"action\" value=\"save\">\
          {name}{image}{command}{env}{secrets}{cpu}{memory}{shm}{timeout}\
          <label for=\"policy\">{t_policy}</label><select id=\"policy\" name=\"policy\">{once}{interval}{always}</select>\
          <small>{policy_hint}</small>{interval_secs}\
-         <label><input type=\"checkbox\" name=\"enabled\"{checked}> {t_enabled}</label>\
-         <p><button>{save}</button></p></form>{delete}",
+         <label class=\"check\"><input type=\"checkbox\" name=\"enabled\"{checked}> {t_enabled}</label>\
+         <p><button class=\"primary\">{save}</button></p></form>{delete}",
         back = lang.t("Managed containers", "Containers gerenciados"),
         title = if existing {
             lang.t("Edit managed container", "Editar container gerenciado")
@@ -2818,7 +3335,6 @@ mod tests {
             slots,
             draining,
             last: None,
-            now: 1_700_000_000,
             polls: true,
             poll_error: None,
             warning: None,
@@ -2828,6 +3344,9 @@ mod tests {
             waiting_for: None,
             safety: None,
             managed: None,
+            last_poll: None,
+            recent: &[],
+            needs_secret: Vec::new(),
         }
     }
 
