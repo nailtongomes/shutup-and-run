@@ -64,9 +64,10 @@ pub trait Runtime: Send + Sync {
     async fn oom_killed(&self, _id: &str) -> Result<bool, RuntimeError> {
         Ok(false)
     }
-    /// The CPU periods a running container has had, and how many of them it
-    /// spent held back at its CPU limit. None where the daemon does not say.
-    async fn cpu_throttling(&self, _id: &str) -> Result<Option<Throttling>, RuntimeError> {
+    /// One reading of a running container's counters: its CPU throttling,
+    /// the CPU time it has used and the memory it holds. None where the
+    /// daemon does not say.
+    async fn stats(&self, _id: &str) -> Result<Option<Stats>, RuntimeError> {
         Ok(None)
     }
     /// The end of a container's stdout and stderr, at most `max_bytes`, for
@@ -75,6 +76,18 @@ pub trait Runtime: Send + Sync {
         let text = self.tail_logs(id, 100_000).await?;
         Ok(crate::joblogs::clip(text.as_bytes(), max_bytes).to_vec())
     }
+}
+
+/// One reading of a running container. Each part is None where the daemon
+/// did not give it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub throttling: Option<Throttling>,
+    /// CPU time used since the container started, in nanoseconds.
+    pub cpu_ns: Option<u64>,
+    /// Memory in use now, without the page cache the kernel can drop
+    /// (`usage` minus `inactive_file`, as `docker stats` shows it).
+    pub memory_bytes: Option<u64>,
 }
 
 /// Counted by the kernel since the container started.

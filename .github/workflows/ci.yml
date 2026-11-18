@@ -187,7 +187,9 @@ jobs:
           Write-Host "latest release: $before, this build: $version"
           & $installed wsl install
           if ($LASTEXITCODE -ne 0) { throw "wsl install of the latest release exited $LASTEXITCODE" }
-          $old = @(Running)
+          # The pid and the start time: Windows reuses a pid, and the new
+          # supervisor can get the old one's.
+          $old = @(Running | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Start = $_.StartTime } })
           if ($old.Count -lt 1) { throw "the older release is not running from $installed" }
 
           # N: this build, over it.
@@ -209,7 +211,10 @@ jobs:
           $got = (Get-FileHash -Algorithm SHA256 $installed).Hash.ToLower()
           if ($got -ne $want) { throw "the update installed $got, expected $want" }
           Leftovers
-          foreach ($p in $old) { if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { throw "the older supervisor (pid $($p.Id)) is still running" } }
+          foreach ($p in $old) {
+            $same = Get-Process -Id $p.Id -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -eq $p.Start }
+            if ($same) { throw "the older supervisor (pid $($p.Id)) is still running" }
+          }
           if ((Running).Count -lt 1) { throw "the task did not start the new .exe" }
           Versions
 

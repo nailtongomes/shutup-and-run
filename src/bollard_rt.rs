@@ -209,10 +209,7 @@ impl Runtime for BollardRuntime {
         }
     }
 
-    async fn cpu_throttling(
-        &self,
-        id: &str,
-    ) -> Result<Option<crate::runtime::Throttling>, RuntimeError> {
+    async fn stats(&self, id: &str) -> Result<Option<crate::runtime::Stats>, RuntimeError> {
         // One reading, not a stream: the counters are totals since the start.
         let options = StatsOptionsBuilder::default()
             .stream(false)
@@ -221,15 +218,37 @@ impl Runtime for BollardRuntime {
         let mut stats = self.docker.stats(&container_ref(id), Some(options));
         let read = tokio::time::timeout(Duration::from_secs(5), stats.next()).await;
         match read {
-            Ok(Some(Ok(stats))) => Ok(stats
-                .cpu_stats
-                .and_then(|cpu| cpu.throttling_data)
-                .and_then(|data| {
-                    Some(crate::runtime::Throttling {
-                        periods: data.periods?,
-                        throttled_periods: data.throttled_periods?,
+            Ok(Some(Ok(stats))) => {
+                let cpu = stats.cpu_stats.as_ref();
+                let memory = stats.memory_stats.as_ref();
+                // cgroup v2 calls the page cache inactive_file, v1 total_inactive_file.
+                let cache = memory
+                    .and_then(|m| m.stats.as_ref())
+                    .and_then(|s| {
+                        s.get("inactive_file")
+                            .or_else(|| s.get("total_inactive_file"))
                     })
-                })),
+                    .copied()
+                    .unwrap_or(0);
+                Ok(Some(crate::runtime::Stats {
+                    throttling: cpu
+                        .and_then(|cpu| cpu.throttling_data.as_ref())
+                        .and_then(|data| {
+                            Some(crate::runtime::Throttling {
+                                periods: data.periods?,
+                                throttled_periods: data.throttled_periods?,
+                            })
+                        }),
+                    cpu_ns: cpu
+                        .and_then(|cpu| cpu.cpu_usage.as_ref())
+                        .and_then(|usage| usage.total_usage)
+                        .filter(|ns| *ns > 0),
+                    memory_bytes: memory
+                        .and_then(|m| m.usage)
+                        .filter(|bytes| *bytes > 0)
+                        .map(|bytes| bytes.saturating_sub(cache)),
+                }))
+            }
             Ok(Some(Err(err))) if is_status(&err, 404) => Ok(None),
             Ok(Some(Err(err))) => Err(docker_err(err)),
             Ok(None) => Ok(None),

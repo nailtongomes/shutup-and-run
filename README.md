@@ -16,6 +16,8 @@ A small, self-hosted Docker job runner, in Rust. An orchestrator you already use
 - **Made to be run by an AI agent.** Every command is non-interactive, prints JSON and has a fixed exit code. The config is one file that is never edited by hand. A doctor names each problem with the command that fixes it.
 - **Small.** One static binary, a SQLite history, a local page on `127.0.0.1` for the person at the PC, and what each job printed kept on the machine for 7 days.
 
+**Questions?** The [FAQ](docs/FAQ.md) answers what to expect: a slow PC, a battery, a shutdown, a job that did not start.
+
 **Contents:** [How it works](#how-it-works) · [Quick start](#quick-start) · [The local page](#the-local-page) · [Protecting the PC](#protecting-the-pc) · [Managed containers](#managed-containers) · [For an AI agent](#for-an-ai-agent) · [The API](#push-pull-and-the-api) · [Security](#security) · [Limits](#limits)
 
 ## What it is, and is not
@@ -147,11 +149,14 @@ The customer's interactive work has priority over job throughput. On a shared PC
 | Jobs at once | 1 | `max_slots` |
 | Starting a job | only with 2 GiB of memory and 5 GiB of disk free | `min_free_memory`, `min_free_disk` |
 | Starting a job (Windows, optional) | only after the PC was not used for N seconds; off by default | `min_idle_secs` |
+| Starting a job, when (optional) | only inside the hours the machine lends itself, like `mon-fri 19-07; sat,sun`; any time by default | `lend_hours` |
+| Starting a job (Windows) | not on the battery below 60%, not while the person presents or has a program in full screen; on the battery above 60% jobs start and the page says so | not configurable |
 | Starting a job, the computer's safety | never while memory, disk or processor are critical; on a small or busy computer, only after its owner authorized it | not configurable; the owner decides on the local page |
 
 - The limits are enforced by Docker (`NanoCpus`, `Memory`, `MemorySwap`), on a pushed job and on a pulled one. A task that names no `cpu` or `memory` gets the machine's limit; one that names less gets what it asked; one that names more is refused with the limit in the answer.
+- Outside `lend_hours`, on the battery below 60%, or while the person presents or has a program in full screen, a push is answered `503` `not lending now` and a pull worker does not ask for work. A job already running goes on in every case.
 - While memory or disk is short, a push is answered `503` `insufficient resources` and a pull worker simply does not ask for work, so no task is claimed and then dropped. It resumes by itself. `status` shows `waiting_for`.
-- Before every job the worker also judges the computer itself, on Windows the PC and not only the WSL2 VM: **healthy**, **warning** or **blocked**. Blocked (under 10% of memory or 2 GiB of disk, processors saturated, a reading that could not be taken, three jobs killed for memory in half an hour) starts nothing, answers a push with `503` `blocked for safety`, and clears by itself. A warning (under 8 GiB of memory or 2 processors or fewer, memory under 20%, processors busy) starts a job only after the owner of the computer read the risks and said yes, once, on the local page or with `shutup-and-run safety authorize` at a terminal; until then a push gets `503` `authorization required`. No flag, config key or API field says yes, and the yes never lifts a block. `shutup-and-run safety` shows the state; a job killed for memory is reported as such (`oom_killed`). The thresholds and what is not covered are in [docs/WINDOWS.md](docs/WINDOWS.md#sharing-the-pc).
+- Before every job the worker also judges the computer itself, on Windows the PC and not only the WSL2 VM: **healthy**, **warning** or **blocked**. Blocked (under 10% of memory or 2 GiB of disk, processors saturated, a reading that could not be taken, three jobs killed for memory in half an hour) starts nothing, answers a push with `503` `blocked for safety`, and clears by itself. A warning (under 8 GiB of memory or 2 processors or fewer, memory under 20%, processors busy) starts a job only after the owner of the computer read the risks and said yes, once, on the local page or with `shutup-and-run safety authorize` at a terminal; until then a push gets `503` `authorization required`. When the owner already agreed in the contract, whoever installs records that consent at the machine with `shutup-and-run wsl install --owner-consent` (or `shutup-and-run safety authorize --owner-consent`), and the PC is ready at once. No config key or API field says yes, and the yes never lifts a block. `shutup-and-run safety` shows the state; a job killed for memory is reported as such (`oom_killed`). The thresholds and what is not covered are in [docs/WINDOWS.md](docs/WINDOWS.md#sharing-the-pc).
 - Where the service sees under 4 GiB (an 8 GiB PC gives WSL2 about 3.2 GiB), the two memory figures are half of what it sees. Not every PC can run a 2 GiB job.
 - The `shared-pc` profile is the default on Windows, also for a worker installed before 0.2.6. On a Linux desktop: `shutup-and-run config set resource_profile shared-pc --apply`. A Linux server is unchanged unless you set it.
 - `.wslconfig` belongs to the user and covers every WSL2 distribution. The install writes it only when it does not exist and the PC has no other distribution. An existing file is changed only by `shutup-and-run wsl limits --apply`, which keeps every other line and a backup. A change takes effect when WSL restarts; this program never runs `wsl --shutdown`.
@@ -205,6 +210,8 @@ Security of the page, plainly. It needs no token, so it answers only a loopback 
 ### Job output
 
 Each job that ran a container leaves what it printed on the machine: the last 256 KiB of stdout and stderr, one file per job in `logs/` next to the history (`/var/lib/shutup-and-run/logs/`, inside the WSL distribution on Windows), deleted after 7 days. Push, pull and managed jobs alike, whatever way they ended. Nothing is masked. `shutup-and-run jobs logs ID` (or `--last`, `--tail N`, `--json`) prints one, `jobs --json` says which jobs have one, and the local page lists them at `/local/logs` to open or download. When the last job failed, `doctor` names the command for its log.
+
+Each job also records what it used: its CPU time and the most memory it held (`cpu_ms` and `memory_peak_bytes` in `jobs --json`, a `used:` line in `jobs`, a column on the page). They come from the reading taken every 30 seconds while it runs, so a job shorter than that may have none, and a short peak can be missed. Compare them with `max_job_cpus` and `max_job_memory` to see whether the machine has room for more.
 
 ## Managed containers
 
@@ -302,6 +309,7 @@ The keys are the same in both. An unknown key is refused.
 | `min_free_memory` | `SHUTUP_AND_RUN_MIN_FREE_MEMORY` | No new job below this much available memory. `"0"`: not checked. |
 | `min_free_disk` | `SHUTUP_AND_RUN_MIN_FREE_DISK` | The same for the disk Docker writes to. |
 | `min_idle_secs` | `SHUTUP_AND_RUN_MIN_IDLE_SECS` | Windows only: a new job waits until the PC was not used for this many seconds. `0` (the default): off. |
+| `lend_hours` | `SHUTUP_AND_RUN_LEND_HOURS` | When the machine lends itself, on its own clock: `"19-07"`, `"mon-fri 19-07; sat,sun"`, `"mon-fri 12:00-13:30"`. A night window belongs to the day it starts. Outside it no new job starts and the worker does not poll. Unset: any time. |
 | `default_timeout_secs` | `SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS` | Default 3600. |
 | `max_timeout_secs` | `SHUTUP_AND_RUN_MAX_TIMEOUT_SECS` | Default 21600. At most 7 days. |
 | `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Optional. Turns pull mode on. |

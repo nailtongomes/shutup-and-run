@@ -74,6 +74,10 @@ pub const SMALL_MACHINE: &str = "SAFETY_SMALL_MACHINE";
 pub const MEMORY_LOW: &str = "SAFETY_MEMORY_LOW";
 pub const CPU_BUSY: &str = "SAFETY_CPU_BUSY";
 pub const HOST_UNKNOWN: &str = "SAFETY_HOST_UNKNOWN";
+/// Every code that is a warning: what a consent can cover. A new warning
+/// code goes here, so the owner's consent from the contract covers it only
+/// with a new `NOTICE_VERSION`.
+pub const WARNING_CODES: [&str; 4] = [SMALL_MACHINE, MEMORY_LOW, CPU_BUSY, HOST_UNKNOWN];
 /// Not a finding: what the worker answers when a warning has no consent.
 pub const AUTHORIZATION_REQUIRED: &str = "AUTHORIZATION_REQUIRED";
 
@@ -190,7 +194,9 @@ impl Assessment {
 }
 
 /// The owner's yes: to which notice, to which risks, when, and through which
-/// of the two places a person can give it (`page` or `terminal`).
+/// of the places it was given: `page` or `terminal` by the owner in person,
+/// `contract` when whoever installs the machine records the consent the
+/// owner gave in the contract (`safety authorize --owner-consent`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Consent {
     pub notice_version: u32,
@@ -576,8 +582,9 @@ impl std::fmt::Display for GrantError {
 }
 
 /// Records the owner's yes to the warnings in `codes`, on top of what the
-/// same notice was already agreed to. `channel` is `page` or `terminal`: the
-/// two places where a person is asked. Nothing else calls this.
+/// same notice was already agreed to. `channel` is `page` or `terminal`,
+/// where a person is asked, or `contract`: every warning in
+/// [`WARNING_CODES`], recorded by `safety authorize --owner-consent`.
 pub fn grant(
     store: &crate::store::Store,
     codes: &[String],
@@ -742,6 +749,7 @@ mod tests {
                 cpus: Some(cpus),
                 cpu_busy_percent: Some(10),
                 disk_available: Some(80 * GIB),
+                ..Feed::default()
             }),
         }
     }
@@ -946,6 +954,39 @@ mod tests {
             admission(&run(&Readings::default()), Some(&everything)),
             Admission::Blocked
         );
+    }
+
+    #[test]
+    fn the_consent_of_the_contract_covers_every_warning_and_never_a_block() {
+        let path = std::env::temp_dir().join(format!(
+            "shutup-and-run-contract-consent-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = crate::store::Store::open(&path).unwrap();
+        let codes: Vec<String> = WARNING_CODES.iter().map(|c| c.to_string()).collect();
+        let consent = grant(&store, &codes, "contract", 7).unwrap();
+        assert_eq!(consent.channel, "contract");
+        // Every warning this module can raise is one the contract covers.
+        let mut warned = windows_pc(2, 5 * GIB, 2 * GIB);
+        warned.host.as_mut().unwrap().cpu_busy_percent = Some(80);
+        let mut unknown = windows_pc(2, 5 * GIB, 900 * MIB + 2 * GIB);
+        unknown.host.as_mut().unwrap().disk_available = None;
+        for readings in [warned, unknown, windows_pc(16, 16 * GIB, 3 * GIB)] {
+            let found = run(&readings);
+            assert!(!found.findings.is_empty());
+            for warning in found.of(Level::Warning) {
+                assert!(
+                    WARNING_CODES.contains(&warning.code.as_str()),
+                    "{}",
+                    warning.code
+                );
+            }
+            assert_eq!(admission(&found, Some(&consent)), Admission::Open);
+        }
+        let blocked = run(&windows_pc(2, 5 * GIB, 500 * MIB));
+        assert_eq!(admission(&blocked, Some(&consent)), Admission::Blocked);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

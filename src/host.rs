@@ -1,5 +1,6 @@
 //! What the Windows side knows and the service inside WSL2 cannot read: how
-//! long the person has not touched the PC, and the PC's own memory. The
+//! long the person has not touched the PC, the PC's own memory, processors
+//! and disk, its battery, and whether the person is presenting. The
 //! supervisor (`wsl serve`) writes one line to the service's stdin every
 //! `FEED_EVERY`. Nothing is asked for, no file, no call back to Windows.
 //!
@@ -38,6 +39,16 @@ pub struct Feed {
     /// Free bytes on the Windows drive that holds the WSL2 disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_available: Option<u64>,
+    /// The PC runs on its battery (true) or on the mains (false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_battery: Option<bool>,
+    /// The battery's charge, 0 to 100. Missing on a PC without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_percent: Option<u64>,
+    /// The person presents, or a program is in full screen (Windows'
+    /// "do not disturb" states of `SHQueryUserNotificationState`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presenting: Option<bool>,
 }
 
 static LAST: Mutex<Option<(Instant, Feed)>> = Mutex::new(None);
@@ -92,6 +103,9 @@ mod tests {
             cpus: Some(8),
             cpu_busy_percent: Some(12),
             disk_available: None,
+            on_battery: Some(true),
+            battery_percent: Some(72),
+            presenting: None,
         };
         let text = line(&feed);
         assert!(text.starts_with("host-feed {") && text.ends_with("}\n"));
