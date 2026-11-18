@@ -468,3 +468,17 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** Up to 256 KiB per job for 7 days on disk: with `max_slots` 1 and a job a minute, about 2.5 GiB at most. A job that prints a secret leaves it in a file readable by root, and on a client's PC by whoever uses it, as the rule about Windows machines already assumes; the local page shows it to anyone at the PC. Output is read once at the end, all of it streamed from Docker and only the end held: a job that printed gigabytes costs that read. There is no live view. stdout and stderr are in the order Docker read them, which is not always the order the job wrote them.
 
+## The local page: one stylesheet, the state first (0.2.17)
+
+**Context.** The page worked and was hard to read: a person sent to it, by the owner or by an AI, could not tell in a few seconds whether the worker was fine, busy, waiting for them or broken, nor what to do next.
+
+**Decision.**
+
+- The top of every status page is the state in one word, coloured by what it asks of the person (ready, working, waiting for you, blocked, error), one sentence under it, and the machine and its last poll. Anything that needs a person comes next, one box each, with its one action: authorize, resume, give a managed container its secret, fix the config, look at the poll URL. Then the facts, the last jobs, the resources.
+- One stylesheet in the binary (`PAGE_CSS`), no font, no framework, no request anywhere: the page works offline. Light and dark follow the system. Surfaces are told apart by a step in tone; lines only inside tables and fields. Text and status colours keep 4.5:1 or more on their grounds in both themes.
+- Times are UTC in the markup and become local time through eight lines of inline script; without it the page still reads.
+- The settings are grouped by subject, each field with a short label and one line of help. Fields behind the admin login are marked as protected. The list of jobs is the history's last 100 jobs with their logs, plus any log whose job the history no longer has.
+- Nothing else changed: the routes, the forms and their field names, the rules of the page, the config and the contract.
+
+**Cost.** About 43 KB more in the binary. The page is longer on a phone, where tables become stacked rows. The screenshots in `docs/screenshots/local-page/` show it at 0.2.16 data and will age.
+
