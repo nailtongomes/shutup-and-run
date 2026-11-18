@@ -193,6 +193,16 @@ impl Store {
                 next_attempt_at INTEGER NOT NULL DEFAULT 0,
                 note TEXT
             );
+            CREATE TABLE IF NOT EXISTS memory_hours (
+                slot INTEGER PRIMARY KEY,
+                at INTEGER NOT NULL,
+                lowest INTEGER NOT NULL,
+                total INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS memory_waits (
+                day INTEGER PRIMARY KEY,
+                secs INTEGER NOT NULL
+            );
             ",
         )
         .map_err(sql)?;
@@ -536,6 +546,76 @@ impl Store {
         )
         .map_err(sql)?;
         Ok(())
+    }
+
+    /// The owner's memory in this hour of the week (`slot`, Monday 00:00 is
+    /// 0): its lowest during the current pass of that hour. A row written
+    /// more than two hours ago is the hour's previous pass, a week back,
+    /// and is replaced.
+    pub fn note_memory_hour(
+        &self,
+        slot: u32,
+        at: i64,
+        available: u64,
+        total: u64,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute(
+            "INSERT INTO memory_hours (slot, at, lowest, total) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(slot) DO UPDATE SET
+               lowest = CASE WHEN memory_hours.at >= ?2 - 7200
+                        THEN MIN(memory_hours.lowest, ?3) ELSE ?3 END,
+               total = ?4, at = ?2",
+            params![slot, at, available as i64, total as i64],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Every hour of the week with a reading since `since`.
+    pub fn memory_hours(&self, since: i64) -> Result<Vec<crate::memory::Hour>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn
+            .prepare("SELECT slot, lowest, total FROM memory_hours WHERE at >= ?1")
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([since], |row| {
+                Ok(crate::memory::Hour {
+                    slot: row.get::<_, i64>(0)? as u32,
+                    lowest: row.get::<_, i64>(1)? as u64,
+                    total: row.get::<_, i64>(2)? as u64,
+                })
+            })
+            .map_err(sql)?;
+        rows.collect::<Result<_, _>>().map_err(sql)
+    }
+
+    /// Adds seconds a new job waited for memory to `day` (days since 1970
+    /// on the PC's clock). Days older than 30 are dropped.
+    pub fn add_memory_wait(&self, day: i64, secs: u64) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute(
+            "INSERT INTO memory_waits (day, secs) VALUES (?1, ?2)
+             ON CONFLICT(day) DO UPDATE SET secs = memory_waits.secs + ?2",
+            params![day, secs as i64],
+        )
+        .map_err(sql)?;
+        conn.execute("DELETE FROM memory_waits WHERE day < ?1", [day - 30])
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Seconds waited for memory on `day`, and over the seven days to it.
+    pub fn memory_waited(&self, day: i64) -> Result<(u64, u64), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN day = ?1 THEN secs END), 0),
+                    COALESCE(SUM(secs), 0)
+             FROM memory_waits WHERE day > ?1 - 7 AND day <= ?1",
+            [day],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )
+        .map_err(sql)
     }
 
     /// The newest incidents first.

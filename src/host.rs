@@ -56,20 +56,59 @@ pub struct Feed {
 }
 
 static LAST: Mutex<Option<(Instant, Feed)>> = Mutex::new(None);
+/// The programs that hold the most memory, sent with a feed line only while
+/// the PC's memory is tight. Kept apart from `Feed`, which is a few numbers
+/// copied everywhere; never written to a file or a log.
+static PROGRAMS: Mutex<Option<(Instant, Vec<crate::memory::Program>)>> = Mutex::new(None);
+
+#[derive(Serialize, Deserialize)]
+struct Line {
+    #[serde(flatten)]
+    feed: Feed,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    programs: Vec<crate::memory::Program>,
+}
 
 pub fn line(feed: &Feed) -> String {
+    line_with(feed, &[])
+}
+
+pub fn line_with(feed: &Feed, programs: &[crate::memory::Program]) -> String {
+    let line = Line {
+        feed: *feed,
+        programs: programs.to_vec(),
+    };
     format!(
         "{FEED_MARK}{}\n",
-        serde_json::to_string(feed).unwrap_or_else(|_| "{}".into())
+        serde_json::to_string(&line).unwrap_or_else(|_| "{}".into())
     )
 }
 
 pub fn parse(line: &str) -> Option<Feed> {
-    serde_json::from_str(line.trim().strip_prefix(FEED_MARK.trim_end())?.trim()).ok()
+    parse_with(line).map(|(feed, _)| feed)
+}
+
+pub fn parse_with(line: &str) -> Option<(Feed, Vec<crate::memory::Program>)> {
+    let line: Line =
+        serde_json::from_str(line.trim().strip_prefix(FEED_MARK.trim_end())?.trim()).ok()?;
+    Some((line.feed, line.programs))
 }
 
 pub fn note(feed: Feed) {
     *LAST.lock().expect("host feed") = Some((Instant::now(), feed));
+}
+
+pub fn note_programs(programs: Vec<crate::memory::Program>) {
+    *PROGRAMS.lock().expect("host programs") = Some((Instant::now(), programs));
+}
+
+/// The programs of the last fresh line. Empty when the PC's memory was not
+/// tight then, or on Linux.
+pub fn programs() -> Vec<crate::memory::Program> {
+    match &*PROGRAMS.lock().expect("host programs") {
+        Some((at, programs)) if fresh(at.elapsed()) => programs.clone(),
+        _ => Vec::new(),
+    }
 }
 
 /// The last feed, when it is fresh.
@@ -87,8 +126,9 @@ pub fn spawn_reader() {
     std::thread::spawn(|| {
         for text in std::io::stdin().lines() {
             let Ok(text) = text else { break };
-            if let Some(feed) = parse(&text) {
+            if let Some((feed, programs)) = parse_with(&text) {
                 note(feed);
+                note_programs(programs);
             }
         }
     });
@@ -117,6 +157,15 @@ mod tests {
         assert!(!text.contains("memory_available"));
         assert_eq!(parse(&text), Some(feed));
         assert_eq!(parse("host-feed {}"), Some(Feed::default()));
+        let chrome = crate::memory::Program {
+            name: "chrome".into(),
+            processes: 38,
+            bytes: 3 << 30,
+        };
+        let with = line_with(&feed, std::slice::from_ref(&chrome));
+        assert_eq!(parse_with(&with), Some((feed, vec![chrome])));
+        assert_eq!(parse(&with), Some(feed));
+        assert!(!text.contains("programs"));
         assert_eq!(parse("hello"), None);
         assert_eq!(parse("host-feed not json"), None);
         // A key from a newer supervisor does not break an older service.

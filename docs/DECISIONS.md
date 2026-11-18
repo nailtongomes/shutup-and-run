@@ -516,3 +516,16 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - The `release` workflow keeps the three newest releases and deletes the others with their tags, after each release and when it is run by hand.
 
 **Cost.** A PC whose Windows clock is wrong lends at the wrong hours, as the person sees them. A suggestion from 20 jobs is only as good as the next jobs are alike; a short peak between two readings is missed, which the factor of two is there for. An old version can no longer be installed from GitHub, and a supervisor older than three releases cannot fetch its own Linux binary for a repair: it has to be updated first.
+
+## Memory: what to close, how much, and what WSL2 gives back
+
+**Context.** On a client's PC the usual reason no job starts is memory, and "low on memory" told nobody what to do. A Windows PC's memory goes to the person's programs, and to the WSL2 VM, which keeps as cache what a job read and wrote until WSL restarts, so `vmmemWSL` looks like it holds the memory after the job is gone.
+
+**Decision.**
+
+- While the PC's memory is tight (under 20% available, or under 1.5 GiB), the supervisor adds the five programs holding the most memory to its line on the service's stdin. They are added up per program; each process counts as the smaller of its working set and its private bytes, which is close to the memory only it holds. Windows' own processes, the antivirus, WSL and the worker are never listed. The list goes to the local page and the local doctor; it never goes to `status.json` (which the service also logs), `doctor --report`, a callback or the poll body.
+- The amount to free is the gap to the line at which a new job can start: a block's recovery line (15%, at least 1.5 GiB on the PC), the 20% warning line while the owner has not agreed to it, or the free memory the VM needs for a job.
+- The service keeps the lowest memory of each hour of the week (168 rows, a row older than two hours replaced on the next pass of that hour) and the seconds new jobs waited for memory per day. An hour under 20% is short. When short hours fall inside `lend_hours` (or any hour, without it), the doctor suggests the `lend_hours` that remains without them, written by the same parser's rules. It is a suggestion: `lend_hours` may be in the contract.
+- When the last job on a Windows PC ends, the service writes `1` to `/proc/sys/vm/drop_caches` (and asks for compaction), so the VM hands the memory back to Windows at once. `wsl limits --apply` adds `autoMemoryReclaim=dropcache` under `[experimental]` when no value is set, for the rest of the VM's idle time; an owner's own value, `disabled` included, is kept. `dropcache` rather than `gradual`: it is the simpler of the two (drop the cache once the VM is idle) and matches what the service does after a job.
+
+**Cost.** The program list is a guess at what closing a program frees: shared memory is not counted, and a process of another user or of the system cannot be read. The hour map shows the last seven days, not a typical week. Dropping the cache makes the next job read its image from disk again. `autoMemoryReclaim` is an experimental WSL key; a WSL that moves or drops it ignores the line.

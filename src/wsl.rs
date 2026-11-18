@@ -826,6 +826,47 @@ pub(crate) fn wslconfig_values(text: &str) -> (Option<String>, Option<String>) {
     (memory, processors)
 }
 
+/// `autoMemoryReclaim`, wherever the file sets it: WSL reads it under
+/// `[experimental]`.
+pub(crate) fn wslconfig_reclaim(text: &str) -> Option<String> {
+    text.lines().map(str::trim).find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (!line.starts_with('#') && key.trim().eq_ignore_ascii_case("automemoryreclaim"))
+            .then(|| value.trim().to_string())
+    })
+}
+
+/// The file with `autoMemoryReclaim=dropcache` under `[experimental]`, when
+/// it does not set that key already: once the VM is idle, WSL2 drops its
+/// file cache and gives the memory back to Windows. An owner's own value,
+/// `disabled` included, is kept. Every other line stays where it was.
+pub(crate) fn with_reclaim(existing: &str) -> String {
+    if wslconfig_reclaim(existing).is_some() {
+        return existing.to_string();
+    }
+    let newline = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut out: Vec<String> = existing.lines().map(str::to_string).collect();
+    match out
+        .iter()
+        .position(|l| l.trim().eq_ignore_ascii_case("[experimental]"))
+    {
+        Some(at) => out.insert(at + 1, RECLAIM_LINE.to_string()),
+        None => {
+            out.push("[experimental]".to_string());
+            out.push(RECLAIM_LINE.to_string());
+        }
+    }
+    let mut text = out.join(newline);
+    text.push_str(newline);
+    text
+}
+
+const RECLAIM_LINE: &str = "autoMemoryReclaim=dropcache";
+
 /// The file with `memory` and `processors` set under `[wsl2]`. Every other
 /// line, comment and section stays where it was.
 pub(crate) fn merge_wslconfig(existing: &str, memory: &str, processors: u64) -> String {
@@ -896,6 +937,9 @@ pub(crate) struct WslLimits {
     /// What `.wslconfig` says now.
     pub memory: Option<String>,
     pub processors: Option<String>,
+    /// `autoMemoryReclaim`. None: WSL2 keeps what jobs filled its cache
+    /// with until it restarts.
+    pub reclaim: Option<String>,
     /// Empty when the file keeps WSL2 inside the budget.
     pub problems: Vec<String>,
 }
@@ -956,6 +1000,7 @@ pub(crate) fn wsl_limits(
         budget,
         memory,
         processors,
+        reclaim: wslconfig.and_then(wslconfig_reclaim),
         problems,
     }
 }
@@ -982,20 +1027,24 @@ fn parse_wsl_memory_mb(flags: &Flags, key: &str) -> WslResult<Option<u64>> {
         .transpose()
 }
 
-/// Write the budget into `.wslconfig`, keeping the rest of the file. An
-/// existing file is copied to `.wslconfig.bak` first.
-fn apply_wsl_limits(limits: &WslLimits) -> WslResult<PathBuf> {
+/// Write the budget into `.wslconfig`, and `autoMemoryReclaim` when it is
+/// not set, keeping the rest of the file. With `budget` false only the
+/// latter, so a size the owner chose below the budget stays. An existing
+/// file is copied to `.wslconfig.bak` first.
+fn apply_wsl_limits(limits: &WslLimits, budget: bool) -> WslResult<PathBuf> {
     let path = wslconfig_path().ok_or_else(|| err("USERPROFILE is unset; no .wslconfig"))?;
     let old = std::fs::read_to_string(&path).ok();
     if old.is_some() {
         let backup = path.with_file_name(".wslconfig.bak");
         std::fs::copy(&path, &backup).map_err(|e| err(format!("{}: {e}", backup.display())))?;
     }
-    let text = merge_wslconfig(
-        old.as_deref().unwrap_or(""),
-        &format!("{}MB", limits.budget.0),
-        limits.budget.1,
-    );
+    let old = old.unwrap_or_default();
+    let text = if budget {
+        merge_wslconfig(&old, &format!("{}MB", limits.budget.0), limits.budget.1)
+    } else {
+        old
+    };
+    let text = with_reclaim(&text);
     std::fs::write(&path, text).map_err(|e| err(format!("{}: {e}", path.display())))?;
     Ok(path)
 }
@@ -1036,6 +1085,16 @@ pub(crate) fn wsl_limits_check(limits: &WslLimits, vm: Option<(u64, u64)>) -> Ch
             .coded("WSL_LIMITS_NOT_IN_EFFECT");
         }
     }
+    if limits.reclaim.is_none() {
+        return soft(
+            "wsl-limits",
+            false,
+            format!(
+                ".wslconfig does not set autoMemoryReclaim: WSL2 keeps the memory jobs filled its cache with until it restarts. {host}{now}"
+            ),
+        )
+        .coded("WSL_MEMORY_NOT_RECLAIMED");
+    }
     soft("wsl-limits", true, format!("{host}{now}"))
 }
 
@@ -1069,7 +1128,10 @@ fn limits_cli(args: &[String]) -> WslResult<ExitCode> {
     // With a size given, --apply sets exactly that, even downwards or upwards.
     let explicit = wanted.0.is_some() || wanted.1.is_some();
     if flags.has("--apply") && (!limits.within() || explicit) {
-        applied = Some(apply_wsl_limits(&limits)?);
+        applied = Some(apply_wsl_limits(&limits, true)?);
+        limits = read();
+    } else if flags.has("--apply") && limits.reclaim.is_none() {
+        applied = Some(apply_wsl_limits(&limits, false)?);
         limits = read();
     }
     let path = wslconfig_path();
@@ -1085,6 +1147,7 @@ fn limits_cli(args: &[String]) -> WslResult<ExitCode> {
                     "path": path,
                     "memory": limits.memory,
                     "processors": limits.processors,
+                    "auto_memory_reclaim": limits.reclaim,
                 },
                 "applied": applied.is_some(),
                 "restart_needed": applied.is_some(),
@@ -1096,9 +1159,10 @@ fn limits_cli(args: &[String]) -> WslResult<ExitCode> {
         let check = wsl_limits_check(&limits, None);
         println!("{}", report(std::slice::from_ref(&check)).0.trim_end());
         println!(
-            ".wslconfig now: memory={}, processors={}",
+            ".wslconfig now: memory={}, processors={}, autoMemoryReclaim={}",
             limits.memory.as_deref().unwrap_or("(not set)"),
-            limits.processors.as_deref().unwrap_or("(not set)")
+            limits.processors.as_deref().unwrap_or("(not set)"),
+            limits.reclaim.as_deref().unwrap_or("(not set)")
         );
         if let Some(path) = &applied {
             println!("wrote {}. {WSL_RESTART}", path.display());
@@ -1484,8 +1548,37 @@ fn doctor(
         ),
         vm_size(),
     ));
+    if let Some(check) = programs_check(
+        inner.as_ref().map(|v| &v["status"]["memory"]),
+        host_processes,
+    ) {
+        checks.push(check);
+    }
 
     Ok((checks, inner))
+}
+
+/// While the PC is what is short of memory, the programs holding the most
+/// of it, read here on Windows. Shown at the PC, never put in the report.
+pub(crate) fn programs_check(
+    memory: Option<&serde_json::Value>,
+    processes: impl FnOnce() -> Vec<(String, u64)>,
+) -> Option<Check> {
+    if memory?["short_of"].as_str() != Some("pc") {
+        return None;
+    }
+    let top = crate::memory::top_programs(processes());
+    (!top.is_empty()).then(|| {
+        soft(
+            "programs",
+            false,
+            format!(
+                "using the most memory: {}",
+                crate::memory::programs_text(&top)
+            ),
+        )
+        .coded(crate::memory::PROGRAMS_CODE)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1623,9 +1716,9 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
             println!("    to set the limits: {LIMITS_APPLY}");
         }
         Some(path) if !path.exists() => {
-            apply_wsl_limits(&limits)?;
+            apply_wsl_limits(&limits, true)?;
             println!(
-                "    wrote {}: memory={}MB, processors={}",
+                "    wrote {}: memory={}MB, processors={}, autoMemoryReclaim=dropcache",
                 path.display(),
                 limits.budget.0,
                 limits.budget.1
@@ -2747,7 +2840,17 @@ fn run_service(log: &Logger) -> WslResult<Option<i32>> {
     if let Some(mut stdin) = child.stdin.take() {
         std::thread::spawn(move || {
             feed_cpu(host_cpu_times, std::thread::sleep, |busy| {
-                let line = crate::host::line(&host_feed(busy));
+                let feed = host_feed(busy);
+                // Only while the PC's memory is tight: a look at every
+                // process is a few milliseconds, and the list is the
+                // person's business otherwise.
+                let programs = match (feed.memory_total, feed.memory_available) {
+                    (Some(total), Some(available)) if crate::memory::tight(total, available) => {
+                        crate::memory::top_programs(host_processes())
+                    }
+                    _ => Vec::new(),
+                };
+                let line = crate::host::line_with(&feed, &programs);
                 stdin.write_all(line.as_bytes()).is_ok() && stdin.flush().is_ok()
             });
         });
@@ -2954,6 +3057,96 @@ pub(crate) fn power_of(ac_line: u8, flag: u8, percent: u8) -> (Option<bool>, Opt
     };
     let percent = (flag != 128 && flag != 255 && percent <= 100).then_some(u64::from(percent));
     (on_battery, percent)
+}
+
+/// Each process of the PC this user may read: its executable and the memory
+/// only it holds (the smaller of its working set and its private bytes).
+/// Processes of another user or of the system are skipped.
+#[cfg(windows)]
+fn host_processes() -> Vec<(String, u64)> {
+    #[repr(C)]
+    struct ProcessEntry {
+        size: u32,
+        usage: u32,
+        process_id: u32,
+        default_heap_id: usize,
+        module_id: u32,
+        threads: u32,
+        parent_process_id: u32,
+        priority: i32,
+        flags: u32,
+        exe_file: [u16; 260],
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> isize;
+        fn Process32FirstW(snapshot: isize, entry: *mut ProcessEntry) -> i32;
+        fn Process32NextW(snapshot: isize, entry: *mut ProcessEntry) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> isize;
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut MemoryCounters, cb: u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const TH32CS_SNAPPROCESS: u32 = 0x2;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const PROCESS_VM_READ: u32 = 0x10;
+    let mut out = Vec::new();
+    // SAFETY: the snapshot handle is checked and closed; each entry and
+    // counter struct is our own, sized in its first field as documented,
+    // and read only after a call that succeeded; each process handle is
+    // checked and closed.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == -1 || snapshot == 0 {
+            return out;
+        }
+        let mut entry: ProcessEntry = std::mem::zeroed();
+        entry.size = std::mem::size_of::<ProcessEntry>() as u32;
+        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+        while more {
+            let mut process = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                0,
+                entry.process_id,
+            );
+            if process == 0 {
+                process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.process_id);
+            }
+            if process != 0 {
+                let mut counters = MemoryCounters {
+                    cb: std::mem::size_of::<MemoryCounters>() as u32,
+                    ..MemoryCounters::default()
+                };
+                if K32GetProcessMemoryInfo(process, &mut counters, counters.cb) != 0 {
+                    let len = entry.exe_file.iter().position(|c| *c == 0).unwrap_or(260);
+                    let name = String::from_utf16_lossy(&entry.exe_file[..len]);
+                    let bytes = counters.working_set_size.min(counters.pagefile_usage) as u64;
+                    out.push((name, bytes));
+                }
+                CloseHandle(process);
+            }
+            more = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn host_processes() -> Vec<(String, u64)> {
+    Vec::new()
 }
 
 /// How far the Windows clock is ahead of UTC now, daylight saving included,
@@ -3801,6 +3994,58 @@ mod tests {
     }
 
     #[test]
+    fn the_doctor_names_the_programs_only_while_the_pc_is_short() {
+        let list = || vec![("chrome.exe".to_string(), 3 * GIB)];
+        let pc = serde_json::json!({"short_of": "pc", "to_free_bytes": 1});
+        let check = programs_check(Some(&pc), list).unwrap();
+        assert_eq!(check.code(), crate::memory::PROGRAMS_CODE);
+        assert_eq!(check.detail, "using the most memory: chrome 3.0 GiB");
+        let vm = serde_json::json!({"short_of": "wsl2"});
+        assert!(programs_check(Some(&vm), list).is_none());
+        assert!(programs_check(None, list).is_none());
+        assert!(programs_check(Some(&pc), Vec::new).is_none());
+    }
+
+    #[test]
+    fn auto_memory_reclaim_is_added_once_and_an_owners_value_is_kept() {
+        let theirs = "[wsl2]\r\nmemory=4GB\r\n[experimental]\r\nsparseVhd=true\r\n";
+        let added = with_reclaim(theirs);
+        assert_eq!(
+            added,
+            "[wsl2]\r\nmemory=4GB\r\n[experimental]\r\nautoMemoryReclaim=dropcache\r\nsparseVhd=true\r\n"
+        );
+        assert_eq!(with_reclaim(&added), added);
+        assert_eq!(wslconfig_reclaim(&added).as_deref(), Some("dropcache"));
+        assert_eq!(
+            with_reclaim("[wsl2]\nmemory=4GB\n"),
+            "[wsl2]\nmemory=4GB\n[experimental]\nautoMemoryReclaim=dropcache\n"
+        );
+        let off = "[experimental]\nAutoMemoryReclaim = disabled\n";
+        assert_eq!(with_reclaim(off), off);
+        assert_eq!(wslconfig_reclaim("# autoMemoryReclaim=gradual\n"), None);
+
+        // Inside the budget but keeping its cache: a warning of its own.
+        let limits = wsl_limits(
+            Some(16 * GIB),
+            8,
+            Some("[wsl2]\nmemory=4GB\nprocessors=2\n"),
+            (None, None),
+        );
+        assert!(limits.within());
+        assert_eq!(limits.reclaim, None);
+        let check = wsl_limits_check(&limits, None);
+        assert_eq!(check.code(), "WSL_MEMORY_NOT_RECLAIMED");
+        assert!(check.hint().contains("wsl limits --apply"));
+        let limits = wsl_limits(
+            Some(16 * GIB),
+            8,
+            Some("[wsl2]\nmemory=4GB\nprocessors=2\n[experimental]\nautoMemoryReclaim=dropcache\n"),
+            (None, None),
+        );
+        assert!(wsl_limits_check(&limits, None).ok);
+    }
+
+    #[test]
     fn an_existing_wslconfig_keeps_everything_that_is_not_ours() {
         let theirs = "# my settings\r\n[wsl2]\r\nswap=0\r\nMemory = 12GB\r\n# processors=99\r\n\r\n[experimental]\r\nsparseVhd=true\r\nmemory=1GB\r\n";
         assert_eq!(wslconfig_values(theirs), (Some("12GB".to_string()), None));
@@ -3857,7 +4102,7 @@ mod tests {
         let lower = wsl_limits(
             Some(16 * GIB),
             8,
-            Some("[wsl2]\nmemory=4GB\nprocessors=2\n"),
+            Some("[wsl2]\nmemory=4GB\nprocessors=2\n[experimental]\nautoMemoryReclaim=dropcache\n"),
             none,
         );
         assert!(lower.within());

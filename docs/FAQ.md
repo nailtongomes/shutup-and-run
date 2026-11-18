@@ -6,7 +6,7 @@ What to expect from a worker on a customer's PC, in short answers. Each one says
 
 **Contents**
 
-- The PC: [Will it get slow?](#will-the-pc-get-slow) · [How much does a job take?](#how-much-of-the-pc-does-a-job-take) · [Laptop on battery](#what-happens-on-a-laptop-on-its-battery) · [Meetings and presentations](#and-during-a-meeting-or-a-presentation) · [Only at some hours](#can-it-lend-the-pc-only-at-night) · [My files](#can-a-job-see-my-files)
+- The PC: [Will it get slow?](#will-the-pc-get-slow) · [How much does a job take?](#how-much-of-the-pc-does-a-job-take) · [Laptop on battery](#what-happens-on-a-laptop-on-its-battery) · [Meetings and presentations](#and-during-a-meeting-or-a-presentation) · [Short of memory](#what-should-i-close-when-memory-is-short) · [Only at some hours](#can-it-lend-the-pc-only-at-night) · [My files](#can-a-job-see-my-files)
 - A running job: [Is it paused and resumed?](#is-a-running-container-paused-and-resumed) · [What can affect it?](#what-can-affect-a-job-that-is-already-running) · [Spikes of CPU or memory](#is-there-a-tolerance-for-a-short-spike-of-cpu-or-memory) · [Turning the PC off](#can-i-turn-the-pc-off-with-a-job-running) · [Internet down](#what-if-the-internet-goes-down) · [Retries](#is-a-failed-job-run-again)
 - When nothing happens: [Why did no job start?](#why-did-no-job-start) · [Waiting for your authorization](#what-does-waiting-for-your-authorization-mean) · [Stop lending for a while](#how-do-i-stop-lending-for-a-while)
 - Afterwards: [What a job printed](#where-do-i-see-what-a-job-printed) · [What a job used](#how-much-did-a-job-use) · [What the operator learns](#what-does-the-poll-url-learn-about-this-pc) · [Update](#how-do-i-update) · [Uninstall](#how-do-i-uninstall)
@@ -38,6 +38,16 @@ A job that is already running is never stopped by the battery. 60% is fixed; no 
 While Windows says the person is presenting, or has a program in full screen (a slide show, a video or a game in full screen, a call in full screen), no new job starts. When that ends, jobs start again by themselves. A call in a window, not in full screen, is not noticed. The code is `USER_PRESENTING`.
 
 To also wait while the person is typing or using the mouse: `shutup-and-run config set min_idle_secs 300 --apply` (five minutes without input).
+
+### What should I close when memory is short?
+
+When memory is what keeps the next job from starting, the page shows **Memory is short** with about how much to free, and, on Windows, the programs holding the most of it, each added up over its processes (`chrome 3.1 GiB (38 processes)`). Windows' own processes, the antivirus, WSL and the worker are never listed. Close one you do not need now, or just wait: jobs start again by themselves. The worker never closes anything. When it is WSL2 that is short, the memory is held by a running job and is freed when it ends.
+
+The list is read on the PC only while its memory is tight, and stays there: it is not in `status.json`, a log, `doctor --report` or anything sent to the poll URL. `shutup-and-run doctor` shows it (`MEMORY_TO_FREE`, and `MEMORY_HELD_BY_PROGRAMS` on Windows).
+
+After the last job ends, the WSL2 VM drops the cache that job filled, so Windows gets that memory back at once instead of when WSL restarts; `shutup-and-run wsl limits --apply` also sets `autoMemoryReclaim=dropcache` in `.wslconfig` for the same reason.
+
+The page also says how long new jobs waited for memory today and in 7 days, and the hours of the week memory ran short. When those fall inside the hours the PC lends itself, the doctor suggests a `lend_hours` that keeps out of them (`MEMORY_SHORT_HOURS`); it changes nothing by itself.
 
 ### Can it lend the PC only at night?
 
@@ -118,7 +128,7 @@ The page's first line says why, and so do `shutup-and-run doctor` and `shutup-an
 | NEW JOBS BLOCKED FOR SAFETY | `SAFETY_*` | by itself, when the PC recovers |
 | WAITING | `OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING` | by itself |
 | waiting: the PC is in use | `USER_ACTIVE` | by itself (`min_idle_secs`) |
-| waiting, not enough resources | `LOW_MEMORY`, `LOW_DISK` | by itself |
+| waiting, not enough resources | `LOW_MEMORY`, `LOW_DISK` | by itself; **Memory is short** says how much to free |
 | busy, every slot is taken | `WORKER_BUSY` | when the running job ends |
 | machine not approved yet | `POLL_NOT_APPROVED` | when the poll URL approves this PC |
 | DOCKER IS DOWN | `DOCKER_UNAVAILABLE` | follow the doctor's hint |

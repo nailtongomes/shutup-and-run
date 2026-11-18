@@ -257,6 +257,9 @@ Num notebook Windows, com o mock servindo jobs curtos (`--image alpine --command
 - [ ] Depois de um job de 90 segundos, `shutup-and-run jobs` tem `used: cpu ... s, memory peak ...`, cerca de um minuto de CPU e alguns MB; `jobs --json` tem `cpu_ms` e `memory_peak_bytes`; a tabela de tarefas da página mostra o mesmo em **CPU / memória**.
 - [ ] Num PC pequeno (ou num em que a página pede autorização), `shutup-and-run wsl uninstall` e depois `shutup-and-run wsl install --poll-url URL --owner-consent`: ele mostra `recorded the owner's consent from the contract`, a página fica **RODANDO** e nunca pergunta, e **Segurança** mostra a autorização pelo `contract`. **Retirar** na página: volta a perguntar.
 
+
+O que nenhum CI alcança num PC Windows real desde então (o relógio do Windows, a pausa por um tempo, a memória e os programas que a ocupam, o cache do WSL2) está em [WINDOWS-PENDING.md](WINDOWS-PENDING.md).
+
 ### Repasse de certificado e as demos
 
 Ainda não rodou no Windows. No PC Windows, com um `.pfx` de teste (nunca um real para isto) numa pasta com espaço e acento no nome:
