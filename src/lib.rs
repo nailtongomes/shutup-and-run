@@ -21,6 +21,7 @@ pub mod launcher;
 pub mod lending;
 pub mod lock;
 pub mod managed;
+pub mod memory;
 pub mod poll;
 pub mod registry;
 pub mod resources;

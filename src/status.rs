@@ -206,7 +206,10 @@ async fn page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Resp
             (job, bytes)
         })
         .collect();
+    let programs = crate::host::programs();
     let view = View {
+        memory: Some(&live.memory),
+        programs: &programs,
         lang: lang_of(&headers, &settings.language),
         worker: &settings.worker_name,
         os: &settings.worker_os,
@@ -626,6 +629,10 @@ pub(crate) struct View<'a> {
     pub recent: &'a [(JobRecord, Option<u64>)],
     /// Managed containers that cannot start: a secret has no value.
     pub needs_secret: Vec<(String, String)>,
+    /// What memory keeps from starting, and how long it did.
+    pub memory: Option<&'a crate::memory::View>,
+    /// The programs holding the most of the PC's memory, while it is tight.
+    pub programs: &'a [crate::memory::Program],
 }
 
 /// The one stylesheet of the local page. Embedded, no font, no script of
@@ -1092,6 +1099,50 @@ pub(crate) fn render(view: &View) -> String {
             ),
         ));
     }
+    if let Some(need) = view.memory.and_then(|m| m.need) {
+        let amount = crate::resources::human(need.to_free_bytes);
+        let body = match need.place {
+            "wsl2" => format!(
+                "<p>{} {amount}. {}</p>",
+                lang.t(
+                    "WSL2, where the jobs run, needs about",
+                    "O WSL2, onde as tarefas rodam, precisa de mais",
+                ),
+                lang.t(
+                    "What a running job holds is freed when it ends; closing programs on Windows does not help here.",
+                    "O que uma tarefa em execução ocupa é liberado quando ela termina; fechar programas no Windows não ajuda aqui.",
+                )
+            ),
+            _ => format!(
+                "<p>{} {amount} {}</p>{}",
+                lang.t(
+                    "For the next job to start, free about",
+                    "Para a próxima tarefa começar, libere cerca de",
+                ),
+                lang.t(
+                    "of memory: close a program you do not need now. Or just wait: jobs start again by themselves.",
+                    "de memória: feche um programa que não precisa agora. Ou só espere: as tarefas voltam sozinhas.",
+                ),
+                if view.programs.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "<p>{} {}</p>",
+                        lang.t("Using the most memory:", "Usando mais memória:"),
+                        escape(&crate::memory::programs_in(
+                view.programs,
+                lang.t("processes", "processos"),
+            ))
+                    )
+                }
+            ),
+        };
+        todo.push(callout(
+            "warn",
+            lang.t("Memory is short", "Falta memória"),
+            body,
+        ));
+    }
     if view.draining {
         todo.push(callout(
             "warn",
@@ -1430,6 +1481,33 @@ fn computer_section(view: &View) -> String {
             ),
         },
     ));
+    if !view.programs.is_empty() {
+        rows.push((
+            lang.t("Using the most memory", "Usando mais memória"),
+            escape(&crate::memory::programs_in(
+                view.programs,
+                lang.t("processes", "processos"),
+            )),
+        ));
+    }
+    if let Some(memory) = view.memory.filter(|m| m.waited_week_secs > 0) {
+        rows.push((
+            lang.t("Waited for memory", "Esperou por memória"),
+            format!(
+                "{} {} &middot; {} {}",
+                lang.t("today", "hoje"),
+                crate::memory::duration_text(memory.waited_today_secs),
+                lang.t("7 days", "7 dias"),
+                crate::memory::duration_text(memory.waited_week_secs)
+            ),
+        ));
+    }
+    if let Some(hours) = view.memory.and_then(|m| m.short_hours.as_ref()) {
+        rows.push((
+            lang.t("Memory short, 7 days", "Memória curta, 7 dias"),
+            format!("<code>{}</code>", escape(&hours.when)),
+        ));
+    }
     let admission = match (view.slots, view.draining, view.waiting_for) {
         (None, _, _) => lang
             .t("no: Docker is down", "não: o Docker parou")
@@ -2957,6 +3035,8 @@ pub struct Live {
     /// When a pause for a while ends by itself.
     pub paused_until: Option<i64>,
     pub job_ids: Vec<String>,
+    /// What memory keeps from starting, and how long it did.
+    pub memory: crate::memory::View,
     pub last_job_at: Option<i64>,
     pub last_job_error: Option<String>,
     pub docker_error: Option<String>,
@@ -3087,7 +3167,7 @@ impl Live {
             self.last_error(false, None),
             self.poll_error,
             // Not the text: its byte counts change every second.
-            self.waiting_for.is_some(),
+            self.waiting_for.is_some() || self.memory.need.is_some(),
             self.computer.delivery
         ) + &self.safety.signature()
             + &format!("|{}", self.managed_mode)
@@ -3164,6 +3244,18 @@ pub fn job_error(job: &JobRecord) -> Option<String> {
     })
 }
 
+fn memory_json(memory: &crate::memory::View) -> serde_json::Value {
+    serde_json::json!({
+        "short_of": memory.need.map(|n| n.place),
+        "to_free_bytes": memory.need.map(|n| n.to_free_bytes),
+        "waiting_since": memory.waiting_since.map(unix_to_iso),
+        "waited_today_secs": memory.waited_today_secs,
+        "waited_week_secs": memory.waited_week_secs,
+        "short_hours": memory.short_hours.as_ref().map(|h| &h.when),
+        "suggested_lend_hours": memory.short_hours.as_ref().and_then(|h| h.suggested_lend_hours.as_ref()),
+    })
+}
+
 #[derive(serde::Serialize)]
 struct FileBody<'a> {
     state: &'a str,
@@ -3187,6 +3279,11 @@ struct FileBody<'a> {
     /// (`OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING`), and the
     /// battery's charge while a Windows PC runs on it and jobs still start.
     lending: serde_json::Value,
+    /// Memory: how much to free before the next job (`short_of`, `pc`,
+    /// `wsl2` or `machine`, and `to_free_bytes`), since when and how long
+    /// new jobs waited for it, and the hours it ran short in 7 days. Never
+    /// which programs hold it: that stays on the page.
+    memory: serde_json::Value,
     /// Interrupted jobs and callbacks not answered, over the history.
     callbacks: &'a crate::store::Delivery,
     /// Whether a new job may start for the sake of this computer's owner:
@@ -3232,6 +3329,7 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
             "hold": live.computer.hold,
             "on_battery_percent": crate::lending::on_battery(live.computer.host),
         }),
+        memory: memory_json(&live.memory),
         callbacks: &live.computer.delivery,
         safety: &live.safety,
         mode: if live.managed_mode { "managed" } else { "jobs" },
@@ -3264,6 +3362,7 @@ fn empty_live() -> Live {
         draining: false,
         paused_until: None,
         job_ids: Vec::new(),
+        memory: Default::default(),
         last_job_at: None,
         last_job_error: None,
         docker_error: None,
@@ -3544,6 +3643,8 @@ mod tests {
             last_poll: None,
             recent: &[],
             needs_secret: Vec::new(),
+            memory: None,
+            programs: &[],
         }
     }
 
@@ -3716,6 +3817,39 @@ mod tests {
             "<td>Power</td><td>on the battery, 72% (below 60% no new job starts)</td>",
             "<td>Lends itself</td><td><code>mon-fri 19-07</code> &middot; now wed 18:30, UTC-03:00</td>",
             "waiting: Outside the hours this machine lends itself (lend_hours)",
+        ] {
+            assert!(page.contains(text), "{text}\n{page}");
+        }
+        let memory = crate::memory::View {
+            need: Some(crate::memory::Need {
+                place: "pc",
+                to_free_bytes: 1536 << 20,
+            }),
+            waiting_since: Some(1_700_000_000),
+            waited_today_secs: 9_600,
+            waited_week_secs: 32_400,
+            short_hours: Some(crate::memory::ShortHours {
+                when: "mon-fri 09-18".into(),
+                suggested_lend_hours: None,
+            }),
+        };
+        let programs = [crate::memory::Program {
+            name: "chrome<1>".into(),
+            processes: 38,
+            bytes: 3 << 30,
+        }];
+        let mut short = view(Lang::Pt, Some((0, 1)), false);
+        short.computer = Some(&computer);
+        short.limits = Some(&limits);
+        short.memory = Some(&memory);
+        short.programs = &programs;
+        let page = render(&short);
+        for text in [
+            "<h2>Falta memória</h2>",
+            "Para a próxima tarefa começar, libere cerca de 1.5 GiB de memória",
+            "Usando mais memória: chrome&lt;1&gt; 3.0 GiB (38 processos)",
+            "<td>Esperou por memória</td><td>hoje 2 h 40 min &middot; 7 dias 9 h</td>",
+            "<td>Memória curta, 7 dias</td><td><code>mon-fri 09-18</code></td>",
         ] {
             assert!(page.contains(text), "{text}\n{page}");
         }
@@ -3898,6 +4032,7 @@ mod tests {
             draining: false,
             paused_until: None,
             job_ids: vec!["abc".into(), "def".into()],
+            memory: Default::default(),
             last_job_at: Some(1_700_000_000),
             last_job_error: None,
             docker_error: None,

@@ -1326,8 +1326,15 @@ pub fn doctor_out(
         .collect();
     let checks = checks.as_slice();
     let (lines, healthy) = report(checks);
-    let full = diagnostic_report(platform, checks, config, status, secrets, recent);
-    let url = issue_url(&full, checks);
+    // The person's programs stay on the PC: not in a report that may be
+    // posted as an issue.
+    let shared: Vec<Check> = checks
+        .iter()
+        .filter(|c| c.code != crate::memory::PROGRAMS_CODE)
+        .cloned()
+        .collect();
+    let full = diagnostic_report(platform, &shared, config, status, secrets, recent);
+    let url = issue_url(&full, &shared);
     let mut text = lines;
     text.push_str(if healthy {
         "the worker is ready"
@@ -1509,6 +1516,57 @@ pub fn capacity_check(
     )
 }
 
+/// What the service said about memory: how much to free before the next
+/// job, how long new jobs waited for it, and the hours it ran short.
+pub fn memory_checks(memory: &Value) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let waited = |today: u64, week: u64| {
+        format!(
+            "new jobs waited for memory {} today, {} in 7 days",
+            crate::memory::duration_text(today),
+            crate::memory::duration_text(week)
+        )
+    };
+    let today = memory["waited_today_secs"].as_u64().unwrap_or(0);
+    let week = memory["waited_week_secs"].as_u64().unwrap_or(0);
+    if let Some(bytes) = memory["to_free_bytes"].as_u64() {
+        let place = match memory["short_of"].as_str() {
+            Some("pc") => "this PC",
+            Some("wsl2") => "WSL2",
+            _ => "this machine",
+        };
+        checks.push(
+            soft(
+                "memory",
+                false,
+                format!(
+                    "free about {} on {place} for the next job to start; {}",
+                    crate::resources::human(bytes),
+                    waited(today, week)
+                ),
+            )
+            .coded("MEMORY_TO_FREE"),
+        );
+    } else if week > 0 {
+        checks.push(check("memory", true, waited(today, week)));
+    }
+    if let (Some(when), Some(lend)) = (
+        memory["short_hours"].as_str(),
+        memory["suggested_lend_hours"].as_str(),
+    ) {
+        checks.push(
+            soft(
+                "memory-hours",
+                false,
+                format!("in the last 7 days memory ran short {when}"),
+            )
+            .coded("MEMORY_SHORT_HOURS")
+            .with(lend),
+        );
+    }
+    checks
+}
+
 /// What the service said about when it lends itself: a wait (outside
 /// `lend_hours`, a low battery, a presentation), or a PC on its battery that
 /// still takes jobs; else, under `lend_hours`, the time it was read at.
@@ -1600,6 +1658,9 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
     }
     if let Some(check) = fresh.and_then(|s| lending_check(&s["lending"])) {
         checks.push(check);
+    }
+    if let Some(status) = fresh {
+        checks.extend(memory_checks(&status["memory"]));
     }
     if let Some(warning) = &settings.config_warning {
         checks.push(soft("config-in-use", false, warning.clone()).coded("CONFIG_FALLBACK_IN_USE"));
@@ -1876,6 +1937,43 @@ mod tests {
         ] {
             assert_eq!(pause_span(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_doctor_says_how_much_memory_to_free_and_when_it_runs_short() {
+        let checks = memory_checks(&json!({
+            "short_of": "pc",
+            "to_free_bytes": 1536u64 << 20,
+            "waited_today_secs": 9_600,
+            "waited_week_secs": 32_400,
+            "short_hours": "mon-fri 09-18",
+            "suggested_lend_hours": "mon-fri 00-09; mon-fri 18-24; sat,sun",
+        }));
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].code(), "MEMORY_TO_FREE");
+        assert_eq!(
+            checks[0].detail,
+            "free about 1.5 GiB on this PC for the next job to start; new jobs waited for memory 2 h 40 min today, 9 h in 7 days"
+        );
+        assert_eq!(checks[1].code(), "MEMORY_SHORT_HOURS");
+        assert!(checks[1]
+            .hint()
+            .contains("config set lend_hours \"mon-fri 00-09; mon-fri 18-24; sat,sun\" --apply"));
+        let calm = memory_checks(&json!({"waited_today_secs": 0, "waited_week_secs": 600}));
+        assert_eq!(calm.len(), 1);
+        assert!(calm[0].ok);
+        assert!(memory_checks(&json!(null)).is_empty());
+
+        // The programs line is shown, and kept out of the report.
+        let programs =
+            soft("programs", false, "secret-app 3.0 GiB").coded(crate::memory::PROGRAMS_CODE);
+        let out = doctor_out("linux", &[programs], None, None, &[], &[], true);
+        assert!(out.text.contains("secret-app"));
+        assert!(!out.json["report"].as_str().unwrap().contains("secret-app"));
+        assert!(!out.json["issue_url"]
+            .as_str()
+            .unwrap()
+            .contains("secret-app"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ O que esperar de um worker no PC de um cliente, em respostas curtas. Cada uma di
 
 **Conteúdo**
 
-- O PC: [Vai ficar lento?](#o-pc-vai-ficar-lento) · [Quanto uma tarefa ocupa?](#quanto-do-pc-uma-tarefa-ocupa) · [Notebook na bateria](#o-que-acontece-com-um-notebook-na-bateria) · [Reuniões e apresentações](#e-durante-uma-reunião-ou-apresentação) · [Só em alguns horários](#dá-para-emprestar-o-pc-só-à-noite) · [Meus arquivos](#uma-tarefa-consegue-ver-meus-arquivos)
+- O PC: [Vai ficar lento?](#o-pc-vai-ficar-lento) · [Quanto uma tarefa ocupa?](#quanto-do-pc-uma-tarefa-ocupa) · [Notebook na bateria](#o-que-acontece-com-um-notebook-na-bateria) · [Reuniões e apresentações](#e-durante-uma-reunião-ou-apresentação) · [Falta memória](#o-que-fecho-quando-falta-memória) · [Só em alguns horários](#dá-para-emprestar-o-pc-só-à-noite) · [Meus arquivos](#uma-tarefa-consegue-ver-meus-arquivos)
 - Uma tarefa rodando: [É pausada e retomada?](#um-container-em-execução-é-pausado-e-retomado) · [O que pode afetá-la?](#o-que-pode-afetar-uma-tarefa-que-já-está-rodando) · [Picos de CPU ou memória](#existe-tolerância-para-um-pico-curto-de-cpu-ou-memória) · [Desligar o PC](#posso-desligar-o-pc-com-uma-tarefa-rodando) · [Internet caiu](#e-se-a-internet-cair) · [Repetição](#uma-tarefa-que-falhou-roda-de-novo)
 - Quando nada acontece: [Por que nenhuma tarefa começou?](#por-que-nenhuma-tarefa-começou) · [Esperando a sua autorização](#o-que-significa-esperando-a-sua-autorização) · [Parar de emprestar por um tempo](#como-paro-de-emprestar-por-um-tempo)
 - Depois: [O que a tarefa imprimiu](#onde-vejo-o-que-uma-tarefa-imprimiu) · [Quanto a tarefa gastou](#quanto-uma-tarefa-gastou) · [O que o operador fica sabendo](#o-que-a-url-de-poll-fica-sabendo-deste-pc) · [Atualizar](#como-atualizo) · [Desinstalar](#como-desinstalo)
@@ -38,6 +38,16 @@ Uma tarefa que já está rodando nunca é interrompida pela bateria. Os 60% são
 Enquanto o Windows disser que a pessoa está apresentando, ou com um programa em tela cheia (apresentação de slides, vídeo ou jogo em tela cheia, chamada em tela cheia), nenhuma tarefa nova começa. Quando isso acaba, as tarefas voltam sozinhas. Uma chamada em janela, fora da tela cheia, não é percebida. O código é `USER_PRESENTING`.
 
 Para esperar também enquanto a pessoa digita ou usa o mouse: `shutup-and-run config set min_idle_secs 300 --apply` (cinco minutos sem uso).
+
+### O que fecho quando falta memória?
+
+Quando é a memória que impede a próxima tarefa, a página mostra **Falta memória** com quanto liberar, mais ou menos, e, no Windows, os programas que mais ocupam, somados por programa (`chrome 3.1 GiB (38 processos)`). Processos do próprio Windows, o antivírus, o WSL e o worker nunca aparecem. Feche um que não precisa agora, ou só espere: as tarefas voltam sozinhas. O worker nunca fecha nada. Quando quem está sem memória é o WSL2, ela está com uma tarefa em execução e volta quando ela termina.
+
+A lista só é lida no PC enquanto a memória está apertada, e fica nele: não vai para o `status.json`, um log, o `doctor --report` nem para a URL de poll. O `shutup-and-run doctor` mostra (`MEMORY_TO_FREE`, e `MEMORY_HELD_BY_PROGRAMS` no Windows).
+
+Quando a última tarefa termina, a VM do WSL2 descarta o cache que ela encheu, e o Windows recebe essa memória de volta na hora, não só quando o WSL reiniciar; `shutup-and-run wsl limits --apply` também põe `autoMemoryReclaim=dropcache` no `.wslconfig` pelo mesmo motivo.
+
+A página também diz quanto tempo as tarefas novas esperaram por memória hoje e em 7 dias, e as horas da semana em que ela ficou curta. Quando essas horas caem dentro do horário em que o PC é emprestado, o doctor sugere um `lend_hours` que as evita (`MEMORY_SHORT_HOURS`); nada muda sozinho.
 
 ### Dá para emprestar o PC só à noite?
 
@@ -118,7 +128,7 @@ A primeira linha da página diz o porquê, assim como `shutup-and-run doctor` e 
 | TAREFAS NOVAS BLOQUEADAS POR SEGURANÇA | `SAFETY_*` | sozinho, quando o PC se recupera |
 | ESPERANDO | `OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING` | sozinho |
 | esperando: o PC está em uso | `USER_ACTIVE` | sozinho (`min_idle_secs`) |
-| esperando, recursos insuficientes | `LOW_MEMORY`, `LOW_DISK` | sozinho |
+| esperando, recursos insuficientes | `LOW_MEMORY`, `LOW_DISK` | sozinho; **Falta memória** diz quanto liberar |
 | ocupado, todas as vagas em uso | `WORKER_BUSY` | quando a tarefa em execução termina |
 | máquina ainda não aprovada | `POLL_NOT_APPROVED` | quando a URL de poll aprova este PC |
 | DOCKER PAROU | `DOCKER_UNAVAILABLE` | siga a dica do doctor |

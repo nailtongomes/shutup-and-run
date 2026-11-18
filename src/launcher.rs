@@ -193,6 +193,12 @@ pub struct Launcher {
     readings: std::sync::Mutex<Option<crate::safety::Readings>>,
     /// What the readings of each running job have said so far.
     samples: std::sync::Mutex<HashMap<String, Sampled>>,
+    /// The hour of the week last written to `memory_hours`: slot, when, and
+    /// the lowest written, so a reading only writes when it says more.
+    memory_hour: std::sync::Mutex<Option<(u32, i64, u64)>>,
+    /// Since when new jobs wait for memory, and up to when that wait is
+    /// already counted in `memory_waits`.
+    memory_wait: std::sync::Mutex<Option<(i64, i64)>>,
 }
 
 impl Launcher {
@@ -232,6 +238,8 @@ impl Launcher {
             // A test must not depend on how busy the machine running it is.
             readings: std::sync::Mutex::new(cfg!(test).then(crate::safety::Readings::healthy)),
             samples: std::sync::Mutex::new(HashMap::new()),
+            memory_hour: std::sync::Mutex::new(None),
+            memory_wait: std::sync::Mutex::new(None),
             settings,
             runtime,
             clock,
@@ -575,6 +583,11 @@ impl Launcher {
         };
         let (managed_mode, managed) =
             crate::managed::views(&self.store, self.now()).unwrap_or_default();
+        let memory = self.memory_view(
+            &safety,
+            &machine,
+            slots.is_some_and(|s| s.free > 0 && !s.draining),
+        );
         crate::status::Live {
             slots_used: slots.map(|s| s.used as u64),
             slots_total: slots.map(|s| s.total as u64),
@@ -596,6 +609,92 @@ impl Launcher {
             config_warning: self.settings.config_warning.clone(),
             managed_mode,
             managed,
+            memory,
+        }
+    }
+
+    /// What memory keeps from starting now, and what the history says about
+    /// it. Records, as it goes, the owner's lowest memory in this hour of
+    /// the week and the time new jobs waited for memory (`open`: a slot is
+    /// free and the worker is not paused).
+    fn memory_view(
+        &self,
+        safety: &crate::safety::Report,
+        machine: &crate::safety::Readings,
+        open: bool,
+    ) -> crate::memory::View {
+        use crate::memory::{self, View};
+        let now = self.clock.now_unix() as i64;
+        let offset = crate::lending::offset_secs(machine.host, now);
+        let shortage = self.shortage_for(None, machine);
+        let need = memory::need(safety, machine, shortage.as_ref());
+
+        let owner = if machine.windows {
+            machine
+                .host
+                .and_then(|h| h.memory_total.zip(h.memory_available))
+        } else {
+            machine
+                .inner
+                .memory_total
+                .zip(machine.inner.memory_available)
+        };
+        if let Some((total, available)) = owner {
+            let slot = memory::slot_of(now, offset);
+            let mut last = self.memory_hour.lock().expect("memory hour");
+            let write = match *last {
+                Some((at_slot, at, lowest)) => {
+                    at_slot != slot || available < lowest || now - at >= 600
+                }
+                None => true,
+            };
+            if write
+                && self
+                    .store
+                    .note_memory_hour(slot, now, available, total)
+                    .is_ok()
+            {
+                let lowest = match *last {
+                    Some((at_slot, _, lowest)) if at_slot == slot => lowest.min(available),
+                    _ => available,
+                };
+                *last = Some((slot, now, lowest));
+            }
+        }
+
+        let day = |at: i64| (at + offset).div_euclid(86_400);
+        let mut wait = self.memory_wait.lock().expect("memory wait");
+        match (*wait, need.is_some() && open) {
+            (None, true) => *wait = Some((now, now)),
+            (Some((since, counted)), true) if now - counted >= 60 => {
+                let _ = self
+                    .store
+                    .add_memory_wait(day(counted), (now - counted) as u64);
+                *wait = Some((since, now));
+            }
+            (Some((_, counted)), false) => {
+                if now > counted {
+                    let _ = self
+                        .store
+                        .add_memory_wait(day(counted), (now - counted) as u64);
+                }
+                *wait = None;
+            }
+            _ => {}
+        }
+        let (today, week) = self.store.memory_waited(day(now)).unwrap_or_default();
+        let ongoing = wait.map_or(0, |(_, counted)| (now - counted).max(0) as u64);
+        let short_hours = self
+            .store
+            .memory_hours(now - memory::WEEK_SECS)
+            .ok()
+            .and_then(|hours| memory::short_hours(&hours, self.settings.lend_hours.as_ref()));
+        View {
+            need,
+            waiting_since: wait.map(|(since, _)| since),
+            waited_today_secs: today + ongoing,
+            waited_week_secs: week + ongoing,
+            short_hours,
         }
     }
 
@@ -950,12 +1049,35 @@ impl Launcher {
                 // A job that never started does not wake the poller: a task
                 // whose image cannot be pulled must not be asked for in a loop.
                 self.job_ended.notify_one();
+                self.give_back_memory();
             }
             Ok(None) => {
                 let _ = self.runtime.remove(id).await;
             }
             Err(err) => tracing::warn!(%id, error = %err, "could not finish job"),
         }
+    }
+
+    /// On a Windows PC, once the last running job has ended, the WSL2 VM
+    /// drops the cache that job filled, so `vmmemWSL` hands the memory back
+    /// to Windows instead of keeping it until WSL restarts. Linux keeps its
+    /// cache: that machine is the owner's, and the cache is its business.
+    fn give_back_memory(&self) {
+        if self.settings.worker_os != "windows" {
+            return;
+        }
+        if !self
+            .store
+            .running_ids()
+            .map(|ids| ids.is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        tokio::task::spawn_blocking(|| match crate::memory::give_back() {
+            Ok(()) => tracing::info!("gave the memory of the last job back to Windows"),
+            Err(err) => tracing::warn!(error = %err, "could not drop the WSL2 cache"),
+        });
     }
 
     /// The job's log file. A failure is a warning: the job has ended either
@@ -2334,6 +2456,41 @@ mod tests {
         let clock = Arc::new(FakeClock::new(T0));
         let launcher = Launcher::with_clock(settings, runtime, clock.clone()).unwrap();
         (launcher, mock, clock)
+    }
+
+    #[tokio::test]
+    async fn memory_says_what_to_free_counts_the_wait_and_remembers_the_hour() {
+        let (launcher, _, clock) = shared(2);
+        launcher.set_readings(with_memory(GIB));
+        let live = launcher.live_status().await;
+        let need = live.memory.need.unwrap();
+        assert_eq!(need.place, "machine");
+        assert_eq!(need.to_free_bytes, 16 * GIB / 100 * 15 - GIB);
+        assert_eq!(live.memory.waiting_since, Some(T0 as i64));
+        assert_eq!(live.memory.waited_today_secs, 0);
+        clock.set(T0 + 90);
+        let live = launcher.live_status().await;
+        assert_eq!(live.memory.waited_today_secs, 90);
+        assert_eq!(live.memory.waited_week_secs, 90);
+        // The hour ran short, so a lend_hours that leaves it out is offered.
+        let hours = live.memory.short_hours.unwrap();
+        let suggested = hours.suggested_lend_hours.unwrap();
+        assert!(crate::lending::LendHours::parse(&suggested).is_ok());
+
+        launcher.set_readings(Readings::healthy());
+        clock.set(T0 + 100);
+        let live = launcher.live_status().await;
+        assert_eq!(live.memory.need, None);
+        assert_eq!(live.memory.waiting_since, None);
+        assert_eq!(live.memory.waited_today_secs, 100);
+        // Counted once, however often the status is read.
+        assert_eq!(launcher.live_status().await.memory.waited_today_secs, 100);
+
+        // A paused worker is not waiting for memory.
+        launcher.set_readings(with_memory(GIB));
+        launcher.set_draining(true).unwrap();
+        clock.set(T0 + 200);
+        assert_eq!(launcher.live_status().await.memory.waiting_since, None);
     }
 
     fn with_memory(available: u64) -> Readings {
