@@ -41,13 +41,13 @@ To also wait while the person is typing or using the mouse: `shutup-and-run conf
 
 ### Can it lend the PC only at night?
 
-Yes, with `lend_hours`, on the PC's own clock:
+Yes, with `lend_hours`, on the PC's own clock (on Windows, the clock Windows shows, with its time zone):
 
 ```
 shutup-and-run config set lend_hours "mon-fri 19-07; sat,sun" --apply
 ```
 
-That is weekday nights and all weekend. A window whose end is before its start runs past midnight and belongs to the day it starts (`fri 19-07` ends Saturday at 7). Outside the windows no new job starts, the worker does not ask for work, and the page says **WAITING** (`OUTSIDE_LEND_HOURS`). A running job goes on past the end of the window. `config unset lend_hours --apply` lends at any time again. The page shows the window and the time now, so a wrong clock is easy to see.
+That is weekday nights and all weekend. A window whose end is before its start runs past midnight and belongs to the day it starts (`fri 19-07` ends Saturday at 7). Outside the windows no new job starts, the worker does not ask for work, and the page says **WAITING** (`OUTSIDE_LEND_HOURS`). A running job goes on past the end of the window. `config unset lend_hours --apply` lends at any time again. The page and `shutup-and-run doctor` show the window and the time now with its zone (`now wed 21:00, UTC-03:00`), so a wrong clock is easy to see.
 
 ### Can a job see my files?
 
@@ -113,7 +113,7 @@ The page's first line says why, and so do `shutup-and-run doctor` and `shutup-an
 
 | The page says | Code | It clears |
 | --- | --- | --- |
-| PAUSED | `WORKER_PAUSED` | when someone resumes, or at the next restart of the PC |
+| PAUSED | `WORKER_PAUSED` | when someone resumes; a pause for a while, at its end; any other, also at the next restart of the PC |
 | WAITING FOR YOUR AUTHORIZATION | `AUTHORIZATION_REQUIRED` | when the owner decides, see below |
 | NEW JOBS BLOCKED FOR SAFETY | `SAFETY_*` | by itself, when the PC recovers |
 | WAITING | `OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING` | by itself |
@@ -140,7 +140,9 @@ The owner can still withdraw it on the page.
 
 ### How do I stop lending for a while?
 
-The **Pause** button on the page, or `shutup-and-run pause`. No new job starts; a running one finishes. `shutup-and-run resume`, or the button again, ends it; on a PC with the page, a restart ends it too, so a forgotten pause does not last forever. To lend only at some hours, use `lend_hours` instead.
+The **Pause** button on the page, or `shutup-and-run pause`. No new job starts; a running one finishes. `shutup-and-run resume`, or the button again, ends it; on a PC with the page, a restart ends it too, so a forgotten pause does not last forever.
+
+For a while: the buttons **for 1 hour**, **for 3 hours** and **for the rest of the day** (until midnight on the PC's clock), or `shutup-and-run pause --for 2h` (`30m`, `2h`, `1d`; a week at most). The worker takes work again by itself at the end, and the page says when. Such a pause outlasts a restart, since it cannot be forgotten. To lend only at some hours, use `lend_hours` instead.
 
 ## Afterwards
 
@@ -150,7 +152,7 @@ The **Pause** button on the page, or `shutup-and-run pause`. No new job starts; 
 
 ### How much did a job use?
 
-Each finished job records its CPU time and the most memory it held: `shutup-and-run jobs` (a `used:` line), `jobs --json` (`cpu_ms`, `memory_peak_bytes`) and the **CPU / memory** column on the page. They come from a reading every 30 seconds while it runs, so a job shorter than that may have none, and a short peak can be missed. Compare them with the limits to see whether the PC has room for more, or for a second slot.
+Each finished job records its CPU time and the most memory it held: `shutup-and-run jobs` (a `used:` line), `jobs --json` (`cpu_ms`, `memory_peak_bytes`) and the **CPU / memory** column on the page. They come from a reading every 30 seconds while it runs, so a job shorter than that may have none, and a short peak can be missed. `shutup-and-run jobs --summary` sums up the last 20 and, with five measured or more and room on this PC, names the `max_job_memory` and `max_slots` that would fit more jobs at once; `doctor` says it too (`ROOM_FOR_MORE_SLOTS`). Nothing is changed by itself.
 
 ### What does the poll URL learn about this PC?
 

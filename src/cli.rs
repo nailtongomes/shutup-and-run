@@ -45,7 +45,8 @@ shutup-and-run config validate
     check the file as the service would. Exit 3 with the reason when invalid.
 shutup-and-run config apply
     restart the service on the file and wait until it is back. Running
-    containers are left alone. A restart also resumes a paused worker.
+    containers are left alone. A restart also resumes a paused worker,
+    unless it was paused with --for.
 shutup-and-run config reset
     factory reset of the config: one slot, nothing to poll, admin/admin. The
     tokens, the worker name and the listen address are kept when readable.
@@ -62,8 +63,9 @@ shutup-and-run doctor [--report]
     poll URL. Every failed line has a `hint:` with the command to run.
     --report also prints a diagnostic report with secrets masked and a URL
     that opens a new GitHub issue with it filled in. Exit 1 when unhealthy.
-shutup-and-run pause | resume
+shutup-and-run pause [--for 30m|2h|1d] | resume
     stop or start taking new work. Running containers are left alone.
+    --for ends the pause by itself after that long (1m to 7d).
 shutup-and-run jobs [--limit N]
     the last N jobs, newest first (default 20): id, image, start, end,
     duration, exit code, status (running, ok, failed, timeout, killed) and
@@ -536,10 +538,49 @@ fn hang_up(_pid: u64) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // pause, resume
 
+/// `30m`, `2h` or `1d`: how long `pause --for` lasts, in seconds. From a
+/// minute to a week; a longer pause is one until someone resumes.
+pub fn pause_span(text: &str) -> Option<u64> {
+    let (number, unit) = text.split_at(text.len().checked_sub(1)?);
+    let number: u64 = number.parse().ok()?;
+    let secs = number.checked_mul(match unit {
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return None,
+    })?;
+    (60..=7 * 86_400).contains(&secs).then_some(secs)
+}
+
 /// The drain flag, written where the running service reads it on every
 /// request. No HTTP, so it works with any listen address and with TLS.
+/// `pause --for 2h` writes when it ends instead, and the worker takes work
+/// again by itself then.
 pub fn pause_cli(pause: bool, args: &[String]) -> ExitCode {
-    let parsed = match parse_or_exit(args) {
+    let mut args = args.to_vec();
+    let mut span = None;
+    if let Some(at) = args.iter().position(|a| a == "--for") {
+        let as_json = args.iter().any(|a| a == "--json");
+        let value = args.get(at + 1).cloned().unwrap_or_default();
+        match pause_span(&value) {
+            Some(secs) if pause => span = Some(secs),
+            _ => {
+                return emit(
+                    Out::fail(
+                        EXIT_USAGE,
+                        if pause {
+                            "--for takes a time from 1m to 7d: 30m, 2h, 1d"
+                        } else {
+                            "--for is for pause, not resume"
+                        },
+                    ),
+                    as_json,
+                )
+            }
+        }
+        args.drain(at..(at + 2).min(args.len()));
+    }
+    let parsed = match parse_or_exit(&args) {
         Ok(parsed) => parsed,
         Err(code) => return code,
     };
@@ -555,10 +596,26 @@ pub fn pause_cli(pause: bool, args: &[String]) -> ExitCode {
                 ))
             }
         })
-        .and_then(|store| store.set_draining(pause).map_err(|e| e.to_string()));
+        .and_then(|store| {
+            match span {
+                Some(secs) => {
+                    let until = crate::status::now_unix() + secs as i64;
+                    store.pause_until(until).map(|()| Some(until))
+                }
+                None => store.set_draining(pause).map(|()| None),
+            }
+            .map_err(|e| e.to_string())
+        });
     let out = match done {
-        Ok(()) => Out::ok(
-            json!({"paused": pause}),
+        Ok(Some(until)) => {
+            let at = crate::status::unix_to_iso(until);
+            Out::ok(
+                json!({"paused": true, "paused_until": at}),
+                format!("paused until {at}: no new work is taken until then"),
+            )
+        }
+        Ok(None) => Out::ok(
+            json!({"paused": pause, "paused_until": null}),
             if pause {
                 "paused: no new work is taken"
             } else {
@@ -1408,22 +1465,75 @@ pub async fn base_checks() -> (Found, Option<Settings>) {
     )
 }
 
+/// The settings as the service would load them, for a command that only
+/// reads them. None when they cannot be read.
+pub fn settings_for_cli() -> Option<Settings> {
+    match config::json_path_for_cli() {
+        Ok(path) if path.exists() => Some(Settings::load_json(&path)),
+        _ => Settings::load().ok(),
+    }
+}
+
+/// Room for more jobs at once, from what the last ones used: a warning that
+/// names the limits that would fit. Nothing without enough readings.
+pub fn capacity_check(
+    settings: &Settings,
+    history: &Path,
+    machine: crate::jobs::Machine,
+) -> Option<Check> {
+    if !history.exists() {
+        return None;
+    }
+    let jobs = crate::store::Store::open(history)
+        .ok()?
+        .recent(crate::jobs::DEFAULT_LIMIT)
+        .ok()?;
+    let summary = crate::jobs::summary(&jobs);
+    let fit = crate::jobs::capacity_of(&summary, settings, machine)?;
+    Some(
+        soft(
+            "capacity",
+            false,
+            format!(
+                "the last {} jobs measured: {}; at max_job_memory {}, {} slots fit (now {})",
+                summary.measured,
+                crate::jobs::summary_text(&summary)
+                    .split_once(": ")
+                    .map_or("", |(_, rest)| rest),
+                crate::jobs::size_value(fit.max_job_memory),
+                fit.max_slots,
+                settings.max_slots
+            ),
+        )
+        .coded("ROOM_FOR_MORE_SLOTS"),
+    )
+}
+
 /// What the service said about when it lends itself: a wait (outside
 /// `lend_hours`, a low battery, a presentation), or a PC on its battery that
-/// still takes jobs. Nothing when neither.
+/// still takes jobs; else, under `lend_hours`, the time it was read at.
 pub fn lending_check(lending: &Value) -> Option<Check> {
     if let Ok(hold) = serde_json::from_value::<crate::lending::Hold>(lending["hold"].clone()) {
         return Some(soft("lending", false, hold.detail).coded(&hold.code));
     }
-    let percent = lending["on_battery_percent"].as_u64()?;
-    Some(
-        soft(
-            "lending",
-            false,
-            format!("the PC is on its battery at {percent}%; jobs still start"),
-        )
-        .coded(crate::lending::ON_BATTERY),
-    )
+    if let Some(percent) = lending["on_battery_percent"].as_u64() {
+        return Some(
+            soft(
+                "lending",
+                false,
+                format!("the PC is on its battery at {percent}%; jobs still start"),
+            )
+            .coded(crate::lending::ON_BATTERY),
+        );
+    }
+    // Inside lend_hours: say on which clock, so a wrong zone shows.
+    let hours = lending["lend_hours"].as_str()?;
+    let clock = lending["clock"].as_str().unwrap_or("?");
+    Some(check(
+        "lending",
+        true,
+        format!("inside lend_hours {hours} (now {clock})"),
+    ))
 }
 
 /// The last job that ended, when it did not end well: a warning that names
@@ -1496,16 +1606,40 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
     }
 
     // The flag itself, not the status file, which is up to a second behind.
-    let paused = settings.history_path.exists()
-        && crate::store::Store::open(&settings.history_path)
-            .and_then(|store| store.draining())
-            .unwrap_or(false);
-    if paused {
-        checks.push(
+    let pause = settings
+        .history_path
+        .exists()
+        .then(|| crate::store::Store::open(&settings.history_path).ok())
+        .flatten()
+        .and_then(|store| {
+            let paused = store.draining_at(now).unwrap_or(false);
+            paused.then(|| store.paused_until(now).ok().flatten())
+        });
+    match pause {
+        Some(Some(until)) => checks.push(
+            soft(
+                "paused",
+                false,
+                format!(
+                    "the worker is paused until {}, and takes work again by itself then",
+                    crate::status::unix_to_iso(until)
+                ),
+            )
+            .coded("WORKER_PAUSED"),
+        ),
+        Some(None) => checks.push(
             soft("paused", false, "the worker is paused and takes no work").coded("WORKER_PAUSED"),
-        );
+        ),
+        None => {}
     }
     if let Some(check) = last_job_check(&settings.history_path) {
+        checks.push(check);
+    }
+    if let Some(check) = capacity_check(
+        settings,
+        &settings.history_path,
+        crate::jobs::Machine::here(),
+    ) {
         checks.push(check);
     }
 
@@ -1723,6 +1857,43 @@ pub(crate) async fn reach(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pause_for_a_while_takes_minutes_hours_or_days_up_to_a_week() {
+        assert_eq!(pause_span("30m"), Some(1800));
+        assert_eq!(pause_span("2h"), Some(7200));
+        assert_eq!(pause_span("7d"), Some(7 * 86_400));
+        for bad in [
+            "",
+            "h",
+            "2",
+            "0m",
+            "8d",
+            "2 h",
+            "-1h",
+            "1.5h",
+            "99999999999999999999d",
+        ] {
+            assert_eq!(pause_span(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn inside_lend_hours_the_doctor_names_the_clock() {
+        let ok = lending_check(&json!({
+            "lend_hours": "mon-fri 19-07",
+            "clock": "wed 21:00, UTC-03:00",
+            "hold": null,
+            "on_battery_percent": null,
+        }))
+        .unwrap();
+        assert!(ok.ok);
+        assert_eq!(
+            ok.detail,
+            "inside lend_hours mon-fri 19-07 (now wed 21:00, UTC-03:00)"
+        );
+        assert!(lending_check(&json!({"lend_hours": null, "hold": null})).is_none());
+    }
 
     /// Nothing but a person typing the word is a yes, and a program that
     /// asks gets a state it can read instead of a prompt.

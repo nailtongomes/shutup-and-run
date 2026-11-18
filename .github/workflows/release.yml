@@ -3,7 +3,8 @@
 # tag v<version> on that commit and the GitHub release with both files and
 # one SHA256SUMS that lists them. Nobody pushes a tag by hand. A push to main
 # that does not change the version does nothing. Pushing a tag v* still
-# works, and "Run workflow" on main retries a release that failed.
+# works, and "Run workflow" on main retries a release that failed. The
+# three newest releases are kept; older ones are deleted with their tags.
 #
 # install.sh downloads the musl asset from releases/latest and checks
 # SHA256SUMS. install.ps1 does the same for the .exe, and the .exe then
@@ -124,6 +125,29 @@ jobs:
             dist/shutup-and-run-x86_64-unknown-linux-musl
             dist/shutup-and-run-x86_64-pc-windows-msvc.exe
             dist/SHA256SUMS
+
+  # Only the three newest releases are kept; older ones go with their tags,
+  # and so does a v* tag left without a release. Runs after a release, and
+  # on "Run workflow" when there is nothing new to release.
+  prune:
+    needs: [version, publish]
+    if: >-
+      always() && needs.version.result == 'success' &&
+      (needs.publish.result == 'success' || needs.version.outputs.release == 'false')
+    runs-on: ubuntu-latest
+    steps:
+      - name: keep three releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/tags" --paginate --jq '.[].name' \
+            | grep -E '^v[0-9]' | sort -rV | tail -n +4 > old-tags || true
+          while read -r tag; do
+            echo "deleting ${tag}"
+            gh release delete "${tag}" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag \
+              || gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}"
+          done < old-tags
+          gh release list --repo "${GITHUB_REPOSITORY}" --limit 10
 
   install:
     needs: [version, publish]

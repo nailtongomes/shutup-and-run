@@ -2904,6 +2904,7 @@ fn host_feed(cpu_busy_percent: Option<u64>) -> crate::host::Feed {
         on_battery: power.0,
         battery_percent: power.1,
         presenting: host_presenting(),
+        utc_offset_secs: host_utc_offset_secs(),
     }
 }
 
@@ -2953,6 +2954,58 @@ pub(crate) fn power_of(ac_line: u8, flag: u8, percent: u8) -> (Option<bool>, Opt
     };
     let percent = (flag != 128 && flag != 255 && percent <= 100).then_some(u64::from(percent));
     (on_battery, percent)
+}
+
+/// How far the Windows clock is ahead of UTC now, daylight saving included,
+/// from `GetTimeZoneInformation`. `lend_hours` is read on this clock, the
+/// one the person sees, whatever zone the distribution was given.
+#[cfg(windows)]
+fn host_utc_offset_secs() -> Option<i64> {
+    #[repr(C)]
+    struct TimeZoneInformation {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: [u16; 8],
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: [u16; 8],
+        daylight_bias: i32,
+    }
+    extern "system" {
+        fn GetTimeZoneInformation(info: *mut TimeZoneInformation) -> u32;
+    }
+    let mut info = TimeZoneInformation {
+        bias: 0,
+        standard_name: [0; 32],
+        standard_date: [0; 8],
+        standard_bias: 0,
+        daylight_name: [0; 32],
+        daylight_date: [0; 8],
+        daylight_bias: 0,
+    };
+    // SAFETY: one TIME_ZONE_INFORMATION of our own, laid out as documented,
+    // written by the call; its answer says which bias applies, or failure.
+    let which = unsafe { GetTimeZoneInformation(&mut info) };
+    utc_offset_of(which, info.bias, info.standard_bias, info.daylight_bias)
+}
+
+#[cfg(not(windows))]
+fn host_utc_offset_secs() -> Option<i64> {
+    None
+}
+
+/// UTC = local time + bias, in minutes. The answer of the call says which
+/// extra bias is in force: 0 none (no daylight saving), 1 standard, 2
+/// daylight; anything else is a failure.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn utc_offset_of(which: u32, bias: i32, standard: i32, daylight: i32) -> Option<i64> {
+    let minutes = match which {
+        0 => bias,
+        1 => bias + standard,
+        2 => bias + daylight,
+        _ => return None,
+    };
+    Some(-i64::from(minutes) * 60)
 }
 
 /// Whether the person presents or has a program in full screen, from
@@ -4209,6 +4262,12 @@ mod tests {
         // A desktop: on the mains, no system battery.
         assert_eq!(power_of(1, 128, 255), (Some(false), None));
         assert_eq!(power_of(255, 255, 255), (None, None));
+        // São Paulo, no daylight saving: bias 180.
+        assert_eq!(utc_offset_of(0, 180, 0, 0), Some(-3 * 3600));
+        // Lisbon in summer: bias 0, daylight bias -60.
+        assert_eq!(utc_offset_of(2, 0, 0, -60), Some(3600));
+        assert_eq!(utc_offset_of(1, -330, 0, 0), Some(5 * 3600 + 1800));
+        assert_eq!(utc_offset_of(u32::MAX, 0, 0, 0), None);
         assert!(presenting_of(2) && presenting_of(3) && presenting_of(4));
         assert!(!presenting_of(1) && !presenting_of(5) && !presenting_of(6) && !presenting_of(7));
     }

@@ -114,6 +114,7 @@ The JSON also carries `fix`. It is the same sentence under the name 0.2.8 used; 
 | `SAFETY_CPU_BUSY` | The processor is busy with other programs. It clears by itself, or the owner authorizes jobs under this condition: see the hint of `AUTHORIZATION_REQUIRED`. | O processador está ocupado com outros programas. Passa sozinho, ou o dono autoriza tarefas nessa condição: veja a dica de `AUTHORIZATION_REQUIRED`. |
 | `SAFETY_HOST_UNKNOWN` | Windows is not telling the worker about the PC. Run `shutup-and-run wsl stop` then `shutup-and-run wsl start`; if it stays, update with the install line. | O Windows não está informando o worker sobre o PC. Rode `shutup-and-run wsl stop` e depois `shutup-and-run wsl start`; se continuar, atualize com a linha de instalação. |
 | `WORKER_BUSY` | Every slot is in use. Wait for the running job (`shutup-and-run jobs`) and try again. | Todos os slots estão em uso. Aguarde a tarefa em execução (`shutup-and-run jobs`) e tente de novo. |
+| `ROOM_FOR_MORE_SLOTS` | If the jobs to come are like these, set the max_job_memory and max_slots the line names with `shutup-and-run config set KEY VALUE`, then `shutup-and-run config apply`. | Se as próximas tarefas forem como estas, ajuste max_job_memory e max_slots com os valores da linha usando `shutup-and-run config set CHAVE VALOR`, depois `shutup-and-run config apply`. |
 | `SLOTS_EXCEED_MEMORY` | Run `shutup-and-run config set max_slots {} --apply`, or lower `max_job_memory`. | Rode `shutup-and-run config set max_slots {} --apply`, ou reduza `max_job_memory`. |
 | `POLL_URL_UNSET` | Run `shutup-and-run config set poll_url URL --apply` with the URL the service gave you. | Rode `shutup-and-run config set poll_url URL --apply` com a URL que o serviço informou. |
 | `POLL_UNREACHABLE` | Check the internet and the address: `shutup-and-run config get poll_url --reveal`. On Windows, a URL on this PC or LAN is blocked by the firewall on a Public network (docs/FOR-AGENTS.md). | Confira a internet e o endereço: `shutup-and-run config get poll_url --reveal`. No Windows, uma URL neste PC ou na rede local é bloqueada pelo firewall em rede Pública (docs/FOR-AGENTS.md). |
@@ -284,6 +285,7 @@ The blocks (`level` `blocked`): `SAFETY_MEMORY_CRITICAL` (under 10% of memory, o
 shutup-and-run status --json     # state: idle | active | draining | failed | stopped; last_poll_at, last_poll_status
 shutup-and-run doctor --json     # worker_ready, poll_endpoint_ok, and checks[], each with status ok|warn|fail, detail, hint
 shutup-and-run jobs --json       # the last 20 jobs and how each ended
+shutup-and-run jobs --summary --json  # what they used, and a max_job_memory and max_slots that would fit more
 ```
 
 "Is it asking for work?" is `last_poll_at` and `last_poll_status` in `status --json`: when the last request went to the poll URL, and how it ended: `task`, `nothing`, `task_rejected` (a task came and this machine refused it), `not_approved` or `error`. Both are null while nothing was sent: no poll URL, or the worker is full, paused or short of memory or disk.
@@ -342,7 +344,7 @@ Run `shutup-and-run doctor` first. Every failed line has a `hint:`. The cases be
 | `resources` warns: N jobs of X each is more than this machine has | `max_slots` times `max_job_memory` does not fit | Run the `config set max_slots` command in its `hint`. |
 | `wsl-limits` warns | `.wslconfig` is missing, or lets WSL2 take more than 40% of the RAM or half the processors | `shutup-and-run wsl limits --apply`, then WSL has to restart (see above). "not in effect yet" needs only the restart. |
 | Jobs never start, and the log says `poll task rejected` | The task asks for more `cpu` or `memory` than `max_job_cpus` / `max_job_memory` | The owner sends a smaller task, or raise the limit: `shutup-and-run config set max_job_memory 3g --apply`. |
-| `paused` warns | Someone paused the worker on the page and forgot | `shutup-and-run resume`. A restart of the PC also resumes it. |
+| `paused` warns | Someone paused the worker on the page and forgot | `shutup-and-run resume`. A restart of the PC also resumes it, unless it was paused for a while (`detail` says until when; it resumes by itself then). |
 | `service` not running (Windows) | The logon task is not running | `shutup-and-run wsl start`. `task` warns if the task is missing: `shutup-and-run wsl task register`. |
 | `config` fails, or `config-in-use` warns | The file was damaged; the service is running on an older copy or on defaults | `shutup-and-run config validate` shows why. `shutup-and-run config reset` writes the factory config (tokens kept), then set the poll URL again. |
 | `docker` or `distribution` fails, or anything odd after a power cut | The WSL distribution is damaged | `shutup-and-run wsl reset` deletes and rebuilds it and keeps the config. `--factory` forgets the config too; the machine then needs approval again. |

@@ -168,7 +168,7 @@ shutup-and-run config set max_job_memory 1g --apply
 shutup-and-run wsl limits             # Windows: the PC, the budget, what .wslconfig says
 ```
 
-**This reduces the risk; it does not remove it.** Free memory is measured inside the WSL2 VM, which is not the same as free memory on the Windows host, and only at the moment a job starts. Disk and network use of a job are not limited. There is no monitoring daemon, and a running job is never stopped to make room or because the person came back. With a job running, Windows asks before it shuts down or signs out; "shut down anyway" and a power cut still end the job, which is then reported as `interrupted` and not run again. A PC can still get slow. The pause button on the local page, or `shutup-and-run pause`, is how the person at the PC says "not now". More: [docs/WINDOWS.md](docs/WINDOWS.md#sharing-the-pc).
+**This reduces the risk; it does not remove it.** Free memory is measured inside the WSL2 VM, which is not the same as free memory on the Windows host, and only at the moment a job starts. Disk and network use of a job are not limited. There is no monitoring daemon, and a running job is never stopped to make room or because the person came back. With a job running, Windows asks before it shuts down or signs out; "shut down anyway" and a power cut still end the job, which is then reported as `interrupted` and not run again. A PC can still get slow. The pause button on the local page, or `shutup-and-run pause`, is how the person at the PC says "not now"; it can also pause for 1 hour, 3 hours or the rest of the day (`pause --for 2h`) and take work again by itself. More: [docs/WINDOWS.md](docs/WINDOWS.md#sharing-the-pc).
 
 ## The local page
 
@@ -211,7 +211,7 @@ Security of the page, plainly. It needs no token, so it answers only a loopback 
 
 Each job that ran a container leaves what it printed on the machine: the last 256 KiB of stdout and stderr, one file per job in `logs/` next to the history (`/var/lib/shutup-and-run/logs/`, inside the WSL distribution on Windows), deleted after 7 days. Push, pull and managed jobs alike, whatever way they ended. Nothing is masked. `shutup-and-run jobs logs ID` (or `--last`, `--tail N`, `--json`) prints one, `jobs --json` says which jobs have one, and the local page lists them at `/local/logs` to open or download. When the last job failed, `doctor` names the command for its log.
 
-Each job also records what it used: its CPU time and the most memory it held (`cpu_ms` and `memory_peak_bytes` in `jobs --json`, a `used:` line in `jobs`, a column on the page). They come from the reading taken every 30 seconds while it runs, so a job shorter than that may have none, and a short peak can be missed. Compare them with `max_job_cpus` and `max_job_memory` to see whether the machine has room for more.
+Each job also records what it used: its CPU time and the most memory it held (`cpu_ms` and `memory_peak_bytes` in `jobs --json`, a `used:` line in `jobs`, a column on the page). They come from the reading taken every 30 seconds while it runs, so a job shorter than that may have none, and a short peak can be missed. `shutup-and-run jobs --summary` sums up the last 20: the highest and the average memory peak, and how many processors they kept busy. With five jobs measured or more and room on the machine, it names a `max_job_memory` (twice the highest peak, rounded up to 256 MiB) and the `max_slots` that would fit at that size, and `doctor` says the same as `ROOM_FOR_MORE_SLOTS`. Neither changes a limit.
 
 ## Managed containers
 
@@ -287,7 +287,7 @@ shutup-and-run config apply                     # restart on the file; container
 shutup-and-run config reset                     # factory config; tokens, name and address kept
 shutup-and-run status                           # idle, active, draining, failed, stopped
 shutup-and-run doctor [--report]                # every failed line has a hint
-shutup-and-run pause | resume
+shutup-and-run pause [--for 2h] | resume   # --for: it takes work again by itself after that
 shutup-and-run jobs [--limit N]                 # the last jobs: status, exit code, duration, why it failed
 ```
 
@@ -309,7 +309,7 @@ The keys are the same in both. An unknown key is refused.
 | `min_free_memory` | `SHUTUP_AND_RUN_MIN_FREE_MEMORY` | No new job below this much available memory. `"0"`: not checked. |
 | `min_free_disk` | `SHUTUP_AND_RUN_MIN_FREE_DISK` | The same for the disk Docker writes to. |
 | `min_idle_secs` | `SHUTUP_AND_RUN_MIN_IDLE_SECS` | Windows only: a new job waits until the PC was not used for this many seconds. `0` (the default): off. |
-| `lend_hours` | `SHUTUP_AND_RUN_LEND_HOURS` | When the machine lends itself, on its own clock: `"19-07"`, `"mon-fri 19-07; sat,sun"`, `"mon-fri 12:00-13:30"`. A night window belongs to the day it starts. Outside it no new job starts and the worker does not poll. Unset: any time. |
+| `lend_hours` | `SHUTUP_AND_RUN_LEND_HOURS` | When the machine lends itself, on its clock (on Windows, the Windows clock the person sees): `"19-07"`, `"mon-fri 19-07; sat,sun"`, `"mon-fri 12:00-13:30"`. A night window belongs to the day it starts. Outside it no new job starts and the worker does not poll. Unset: any time. |
 | `default_timeout_secs` | `SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS` | Default 3600. |
 | `max_timeout_secs` | `SHUTUP_AND_RUN_MAX_TIMEOUT_SECS` | Default 21600. At most 7 days. |
 | `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Optional. Turns pull mode on. |
@@ -430,7 +430,7 @@ The answer is nothing (`204`), a task, `{"task": {...}}`, or `{"manifest_url": "
 
 Field limits, every status code, the callback, idempotency, and what is not guaranteed: [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md).
 
-**`status.json`** has the same facts as the local page, for a script that should not call HTTP: `state` (`idle`, `active`, `draining`, `failed`, `stopped`), `slots_total`, `slots_used`, `job_ids`, `last_job_at`, `last_error`, `poll_error`, `waiting_for`, `callbacks` (interrupted jobs, callbacks pending and given up), `limits`, `config_warning`, `version`, `pid`, `started_at`, `updated_at`. Linux: beside the history file, `/var/lib/shutup-and-run/status.json`, root only. Windows: `C:\ProgramData\shutup-and-run\status.json`, readable by the user. If `updated_at` is more than 60 seconds old, the worker is dead. `shutup-and-run status --json` reads it for you.
+**`status.json`** has the same facts as the local page, for a script that should not call HTTP: `state` (`idle`, `active`, `draining`, `failed`, `stopped`), `slots_total`, `slots_used`, `job_ids`, `last_job_at`, `last_error`, `poll_error`, `waiting_for`, `paused_until` (the end of a pause for a while), `lending` (`lend_hours`, the time on its clock, the wait there is now), `callbacks` (interrupted jobs, callbacks pending and given up), `limits`, `config_warning`, `version`, `pid`, `started_at`, `updated_at`. Linux: beside the history file, `/var/lib/shutup-and-run/status.json`, root only. Windows: `C:\ProgramData\shutup-and-run\status.json`, readable by the user. If `updated_at` is more than 60 seconds old, the worker is dead. `shutup-and-run status --json` reads it for you.
 
 ## Security
 

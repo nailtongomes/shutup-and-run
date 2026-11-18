@@ -49,6 +49,10 @@ pub struct Feed {
     /// "do not disturb" states of `SHQueryUserNotificationState`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presenting: Option<bool>,
+    /// How far the Windows clock is ahead of UTC, in seconds, daylight
+    /// saving included: `lend_hours` follows the clock the person sees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utc_offset_secs: Option<i64>,
 }
 
 static LAST: Mutex<Option<(Instant, Feed)>> = Mutex::new(None);
@@ -106,6 +110,7 @@ mod tests {
             on_battery: Some(true),
             battery_percent: Some(72),
             presenting: None,
+            utc_offset_secs: Some(-10_800),
         };
         let text = line(&feed);
         assert!(text.starts_with("host-feed {") && text.ends_with("}\n"));

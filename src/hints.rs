@@ -94,6 +94,7 @@ pub const CATALOG: &[(&str, &str, &str)] = &[
     ("ON_BATTERY", "Jobs still start; on the battery below 60% they wait. Plug the PC in to keep it from draining.", "As tarefas ainda começam; na bateria abaixo de 60% elas esperam. Ligue o PC na tomada para não descarregar."),
     ("USER_PRESENTING", "The person at the PC is presenting or has a program in full screen; jobs start again by themselves when that ends.", "Quem usa o PC está apresentando ou com um programa em tela cheia; as tarefas voltam sozinhas quando isso acabar."),
     ("WORKER_BUSY", "Every slot is in use. Wait for the running job (`shutup-and-run jobs`) and try again.", "Todos os slots estão em uso. Aguarde a tarefa em execução (`shutup-and-run jobs`) e tente de novo."),
+    ("ROOM_FOR_MORE_SLOTS", "If the jobs to come are like these, set the max_job_memory and max_slots the line names with `shutup-and-run config set KEY VALUE`, then `shutup-and-run config apply`.", "Se as próximas tarefas forem como estas, ajuste max_job_memory e max_slots com os valores da linha usando `shutup-and-run config set CHAVE VALOR`, depois `shutup-and-run config apply`."),
     ("SLOTS_EXCEED_MEMORY", "Run `shutup-and-run config set max_slots {} --apply`, or lower `max_job_memory`.", "Rode `shutup-and-run config set max_slots {} --apply`, ou reduza `max_job_memory`."),
     // The poll URL.
     ("POLL_URL_UNSET", "Run `shutup-and-run config set poll_url URL --apply` with the URL the service gave you.", "Rode `shutup-and-run config set poll_url URL --apply` com a URL que o serviço informou."),
