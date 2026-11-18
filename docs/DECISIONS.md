@@ -504,7 +504,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** A machine whose WSL2 clock is in the wrong zone lends at the wrong hours; the page shows the time next to the window so it is seen. A meeting in a window, not in full screen, is not noticed. The usage figures miss the last seconds of a job and peaks shorter than 30 seconds, and a job under 30 seconds may have none. The consent from the contract is only as good as the contract: the worker cannot tell whether the owner read it, and the page is the place where the owner can still say no.
 
-## lend_hours on the Windows clock, a pause for a while, a suggested capacity, three releases kept
+## lend_hours on the Windows clock, a pause for a while, a suggested capacity, three releases kept (0.2.20)
 
 **Context.** `lend_hours` was read on the clock inside WSL2. WSL sets that zone from Windows when the distribution starts, so a zone changed later in Windows, or a distribution that did not get one, moves every window by hours without a word. A pause lasted until someone resumed or the PC restarted, and the person who pauses for a meeting wants to forget it. Each job records what it used (0.2.19), and turning that into "how many fit" was left to arithmetic. The releases piled up: every patch version was kept, with no one installing an old one.
 
@@ -517,7 +517,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** A PC whose Windows clock is wrong lends at the wrong hours, as the person sees them. A suggestion from 20 jobs is only as good as the next jobs are alike; a short peak between two readings is missed, which the factor of two is there for. An old version can no longer be installed from GitHub, and a supervisor older than three releases cannot fetch its own Linux binary for a repair: it has to be updated first.
 
-## Memory: what to close, how much, and what WSL2 gives back
+## Memory: what to close, how much, and what WSL2 gives back (0.2.20)
 
 **Context.** On a client's PC the usual reason no job starts is memory, and "low on memory" told nobody what to do. A Windows PC's memory goes to the person's programs, and to the WSL2 VM, which keeps as cache what a job read and wrote until WSL restarts, so `vmmemWSL` looks like it holds the memory after the job is gone.
 

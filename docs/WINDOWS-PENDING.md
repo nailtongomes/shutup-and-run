@@ -2,13 +2,13 @@
 
 [TESTING.pt-BR.md](TESTING.pt-BR.md) tem o roteiro completo. Esta lista é só o que o CI não alcança: o runner do Windows instala, atualiza e faz rollback, mas não tem bateria, não tem tela, não tem programas de usuário abertos e não roda uma tarefa de verdade dentro do WSL2. Cada item diz o que conferir e onde. Ao terminar, anote o resultado (ok, falhou, com a saída) em [TESTING.pt-BR.md](TESTING.pt-BR.md) e apague daqui o que passou.
 
-Um PC Windows 11 com WSL2, instalado com `irm .../install.ps1 | iex`, a página em `http://127.0.0.1:8787/` e o mock de poll do roteiro ([TESTING.pt-BR.md, seção 2](TESTING.pt-BR.md#2-uma-url-de-poll-para-testar)) servindo jobs curtos.
+Um PC Windows 11 com WSL2, instalado ou atualizado para a 0.2.20 com `irm .../install.ps1 | iex` (`shutup-and-run version` diz 0.2.20), a página em `http://127.0.0.1:8787/` e o mock de poll do roteiro ([TESTING.pt-BR.md, seção 2](TESTING.pt-BR.md#2-uma-url-de-poll-para-testar)) servindo jobs curtos.
 
 ## Da 0.2.19 (ainda não testado)
 
 A lista está em [TESTING.pt-BR.md, "0.2.19"](TESTING.pt-BR.md#0219-bateria-tela-cheia-horário-consumo-consentimento-do-contrato): bateria acima e abaixo de 60%, apresentação ou tela cheia, `lend_hours`, `used:` no `jobs`, e `wsl install --owner-consent`.
 
-## Relógio do Windows para `lend_hours` (PR #35)
+## 0.2.20: relógio do Windows para `lend_hours`
 
 O supervisor lê o fuso com `GetTimeZoneInformation` e manda a diferença para UTC a cada 10 s.
 
@@ -17,14 +17,14 @@ O supervisor lê o fuso com `GetTimeZoneInformation` e manda a diferença para U
 - [ ] Num fuso com horário de verão em vigor, o deslocamento inclui a hora a mais.
 - [ ] `wsl -d shutup-and-run -u root date` pode mostrar outro fuso: tudo bem, o `lend_hours` segue o Windows.
 
-## Pausar por um tempo (PR #35)
+## 0.2.20: pausar por um tempo
 
 - [ ] Na página, **por 1 hora**: o topo diz **PAUSADO** e "até HH:MM" no relógio do Windows; o mock não recebe poll; uma tarefa que já roda termina.
 - [ ] **pelo resto do dia**: o horário mostrado é 00:00.
 - [ ] `shutup-and-run pause --for 2m`, espere dois minutos: os polls voltam sozinhos, sem clicar em nada.
 - [ ] Com uma pausa por 1 hora, reinicie o PC: depois de entrar, a página ainda diz **PAUSADO** com o mesmo horário. Uma pausa sem prazo (o botão **Pausar**) termina com o reinício.
 
-## Memória: o que fechar, quanto, e o WSL devolvendo (este PR)
+## 0.2.20: memória, o que fechar, quanto, e o WSL devolvendo
 
 Prepare um PC com pouca memória livre: abra o Chrome com muitas abas, o Teams e o Excel até a memória livre do Windows ficar abaixo de 20% (Gerenciador de Tarefas, Desempenho, Memória).
 
