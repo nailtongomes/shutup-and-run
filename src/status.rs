@@ -340,12 +340,20 @@ pub(crate) fn safety_view(
     };
     let authorization = match &report.authorization {
         Some(consent) => format!(
-            "<h2>{}</h2><p>{} {} ({} v{}): {}</p>{}\
+            "<h2>{}</h2><p>{} {}{} ({} v{}): {}</p>{}\
              <form method=\"post\" action=\"/local/safety\"><p>\
              <button name=\"action\" value=\"revoke\">{}</button></p></form>",
             lang.t("Your authorization", "Sua autorização"),
             lang.t("Given on", "Dada em"),
             when(consent.at),
+            if consent.channel == "contract" {
+                lang.t(
+                    ", in the contract, recorded when this PC was installed",
+                    ", no contrato, registrada na instalação deste PC",
+                )
+            } else {
+                ""
+            },
             lang.t("notice", "aviso"),
             consent.notice_version,
             consent
@@ -748,6 +756,7 @@ fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
         lang.t("Exit", "Saída"),
         lang.t("Log", "Log"),
     );
+    let l_used = lang.t("CPU / memory", "CPU / memória");
     let body: String = rows
         .iter()
         .map(|row| {
@@ -767,8 +776,10 @@ fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
                 Some(job) => format!(
                     "<tr><td data-label=\"{l_status}\">{status}</td><td data-label=\"{l_image}\"><span>{image}<br><small><code>{short}</code></small></span></td>\
                      <td data-label=\"{l_started}\">{started}</td><td class=\"num\" data-label=\"{l_duration}\">{duration}</td>\
+                     <td class=\"num\" data-label=\"{l_used}\">{used}</td>\
                      <td class=\"num\" data-label=\"{l_exit}\">{exit}</td><td data-label=\"{l_log}\"><span>{links}</span></td></tr>",
                     status = job_status(job, lang),
+                    used = used_cell(job),
                     image = short_image(&job.image),
                     short = escape(&id[..id.len().min(12)]),
                     started = when(job.started_at),
@@ -785,6 +796,7 @@ fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
                     "<tr><td data-label=\"{l_status}\"><span class=\"pill tone-warn\">?</span></td>\
                      <td data-label=\"{l_image}\"><small><code>{short}</code></small></td>\
                      <td data-label=\"{l_started}\">{written}</td><td class=\"num\" data-label=\"{l_duration}\">&ndash;</td>\
+                     <td class=\"num\" data-label=\"{l_used}\">&ndash;</td>\
                      <td class=\"num\" data-label=\"{l_exit}\">&ndash;</td><td data-label=\"{l_log}\"><span>{links}</span></td></tr>",
                     short = escape(&id[..id.len().min(12)]),
                     written = row.log_written_at.map(when).unwrap_or_default(),
@@ -794,7 +806,24 @@ fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
         .collect();
     format!(
         "<div class=\"scroll\"><table class=\"jobs\"><tr><th>{l_status}</th><th>{l_image}</th><th>{l_started}</th>\
-         <th class=\"num\">{l_duration}</th><th class=\"num\">{l_exit}</th><th>{l_log}</th></tr>{body}</table></div>"
+         <th class=\"num\">{l_duration}</th><th class=\"num\">{l_used}</th><th class=\"num\">{l_exit}</th><th>{l_log}</th></tr>{body}</table></div>"
+    )
+}
+
+/// `5.5 s / 300 MiB`: the CPU time a job used and the most memory it held,
+/// from readings every 30 seconds. A dash for what was not read.
+fn used_cell(job: &JobRecord) -> String {
+    if job.cpu_ms.is_none() && job.memory_peak.is_none() {
+        return "&ndash;".to_string();
+    }
+    format!(
+        "{} / {}",
+        job.cpu_ms
+            .map(|ms| format!("{:.1} s", ms as f64 / 1000.0))
+            .unwrap_or_else(|| "&ndash;".into()),
+        job.memory_peak
+            .map(|bytes| escape(&crate::jobs::memory_text(bytes)))
+            .unwrap_or_else(|| "&ndash;".into())
     )
 }
 
@@ -812,6 +841,14 @@ fn shell(lang: Lang, here: &str, refresh: Option<(u32, &str)>, body: &str) -> St
         ("/local/logs", lang.t("Jobs and logs", "Tarefas e logs")),
         ("/local/safety", lang.t("Safety", "Segurança")),
         ("/local/managed", lang.t("Managed", "Gerenciados")),
+        // What to expect, in short answers. The one page that is not here.
+        (
+            lang.t(
+                "https://github.com/nailtongomes/shutup-and-run/blob/main/docs/FAQ.md",
+                "https://github.com/nailtongomes/shutup-and-run/blob/main/docs/FAQ.pt-BR.md",
+            ),
+            lang.t("Questions", "Dúvidas"),
+        ),
     ]
     .iter()
     .map(|(path, name)| {
@@ -901,15 +938,31 @@ pub(crate) fn render(view: &View) -> String {
                     lang.t("Working now: jobs", "Trabalhando agora: tarefas")
                 ),
             ),
-            _ => (
-                lang.t("RUNNING", "RODANDO"),
-                "ok",
-                lang.t(
-                    "Idle and ready: no job is running.",
-                    "Livre e pronto: nenhuma tarefa rodando.",
-                )
-                .to_string(),
-            ),
+            _ => match view.computer.and_then(|c| c.hold.as_ref()) {
+                // Outside lend_hours, a low battery, a presentation: it
+                // clears by itself and nobody has to do anything.
+                Some(hold) => (
+                    lang.t("WAITING", "ESPERANDO"),
+                    "warn",
+                    format!(
+                        "{}. {}",
+                        crate::lending::label(&hold.code, lang == Lang::Pt),
+                        lang.t(
+                            "New jobs start again by themselves.",
+                            "As tarefas novas voltam sozinhas."
+                        )
+                    ),
+                ),
+                None => (
+                    lang.t("RUNNING", "RODANDO"),
+                    "ok",
+                    lang.t(
+                        "Idle and ready: no job is running.",
+                        "Livre e pronto: nenhuma tarefa rodando.",
+                    )
+                    .to_string(),
+                ),
+            },
         },
     };
     let managed_on = view.managed.is_some_and(|(on, _, _)| on);
@@ -993,6 +1046,19 @@ pub(crate) fn render(view: &View) -> String {
             )),
             Admission::Open => {}
         }
+    }
+    if let Some(percent) = crate::lending::on_battery(view.computer.and_then(|c| c.host)) {
+        todo.push(callout(
+            "warn",
+            lang.t("This PC is on its battery", "Este PC está na bateria"),
+            format!(
+                "<p>{percent}%. {}</p>",
+                lang.t(
+                    "Jobs still start, and use the battery. Below 60% no new job starts until the PC is plugged in.",
+                    "As tarefas ainda começam, e gastam a bateria. Abaixo de 60% nenhuma tarefa nova começa até o PC ir para a tomada.",
+                )
+            ),
+        ));
     }
     if view.draining {
         todo.push(callout(
@@ -1280,7 +1346,36 @@ fn computer_section(view: &View) -> String {
             lang.t("PC without use for", "PC sem uso há"),
             format!("{idle} ({rule})"),
         ));
+        let host = computer.host.unwrap_or_default();
+        rows.push((
+            lang.t("Power", "Energia"),
+            match (host.on_battery, host.battery_percent) {
+                (Some(true), Some(percent)) => format!(
+                    "{} {percent}% ({})",
+                    lang.t("on the battery,", "na bateria,"),
+                    lang.t(
+                        "below 60% no new job starts",
+                        "abaixo de 60% nenhuma tarefa nova começa"
+                    )
+                ),
+                (Some(true), None) => lang.t("on the battery", "na bateria").to_string(),
+                (Some(false), _) => lang.t("plugged in", "na tomada").to_string(),
+                (None, _) => lang.t("not reported", "não informado").to_string(),
+            },
+        ));
     }
+    rows.push((
+        lang.t("Lends itself", "Empresta"),
+        match &computer.lend_hours {
+            None => lang.t("at any time", "a qualquer hora").to_string(),
+            Some(hours) => format!(
+                "<code>{}</code> &middot; {} {}",
+                escape(hours),
+                lang.t("now", "agora"),
+                crate::lending::Local::at(now_unix())
+            ),
+        },
+    ));
     let admission = match (view.slots, view.draining, view.waiting_for) {
         (None, _, _) => lang
             .t("no: Docker is down", "não: o Docker parou")
@@ -1315,6 +1410,15 @@ fn computer_section(view: &View) -> String {
         (_, _, Some(_)) if computer.user_active => lang
             .t("waiting: the PC is in use", "esperando: o PC está em uso")
             .to_string(),
+        (_, _, Some(_)) if computer.hold.is_some() => format!(
+            "{}: {}",
+            lang.t("waiting", "esperando"),
+            computer
+                .hold
+                .as_ref()
+                .map(|h| crate::lending::label(&h.code, lang == Lang::Pt))
+                .unwrap_or_default()
+        ),
         (_, _, Some(why)) => format!(
             "{}: {}",
             lang.t(
@@ -1392,6 +1496,13 @@ fn field_text(name: &str, lang: Lang) -> (&'static str, &'static str) {
                 "Windows: só começar uma tarefa depois de o PC ficar sem uso por esse tempo. 0: a qualquer hora.",
             ),
         ),
+        "lend_hours" => (
+            lang.t("Lend only at these hours", "Emprestar só nestes horários"),
+            lang.t(
+                "Local time, like mon-fri 19-07; sat,sun. Outside them no new job starts. Empty: at any time.",
+                "Hora local, como mon-fri 19-07; sat,sun. Fora deles nenhuma tarefa nova começa. Vazio: a qualquer hora.",
+            ),
+        ),
         "allowlist" => (
             lang.t("Allowed images", "Imagens permitidas"),
             lang.t("One per line. A job with any other image is refused.", "Uma por linha. Uma tarefa com outra imagem é recusada."),
@@ -1467,7 +1578,7 @@ fn field_groups(lang: Lang) -> [(&'static str, &'static [&'static str]); 6] {
                 "How much this computer lends",
                 "Quanto este computador empresta",
             ),
-            &["max_slots", "min_idle_secs"],
+            &["max_slots", "min_idle_secs", "lend_hours"],
         ),
         (
             lang.t("Which images may run", "Quais imagens podem rodar"),
@@ -2822,6 +2933,10 @@ pub struct Computer {
     pub min_idle_secs: u64,
     /// `waiting_for` is the idle wait, not memory or disk.
     pub user_active: bool,
+    /// Outside `lend_hours`, a low battery, or a presentation.
+    pub hold: Option<crate::lending::Hold>,
+    /// `lend_hours` as written. None: at any time.
+    pub lend_hours: Option<String>,
     pub delivery: crate::store::Delivery,
 }
 
@@ -2834,6 +2949,12 @@ impl Computer {
             memory_available: machine.inner.memory_available,
             min_idle_secs: launcher.settings().min_idle_secs,
             user_active: launcher.shortage().is_none() && launcher.user_active().is_some(),
+            hold: launcher.lending_hold(),
+            lend_hours: launcher
+                .settings()
+                .lend_hours
+                .as_ref()
+                .map(|h| h.text.clone()),
             delivery: launcher.delivery(),
         }
     }
@@ -2999,6 +3120,10 @@ struct FileBody<'a> {
     /// `task`, `nothing`, `task_rejected`, `not_approved` or `error`.
     last_poll_status: Option<&'a str>,
     waiting_for: Option<&'a str>,
+    /// When the machine lends itself: `lend_hours`, the wait there is now
+    /// (`OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING`), and the
+    /// battery's charge while a Windows PC runs on it and jobs still start.
+    lending: serde_json::Value,
     /// Interrupted jobs and callbacks not answered, over the history.
     callbacks: &'a crate::store::Delivery,
     /// Whether a new job may start for the sake of this computer's owner:
@@ -3037,6 +3162,11 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
         last_poll_at: live.last_poll.map(|(at, _)| unix_to_iso(at)),
         last_poll_status: live.last_poll.map(|(_, status)| status),
         waiting_for: live.waiting_for.as_deref(),
+        lending: serde_json::json!({
+            "lend_hours": live.computer.lend_hours,
+            "hold": live.computer.hold,
+            "on_battery_percent": crate::lending::on_battery(live.computer.host),
+        }),
         callbacks: &live.computer.delivery,
         safety: &live.safety,
         mode: if live.managed_mode { "managed" } else { "jobs" },
@@ -3433,12 +3563,15 @@ mod tests {
                 cpus: Some(8),
                 cpu_busy_percent: None,
                 disk_available: None,
+                ..Feed::default()
             }),
             cpus: Some(4),
             memory_total: Some(4 * GIB),
             memory_available: Some(3 * GIB),
             min_idle_secs: 300,
             user_active: true,
+            hold: None,
+            lend_hours: None,
             delivery: crate::store::Delivery {
                 interrupted: 2,
                 interrupted_unnotified: 1,
@@ -3460,6 +3593,8 @@ mod tests {
             "<td>Limite de cada tarefa</td><td>CPU: 1, memória: 2.0 GiB</td>",
             "<td>Tarefas rodando / máximo</td><td>0 / 1</td>",
             "<td>PC sem uso há</td><td>90 s (uma tarefa começa depois de 5 min)</td>",
+            "<td>Energia</td><td>não informado</td>",
+            "<td>Empresta</td><td>a qualquer hora</td>",
             "esperando: o PC está em uso",
             "<td>Tarefas interrompidas</td><td>2 (1 sem aviso entregue)</td>",
             "<td>Entrega de callbacks</td><td>1 aguardando nova tentativa, 3 desistidos</td>",
@@ -3482,6 +3617,38 @@ mod tests {
         assert!(page.contains("waiting, not enough resources: low on memory"));
         v.waiting_for = None;
         assert!(render(&v).contains("<td>Can a new job start?</td><td>yes</td>"));
+        // On the battery above 60%: a job starts, and the page says so.
+        // Outside lend_hours: the state is a wait, the row says why.
+        computer.host = Some(Feed {
+            on_battery: Some(true),
+            battery_percent: Some(72),
+            ..Feed::default()
+        });
+        computer.lend_hours = Some("mon-fri 19-07".into());
+        computer.hold = Some(crate::lending::Hold {
+            code: crate::lending::OUTSIDE_LEND_HOURS.into(),
+            detail: "outside lend_hours mon-fri 19-07 (now wed 14:05)".into(),
+        });
+        let mut v = view(Lang::En, Some((0, 1)), false);
+        v.limits = Some(&limits);
+        v.computer = Some(&computer);
+        v.waiting_for = Some("outside lend_hours mon-fri 19-07 (now wed 14:05)");
+        let page = render(&v);
+        for text in [
+            "<h1 class=\"state\">WAITING</h1>",
+            "<h2>This PC is on its battery</h2>",
+            "<td>Power</td><td>on the battery, 72% (below 60% no new job starts)</td>",
+            "<td>Lends itself</td><td><code>mon-fri 19-07</code> &middot; now ",
+            "waiting: Outside the hours this machine lends itself (lend_hours)",
+        ] {
+            assert!(page.contains(text), "{text}\n{page}");
+        }
+        computer.hold = None;
+        computer.host = None;
+        computer.lend_hours = None;
+        let mut v = view(Lang::En, Some((0, 1)), false);
+        v.limits = Some(&limits);
+        v.computer = Some(&computer);
         v.slots = Some((1, 1));
         assert!(render(&v).contains("no: busy"));
         v.draining = true;

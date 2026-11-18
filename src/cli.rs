@@ -71,8 +71,9 @@ shutup-and-run jobs [--limit N]
 shutup-and-run safety [status] | revoke
     whether a new job may start for the sake of the computer's owner, and
     why not. `safety authorize` is the one command here that asks a
-    question: it is for the owner, at a terminal, and nothing answers it
-    for them. `shutup-and-run safety --help`.
+    question: it is for the owner, at a terminal. `safety authorize
+    --owner-consent` records instead the consent the owner gave in the
+    contract. `shutup-and-run safety --help`.
 
 Every failure, and every doctor or check line that is not ok, carries a
 `hint`: the next step, short, with the command when there is one. In JSON it
@@ -580,9 +581,13 @@ shutup-and-run safety [status] [--json]
     resource incidents. From the running service.
 shutup-and-run safety authorize
     for the owner, at the machine, in a terminal: shows the risks there are
-    now and the notice, and asks. There is no flag that answers for the
-    owner: without a terminal, or with --json, it exits 1 with
-    AUTHORIZATION_REQUIRED and changes nothing. On Windows use the local page.
+    now and the notice, and asks. Without a terminal, or with --json, it
+    exits 1 with AUTHORIZATION_REQUIRED and changes nothing.
+shutup-and-run safety authorize --owner-consent [--json]
+    for whoever installs the machine, when its owner agreed in the contract
+    to lend it under every warning: records that consent (channel
+    `contract`) without asking, for this notice version. Blocked conditions
+    still block. The service does not need to be running.
 shutup-and-run safety revoke [--json]
     withdraw the authorization. Jobs under a warning wait again."
 }
@@ -657,12 +662,43 @@ fn safety_text(report: &crate::safety::Report, portuguese: bool) -> String {
     text.trim_end().to_string()
 }
 
+/// Records the consent the owner gave in the contract, for every warning.
+/// The history is made when the service has not run yet: an install records
+/// this before it starts the service.
+fn owner_consent_out(now: i64) -> Out {
+    let store = Settings::history_path().map_err(|e| e.0).and_then(|path| {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        crate::store::Store::open(&path).map_err(|e| e.to_string())
+    });
+    let codes: Vec<String> = crate::safety::WARNING_CODES
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+    match store.and_then(|store| {
+        crate::safety::grant(&store, &codes, "contract", now).map_err(|e| e.to_string())
+    }) {
+        Ok(consent) => Out::ok(
+            json!({"authorized": true, "authorization": consent}),
+            format!(
+                "recorded the owner's consent from the contract (notice v{}): {}. Blocked \
+                 conditions still block. `shutup-and-run safety revoke` withdraws it.",
+                consent.notice_version,
+                consent.codes.join(", ")
+            ),
+        ),
+        Err(msg) => Out::fail(EXIT_FAILED, msg),
+    }
+}
+
 /// The answer to anything that is not a person at a terminal.
 fn human_required(report: &crate::safety::Report) -> Out {
     let mut out = Out::fail(
         EXIT_FAILED,
-        "only the owner of this computer can authorize, in person: on the local page, or in a \
-         terminal with `shutup-and-run safety authorize`. Nothing was changed.",
+        "only the owner of this computer can authorize: in person on the local page, or in a \
+         terminal with `shutup-and-run safety authorize`; or, when the contract gives that \
+         consent, with `shutup-and-run safety authorize --owner-consent`. Nothing was changed.",
     );
     out.json["code"] = Value::String(crate::safety::AUTHORIZATION_REQUIRED.to_string());
     out.json["notice_version"] = json!(crate::safety::NOTICE_VERSION);
@@ -700,6 +736,13 @@ fn ask_owner(
 
 pub fn safety_cli(args: &[String]) -> ExitCode {
     use std::io::IsTerminal;
+    let owner_consent = args.iter().any(|a| a == "--owner-consent");
+    let args: Vec<String> = args
+        .iter()
+        .filter(|a| *a != "--owner-consent")
+        .cloned()
+        .collect();
+    let args = args.as_slice();
     let parsed = match split_args(args) {
         Ok(parsed) if parsed.help => {
             println!("{}", safety_usage());
@@ -716,6 +759,11 @@ pub fn safety_cli(args: &[String]) -> ExitCode {
     let portuguese = crate::hints::lang() == crate::hints::Lang::Pt;
     let now = crate::status::now_unix();
     let out = match parsed.words.first().map(String::as_str) {
+        Some("authorize") if owner_consent => owner_consent_out(now),
+        _ if owner_consent => Out::fail(
+            EXIT_USAGE,
+            "--owner-consent goes with `safety authorize`. See `shutup-and-run safety --help`.",
+        ),
         None | Some("status") => match safety_from_status() {
             Ok(report) => Out::ok(json!({"safety": report}), safety_text(&report, portuguese)),
             Err(msg) => Out::fail(EXIT_FAILED, msg),
@@ -1360,8 +1408,24 @@ pub async fn base_checks() -> (Found, Option<Settings>) {
     )
 }
 
-/// What only a running service can answer: its state, a pause, bans, the
-/// poll URL as the service last saw it.
+/// What the service said about when it lends itself: a wait (outside
+/// `lend_hours`, a low battery, a presentation), or a PC on its battery that
+/// still takes jobs. Nothing when neither.
+pub fn lending_check(lending: &Value) -> Option<Check> {
+    if let Ok(hold) = serde_json::from_value::<crate::lending::Hold>(lending["hold"].clone()) {
+        return Some(soft("lending", false, hold.detail).coded(&hold.code));
+    }
+    let percent = lending["on_battery_percent"].as_u64()?;
+    Some(
+        soft(
+            "lending",
+            false,
+            format!("the PC is on its battery at {percent}%; jobs still start"),
+        )
+        .coded(crate::lending::ON_BATTERY),
+    )
+}
+
 /// The last job that ended, when it did not end well: a warning that names
 /// the command printing its output.
 pub fn last_job_check(history: &Path) -> Option<Check> {
@@ -1385,6 +1449,8 @@ pub fn last_job_check(history: &Path) -> Option<Check> {
     })
 }
 
+/// What only a running service can answer: its state, a pause, bans, the
+/// poll URL as the service last saw it.
 async fn service_checks(found: &mut Found, settings: &Settings) {
     let mut checks = std::mem::take(&mut found.checks);
     let status = read_status(&crate::status::status_path(&settings.history_path));
@@ -1421,6 +1487,9 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
         .filter(|report| report.applies)
     {
         checks.push(safety_check(&report));
+    }
+    if let Some(check) = fresh.and_then(|s| lending_check(&s["lending"])) {
+        checks.push(check);
     }
     if let Some(warning) = &settings.config_warning {
         checks.push(soft("config-in-use", false, warning.clone()).coded("CONFIG_FALLBACK_IN_USE"));
@@ -1681,7 +1750,7 @@ mod tests {
         assert!(out.json["hint"]
             .as_str()
             .unwrap()
-            .starts_with("Do not answer for the owner"));
+            .contains("safety authorize --owner-consent"));
 
         let ask = |typed: &str, portuguese: bool| {
             let mut shown = Vec::new();

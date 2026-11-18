@@ -18,6 +18,7 @@ pub mod host;
 pub mod joblogs;
 pub mod jobs;
 pub mod launcher;
+pub mod lending;
 pub mod lock;
 pub mod managed;
 pub mod poll;

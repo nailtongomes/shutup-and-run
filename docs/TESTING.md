@@ -246,6 +246,17 @@ CI installs the latest release in WSL2 on the Windows runner and updates it, wit
 - [ ] A worker paused before the update is still paused; a PC whose owner had authorized is still authorized.
 - [ ] Put the old binary back by hand (`wsl -d shutup-and-run -u root -- cp ...`): the doctor says `VERSION_MISMATCH` with the hint `shutup-and-run wsl update`, and that command clears it.
 
+### 0.2.19: battery, full screen, lend hours, usage, consent from the contract
+
+On a Windows laptop with the mock serving short jobs (`--image alpine --command "sh -c 'yes > /dev/null & sleep 90'"`).
+
+- [ ] Plugged in: the page's **Power** line says plugged in. Unplug it above 60%: the **This PC is on its battery** box appears with the charge, and jobs still start. The doctor has a `lending` line with `ON_BATTERY`.
+- [ ] Let it drain under 60% (or test at that point): the page says **WAITING**, the mock gets no polls, a job already running ends normally, and `shutup-and-run doctor` says `BATTERY_LOW`. Plug it in: polls resume within a minute.
+- [ ] Start a PowerPoint slide show (or a video in full screen): **WAITING**, "presenting or has a program in full screen", no polls. Leave it: polls resume. A Teams call in a window is not a wait; write down whether one in full screen is.
+- [ ] `shutup-and-run config set lend_hours "mon-fri 19-07" --apply` at a time outside it: **WAITING**, `OUTSIDE_LEND_HOURS`, and the **Lends itself** line shows the window and the time now, which is the PC's clock. `config unset lend_hours --apply`: polls resume.
+- [ ] After a job of 90 seconds, `shutup-and-run jobs` has `used: cpu ... s, memory peak ...`, about one CPU-minute and a few MB; `jobs --json` has `cpu_ms` and `memory_peak_bytes`; the page's jobs table has the same in **CPU / memory**.
+- [ ] On a small PC (or one where the page asks for an authorization), `shutup-and-run wsl uninstall`, then `shutup-and-run wsl install --poll-url URL --owner-consent`: it prints `recorded the owner's consent from the contract`, the page is **RUNNING** and never asks, and **Safety** shows the authorization on the `contract`. **Withdraw** on the page: it asks again.
+
 ### Certificate passthrough and the demos
 
 Not run on Windows yet. On the Windows PC, with a test `.pfx` (never a real one for this) in a folder whose name has a space and an accent:

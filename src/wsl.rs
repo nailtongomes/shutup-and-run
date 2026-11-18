@@ -163,6 +163,10 @@ shutup-and-run wsl install [--poll-url URL] [options]
                                  and without these options none is written on a PC
                                  that has other WSL distributions: see `wsl limits`.
       --no-task                  do not register the scheduled task
+      --owner-consent            the owner of this PC agreed in the contract to lend it
+                                 under every safety warning: record that consent, so a
+                                 small or busy PC does not wait for someone to authorize
+                                 on its page. Blocked conditions still block.
 
 shutup-and-run wsl update [--bin PATH]
     after a new .exe: put the Linux binary of the same version in the
@@ -1518,7 +1522,7 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
             "--wsl-memory",
             "--wsl-processors",
         ],
-        &["--no-task"],
+        &["--no-task", "--owner-consent"],
     )?;
 
     let poll_url = flags
@@ -1792,6 +1796,19 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
     );
     save_host_backup(&text);
     println!("    {INNER_CONFIG} (600), {INNER_SERVE}");
+    // Before the service starts, so its first assessment already has it.
+    if flags.has("--owner-consent") {
+        let args = [INNER_BIN, "safety", "authorize", "--owner-consent"];
+        let out = in_distro(&args, None, SHORT)?;
+        if !out.ok() {
+            return Err(step_failed(
+                "recording the owner's consent",
+                &args.join(" "),
+                &out,
+            ));
+        }
+        println!("    recorded the owner's consent from the contract (safety: contract)");
+    }
     // An earlier install may have banned this machine's own address by
     // sending a new token to an old service, and a ban outlives a restart.
     // This is `bans lift` as root inside the distribution, where the listener
@@ -2876,6 +2893,7 @@ fn session_is_ending() {
 /// The PC's side of the feed. A reading Windows does not give is left out.
 fn host_feed(cpu_busy_percent: Option<u64>) -> crate::host::Feed {
     let memory = host_memory();
+    let power = host_power();
     crate::host::Feed {
         idle_secs: user_idle_secs(),
         memory_total: memory.map(|(total, _)| total),
@@ -2883,7 +2901,87 @@ fn host_feed(cpu_busy_percent: Option<u64>) -> crate::host::Feed {
         cpus: Some(host_cpus()),
         cpu_busy_percent,
         disk_available: host_disk_available(),
+        on_battery: power.0,
+        battery_percent: power.1,
+        presenting: host_presenting(),
     }
+}
+
+/// On the battery or not, and its charge, from `GetSystemPowerStatus`.
+#[cfg(windows)]
+fn host_power() -> (Option<bool>, Option<u64>) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemPowerStatus {
+        ac_line_status: u8,
+        battery_flag: u8,
+        battery_life_percent: u8,
+        system_status_flag: u8,
+        battery_life_time: u32,
+        battery_full_life_time: u32,
+    }
+    extern "system" {
+        fn GetSystemPowerStatus(status: *mut SystemPowerStatus) -> i32;
+    }
+    let mut status = SystemPowerStatus::default();
+    // SAFETY: one SYSTEM_POWER_STATUS of our own, laid out as documented,
+    // written by the call and read only when it succeeded.
+    if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
+        return (None, None);
+    }
+    power_of(
+        status.ac_line_status,
+        status.battery_flag,
+        status.battery_life_percent,
+    )
+}
+
+#[cfg(not(windows))]
+fn host_power() -> (Option<bool>, Option<u64>) {
+    (None, None)
+}
+
+/// `ACLineStatus` 0 is the battery, 1 the mains, 255 unknown. A
+/// `BatteryFlag` of 128 is no battery and 255 unknown; a charge of 255 is
+/// unknown.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn power_of(ac_line: u8, flag: u8, percent: u8) -> (Option<bool>, Option<u64>) {
+    let on_battery = match ac_line {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    };
+    let percent = (flag != 128 && flag != 255 && percent <= 100).then_some(u64::from(percent));
+    (on_battery, percent)
+}
+
+/// Whether the person presents or has a program in full screen, from
+/// `SHQueryUserNotificationState`.
+#[cfg(windows)]
+fn host_presenting() -> Option<bool> {
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHQueryUserNotificationState(state: *mut i32) -> i32;
+    }
+    let mut state = 0i32;
+    // SAFETY: one i32 of our own for the QUERY_USER_NOTIFICATION_STATE,
+    // read only when the call returned S_OK.
+    let ok = unsafe { SHQueryUserNotificationState(&mut state) } == 0;
+    ok.then(|| presenting_of(state))
+}
+
+#[cfg(not(windows))]
+fn host_presenting() -> Option<bool> {
+    None
+}
+
+/// QUNS_BUSY (2, a program in full screen), QUNS_RUNNING_D3D_FULL_SCREEN
+/// (3, a game or video in exclusive full screen) and QUNS_PRESENTATION_MODE
+/// (4). Not QUNS_NOT_PRESENT (1, locked or screen saver: nobody is there),
+/// and not QUNS_APP (7), which a Store app in a window can be.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn presenting_of(state: i32) -> bool {
+    matches!(state, 2..=4)
 }
 
 /// Processor time of the whole PC since boot, in 100 ns units: idle, and
@@ -2916,8 +3014,6 @@ fn host_cpu_times() -> Option<(u64, u64)> {
     None
 }
 
-/// From two `(idle, total)` readings: the share of the time between them
-/// that the processors were not idle. None when no time passed.
 /// How long apart the first two readings of the CPU totals are.
 const CPU_FIRST_SAMPLE: Duration = Duration::from_secs(1);
 
@@ -2944,6 +3040,8 @@ pub(crate) fn feed_cpu(
     }
 }
 
+/// From two `(idle, total)` readings: the share of the time between them
+/// that the processors were not idle. None when no time passed.
 pub(crate) fn busy_percent(before: (u64, u64), now: (u64, u64)) -> Option<u64> {
     let total = now.1.checked_sub(before.1).filter(|total| *total > 0)?;
     let idle = now.0.checked_sub(before.0)?.min(total);
@@ -4102,5 +4200,16 @@ mod tests {
         let feed = host_feed(Some(42));
         assert_eq!(feed.cpu_busy_percent, Some(42));
         assert!(feed.cpus.is_some());
+    }
+
+    #[test]
+    fn the_battery_and_full_screen_states_are_read_as_windows_documents_them() {
+        assert_eq!(power_of(0, 1, 72), (Some(true), Some(72)));
+        assert_eq!(power_of(1, 8, 100), (Some(false), Some(100)));
+        // A desktop: on the mains, no system battery.
+        assert_eq!(power_of(1, 128, 255), (Some(false), None));
+        assert_eq!(power_of(255, 255, 255), (None, None));
+        assert!(presenting_of(2) && presenting_of(3) && presenting_of(4));
+        assert!(!presenting_of(1) && !presenting_of(5) && !presenting_of(6) && !presenting_of(7));
     }
 }

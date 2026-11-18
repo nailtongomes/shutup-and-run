@@ -577,6 +577,7 @@ async fn run_one(bench: &Bench, request: LaunchRequest, checks: &mut Vec<Check>)
                 LaunchError::LowResources(short) if short.resource == "disk" => "LOW_DISK",
                 LaunchError::LowResources(_) => "LOW_MEMORY",
                 LaunchError::UserActive(_) => "USER_ACTIVE",
+                LaunchError::NotLending(hold) => hold.code.as_str(),
                 LaunchError::AuthorizationRequired(_) => crate::safety::AUTHORIZATION_REQUIRED,
                 LaunchError::SafetyBlocked(found) => {
                     found.first().map_or("SAFETY_BLOCKED", |f| f.code.as_str())

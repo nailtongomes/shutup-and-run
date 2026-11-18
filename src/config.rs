@@ -114,6 +114,8 @@ pub struct Settings {
     /// Windows only: no new job starts until the person has not touched the
     /// keyboard or mouse for this many seconds. Zero: off.
     pub min_idle_secs: u64,
+    /// When the machine lends itself. None: at any time.
+    pub lend_hours: Option<crate::lending::LendHours>,
     /// Certificate passthrough: every container of this machine gets the
     /// owner's PKCS#12 file and its password. Off unless the owner turned it
     /// on and accepted that in the config.
@@ -191,6 +193,7 @@ struct FileConfig {
     min_free_memory: Option<String>,
     min_free_disk: Option<String>,
     min_idle_secs: Option<u64>,
+    lend_hours: Option<String>,
     certificate_enabled: Option<bool>,
     certificate_consent: Option<bool>,
     certificate_name: Option<String>,
@@ -539,6 +542,9 @@ impl Settings {
                 "min_idle_secs must be between 0 and 86400".into(),
             ));
         }
+        let lend_hours = take_string(env, "SHUTUP_AND_RUN_LEND_HOURS", file.lend_hours)
+            .map(|text| crate::lending::LendHours::parse(&text).map_err(ConfigError))
+            .transpose()?;
         let certificate_enabled = file.certificate_enabled.unwrap_or(false);
         if certificate_enabled && !file.certificate_consent.unwrap_or(false) {
             return Err(ConfigError(
@@ -633,6 +639,7 @@ impl Settings {
             min_free_memory,
             min_free_disk,
             min_idle_secs,
+            lend_hours,
             certificate_enabled,
             certificate_name,
             certificate_dir: PathBuf::from(CERTIFICATE_DIR),
@@ -746,6 +753,7 @@ pub const KEYS: &[Key] = &[
     key("min_free_memory", Kind::Text, OnPage::Locked),
     key("min_free_disk", Kind::Text, OnPage::Locked),
     key("min_idle_secs", Kind::Int, OnPage::Open),
+    key("lend_hours", Kind::Text, OnPage::Open),
     key("certificate_enabled", Kind::Bool, OnPage::No),
     key("certificate_consent", Kind::Bool, OnPage::No),
     key("certificate_name", Kind::Text, OnPage::No),

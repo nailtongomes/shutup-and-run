@@ -101,7 +101,32 @@ pub fn job_json(job: &JobRecord) -> Value {
         "status": status_of(job),
         "failure": failure_of(job),
         "oom_killed": job.oom_killed,
+        "cpu_ms": job.cpu_ms,
+        "memory_peak_bytes": job.memory_peak,
     })
+}
+
+/// `cpu 5.5 s, memory peak 300 MiB`, from what the readings saw. None when
+/// the job was never read (it ran under 30 seconds, or it is still running).
+pub fn usage_text(job: &JobRecord) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(ms) = job.cpu_ms {
+        parts.push(format!("cpu {:.1} s", ms as f64 / 1000.0));
+    }
+    if let Some(bytes) = job.memory_peak {
+        parts.push(format!("memory peak {}", memory_text(bytes)));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// A job's memory peak: `300 MiB`, `1.5 GiB`, and `< 1 MiB` for a job that
+/// held almost nothing, which `0 MiB` would misstate.
+pub fn memory_text(bytes: u64) -> String {
+    if bytes < 1024 * 1024 {
+        "< 1 MiB".to_string()
+    } else {
+        crate::resources::human(bytes)
+    }
 }
 
 /// The command that prints the log of job `id`.
@@ -137,7 +162,7 @@ pub fn jobs_out(history: &Path, limit: usize) -> Out {
     for job in &jobs {
         let has_log = crate::joblogs::info(history, &job.id).is_some();
         text.push_str(&format!(
-            "{}  {:<8} {:>6}  exit {:<4} {}  {}{}{}\n",
+            "{}  {:<8} {:>6}  exit {:<4} {}  {}{}{}{}\n",
             utc(job.started_at),
             status_of(job),
             job.duration_secs()
@@ -148,6 +173,9 @@ pub fn jobs_out(history: &Path, limit: usize) -> Out {
                 .unwrap_or_else(|| "-".into()),
             job.id,
             job.image,
+            usage_text(job)
+                .map(|used| format!("\n    used: {used}"))
+                .unwrap_or_default(),
             failure_of(job)
                 .map(|why| format!("\n    why: {why}"))
                 .unwrap_or_default(),
@@ -393,6 +421,9 @@ mod tests {
         store
             .finish("a-ok", 1_030, Some(0), crate::REASON_EXITED, noisy)
             .unwrap();
+        store
+            .set_usage("a-ok", Some(12_345), Some(300 << 20))
+            .unwrap();
         start("b-failed", 1_100);
         store
             .finish("b-failed", 1_105, Some(3), crate::REASON_EXITED, noisy)
@@ -442,6 +473,12 @@ mod tests {
         assert_eq!(ok["duration_secs"], 30);
         assert_eq!(ok["exit_code"], 0);
         assert!(ok["failure"].is_null());
+        assert_eq!(
+            (ok["cpu_ms"].clone(), ok["memory_peak_bytes"].clone()),
+            (json!(12_345), json!(300 << 20))
+        );
+        assert!(jobs[4]["cpu_ms"].is_null() && jobs[4]["memory_peak_bytes"].is_null());
+        assert!(out.text.contains("used: cpu 12.3 s, memory peak 300 MiB"));
         assert_eq!(jobs[4]["failure"], "the container exited with code 3");
         assert_eq!(jobs[1]["failure"], "did not start: failed to pull image");
         assert!(jobs[1]["exit_code"].is_null());
@@ -455,6 +492,7 @@ mod tests {
         assert_eq!(
             fields,
             [
+                "cpu_ms",
                 "duration_secs",
                 "ended_at",
                 "exit_code",
@@ -462,6 +500,7 @@ mod tests {
                 "id",
                 "image",
                 "log",
+                "memory_peak_bytes",
                 "oom_killed",
                 "started_at",
                 "status"

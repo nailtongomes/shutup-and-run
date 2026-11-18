@@ -246,6 +246,17 @@ O CI instala a última release no WSL2 do runner Windows e a atualiza, sem job, 
 - [ ] Um worker pausado antes do update continua pausado; um PC cujo dono tinha autorizado continua autorizado.
 - [ ] Coloque o binário antigo de volta à mão (`wsl -d shutup-and-run -u root -- cp ...`): o doctor diz `VERSION_MISMATCH` com a dica `shutup-and-run wsl update`, e esse comando resolve.
 
+### 0.2.19: bateria, tela cheia, horário, consumo, consentimento do contrato
+
+Num notebook Windows, com o mock servindo jobs curtos (`--image alpine --command "sh -c 'yes > /dev/null & sleep 90'"`).
+
+- [ ] Na tomada: a linha **Energia** da página diz na tomada. Tire da tomada acima de 60%: aparece o quadro **Este PC está na bateria** com a carga, e os jobs ainda começam. O doctor tem uma linha `lending` com `ON_BATTERY`.
+- [ ] Deixe descarregar abaixo de 60% (ou teste quando estiver assim): a página diz **ESPERANDO**, o mock não recebe poll, um job que já roda termina normalmente, e o `shutup-and-run doctor` diz `BATTERY_LOW`. Ligue na tomada: os polls voltam em até um minuto.
+- [ ] Inicie uma apresentação do PowerPoint (ou um vídeo em tela cheia): **ESPERANDO**, "apresentando ou com um programa em tela cheia", sem polls. Saia: os polls voltam. Uma chamada do Teams em janela não é espera; anote se uma em tela cheia é.
+- [ ] `shutup-and-run config set lend_hours "mon-fri 19-07" --apply` num horário fora dela: **ESPERANDO**, `OUTSIDE_LEND_HOURS`, e a linha **Empresta** mostra a janela e a hora agora, que é o relógio do PC. `config unset lend_hours --apply`: os polls voltam.
+- [ ] Depois de um job de 90 segundos, `shutup-and-run jobs` tem `used: cpu ... s, memory peak ...`, cerca de um minuto de CPU e alguns MB; `jobs --json` tem `cpu_ms` e `memory_peak_bytes`; a tabela de tarefas da página mostra o mesmo em **CPU / memória**.
+- [ ] Num PC pequeno (ou num em que a página pede autorização), `shutup-and-run wsl uninstall` e depois `shutup-and-run wsl install --poll-url URL --owner-consent`: ele mostra `recorded the owner's consent from the contract`, a página fica **RODANDO** e nunca pergunta, e **Segurança** mostra a autorização pelo `contract`. **Retirar** na página: volta a perguntar.
+
 ### Repasse de certificado e as demos
 
 Ainda não rodou no Windows. No PC Windows, com um `.pfx` de teste (nunca um real para isto) numa pasta com espaço e acento no nome:

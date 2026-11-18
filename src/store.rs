@@ -20,6 +20,12 @@ pub struct JobRecord {
     /// Docker confirmed the kernel killed a process of this container for
     /// memory. False for every other end, a plain SIGKILL included.
     pub oom_killed: bool,
+    /// CPU time the job used, in milliseconds, and the most memory it held,
+    /// in bytes: from readings every 30 seconds while it ran, so the last
+    /// seconds and a short peak can be missed. None: no reading (a job that
+    /// ended within its first seconds, or a history from before 0.2.19).
+    pub cpu_ms: Option<u64>,
+    pub memory_peak: Option<u64>,
 }
 
 /// Something that happened to the machine or to a job's resources, kept for
@@ -193,8 +199,15 @@ impl Store {
         // A history written before 0.2.11 has no such column. Its rows keep
         // NULL: their callbacks were sent, or not, by the old three tries.
         // The same for `oom_killed`, added in 0.2.13: NULL reads as false,
-        // and for `managed`: NULL is a pushed or polled job.
-        for column in ["callback_state TEXT", "oom_killed INTEGER", "managed TEXT"] {
+        // and for `managed`: NULL is a pushed or polled job. `cpu_ms` and
+        // `memory_peak`, 0.2.19: NULL is "not measured".
+        for column in [
+            "callback_state TEXT",
+            "oom_killed INTEGER",
+            "managed TEXT",
+            "cpu_ms INTEGER",
+            "memory_peak INTEGER",
+        ] {
             match conn.execute(&format!("ALTER TABLE jobs ADD COLUMN {column}"), []) {
                 Ok(_) => {}
                 Err(err) if err.to_string().contains("duplicate column") => {}
@@ -213,7 +226,7 @@ impl Store {
 
     pub fn get(&self, id: &str) -> Result<Option<JobRecord>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
-        conn.query_row("SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed FROM jobs WHERE id = ?1", [id], map_job)
+        conn.query_row("SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak FROM jobs WHERE id = ?1", [id], map_job)
             .optional()
             .map_err(sql)
     }
@@ -222,7 +235,7 @@ impl Store {
     pub fn last_job(&self) -> Result<Option<JobRecord>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         conn.query_row(
-            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed FROM jobs ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak FROM jobs ORDER BY started_at DESC, rowid DESC LIMIT 1",
             [],
             map_job,
         )
@@ -233,7 +246,7 @@ impl Store {
     pub fn get_by_key(&self, key: &str) -> Result<Option<JobRecord>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         conn.query_row(
-            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed FROM jobs WHERE job_key = ?1",
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak FROM jobs WHERE job_key = ?1",
             [key],
             map_job,
         )
@@ -318,7 +331,7 @@ impl Store {
             return Ok(None);
         }
         conn.query_row(
-            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed FROM jobs WHERE id = ?1",
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak FROM jobs WHERE id = ?1",
             [id],
             map_job,
         )
@@ -343,7 +356,7 @@ impl Store {
         let conn = self.conn.lock().expect("sqlite");
         let mut stmt = conn
             .prepare(
-                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed
+                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak
                  FROM jobs WHERE callback_state = 'pending' AND ended_at BETWEEN ?1 AND ?2",
             )
             .map_err(sql)?;
@@ -416,7 +429,7 @@ impl Store {
         let conn = self.conn.lock().expect("sqlite");
         let mut stmt = conn
             .prepare(
-                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed
+                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak
                  FROM jobs ORDER BY started_at DESC, rowid DESC LIMIT ?1",
             )
             .map_err(sql)?;
@@ -486,6 +499,26 @@ impl Store {
         let conn = self.conn.lock().expect("sqlite");
         conn.execute("UPDATE jobs SET oom_killed = 1 WHERE id = ?1", [id])
             .map_err(sql)?;
+        Ok(())
+    }
+
+    /// What a job used, from its readings. Before `finish` or after it.
+    pub fn set_usage(
+        &self,
+        id: &str,
+        cpu_ms: Option<u64>,
+        memory_peak: Option<u64>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute(
+            "UPDATE jobs SET cpu_ms = ?2, memory_peak = ?3 WHERE id = ?1",
+            params![
+                id,
+                cpu_ms.map(|v| v.min(i64::MAX as u64) as i64),
+                memory_peak.map(|v| v.min(i64::MAX as u64) as i64)
+            ],
+        )
+        .map_err(sql)?;
         Ok(())
     }
 
@@ -772,7 +805,7 @@ impl Store {
     pub fn managed_last(&self, name: &str) -> Result<Option<JobRecord>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         conn.query_row(
-            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak
              FROM jobs WHERE managed = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
             [name],
             map_job,
@@ -925,6 +958,8 @@ fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
         callback_url: row.get(7)?,
         logs: row.get(8)?,
         oom_killed: row.get::<_, Option<i64>>(9)?.unwrap_or(0) != 0,
+        cpu_ms: row.get::<_, Option<i64>>(10)?.map(|v| v.max(0) as u64),
+        memory_peak: row.get::<_, Option<i64>>(11)?.map(|v| v.max(0) as u64),
     })
 }
 

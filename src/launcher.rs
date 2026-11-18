@@ -67,6 +67,10 @@ pub enum LaunchError {
     /// `min_idle_secs` is set and the person at the PC is using it.
     #[error("{0}")]
     UserActive(UserActive),
+    /// Outside `lend_hours`, a PC on a low battery, or a person presenting.
+    /// It clears by itself; nothing was stored.
+    #[error("{0}")]
+    NotLending(crate::lending::Hold),
     /// A critical condition of the computer. No consent lifts it; it clears
     /// by itself. Nothing was stored.
     #[error("blocked to protect this computer: {}", codes_of(.0))]
@@ -96,9 +100,27 @@ fn codes_of(findings: &[crate::safety::Finding]) -> String {
         .join(", ")
 }
 
-/// How often a running job's CPU throttling is read: once per job every
-/// this long, one small Docker call, kept in memory until the job ends.
+/// How often a running job's counters are read (CPU throttling, CPU time,
+/// memory): once per job every this long, one small Docker call, kept in
+/// memory until the job ends.
 pub const THROTTLE_SAMPLE_SECS: u64 = 30;
+
+/// A running job's readings so far: the last throttling counters, the CPU
+/// time at the last reading, and the most memory any reading saw.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sampled {
+    pub throttling: Option<crate::runtime::Throttling>,
+    pub cpu_ns: Option<u64>,
+    pub memory_peak: Option<u64>,
+}
+
+impl Sampled {
+    fn add(&mut self, read: crate::runtime::Stats) {
+        self.throttling = read.throttling.or(self.throttling);
+        self.cpu_ns = self.cpu_ns.max(read.cpu_ns);
+        self.memory_peak = self.memory_peak.max(read.memory_bytes);
+    }
+}
 
 /// Why a job waits under `min_idle_secs`. It can start later, unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,8 +191,8 @@ pub struct Launcher {
     safety_seen: std::sync::Mutex<Option<(crate::safety::Admission, Vec<String>)>>,
     /// Readings given instead of the machine's own. Tests only.
     readings: std::sync::Mutex<Option<crate::safety::Readings>>,
-    /// The last CPU throttling read of each running job.
-    throttling: std::sync::Mutex<HashMap<String, crate::runtime::Throttling>>,
+    /// What the readings of each running job have said so far.
+    samples: std::sync::Mutex<HashMap<String, Sampled>>,
 }
 
 impl Launcher {
@@ -209,7 +231,7 @@ impl Launcher {
             safety_seen: std::sync::Mutex::new(None),
             // A test must not depend on how busy the machine running it is.
             readings: std::sync::Mutex::new(cfg!(test).then(crate::safety::Readings::healthy)),
-            throttling: std::sync::Mutex::new(HashMap::new()),
+            samples: std::sync::Mutex::new(HashMap::new()),
             settings,
             runtime,
             clock,
@@ -438,16 +460,21 @@ impl Launcher {
         crate::safety::revoke(&self.safety_store, channel, self.clock.now_unix() as i64)
     }
 
-    /// One reading of each running job's CPU throttling, kept until the job
-    /// ends. A job that ends before its first reading has none.
+    /// One reading of each running job's counters, kept until the job ends.
+    /// A job that ends before its first reading has none.
     pub async fn sample_throttling(&self) {
         let ids = self.store.running_ids().unwrap_or_default();
         for id in ids {
             if self.starting.lock().await.contains(&id) {
                 continue;
             }
-            if let Ok(Some(read)) = self.runtime.cpu_throttling(&id).await {
-                self.throttling.lock().expect("throttling").insert(id, read);
+            if let Ok(Some(read)) = self.runtime.stats(&id).await {
+                self.samples
+                    .lock()
+                    .expect("samples")
+                    .entry(id)
+                    .or_default()
+                    .add(read);
             }
         }
     }
@@ -457,6 +484,16 @@ impl Launcher {
     /// reading that is missing or old does not block, like `shortage`.
     pub fn user_active(&self) -> Option<UserActive> {
         user_active(self.settings.min_idle_secs, crate::host::current())
+    }
+
+    /// Outside `lend_hours`, on a battery below the minimum, or while the
+    /// person presents (`src/lending.rs`).
+    pub fn lending_hold(&self) -> Option<crate::lending::Hold> {
+        crate::lending::hold(
+            self.settings.lend_hours.as_ref(),
+            crate::host::current(),
+            self.clock.now_unix() as i64,
+        )
     }
 
     /// Why no new job starts now though a slot may be free.
@@ -474,6 +511,7 @@ impl Launcher {
             .waiting_for()
             .or_else(|| self.shortage_for(None, machine).map(|s| s.to_string()))
             .or_else(|| self.user_active().map(|u| u.to_string()))
+            .or_else(|| self.lending_hold().map(|h| h.to_string()))
     }
 
     pub fn delivery(&self) -> crate::store::Delivery {
@@ -650,6 +688,9 @@ impl Launcher {
         }
         if let Some(active) = self.user_active() {
             return Err(LaunchError::UserActive(active));
+        }
+        if let Some(hold) = self.lending_hold() {
+            return Err(LaunchError::NotLending(hold));
         }
         let id = random_id();
         let record = NewJob {
@@ -873,7 +914,12 @@ impl Launcher {
             Ok(Some(job)) => {
                 // Only the call that closed the row: the die event and a
                 // status request can both get here for the same job.
-                self.note_resource_incidents(&job);
+                let sampled = self.samples.lock().expect("samples").remove(id);
+                if let Some(sampled) = sampled {
+                    let cpu_ms = sampled.cpu_ns.map(|ns| ns / 1_000_000);
+                    let _ = self.store.set_usage(id, cpu_ms, sampled.memory_peak);
+                }
+                self.note_resource_incidents(&job, sampled.and_then(|s| s.throttling));
                 // Before the container goes, with its output.
                 self.save_output(id).await;
                 self.timeouts.lock().await.remove(id);
@@ -915,9 +961,12 @@ impl Launcher {
     /// What Docker and the kernel said about how a job used its limits,
     /// recorded once as it ends: killed for memory, or held at its CPU limit
     /// most of the time. For the owner; the job's exit code is not changed.
-    fn note_resource_incidents(&self, job: &JobRecord) {
+    fn note_resource_incidents(
+        &self,
+        job: &JobRecord,
+        throttled: Option<crate::runtime::Throttling>,
+    ) {
         let at = self.clock.now_unix() as i64;
-        let throttled = self.throttling.lock().expect("throttling").remove(&job.id);
         if let Some(read) = throttled.filter(|read| read.significant()) {
             let detail = format!(
                 "job {} ({}) was held at its CPU limit in {}% of its time",
@@ -2271,6 +2320,7 @@ mod tests {
                 cpus: Some(2),
                 cpu_busy_percent: Some(8),
                 disk_available: Some(40 * GIB),
+                ..Default::default()
             }),
         }
     }
@@ -2651,6 +2701,66 @@ mod tests {
             throttled_periods: 400
         }
         .significant());
+    }
+
+    #[tokio::test]
+    async fn a_job_records_its_cpu_time_and_its_memory_peak() {
+        use crate::runtime::Stats;
+        let (launcher, mock) = harness_with(2, |_| {});
+        let id = started(&launcher, job("alpine", None)).await;
+        let read = |cpu_ns, memory| Stats {
+            cpu_ns: Some(cpu_ns),
+            memory_bytes: Some(memory),
+            ..Stats::default()
+        };
+        mock.set_stats(Some(read(2_000_000_000, 300 << 20))).await;
+        launcher.sample_throttling().await;
+        // The peak is the most any reading saw; the CPU time, the last.
+        mock.set_stats(Some(read(5_500_000_000, 120 << 20))).await;
+        launcher.sample_throttling().await;
+        mock.stop(&id, 0).await;
+        launcher.on_exit(&id, 0).await;
+        let row = launcher.store.get(&id).unwrap().unwrap();
+        assert_eq!(
+            (row.cpu_ms, row.memory_peak),
+            (Some(5_500), Some(300 << 20))
+        );
+        // Never read: nothing is made up.
+        mock.set_stats(None).await;
+        let quick = started(&launcher, job("alpine", None)).await;
+        mock.stop(&quick, 0).await;
+        launcher.on_exit(&quick, 0).await;
+        let row = launcher.store.get(&quick).unwrap().unwrap();
+        assert_eq!((row.cpu_ms, row.memory_peak), (None, None));
+    }
+
+    #[tokio::test]
+    async fn outside_lend_hours_a_job_waits_and_nothing_is_stored() {
+        // The test clock's day and hour are not one minute of Monday.
+        let (launcher, mock) = harness_with(2, |s| {
+            s.lend_hours = Some(crate::lending::LendHours::parse("mon 00:00-00:01").unwrap())
+        });
+        let keyed = LaunchRequest {
+            job_key: Some("k-1".into()),
+            ..job("alpine", None)
+        };
+        match launcher.launch(keyed).await {
+            Err(LaunchError::NotLending(hold)) => {
+                assert_eq!(hold.code, crate::lending::OUTSIDE_LEND_HOURS);
+                assert!(hold
+                    .detail
+                    .starts_with("outside lend_hours mon 00:00-00:01 (now "));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(mock.start_count().await, 0);
+        assert!(launcher.store.get_by_key("k-1").unwrap().is_none());
+        let live = launcher.live_status().await;
+        assert!(live.waiting_for.unwrap().starts_with("outside lend_hours"));
+        assert_eq!(
+            live.computer.hold.map(|h| h.code).as_deref(),
+            Some(crate::lending::OUTSIDE_LEND_HOURS)
+        );
     }
 
     #[tokio::test]

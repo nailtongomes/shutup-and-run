@@ -16,6 +16,8 @@ Um runner de jobs Docker pequeno e auto-hospedado, em Rust. Um orquestrador que 
 - **Feito para ser operado por um agente de IA.** Todo comando é não interativo, imprime JSON e tem código de saída fixo. A configuração é um arquivo só, que nunca se edita à mão. Um doctor aponta cada problema com o comando que resolve.
 - **Pequeno.** Um binário estático, um histórico em SQLite, uma página local em `127.0.0.1` para a pessoa no PC, e o que cada job imprimiu guardado na máquina por 7 dias.
 
+**Dúvidas?** O [FAQ](docs/FAQ.pt-BR.md) responde o que esperar: PC lento, bateria, desligamento, uma tarefa que não começou.
+
 **Conteúdo:** [Como funciona](#como-funciona) · [Início rápido](#início-rápido) · [A página local](#a-página-local) · [Protegendo o PC](#protegendo-o-pc) · [Containers gerenciados](#containers-gerenciados) · [Para um agente de IA](#para-um-agente-de-ia) · [A API](#push-pull-e-a-api) · [Segurança](#segurança) · [Limites](#limites)
 
 ## O que é, e o que não é
@@ -147,11 +149,14 @@ O trabalho interativo do cliente tem prioridade sobre a vazão de jobs. Num PC c
 | Jobs ao mesmo tempo | 1 | `max_slots` |
 | Iniciar um job | só com 2 GiB de memória e 5 GiB de disco livres | `min_free_memory`, `min_free_disk` |
 | Iniciar um job (Windows, opcional) | só depois de o PC ficar N segundos sem uso; desligado por padrão | `min_idle_secs` |
+| Iniciar um job, quando (opcional) | só dentro do horário em que a máquina é emprestada, como `mon-fri 19-07; sat,sun`; a qualquer hora por padrão | `lend_hours` |
+| Iniciar um job (Windows) | não na bateria abaixo de 60%, não enquanto a pessoa apresenta ou tem um programa em tela cheia; na bateria acima de 60% os jobs começam e a página avisa | não é configurável |
 | Iniciar um job, a segurança do computador | nunca com memória, disco ou processador em nível crítico; num computador pequeno ou ocupado, só depois que o dono autorizar | não é configurável; o dono decide na página local |
 
 - Quem aplica os limites é o Docker (`NanoCpus`, `Memory`, `MemorySwap`), num job de push e num de pull. Tarefa que não informa `cpu` ou `memory` recebe o limite da máquina; a que informa menos recebe o que pediu; a que informa mais é recusada, com o limite na resposta.
+- Fora de `lend_hours`, na bateria abaixo de 60%, ou enquanto a pessoa apresenta ou tem um programa em tela cheia, um push recebe `503` `not lending now` e um worker em pull não pede trabalho. Um job que já está rodando continua em todos os casos.
 - Enquanto faltar memória ou disco, um push recebe `503` `insufficient resources` e um worker em pull simplesmente não pede trabalho, então nenhuma tarefa é retirada da fila e depois descartada. Ele volta sozinho. O `status` mostra `waiting_for`.
-- Antes de cada job o worker também avalia o computador em si, no Windows o PC e não só a VM do WSL2: **saudável**, **alerta** ou **bloqueado**. Bloqueado (menos de 10% de memória ou 2 GiB de disco, processadores saturados, uma leitura que não pôde ser feita, três jobs mortos por memória em meia hora) não inicia nada, responde um push com `503` `blocked for safety` e passa sozinho. Um alerta (menos de 8 GiB de memória ou 2 processadores ou menos, memória abaixo de 20%, processadores ocupados) só inicia um job depois que o dono do computador leu os riscos e disse sim, uma vez, na página local ou com `shutup-and-run safety authorize` em um terminal; até lá um push recebe `503` `authorization required`. Nenhuma flag, chave de config ou campo da API diz sim, e o sim nunca libera um bloqueio. `shutup-and-run safety` mostra o estado; um job morto por memória é informado como tal (`oom_killed`). Os limiares e o que não é coberto estão em [docs/WINDOWS.md](docs/WINDOWS.md#sharing-the-pc).
+- Antes de cada job o worker também avalia o computador em si, no Windows o PC e não só a VM do WSL2: **saudável**, **alerta** ou **bloqueado**. Bloqueado (menos de 10% de memória ou 2 GiB de disco, processadores saturados, uma leitura que não pôde ser feita, três jobs mortos por memória em meia hora) não inicia nada, responde um push com `503` `blocked for safety` e passa sozinho. Um alerta (menos de 8 GiB de memória ou 2 processadores ou menos, memória abaixo de 20%, processadores ocupados) só inicia um job depois que o dono do computador leu os riscos e disse sim, uma vez, na página local ou com `shutup-and-run safety authorize` em um terminal; até lá um push recebe `503` `authorization required`. Quando o dono já concordou no contrato, quem instala registra esse consentimento na própria máquina com `shutup-and-run wsl install --owner-consent` (ou `shutup-and-run safety authorize --owner-consent`), e o PC fica pronto na hora. Nenhuma chave de config ou campo da API diz sim, e o sim nunca libera um bloqueio. `shutup-and-run safety` mostra o estado; um job morto por memória é informado como tal (`oom_killed`). Os limiares e o que não é coberto estão em [docs/WINDOWS.md](docs/WINDOWS.md#sharing-the-pc).
 - Onde o serviço enxerga menos de 4 GiB (um PC de 8 GiB dá ao WSL2 cerca de 3,2 GiB), os dois valores de memória são a metade do que ele enxerga. Nem todo PC aguenta um job de 2 GiB.
 - O perfil `shared-pc` é o padrão no Windows, inclusive para um worker instalado antes da 0.2.6. Num desktop Linux: `shutup-and-run config set resource_profile shared-pc --apply`. Um servidor Linux não muda, a menos que você configure.
 - O `.wslconfig` é do usuário e vale para todas as distribuições WSL2. A instalação só o escreve quando ele não existe e o PC não tem outra distribuição. Um arquivo existente só muda com `shutup-and-run wsl limits --apply`, que preserva todas as outras linhas e guarda um backup. A mudança vale quando o WSL reinicia; este programa nunca roda `wsl --shutdown`.
@@ -205,6 +210,8 @@ A segurança da página, sem rodeios. Ela não pede token, então só responde a
 ### Saída dos jobs
 
 Cada job que rodou um container deixa na máquina o que imprimiu: os últimos 256 KiB de stdout e stderr, um arquivo por job em `logs/` ao lado do histórico (`/var/lib/shutup-and-run/logs/`, dentro da distribuição WSL no Windows), apagados depois de 7 dias. Vale para push, pull e gerenciado, e para qualquer jeito de terminar. Nada é mascarado. `shutup-and-run jobs logs ID` (ou `--last`, `--tail N`, `--json`) mostra um, `jobs --json` diz quais jobs têm log, e a página local lista os últimos em `/local/logs` para abrir ou baixar. Quando o último job falha, o `doctor` mostra o comando do log dele.
+
+Cada job também registra o que usou: o tempo de CPU e o máximo de memória que ocupou (`cpu_ms` e `memory_peak_bytes` no `jobs --json`, uma linha `used:` no `jobs`, uma coluna na página). Os números vêm da leitura feita a cada 30 segundos enquanto ele roda, então um job mais curto que isso pode não ter nenhum, e um pico curto pode escapar. Compare com `max_job_cpus` e `max_job_memory` para ver se a máquina comporta mais.
 
 ## Containers gerenciados
 
@@ -302,6 +309,7 @@ As chaves são as mesmas nos dois. Chave desconhecida é recusada.
 | `min_free_memory` | `SHUTUP_AND_RUN_MIN_FREE_MEMORY` | Nenhum job novo abaixo dessa memória disponível. `"0"`: não confere. |
 | `min_free_disk` | `SHUTUP_AND_RUN_MIN_FREE_DISK` | O mesmo para o disco em que o Docker grava. |
 | `min_idle_secs` | `SHUTUP_AND_RUN_MIN_IDLE_SECS` | Só Windows: um job novo espera até o PC ficar estes segundos sem uso. `0` (o padrão): desligado. |
+| `lend_hours` | `SHUTUP_AND_RUN_LEND_HOURS` | Quando a máquina é emprestada, no relógio dela: `"19-07"`, `"mon-fri 19-07; sat,sun"`, `"mon-fri 12:00-13:30"`. Uma janela noturna pertence ao dia em que começa. Fora dela nenhum job novo começa e o worker não faz poll. Sem a chave: a qualquer hora. |
 | `default_timeout_secs` | `SHUTUP_AND_RUN_DEFAULT_TIMEOUT_SECS` | Padrão 3600. |
 | `max_timeout_secs` | `SHUTUP_AND_RUN_MAX_TIMEOUT_SECS` | Padrão 21600. No máximo 7 dias. |
 | `poll_url` | `SHUTUP_AND_RUN_POLL_URL` | Opcional. Liga o modo pull. |

@@ -7,8 +7,8 @@
 # missing). It runs on a history of its own, in a temporary folder, on
 # 127.0.0.1 only, with a stand-in poll URL that never has work: three jobs
 # (one ok, one that exits 3, one still running), then the pages in English
-# and Portuguese, light, dark and on a phone. The state of a small PC waiting
-# for its owner comes from the page's own render function
+# and Portuguese, light, dark and on a phone; about a minute. The state of a
+# small PC waiting for its owner comes from the page's own render function
 # (`render_states_for_screenshots`), since a test machine is not one.
 #
 # Needs Docker, python3, cargo, and node with the playwright package and its
@@ -110,12 +110,15 @@ job() {
   fi
   JOBS+=("$id")
 }
-job '{"image":"alpine","command":["sh","-c","echo protocol 2026-0042 sent; echo ok"]}'
+# The first one is busy for longer than one usage reading (every 30 s), so
+# the table shows what a job used. $p is the container's shell's.
+# shellcheck disable=SC2016
+job '{"image":"alpine","command":["sh","-c","echo protocol 2026-0042 sent; yes >/dev/null & p=$!; sleep 33; kill $p; echo ok"]}'
 sleep 2
 job '{"image":"alpine","command":["sh","-c","echo opening the portal; echo Traceback: timeout waiting for login >&2; exit 3"]}'
 sleep 3
 job '{"image":"alpine","timeout_secs":900,"command":["sh","-c","echo working; sleep 600"]}'
-sleep 3
+sleep 32
 
 (cd "$ROOT" && SHUTUP_AND_RUN_SHOTS_DIR="$WORK" cargo test --locked -q render_states_for_screenshots -- --ignored >/dev/null)
 

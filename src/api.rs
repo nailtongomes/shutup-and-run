@@ -208,6 +208,11 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
                 "needed_secs": active.needed_secs,
             })),
         ),
+        Err(LaunchError::NotLending(hold)) => error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not lending now",
+            Some(json!({"code": hold.code, "detail": hold.detail})),
+        ),
         // Both are "not now, on this machine": 503, like the other waits. The
         // caller cannot lift either; the second needs a person at the machine.
         Err(LaunchError::SafetyBlocked(reasons)) => error_body(

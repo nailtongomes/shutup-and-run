@@ -105,7 +105,8 @@ shutup-and-run managed [list|mode|apply|show|secret|enable|disable|start|stop|re
 
 shutup-and-run safety [status|authorize|revoke]
     is it safe for this computer's owner to start a job, and the owner's
-    authorization when it is a risk. Only a person at the machine authorizes.
+    authorization when it is a risk: a person at the machine, or
+    `safety authorize --owner-consent` when the contract gives it.
 
 shutup-and-run version
 shutup-and-run config check

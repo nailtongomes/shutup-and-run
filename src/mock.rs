@@ -19,7 +19,7 @@ struct Inner {
     exit_on_start: Option<i64>,
     oom_on_start: bool,
     oom: std::collections::HashSet<String>,
-    throttling: Option<crate::runtime::Throttling>,
+    stats: Option<crate::runtime::Stats>,
 }
 
 pub struct MockRuntime {
@@ -51,7 +51,7 @@ impl MockRuntime {
                 exit_on_start: None,
                 oom_on_start: false,
                 oom: std::collections::HashSet::new(),
-                throttling: None,
+                stats: None,
             }),
         }
     }
@@ -117,7 +117,15 @@ impl MockRuntime {
 
     /// What every running container reports about CPU throttling.
     pub async fn throttle(&self, throttling: Option<crate::runtime::Throttling>) {
-        self.inner.lock().await.throttling = throttling;
+        self.inner.lock().await.stats = throttling.map(|t| crate::runtime::Stats {
+            throttling: Some(t),
+            ..Default::default()
+        });
+    }
+
+    /// What every running container reports, all of it.
+    pub async fn set_stats(&self, stats: Option<crate::runtime::Stats>) {
+        self.inner.lock().await.stats = stats;
     }
 
     /// What the container printed, in place of the default line.
@@ -288,11 +296,8 @@ impl Runtime for MockRuntime {
         Ok(self.inner.lock().await.oom.contains(id))
     }
 
-    async fn cpu_throttling(
-        &self,
-        id: &str,
-    ) -> Result<Option<crate::runtime::Throttling>, RuntimeError> {
+    async fn stats(&self, id: &str) -> Result<Option<crate::runtime::Stats>, RuntimeError> {
         let inner = self.inner.lock().await;
-        Ok(inner.throttling.filter(|_| inner.running.contains_key(id)))
+        Ok(inner.stats.filter(|_| inner.running.contains_key(id)))
     }
 }
