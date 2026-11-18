@@ -455,7 +455,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** An update ends running jobs, as a re-install did. The rollback of the `.exe` and of the binary are two steps in two places; a power cut between them leaves a `VERSION_MISMATCH`, which the doctor names and `wsl update` fixes. CI installs the latest release in WSL2 on the Windows runner, updates it with this build and rolls back from an `.exe` that does not start. Until a release differs from the build, the two versions there are the same, so the swap is real but the numbers do not change; a PC with jobs, pause and authorization is still a hand test.
 
-## A job's output is kept on the machine, unmasked, for 7 days
+## A job's output is kept on the machine, unmasked, for 7 days (0.2.16)
 
 **Context.** The container is removed when a job ends, and with it what the job printed. A managed job on a Windows PC ended with exit 0 and left nothing to read: `docker ps -a` was empty, and `wsl logs` has only the worker's own lines. The history row kept the last `log_lines` lines for `GET /v1/jobs/{id}?logs=true`, which neither the owner nor an agent at the PC uses. The rule until now was that `jobs` and the local page never show a job's output; the owner asked for it.
 
