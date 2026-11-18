@@ -2,13 +2,21 @@
 
 [Português](README.pt-BR.md)
 
-A small, self-hosted Docker job runner, in Rust, for the spare capacity of computers people already own.
+[![CI](https://github.com/nailtongomes/shutup-and-run/actions/workflows/ci.yml/badge.svg)](https://github.com/nailtongomes/shutup-and-run/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/nailtongomes/shutup-and-run)](https://github.com/nailtongomes/shutup-and-run/releases/latest)
 
-A customer has PCs that sit mostly idle. Their automations (RPA, Selenium, scripts in a container) need somewhere to run. shutup-and-run turns such a PC, Windows 11 or Linux, into a worker: an orchestrator you already use, such as n8n or Kestra, decides what runs and where; this program starts the container on the customer's own machine, limits it, times it out, and reports how it ended.
+**Run your automations' containers on the idle PCs your customers already own, without getting in the way of the person using them.**
 
-It is built for a **shared PC**. Someone may be working on the machine while a job runs, and their work comes first: one job at a time, a CPU and a memory limit on every container, and no new job while memory or disk is short.
+A small, self-hosted Docker job runner, in Rust. An orchestrator you already use (n8n, Kestra, your own API) hands it a task; it starts that container on the customer's Windows 11 or Linux machine, keeps it inside limits, stops it at its time limit, and calls you back with how it ended.
 
-It is also built to be run by the customer's own **AI agent**. Every command is non-interactive, prints JSON, and has a fixed exit code. The config is one file that is never edited by hand. A doctor names each problem with the command that fixes it.
+![The local page of a worker running one job: the state on top, the facts, the last jobs with their logs](docs/screenshots/en-status.png)
+
+- **Made for a shared PC.** Someone may be working on the machine while a job runs, and their work comes first: a CPU and a memory limit on every container, one job at a time by default, no new job while memory or disk is short, and on a small PC nothing runs until its owner says yes.
+- **Nothing to open on the customer's PC.** A Windows worker asks a URL of yours for work. No inbound port, no Docker Desktop, no administrator after WSL2 is enabled, and no window.
+- **Made to be run by an AI agent.** Every command is non-interactive, prints JSON and has a fixed exit code. The config is one file that is never edited by hand. A doctor names each problem with the command that fixes it.
+- **Small.** One static binary, a SQLite history, a local page on `127.0.0.1` for the person at the PC, and what each job printed kept on the machine for 7 days.
+
+**Contents:** [How it works](#how-it-works) · [Quick start](#quick-start) · [The local page](#the-local-page) · [Protecting the PC](#protecting-the-pc) · [Managed containers](#managed-containers) · [For an AI agent](#for-an-ai-agent) · [The API](#push-pull-and-the-api) · [Security](#security) · [Limits](#limits)
 
 ## What it is, and is not
 
@@ -19,7 +27,7 @@ It is also built to be run by the customer's own **AI agent**. Every command is 
 | Take work two ways: **push** (`POST /v1/jobs`) and **pull** (the worker polls a URL of yours) | Coordinate machines. Each worker knows only itself |
 | Cap concurrency (`max_slots`), time (`timeout_secs`, then SIGKILL), CPU and memory per job | Sandbox the job. A container has Docker's default privileges and network |
 | Refuse work when full, draining, or short of memory or disk | Mount host folders, publish ports, or run privileged. There are no such fields |
-| Keep a job history in SQLite and call a webhook when a job ends | Return a job's output. A job reports an exit code; its data is sent by the container |
+| Keep a job history in SQLite and call a webhook when a job ends | Return a job's output to you. A job reports an exit code and its data is sent by the container; what it printed stays on the machine for 7 days |
 | Show a local page with status and settings, on the machine only | Offer a dashboard, or any page reachable from the network |
 
 ## How it works
@@ -45,6 +53,24 @@ It is also built to be run by the customer's own **AI agent**. Every command is 
 - **Windows 11** runs the same Linux binary inside a WSL2 distribution of its own, in pull mode only. No port is opened on the PC and nothing is pushed to it. The `.exe` is a supervisor: it installs the distribution, keeps the service running while the user is logged on, and never shows a window. Details: [docs/WINDOWS.md](docs/WINDOWS.md).
 - **A job** is one container. `202` means the machine took it and holds a slot; the image is pulled afterwards. When it ends, by itself, at its timeout, or because it could not start, the result is POSTed to the task's `callback_url`, and sent again for up to an hour if nobody answers.
 - **The contract** for an orchestrator, with JSON Schemas, is [docs/INTEGRATION-CONTRACT.md](docs/INTEGRATION-CONTRACT.md). A complete n8n example, with worker approval, is in [examples/n8n](examples/n8n/README.md).
+
+The life of one task in pull mode, the Windows way:
+
+```mermaid
+sequenceDiagram
+    participant O as Your orchestrator
+    participant W as shutup-and-run on the PC
+    participant D as Docker
+    W->>O: POST poll_url: who I am, free slots, CPUs, memory
+    O-->>W: one task: image, env, timeout, callback_url, job_key
+    Note over W: allowlist, free slot, memory and disk,<br/>the owner's consent on a small PC
+    W->>D: start the container, CPU and memory limited
+    D-->>W: it exits, or is killed at its time limit
+    Note over W: keep the last 256 KiB it printed, 7 days
+    W->>O: POST callback_url: status, exit code, job_key
+```
+
+In push mode the first two steps are one `POST /v1/jobs` from your orchestrator to the worker, answered `202`.
 
 ## Quick start
 
@@ -143,9 +169,25 @@ shutup-and-run wsl limits             # Windows: the PC, the budget, what .wslco
 
 With `status_page = true` (the Windows install turns it on; a Linux install does not), the service answers a browser **on the machine itself** at `http://127.0.0.1:8787/`, the address in `listen`. On Windows the install puts a `shutup-and-run` shortcut to it on the desktop.
 
+The status page is at the [top of this file](#shutup-and-run). The others:
+
+| Waiting for the owner | Jobs and logs |
+| --- | --- |
+| ![A small PC waits for its owner's authorization; the risk and the button to decide are on top](docs/screenshots/en-authorization.png) | ![Jobs and logs: each job with its status, start, duration, exit code and log](docs/screenshots/en-jobs.png) |
+| **Advanced settings** | **Dark theme** |
+| ![Advanced settings: grouped, each field with its help, protected fields marked](docs/screenshots/en-advanced.png) | ![The status page in the dark theme](docs/screenshots/en-dark.png) |
+
+<img src="docs/screenshots/en-phone.png" alt="The status page on a phone" width="260" align="right">
+
+It follows the system's light or dark theme and works on a phone, with no network: one stylesheet in the binary, no font, no framework. Times are shown in the computer's own time zone.
+
+<br clear="right">
+
 | Page | What is there | Login |
 | --- | --- | --- |
-| `/` | Running, paused or Docker down. Whether the PC can be turned off. Jobs now, the last job, whether the queue answers, the machine's name. A button to pause or resume taking jobs. Reloads every 10 seconds | none |
+| `/` | The state in one word and colour: running and idle, working, paused, waiting for your authorization, blocked, Docker down. Under it, anything that needs a person, each with its button: authorize, resume, give a managed container its secret. Then whether the PC can be turned off, jobs now, the last job, the queue, the last jobs with their logs, and the computer's resources. Reloads every 10 seconds | none |
+| Jobs and logs (`/local/logs`) | The last 100 jobs: status, image, start in local time, duration, exit code, and what each printed, to open or download | none |
+| Safety (`/local/safety`) | Whether this computer is healthy, warned or blocked, and why. Where the owner reads the risks and authorizes, or withdraws an authorization | none: the owner's own decision |
 | Settings (`/local/config`) | Poll URL, poll interval, jobs at once, machine name | none |
 | Advanced settings (`/local/advanced`) | Allowed images, any-image, time limits, the resource limits, both tokens, the admin login | `admin` / `admin` until changed |
 | Managed containers (`/local/managed`) | [Managed containers](#managed-containers): the list with state and last run; Start, Stop, Enable, Disable | none for the buttons; the same login for the editor, removing, and the mode |
@@ -288,7 +330,26 @@ The keys are the same in both. An unknown key is refused.
 
 ## For an AI agent
 
-[docs/FOR-AGENTS.md](docs/FOR-AGENTS.md) is the guide: install, the known problems and their fixes. The whole loop on a Windows PC, with no question asked and nothing edited by hand:
+[docs/FOR-AGENTS.md](docs/FOR-AGENTS.md) is the guide: install, the known problems and their fixes. What the doctor answers on a machine whose last job failed (on Windows, the same lines come after the WSL and Docker checks):
+
+```text
+$ shutup-and-run doctor
+ok   config                 /etc/shutup-and-run/config.json
+ok   docker                 answers
+ok   service                running (active), listening on 127.0.0.1:8787
+ok   resources              profile shared-pc; per job: cpu 1, memory 2.0 GiB; a new job needs free memory 2.0 GiB, free disk 5.0 GiB; free now: memory 15.1 GiB, disk 5.2 GiB
+ok   safety                 healthy: nothing in the way of a new job
+--   last-job               job c914c6e4bfec26c1e58959f054a3d01c (alpine): the container exited with code 3
+                            hint: Read what it printed: `shutup-and-run jobs logs c914c6e4bfec26c1e58959f054a3d01c`.
+ok   poll                   https://queue.example/poll?user=*** answers the service
+the worker is ready
+
+$ shutup-and-run jobs logs c914 --tail 2
+opening the portal
+Traceback: timeout waiting for login
+```
+
+The whole loop on a Windows PC, with no question asked and nothing edited by hand:
 
 ```powershell
 # 1. Install. Exit 0 only when the worker runs.
