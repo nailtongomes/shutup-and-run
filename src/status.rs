@@ -3350,6 +3350,38 @@ mod tests {
         }
     }
 
+    /// Not a check. `scripts/screenshots.sh` runs it to render a state a
+    /// test machine does not reach by itself: a small PC waiting for its
+    /// owner. Writes `auth-en.html` and `auth-pt.html` into the folder named
+    /// by SHUTUP_AND_RUN_SHOTS_DIR, and does nothing without it.
+    #[test]
+    #[ignore]
+    fn render_states_for_screenshots() {
+        use crate::safety::{Admission, Finding, Level, Report};
+        let Ok(dir) = std::env::var("SHUTUP_AND_RUN_SHOTS_DIR") else {
+            return;
+        };
+        let asked = Report {
+            applies: true,
+            level: Level::Warning,
+            admission: Admission::AuthorizationRequired,
+            reasons: vec![Finding {
+                code: crate::safety::SMALL_MACHINE.into(),
+                level: Level::Warning,
+                detail: "7.6 GiB of memory, 2 processors".into(),
+            }],
+            needs_authorization: vec![crate::safety::SMALL_MACHINE.into()],
+            ..Default::default()
+        };
+        for (lang, tag) in [(Lang::En, "en"), (Lang::Pt, "pt")] {
+            let mut v = view(lang, Some((0, 1)), false);
+            v.worker = "DESK-07";
+            v.safety = Some(&asked);
+            v.last_poll = Some((1_794_960_000, "nothing"));
+            std::fs::write(Path::new(&dir).join(format!("auth-{tag}.html")), render(&v)).unwrap();
+        }
+    }
+
     #[test]
     fn the_page_says_the_state_and_whether_the_pc_can_be_turned_off() {
         let idle = render(&view(Lang::Pt, Some((0, 2)), false));

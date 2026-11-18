@@ -527,6 +527,8 @@ O binário estático que as releases publicam:
 rustup target add x86_64-unknown-linux-musl && sudo apt-get install -y musl-tools build-essential && CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked --target x86_64-unknown-linux-musl
 ```
 
+As imagens da página local neste README saem de `bash scripts/screenshots.sh`: um worker de demonstração com histórico próprio, três tarefas no Docker e o Playwright nos dois idiomas, claro, escuro e no celular. Rode de novo depois de mudar a página.
+
 Uma release é uma tag `v*` enviada a partir do `main`. Ela anexa o binário Linux, o `.exe` do Windows e o `SHA256SUMS`, publica a imagem, e depois roda a instalação de uma linha e o smoke test num runner limpo.
 
 Licença MIT. Mais leitura:

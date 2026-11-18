@@ -480,5 +480,13 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - The settings are grouped by subject, each field with a short label and one line of help. Fields behind the admin login are marked as protected. The list of jobs is the history's last 100 jobs with their logs, plus any log whose job the history no longer has.
 - Nothing else changed: the routes, the forms and their field names, the rules of the page, the config and the contract.
 
-**Cost.** About 43 KB more in the binary. The page is longer on a phone, where tables become stacked rows. The screenshots in `docs/screenshots/local-page/` show it at 0.2.16 data and will age.
+**Cost.** About 43 KB more in the binary. The page is longer on a phone, where tables become stacked rows. The screenshots in `docs/screenshots/local-page/` show it at 0.2.16 data and will age; the README's own come from `scripts/screenshots.sh`, which makes them again.
+
+## The first host-feed line waits a second for the CPU reading
+
+**Context.** The PC's CPU use is the difference between two readings of the totals `GetSystemTimes` keeps. The supervisor took both readings back to back for its first line, so that line never had a CPU figure. The safety assessment reads a missing figure as "Windows did not report CPU use" (`SAFETY_HOST_UNKNOWN`), a warning, and every install, update and restart asked the owner for an authorization for about ten seconds, until the next line. The doctor that closes an install showed it on every Windows CI run.
+
+**Decision.** The first line is sent one second after the first reading (`CPU_FIRST_SAMPLE`), with the CPU use of that second. Every later line is the same as before, ten seconds apart. The rule that a missing reading warns, never passes, is unchanged.
+
+**Cost.** The service gets its first line from Windows one second later.
 

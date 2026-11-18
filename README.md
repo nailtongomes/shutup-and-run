@@ -527,6 +527,8 @@ The static binary that releases ship:
 rustup target add x86_64-unknown-linux-musl && sudo apt-get install -y musl-tools build-essential && CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked --target x86_64-unknown-linux-musl
 ```
 
+The pictures of the local page in this README come from `bash scripts/screenshots.sh`: a demo worker on its own history, three jobs against Docker, and Playwright in both languages, light, dark and on a phone. Run it again after a change to the page.
+
 A release is a `v*` tag pushed from `main`. It attaches the Linux binary, the Windows `.exe` and `SHA256SUMS`, publishes the image, then runs the one-line install and the smoke test on a fresh runner.
 
 MIT license. More reading:
