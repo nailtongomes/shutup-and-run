@@ -2,11 +2,13 @@
 
 [TESTING.pt-BR.md](TESTING.pt-BR.md) tem o roteiro completo. Esta lista é só o que o CI não alcança: o runner do Windows instala, atualiza e faz rollback, mas não tem bateria, não tem tela, não tem programas de usuário abertos e não roda uma tarefa de verdade dentro do WSL2. Cada item diz o que conferir e onde. Ao terminar, anote o resultado (ok, falhou, com a saída) em [TESTING.pt-BR.md](TESTING.pt-BR.md) e apague daqui o que passou.
 
-Um PC Windows 11 com WSL2, instalado ou atualizado para a 0.2.20 com `irm .../install.ps1 | iex` (`shutup-and-run version` diz 0.2.20), a página em `http://127.0.0.1:8787/` e o mock de poll do roteiro ([TESTING.pt-BR.md, seção 2](TESTING.pt-BR.md#2-uma-url-de-poll-para-testar)) servindo jobs curtos.
+Um PC Windows 11 com WSL2, instalado ou atualizado para a 0.2.20 com `irm .../install.ps1 | iex` (`shutup-and-run version` diz 0.2.20), a página em `http://127.0.0.1:8787/` e o mock de poll do roteiro ([TESTING.pt-BR.md, seção 2](TESTING.pt-BR.md#2-uma-url-de-poll-para-testar)) servindo jobs curtos. Sem URL de poll, o modo gerenciado serve: um container `once` (`managed apply`, `managed mode on`) e `managed start NOME` para cada tarefa que um item pedir. Um container desabilitado não começa nem com `start`: `enable`, `start`, `disable`.
 
-## Da 0.2.19 (ainda não testado)
+Para um agente que lê a página com um script: um POST para `/local/*` vindo de fora da própria página recebe 403 de propósito (só a página, no navegador, muda algo). Para pausar, autorizar ou mudar config por script, use a CLI (`shutup-and-run pause`, `safety authorize`, `config set`).
 
-A lista está em [TESTING.pt-BR.md, "0.2.19"](TESTING.pt-BR.md#0219-bateria-tela-cheia-horário-consumo-consentimento-do-contrato): bateria acima e abaixo de 60%, apresentação ou tela cheia, `lend_hours`, `used:` no `jobs`, e `wsl install --owner-consent`.
+## Da 0.2.19 (o que a rodada 3 não cobriu)
+
+Em [TESTING.pt-BR.md, "0.2.19"](TESTING.pt-BR.md#0219-bateria-tela-cheia-horário-consumo-consentimento-do-contrato): um job rodando ao cruzar 60% de bateria termina normalmente; de volta à tomada, os polls voltam em até um minuto; Teams ou PowerPoint em tela cheia; `lend_hours`; e `wsl install --owner-consent`.
 
 ## 0.2.20: relógio do Windows para `lend_hours`
 
@@ -32,14 +34,27 @@ Prepare um PC com pouca memória livre: abra o Chrome com muitas abas, o Teams e
 - [ ] Os números batem, mais ou menos, com a coluna **Memória** do Gerenciador de Tarefas (ela mostra a memória privada; a soma por programa pode ficar um pouco abaixo).
 - [ ] Feche o programa maior: em até 10 s o quadro diminui ou some, e a tarefa seguinte começa sozinha.
 - [ ] `shutup-and-run doctor` tem as linhas `memory` (`MEMORY_TO_FREE`, com o tempo de espera) e `programs` (`MEMORY_HELD_BY_PROGRAMS`). `shutup-and-run doctor --report` **não** tem os nomes dos programas, nem no relatório nem no link do issue.
-- [ ] `C:\ProgramData\shutup-and-run\status.json` tem o objeto `memory` (`short_of`, `to_free_bytes`, `waited_today_secs`) e **nenhum** nome de programa. O log do supervisor também não tem.
+- [ ] `C:\ProgramData\shutup-and-run\status.json` tem o objeto `memory` (`short_of`, `to_free_bytes`, `waited_today_secs`). (Rodada 3: sem nomes de programa nele nem no log do supervisor, ok.)
 - [ ] Com memória sobrando, nenhuma lista de programas aparece na página.
 - [ ] Depois de alguns minutos esperando, a linha **Esperou por memória** mostra "hoje N min", e o número continua depois de reiniciar o serviço (`shutup-and-run wsl stop` e `wsl start`).
-- [ ] Deixe o PC um dia inteiro instalado, com a memória curta em horário de uso: no dia seguinte a linha **Memória curta, 7 dias** mostra as horas (por exemplo `mon-fri 09-18`) e o doctor tem `MEMORY_SHORT_HOURS` com um `lend_hours` sugerido. Confira que esse texto passa no `shutup-and-run config set lend_hours "..."`, e não aplique sem o dono concordar.
+- [ ] Deixe o PC três dias instalado, com a memória curta em horário de uso: depois disso a linha **Memória curta, 7 dias** mostra as horas (por exemplo `mon-fri 09-18`) e o doctor tem `MEMORY_SHORT_HOURS` com um `lend_hours` sugerido. Confira que esse texto passa no `shutup-and-run config set lend_hours "..."`, e não aplique sem o dono concordar.
 
 ### O WSL devolvendo a memória
 
-- [ ] Rode uma tarefa que encha o cache do Linux, por exemplo `sh -c 'dd if=/dev/zero of=/tmp/x bs=1M count=1500; cat /tmp/x > /dev/null; sleep 5'`. Durante ela, o processo **VmmemWSL** do Gerenciador de Tarefas cresce. Quando ela termina e não há outra rodando, o log do serviço tem `gave the memory of the last job back to Windows` e o VmmemWSL cai em até um minuto.
 - [ ] Num `.wslconfig` sem `autoMemoryReclaim`, `shutup-and-run wsl doctor` tem a linha `wsl-limits` com `WSL_MEMORY_NOT_RECLAIMED`. `shutup-and-run wsl limits --apply` acrescenta `autoMemoryReclaim=dropcache` em `[experimental]`, mantém o resto e cria o `.wslconfig.bak`; ele não muda um `memory=` que o dono deixou abaixo do orçamento.
 - [ ] Depois de `wsl --shutdown` (num momento sem tarefa e sem outro uso do WSL), confira que o WSL ainda sobe e que o `autoMemoryReclaim` é aceito pela versão instalada: `wsl --version` e nenhum aviso de chave desconhecida ao abrir a distribuição. Anote a versão do WSL. Se a sua versão aceitar a chave em `[wsl2]` e não em `[experimental]`, registre isso.
 - [ ] Um `.wslconfig` com `autoMemoryReclaim=disabled` (escolha do dono) fica como está depois do `--apply`.
+
+## Depois da 0.2.20: o que a rodada 3 encontrou
+
+Rodada 3 (0.2.20): ok o WSL devolvendo a memória (VmmemWSL de ~2,4 GiB para 720 MiB menos de 20 s depois do log `gave the memory of the last job back to Windows`) e o `SAFETY_MEMORY_CRITICAL` que bloqueou sem matar o job em curso. O que ela achou e mudou depois:
+
+- [ ] **Relógio do WSL2.** Compare `wsl -d shutup-and-run -u root date +%s` com `[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()` no PowerShell: no máximo 5 s de diferença, mesmo logo depois de o notebook voltar da suspensão (espere 10 s). Quando o serviço acerta, o log tem `set the WSL2 clock to Windows' time` com a diferença. `status.json` tem `lending.clock_skew_secs` nulo; o doctor só tem a linha `clock` (`CLOCK_SKEW`) se o acerto falhar.
+- [ ] **Horas na página sem JavaScript.** `(Invoke-WebRequest http://127.0.0.1:8787/).Content` mostra as horas da tabela de tarefas no fuso do Windows (`2026-11-18 15:30 UTC-03:00`), não em UTC. No navegador, a hora local como antes.
+- [ ] **Pausa pela CLI.** `shutup-and-run pause --for day` diz `paused until ... (... 00:00 on the PC's clock)`; `pause --until 08:00` diz 08:00 do dia seguinte (ou de hoje, antes das 8); `--until 8:00` e `--until 24:00` são recusados com exit 2. `resume` depois de cada um.
+- [ ] **Sem `.wslconfig`.** `shutup-and-run wsl doctor`: a linha `wsl-limits` (`WSL_LIMITS_ABOVE_BUDGET`) termina com `no autoMemoryReclaim either`; depois do `wsl limits --apply` as duas coisas estão no arquivo.
+- [ ] **Aviso autorizado e outro novo.** Com `SAFETY_MEMORY_LOW` autorizado, quando aparecer um aviso que não está autorizado (por exemplo `SAFETY_CPU_BUSY`), o doctor tem `AUTHORIZATION_REQUIRED` com `(already authorized: SAFETY_MEMORY_LOW)` no fim. Texto e `--json` rodados no mesmo minuto concordam.
+- [ ] **Memória apertada mas sem bloquear.** Com o Windows abaixo de 20% livre e `SAFETY_MEMORY_LOW` autorizado: não há o quadro **Falta memória**, e a linha da lista de programas se chama **Memória apertada, as tarefas ainda começam; usando mais**. Com o quadro (memória impedindo uma tarefa), ela volta a se chamar **Usando mais memória**.
+- [ ] **Bateria no `status.json`.** Na bateria, abaixo e acima de 60%, `lending.battery_percent` tem a carga; na tomada, nulo. `on_battery_percent` continua como antes (só acima de 60%).
+- [ ] **Consumo durante a tarefa.** Com um job de mais de 30 s rodando, a coluna **CPU / memória** da página e o `shutup-and-run jobs` (`used: ... so far`) já mostram números; no fim, os finais.
+- [ ] **Horas de memória curta.** Com menos de três dias instalado, a linha **Memória curta, 7 dias** pode aparecer, mas o doctor não sugere `lend_hours` (sem `MEMORY_SHORT_HOURS`).

@@ -47,7 +47,7 @@ The list is read on the PC only while its memory is tight, and stays there: it i
 
 After the last job ends, the WSL2 VM drops the cache that job filled, so Windows gets that memory back at once instead of when WSL restarts; `shutup-and-run wsl limits --apply` also sets `autoMemoryReclaim=dropcache` in `.wslconfig` for the same reason.
 
-The page also says how long new jobs waited for memory today and in 7 days, and the hours of the week memory ran short. When those fall inside the hours the PC lends itself, the doctor suggests a `lend_hours` that keeps out of them (`MEMORY_SHORT_HOURS`); it changes nothing by itself.
+The page also says how long new jobs waited for memory today and in 7 days, and the hours of the week memory ran short. When those fall inside the hours the PC lends itself, the doctor suggests a `lend_hours` that keeps out of them (`MEMORY_SHORT_HOURS`), once 72 hours of the week have a reading; it changes nothing by itself.
 
 ### Can it lend the PC only at night?
 
@@ -152,7 +152,7 @@ The owner can still withdraw it on the page.
 
 The **Pause** button on the page, or `shutup-and-run pause`. No new job starts; a running one finishes. `shutup-and-run resume`, or the button again, ends it; on a PC with the page, a restart ends it too, so a forgotten pause does not last forever.
 
-For a while: the buttons **for 1 hour**, **for 3 hours** and **for the rest of the day** (until midnight on the PC's clock), or `shutup-and-run pause --for 2h` (`30m`, `2h`, `1d`; a week at most). The worker takes work again by itself at the end, and the page says when. Such a pause outlasts a restart, since it cannot be forgotten. To lend only at some hours, use `lend_hours` instead.
+For a while: the buttons **for 1 hour**, **for 3 hours** and **for the rest of the day** (until midnight on the PC's clock), or `shutup-and-run pause --for 2h` (`30m`, `2h`, `1d`, a week at most; `day` to midnight), or `--until 08:00`, on the PC's clock. The worker takes work again by itself at the end, and the page says when. Such a pause outlasts a restart, since it cannot be forgotten. To lend only at some hours, use `lend_hours` instead.
 
 ## Afterwards
 
@@ -162,7 +162,7 @@ For a while: the buttons **for 1 hour**, **for 3 hours** and **for the rest of t
 
 ### How much did a job use?
 
-Each finished job records its CPU time and the most memory it held: `shutup-and-run jobs` (a `used:` line), `jobs --json` (`cpu_ms`, `memory_peak_bytes`) and the **CPU / memory** column on the page. They come from a reading every 30 seconds while it runs, so a job shorter than that may have none, and a short peak can be missed. `shutup-and-run jobs --summary` sums up the last 20 and, with five measured or more and room on this PC, names the `max_job_memory` and `max_slots` that would fit more jobs at once; `doctor` says it too (`ROOM_FOR_MORE_SLOTS`). Nothing is changed by itself.
+Each job records its CPU time and the most memory it held: `shutup-and-run jobs` (a `used:` line), `jobs --json` (`cpu_ms`, `memory_peak_bytes`) and the **CPU / memory** column on the page. They come from a reading every 30 seconds while it runs, and show while it runs too (`so far`), so a job shorter than that may have none, and a short peak can be missed. `shutup-and-run jobs --summary` sums up the last 20 and, with five measured or more and room on this PC, names the `max_job_memory` and `max_slots` that would fit more jobs at once; `doctor` says it too (`ROOM_FOR_MORE_SLOTS`). Nothing is changed by itself.
 
 ### What does the poll URL learn about this PC?
 

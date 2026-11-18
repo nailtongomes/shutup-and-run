@@ -94,7 +94,7 @@ shutup-and-run serve
 shutup-and-run config show|get|set|unset|validate|apply|reset|keys
 shutup-and-run status
 shutup-and-run doctor [--report]
-shutup-and-run pause [--for 2h] | resume
+shutup-and-run pause [--for 2h|day | --until 08:00] | resume
 shutup-and-run jobs [--limit N]
     for an agent or a script: no questions, --json, stable exit codes.
     `shutup-and-run config --help` documents all of them.

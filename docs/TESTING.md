@@ -363,3 +363,6 @@ Not exercised: anything on Windows. There the commands are forwarded into the WS
 - [ ] `shutup-and-run managed apply C:\path\rpa-selenium.json`, then `managed secret rpa-selenium API_TOKEN` with the value piped in, then `managed mode on`: `managed list` shows it `running` and the page at `http://127.0.0.1:8787/local/managed` agrees.
 - [ ] With it running, sign out of Windows: the shutdown screen names `shutup-and-run`, as for any job.
 - [ ] `managed mode off` while it runs is refused with `MANAGED_BUSY`; after `managed stop`, it is accepted and the worker polls again.
+- [ ] A disabled container does not start, not even with `managed start` (on purpose). For one run of a disabled one: `managed enable NAME`, `managed start NAME`, `managed disable NAME`; the run in progress finishes.
+
+Managed mode is also the easiest way to test a Windows PC without a poll URL: the checks in [WINDOWS-PENDING.md](WINDOWS-PENDING.md) that need a job running take a `once` container started with `managed start`.

@@ -47,7 +47,7 @@ A lista só é lida no PC enquanto a memória está apertada, e fica nele: não 
 
 Quando a última tarefa termina, a VM do WSL2 descarta o cache que ela encheu, e o Windows recebe essa memória de volta na hora, não só quando o WSL reiniciar; `shutup-and-run wsl limits --apply` também põe `autoMemoryReclaim=dropcache` no `.wslconfig` pelo mesmo motivo.
 
-A página também diz quanto tempo as tarefas novas esperaram por memória hoje e em 7 dias, e as horas da semana em que ela ficou curta. Quando essas horas caem dentro do horário em que o PC é emprestado, o doctor sugere um `lend_hours` que as evita (`MEMORY_SHORT_HOURS`); nada muda sozinho.
+A página também diz quanto tempo as tarefas novas esperaram por memória hoje e em 7 dias, e as horas da semana em que ela ficou curta. Quando essas horas caem dentro do horário em que o PC é emprestado, o doctor sugere um `lend_hours` que as evita (`MEMORY_SHORT_HOURS`), depois que 72 horas da semana têm leitura; nada muda sozinho.
 
 ### Dá para emprestar o PC só à noite?
 
@@ -152,7 +152,7 @@ O dono ainda pode retirar na página.
 
 O botão **Pausar** na página, ou `shutup-and-run pause`. Nenhuma tarefa nova começa; a que está rodando termina. `shutup-and-run resume`, ou o botão de novo, encerra a pausa; num PC com a página, um reinício também encerra, para uma pausa esquecida não durar para sempre.
 
-Por um tempo: os botões **por 1 hora**, **por 3 horas** e **pelo resto do dia** (até a meia-noite no relógio do PC), ou `shutup-and-run pause --for 2h` (`30m`, `2h`, `1d`; no máximo uma semana). O worker volta a aceitar sozinho no fim, e a página diz quando. Essa pausa sobrevive a um reinício, porque não tem como ser esquecida. Para emprestar só em alguns horários, use `lend_hours`.
+Por um tempo: os botões **por 1 hora**, **por 3 horas** e **pelo resto do dia** (até a meia-noite no relógio do PC), ou `shutup-and-run pause --for 2h` (`30m`, `2h`, `1d`, no máximo uma semana; `day` até a meia-noite), ou `--until 08:00`, no relógio do PC. O worker volta a aceitar sozinho no fim, e a página diz quando. Essa pausa sobrevive a um reinício, porque não tem como ser esquecida. Para emprestar só em alguns horários, use `lend_hours`.
 
 ## Depois
 
@@ -162,7 +162,7 @@ Por um tempo: os botões **por 1 hora**, **por 3 horas** e **pelo resto do dia**
 
 ### Quanto uma tarefa gastou?
 
-Cada tarefa terminada registra o tempo de CPU e o máximo de memória que ocupou: `shutup-and-run jobs` (uma linha `used:`), `jobs --json` (`cpu_ms`, `memory_peak_bytes`) e a coluna **CPU / memória** na página. Os números vêm de uma leitura a cada 30 segundos enquanto ela roda, então uma tarefa mais curta que isso pode não ter nenhum, e um pico curto pode escapar. `shutup-and-run jobs --summary` resume as últimas 20 e, com cinco medidas ou mais e espaço neste PC, sugere o `max_job_memory` e o `max_slots` que caberiam mais tarefas ao mesmo tempo; o `doctor` também diz (`ROOM_FOR_MORE_SLOTS`). Nada muda sozinho.
+Cada tarefa registra o tempo de CPU e o máximo de memória que ocupou: `shutup-and-run jobs` (uma linha `used:`), `jobs --json` (`cpu_ms`, `memory_peak_bytes`) e a coluna **CPU / memória** na página. Os números vêm de uma leitura a cada 30 segundos enquanto ela roda, e já aparecem durante a execução (`so far`), então uma tarefa mais curta que isso pode não ter nenhum, e um pico curto pode escapar. `shutup-and-run jobs --summary` resume as últimas 20 e, com cinco medidas ou mais e espaço neste PC, sugere o `max_job_memory` e o `max_slots` que caberiam mais tarefas ao mesmo tempo; o `doctor` também diz (`ROOM_FOR_MORE_SLOTS`). Nada muda sozinho.
 
 ### O que a URL de poll fica sabendo deste PC?
 

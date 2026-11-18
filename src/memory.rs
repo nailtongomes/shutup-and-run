@@ -270,8 +270,14 @@ pub struct ShortHours {
     pub suggested_lend_hours: Option<String>,
 }
 
+/// Hours of the week with a reading before a `lend_hours` is suggested:
+/// three days. An hour never read counts as one with memory to spare, so a
+/// day of readings would suggest the other six.
+pub const MIN_SAMPLED_HOURS: usize = 72;
+
 /// None when no hour with a reading ran short, or when none of those is an
-/// hour this machine lends itself in now.
+/// hour this machine lends itself in now. The short hours are said from the
+/// first reading; the suggestion waits for `MIN_SAMPLED_HOURS`.
 pub fn short_hours(hours: &[Hour], lend: Option<&LendHours>) -> Option<ShortHours> {
     let mut short = [false; 168];
     for hour in hours.iter().filter(|h| h.slot < 168) {
@@ -297,7 +303,9 @@ pub fn short_hours(hours: &[Hour], lend: Option<&LendHours>) -> Option<ShortHour
     }
     Some(ShortHours {
         when: grid_text(&in_lending),
-        suggested_lend_hours: keep.contains(&true).then(|| grid_text(&keep)),
+        suggested_lend_hours: (keep.contains(&true)
+            && hours.iter().filter(|h| h.slot < 168).count() >= MIN_SAMPLED_HOURS)
+            .then(|| grid_text(&keep)),
     })
 }
 
@@ -555,6 +563,16 @@ mod tests {
         );
         // No reading short: nothing.
         assert_eq!(short_hours(&[hour(3, 8 * GIB)], None), None);
+        // One day of readings: the short hours, and no suggestion yet.
+        let monday: Vec<Hour> = hours.iter().filter(|h| h.slot < 24).cloned().collect();
+        let found = short_hours(&monday, None).unwrap();
+        assert_eq!(found.when, "mon 09-18");
+        assert_eq!(found.suggested_lend_hours, None);
+        let three: Vec<Hour> = hours.iter().filter(|h| h.slot < 72).cloned().collect();
+        assert!(short_hours(&three, None)
+            .unwrap()
+            .suggested_lend_hours
+            .is_some());
     }
 
     #[test]

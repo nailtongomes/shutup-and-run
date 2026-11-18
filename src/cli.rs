@@ -63,9 +63,10 @@ shutup-and-run doctor [--report]
     poll URL. Every failed line has a `hint:` with the command to run.
     --report also prints a diagnostic report with secrets masked and a URL
     that opens a new GitHub issue with it filled in. Exit 1 when unhealthy.
-shutup-and-run pause [--for 30m|2h|1d] | resume
+shutup-and-run pause [--for 30m|2h|1d|day | --until HH:MM] | resume
     stop or start taking new work. Running containers are left alone.
-    --for ends the pause by itself after that long (1m to 7d).
+    --for ends the pause by itself after that long (1m to 7d); --for day
+    ends it at midnight and --until 08:00 at that time, on the PC's clock.
 shutup-and-run jobs [--limit N]
     the last N jobs, newest first (default 20): id, image, start, end,
     duration, exit code, status (running, ok, failed, timeout, killed) and
@@ -552,6 +553,33 @@ pub fn pause_span(text: &str) -> Option<u64> {
     (60..=7 * 86_400).contains(&secs).then_some(secs)
 }
 
+/// How long a timed pause lasts: `--for 30m|2h|1d|day` (`day` is until
+/// midnight) or `--until HH:MM`, both on the PC's clock (`offset`). None for
+/// a value it does not take.
+pub fn pause_secs(flag: &str, value: &str, offset: i64, now_unix: i64) -> Option<u64> {
+    match (flag, value) {
+        ("--for", "day") => Some(crate::lending::secs_to_minute(0, offset, now_unix)),
+        ("--for", span) => pause_span(span),
+        ("--until", at) => {
+            let (h, m) = at.split_once(':')?;
+            let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+            (h < 24 && m < 60 && at.len() == 5)
+                .then(|| crate::lending::secs_to_minute(h * 60 + m, offset, now_unix))
+        }
+        _ => None,
+    }
+}
+
+/// How far the PC's clock is ahead of UTC, as the service last wrote it:
+/// on Windows the Windows zone, which the CLI inside WSL2 does not know.
+fn pc_offset(now_unix: i64) -> i64 {
+    Settings::history_path()
+        .ok()
+        .and_then(|history| read_status(&crate::status::status_path(&history)))
+        .and_then(|status| status["lending"]["utc_offset_secs"].as_i64())
+        .unwrap_or_else(|| crate::lending::offset_secs(None, now_unix))
+}
+
 /// The drain flag, written where the running service reads it on every
 /// request. No HTTP, so it works with any listen address and with TLS.
 /// `pause --for 2h` writes when it ends instead, and the worker takes work
@@ -559,19 +587,29 @@ pub fn pause_span(text: &str) -> Option<u64> {
 pub fn pause_cli(pause: bool, args: &[String]) -> ExitCode {
     let mut args = args.to_vec();
     let mut span = None;
-    if let Some(at) = args.iter().position(|a| a == "--for") {
+    let now = crate::status::now_unix();
+    let mut offset = None;
+    if let Some(at) = args.iter().position(|a| a == "--for" || a == "--until") {
         let as_json = args.iter().any(|a| a == "--json");
+        let flag = args[at].clone();
         let value = args.get(at + 1).cloned().unwrap_or_default();
-        match pause_span(&value) {
-            Some(secs) if pause => span = Some(secs),
+        let pc = pc_offset(now);
+        match pause_secs(&flag, &value, pc, now) {
+            Some(secs) if pause => {
+                span = Some(secs);
+                offset = Some(pc);
+            }
             _ => {
                 return emit(
                     Out::fail(
                         EXIT_USAGE,
-                        if pause {
-                            "--for takes a time from 1m to 7d: 30m, 2h, 1d"
+                        if !pause {
+                            format!("{flag} is for pause, not resume")
+                        } else if flag == "--until" {
+                            "--until takes a time of day on the PC's clock: 08:00, 13:30"
+                                .to_string()
                         } else {
-                            "--for is for pause, not resume"
+                            "--for takes a time from 1m to 7d, or day for the rest of the day: 30m, 2h, 1d, day".to_string()
                         },
                     ),
                     as_json,
@@ -599,7 +637,7 @@ pub fn pause_cli(pause: bool, args: &[String]) -> ExitCode {
         .and_then(|store| {
             match span {
                 Some(secs) => {
-                    let until = crate::status::now_unix() + secs as i64;
+                    let until = now + secs as i64;
                     store.pause_until(until).map(|()| Some(until))
                 }
                 None => store.set_draining(pause).map(|()| None),
@@ -609,9 +647,12 @@ pub fn pause_cli(pause: bool, args: &[String]) -> ExitCode {
     let out = match done {
         Ok(Some(until)) => {
             let at = crate::status::unix_to_iso(until);
+            let local = crate::lending::Local::at(until, offset.unwrap_or(0));
             Out::ok(
                 json!({"paused": true, "paused_until": at}),
-                format!("paused until {at}: no new work is taken until then"),
+                format!(
+                    "paused until {at} ({local} on the PC's clock): no new work is taken until then"
+                ),
             )
         }
         Ok(None) => Out::ok(
@@ -1567,6 +1608,23 @@ pub fn memory_checks(memory: &Value) -> Vec<Check> {
     checks
 }
 
+/// The clock inside WSL2 that the service could not set back to Windows'.
+pub fn clock_check(lending: &Value) -> Option<Check> {
+    let skew = lending["clock_skew_secs"].as_i64()?;
+    let side = if skew > 0 { "ahead of" } else { "behind" };
+    Some(
+        soft(
+            "clock",
+            false,
+            format!(
+                "the clock inside WSL2 is {} s {side} Windows: times on the page, lend_hours and the end of a pause are off by that much",
+                skew.abs()
+            ),
+        )
+        .coded(crate::host::CLOCK_SKEW),
+    )
+}
+
 /// What the service said about when it lends itself: a wait (outside
 /// `lend_hours`, a low battery, a presentation), or a PC on its battery that
 /// still takes jobs; else, under `lend_hours`, the time it was read at.
@@ -1657,6 +1715,9 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
         checks.push(safety_check(&report));
     }
     if let Some(check) = fresh.and_then(|s| lending_check(&s["lending"])) {
+        checks.push(check);
+    }
+    if let Some(check) = fresh.and_then(|s| clock_check(&s["lending"])) {
         checks.push(check);
     }
     if let Some(status) = fresh {
@@ -1937,6 +1998,24 @@ mod tests {
         ] {
             assert_eq!(pause_span(bad), None, "{bad:?}");
         }
+        // 2026-11-18 18:30 UTC is 15:30 in Brasília.
+        let now = 1_795_026_600;
+        let brt = -3 * 3600;
+        assert_eq!(pause_secs("--for", "2h", brt, now), Some(7200));
+        assert_eq!(
+            pause_secs("--for", "day", brt, now),
+            Some(8 * 3600 + 30 * 60)
+        );
+        assert_eq!(pause_secs("--until", "17:00", brt, now), Some(90 * 60));
+        // A time already gone today is tomorrow's.
+        assert_eq!(
+            pause_secs("--until", "08:00", brt, now),
+            Some(16 * 3600 + 30 * 60)
+        );
+        for bad in ["8", "8:00", "24:00", "07:60", "ab:cd", ""] {
+            assert_eq!(pause_secs("--until", bad, brt, now), None, "{bad:?}");
+        }
+        assert_eq!(pause_secs("--for", "week", brt, now), None);
     }
 
     #[test]
@@ -1991,6 +2070,20 @@ mod tests {
             "inside lend_hours mon-fri 19-07 (now wed 21:00, UTC-03:00)"
         );
         assert!(lending_check(&json!({"lend_hours": null, "hold": null})).is_none());
+    }
+
+    #[test]
+    fn a_wsl2_clock_the_service_could_not_set_is_a_line_of_its_own() {
+        let off = clock_check(&json!({"clock_skew_secs": 35})).unwrap();
+        assert!(!off.ok);
+        assert_eq!(off.code(), crate::host::CLOCK_SKEW);
+        assert!(off
+            .detail
+            .starts_with("the clock inside WSL2 is 35 s ahead of Windows"));
+        let behind = clock_check(&json!({"clock_skew_secs": -8})).unwrap();
+        assert!(behind.detail.contains("8 s behind Windows"));
+        assert!(clock_check(&json!({"clock_skew_secs": null})).is_none());
+        assert!(clock_check(&json!({})).is_none());
     }
 
     /// Nothing but a person typing the word is a yes, and a program that
