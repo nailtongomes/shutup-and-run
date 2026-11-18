@@ -42,7 +42,10 @@ WORKER_PID=""
 POLL_PID=""
 JOBS=()
 cleanup() {
-  [[ -n "$WORKER_PID" ]] && kill "$WORKER_PID" 2>/dev/null || true
+  if [[ -n "$WORKER_PID" ]]; then
+    kill "$WORKER_PID" 2>/dev/null || true
+    wait "$WORKER_PID" 2>/dev/null || true
+  fi
   [[ -n "$POLL_PID" ]] && kill "$POLL_PID" 2>/dev/null || true
   for id in "${JOBS[@]}"; do
     docker rm -f "shutup-and-run-$id" >/dev/null 2>&1 || true
@@ -64,6 +67,11 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 ' "$POLL_PORT" &
 POLL_PID=$!
+# The worker polls once at start: the stand-in must already answer.
+for _ in $(seq 1 30); do
+  curl -s -o /dev/null -X POST "http://127.0.0.1:$POLL_PORT/poll" && break
+  sleep 0.2
+done
 
 cat >"$WORK/config.json" <<JSON
 {
@@ -77,6 +85,7 @@ cat >"$WORK/config.json" <<JSON
   "poll_url": "http://127.0.0.1:$POLL_PORT/poll?user=ana",
   "worker_name": "DESK-07",
   "resource_profile": "shared-pc",
+  "min_free_disk": "1g",
   "admin_user": "admin",
   "admin_password": "demo-password"
 }
@@ -86,15 +95,19 @@ SHUTUP_AND_RUN_CONFIG="$WORK/config.json" "$BIN" >"$WORK/worker.log" 2>&1 &
 WORKER_PID=$!
 
 for _ in $(seq 1 30); do
-  curl -sf "http://127.0.0.1:$PORT/health" -H "Authorization: Bearer $TOKEN" >/dev/null 2>&1 && break
+  curl -s -o /dev/null "http://127.0.0.1:$PORT/health" -H "Authorization: Bearer $TOKEN" && break
   sleep 1
 done
 
 job() {
-  local id
-  id=$(curl -sf -X POST "http://127.0.0.1:$PORT/v1/jobs" \
-    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$1" |
-    python3 -I -c 'import json, sys; print(json.load(sys.stdin)["id"])')
+  local body id
+  body=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/jobs" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$1")
+  if ! id=$(printf '%s' "$body" | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["id"])' 2>/dev/null); then
+    echo "FAIL: the worker did not take a job: ${body:-no answer}" >&2
+    tail -n 20 "$WORK/worker.log" >&2
+    exit 1
+  fi
   JOBS+=("$id")
 }
 job '{"image":"alpine","command":["sh","-c","echo protocol 2026-0042 sent; echo ok"]}'
