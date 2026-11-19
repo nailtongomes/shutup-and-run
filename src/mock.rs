@@ -20,6 +20,7 @@ struct Inner {
     oom_on_start: bool,
     oom: std::collections::HashSet<String>,
     stats: Option<crate::runtime::Stats>,
+    disk: Option<u64>,
 }
 
 pub struct MockRuntime {
@@ -52,6 +53,7 @@ impl MockRuntime {
                 oom_on_start: false,
                 oom: std::collections::HashSet::new(),
                 stats: None,
+                disk: None,
             }),
         }
     }
@@ -126,6 +128,11 @@ impl MockRuntime {
     /// What every running container reports, all of it.
     pub async fn set_stats(&self, stats: Option<crate::runtime::Stats>) {
         self.inner.lock().await.stats = stats;
+    }
+
+    /// What every stopped container says it wrote to its disk.
+    pub async fn set_disk(&self, bytes: Option<u64>) {
+        self.inner.lock().await.disk = bytes;
     }
 
     /// What the container printed, in place of the default line.
@@ -299,5 +306,10 @@ impl Runtime for MockRuntime {
     async fn stats(&self, id: &str) -> Result<Option<crate::runtime::Stats>, RuntimeError> {
         let inner = self.inner.lock().await;
         Ok(inner.stats.filter(|_| inner.running.contains_key(id)))
+    }
+
+    async fn disk_written(&self, id: &str) -> Result<Option<u64>, RuntimeError> {
+        let inner = self.inner.lock().await;
+        Ok(inner.disk.filter(|_| inner.stopped.contains_key(id)))
     }
 }

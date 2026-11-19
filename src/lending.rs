@@ -35,6 +35,10 @@ pub const ON_BATTERY: &str = "ON_BATTERY";
 pub struct Hold {
     pub code: String,
     pub detail: String,
+    /// Outside `lend_hours`: when the next window opens. Not in the hold's
+    /// JSON: `status.json` has it as `lending.resumes_at`.
+    #[serde(skip)]
+    pub resumes_at: Option<i64>,
 }
 
 impl std::fmt::Display for Hold {
@@ -55,20 +59,30 @@ pub fn hold(
         Some(Hold {
             code: code.to_string(),
             detail,
+            resumes_at: None,
         })
     };
     if let Some(hours) = hours {
         let offset = offset_secs(feed, now_unix);
         let now = Local::at(now_unix, offset);
         if !hours.allows(now) {
-            return hold(
-                OUTSIDE_LEND_HOURS,
-                format!(
-                    "outside lend_hours {} (now {now}, {})",
-                    hours.text,
-                    zone(offset)
-                ),
-            );
+            let resumes_at = hours
+                .secs_to_open(now_unix + offset)
+                .map(|secs| now_unix + secs);
+            let next = resumes_at
+                .map(|at| format!("; next window {}", Local::at(at, offset)))
+                .unwrap_or_default();
+            return Some(Hold {
+                resumes_at,
+                ..hold(
+                    OUTSIDE_LEND_HOURS,
+                    format!(
+                        "outside lend_hours {} (now {now}, {}){next}",
+                        hours.text,
+                        zone(offset)
+                    ),
+                )?
+            });
         }
     }
     let feed = feed?;
@@ -172,6 +186,21 @@ pub fn clock(feed: Option<Feed>, now_unix: i64) -> String {
     format!("{}, {}", Local::at(now_unix, offset), zone(offset))
 }
 
+/// `wed 19:00` (`qua 19:00`) on that clock: when a wait ends.
+pub fn day_hour(feed: Option<Feed>, at_unix: i64, portuguese: bool) -> String {
+    let local = Local::at(at_unix, offset_secs(feed, at_unix));
+    if !portuguese {
+        return local.to_string();
+    }
+    const DIAS: [&str; 7] = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"];
+    format!(
+        "{} {:02}:{:02}",
+        DIAS[local.weekday],
+        local.minute / 60,
+        local.minute % 60
+    )
+}
+
 /// `15:30` on that clock, for the end of a pause.
 pub fn hour_at(feed: Option<Feed>, at_unix: i64) -> String {
     let local = Local::at(at_unix, offset_secs(feed, at_unix));
@@ -266,6 +295,19 @@ impl LendHours {
             text: text.trim().to_string(),
             windows,
         })
+    }
+
+    /// Seconds from `local_secs` (seconds since 1970 on the clock it is read
+    /// on) to the next minute a window allows. None inside a window, or if
+    /// none opens within a week, which a parsed window always does.
+    pub fn secs_to_open(&self, local_secs: i64) -> Option<i64> {
+        if self.allows(Local::of(local_secs)) {
+            return None;
+        }
+        let into_minute = local_secs.rem_euclid(60);
+        (1..=7 * 24 * 60)
+            .map(|minutes| minutes * 60 - into_minute)
+            .find(|secs| self.allows(Local::of(local_secs + secs)))
     }
 
     pub fn allows(&self, now: Local) -> bool {
@@ -460,8 +502,11 @@ mod tests {
         assert_eq!(held.code, OUTSIDE_LEND_HOURS);
         assert_eq!(
             held.detail,
-            "outside lend_hours 19-07 (now wed 18:30, UTC-03:00)"
+            "outside lend_hours 19-07 (now wed 18:30, UTC-03:00); next window wed 19:00"
         );
+        assert_eq!(held.resumes_at, Some(now + 1800));
+        assert_eq!(day_hour(Some(sao_paulo), now + 1800, false), "wed 19:00");
+        assert_eq!(day_hour(Some(sao_paulo), now + 1800, true), "qua 19:00");
         let utc = Feed {
             utc_offset_secs: Some(0),
             ..Feed::default()
@@ -474,6 +519,22 @@ mod tests {
         assert_eq!(secs_to_midnight(Some(sao_paulo), now), 5 * 3600 + 1800);
         assert_eq!(zone(19_800), "UTC+05:30");
         assert_eq!(zone(0), "UTC+00:00");
+    }
+
+    #[test]
+    fn the_next_window_is_found_across_the_weekend_and_inside_one_there_is_none() {
+        // 1970-01-01 was a Thursday: day 2 is a Saturday, day 4 a Monday.
+        let at = |day: i64, hour: i64, minute: i64| day * 86_400 + hour * 3600 + minute * 60;
+        let weekdays = LendHours::parse("mon-fri 19-07").unwrap();
+        // Saturday noon: the Friday night window closed at 07:00.
+        assert_eq!(
+            weekdays.secs_to_open(at(2, 12, 0)),
+            Some(at(4, 19, 0) - at(2, 12, 0))
+        );
+        // Saturday 06:59:30 is still Friday night's window.
+        assert_eq!(weekdays.secs_to_open(at(2, 6, 59) + 30), None);
+        // Seconds into a minute count to the window's first minute.
+        assert_eq!(weekdays.secs_to_open(at(1, 18, 59) + 45), Some(15));
     }
 
     #[test]

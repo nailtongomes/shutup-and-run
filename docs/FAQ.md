@@ -65,7 +65,7 @@ That is weekday nights and all weekend. A window whose end is before its start r
 
 ### Does it fill my disk with leftovers?
 
-No. Once a day the worker removes the images no job used for 30 days (on Windows also the old copies an image pulled again leaves behind), job logs go after 7 days and finished jobs after 30. On Windows the disk file of WSL2 does not shrink by itself: when it is much bigger than what is in use, `shutup-and-run wsl doctor` says `WSL_DISK_TO_COMPACT`, and [docs/WINDOWS.md](WINDOWS.md#give-the-wsl2-disks-space-back) shows how to compact it, by hand, with WSL stopped. The page's **Cleanup** row says when the last pass ran and what it freed.
+No. Once a day the worker removes the images no job used for 30 days (on Windows also the old copies an image pulled again leaves behind), job logs go after 7 days and finished jobs after 30. Docker keeps at most 10 MB of what a container printed. On Windows the disk file of WSL2 does not shrink by itself: when it is much bigger than what is in use, `shutup-and-run wsl doctor` says `WSL_DISK_TO_COMPACT`, and [docs/WINDOWS.md](WINDOWS.md#give-the-wsl2-disks-space-back) shows how to compact it, by hand, with WSL stopped. The page's **Cleanup** row says when the last pass ran and what it freed.
 
 ### Can a job see my files?
 
@@ -170,7 +170,7 @@ For a while: the buttons **for 1 hour**, **for 3 hours** and **for the rest of t
 
 ### How much did a job use?
 
-Each job records its CPU time, the most memory it held and what it received and sent on the network: `shutup-and-run jobs` (a `used:` line), `jobs --json` (`cpu_ms`, `memory_peak_bytes`, `network_bytes`) and the **CPU / memory / network** column on the page. `jobs --summary` gives the network per job of each image, which is what a job of it costs a PC on a data plan, its pull aside. They come from a reading every 30 seconds while it runs, and show while it runs too (`so far`), so a job shorter than that may have none, and a short peak can be missed. `shutup-and-run jobs --summary` sums up the last 20 and, with five measured or more and room on this PC, names the `max_job_memory` and `max_slots` that would fit more jobs at once; `doctor` says it too (`ROOM_FOR_MORE_SLOTS`). Nothing is changed by itself.
+Each job records its CPU time, the most memory it held, what it received and sent on the network and what it wrote inside its container: `shutup-and-run jobs` (a `used:` line), `jobs --json` (`cpu_ms`, `memory_peak_bytes`, `network_bytes`, `disk_bytes`) and the **CPU / memory / network / disk** column on the page. `jobs --summary` gives the network per job of each image, which is what a job of it costs a PC on a data plan, its pull aside, and the disk per job. The disk is read once, as the container is removed. They come from a reading every 30 seconds while it runs, and show while it runs too (`so far`), so a job shorter than that may have none, and a short peak can be missed. `shutup-and-run jobs --summary` sums up the last 20 and, with five measured or more and room on this PC, names the `max_job_memory` and `max_slots` that would fit more jobs at once; `doctor` says it too (`ROOM_FOR_MORE_SLOTS`). Nothing is changed by itself.
 
 ### What does the poll URL learn about this PC?
 

@@ -16,7 +16,7 @@ A job that was accepted and is still pulling its image also holds a slot. That p
 
 `POST /v1/jobs` used to pull the image and start the container before it answered. A slow registry made Kestra and n8n wait, and a full machine pulled before it said `429`.
 
-Now the request takes the slot, writes the row, and answers `202` at once. The pull and the start happen afterwards. The job runs either way. If the pull or the start fails, the job ends with reason `start_failed`, its stored log line says which, and the callback is sent. That is no longer a `502`. The pull has the job's own `timeout_secs` as its limit, and the container's timeout starts when the container does.
+Now the request takes the slot, writes the row, and answers `202` at once. The pull and the start happen afterwards. The job runs either way. If the pull or the start fails, the job ends with reason `start_failed`, its stored log line says which, and the callback is sent. That is no longer a `502`. The pull has a limit of its own, 30 minutes (`launcher::PULL_LIMIT_SECS`; until 0.2.24 it was the job's `timeout_secs`), and the container's timeout starts when the container does.
 
 To answer before a container exists, the launcher picks the job id itself and names the container `shutup-and-run-<id>`.
 
@@ -569,3 +569,17 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - `jobs logs ID` and the page read a running job's output from Docker at that moment (`live: true`); the file is still written only when the job ends. Same content, same readers, nothing kept.
 
 **Cost.** A Wi-Fi that Windows does not know is a phone's hotspot counts as unmetered unless the person marks it. A job that only waits on a metered network waits until the PC changes network. The network number misses up to 30 seconds of traffic at the end of a job.
+
+## The pull's own limit, Docker's log capped, disk per job, digests not pulled again, when lending resumes (0.2.24)
+
+**Context.** The pull had the job's `timeout_secs` as its limit. A short job of a big image on a slow line ended `start_failed` ("image pull timed out") before it ran, and failed the same way every time (CI's smoke test hit it with a 2-second job); a 6-hour job let a stuck pull hold its slot for 6 hours. Docker kept everything a container printed, so a chatty job or a managed `always` container could fill the WSL2 disk, which does not give space back to Windows by itself. A job that wrote 30 GB inside its container went unseen: `min_free_disk` is read only at admission. An image named by its digest was still asked of the registry on every job. And outside `lend_hours` the page said the PC waited, not until when.
+
+**Decision.**
+
+- The pull has a fixed limit of 30 minutes (`launcher::PULL_LIMIT_SECS`), apart from `timeout_secs`, which still counts from the container's start. A constant, not a setting.
+- Every container is created with the `json-file` log driver, `max-size` 5m and `max-file` 2: at most 10 MB of output per container, read by `docker logs` and by the job's log file as before. It also overrides another driver an owner set on a Linux daemon, for the worker's containers only.
+- Before a finished container is removed, the worker asks Docker its `SizeRw` (what it wrote to its own layer, bounded at 20 seconds) and keeps it as `disk_bytes`: in `jobs`, on the page and per image in `jobs --summary`. A number, not a limit.
+- An image named `repo@sha256:...` that is already on the machine starts without asking the registry. A tag is still pulled every time.
+- Outside `lend_hours`, the wait says when the next window opens: `; next window wed 19:00` in its detail, the time on the page's state line, and `lending.resumes_at` in `status.json`. The other waits have no known end and say nothing new.
+
+**Cost.** A pull that really needs more than 30 minutes now fails where a long job used to let it finish. A job that prints more than 10 MB keeps only the last part in Docker (the log file kept 256 KiB anyway). Sizing the layer walks it, which on a job that wrote many files takes a while at its end. A digest is trusted to be what is on the machine.

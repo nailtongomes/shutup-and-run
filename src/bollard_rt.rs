@@ -9,12 +9,13 @@ use async_trait::async_trait;
 use bollard::auth::DockerCredentials;
 use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary, EventMessage,
-    HostConfig,
+    HostConfig, HostConfigLogConfig,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, EventsOptionsBuilder,
-    InspectContainerOptions, KillContainerOptionsBuilder, ListContainersOptionsBuilder,
-    RemoveContainerOptionsBuilder, StartContainerOptions, StatsOptionsBuilder,
+    InspectContainerOptions, InspectContainerOptionsBuilder, KillContainerOptionsBuilder,
+    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
+    StatsOptionsBuilder,
 };
 use bollard::Docker;
 use futures_util::StreamExt;
@@ -93,10 +94,18 @@ impl BollardRuntime {
 impl Runtime for BollardRuntime {
     async fn pull(&self, image: &str) -> Result<(), RuntimeError> {
         let reference = pull_reference(image);
+        // An image named by its digest cannot change: once here, the
+        // registry is not asked again, so no network and no wait.
+        if pinned(image)
+            && (self.image_present(image).await
+                || (reference != image && self.image_present(&reference).await))
+        {
+            return Ok(());
+        }
         let creds = self.credentials_for(image).await;
-        // shortcut: pull on every job so tags stay current, then fall back to a
-        // local image if the registry is unreachable. Upgrade to IfNotPresent
-        // when registry latency dominates and tags are pinned.
+        // shortcut: pull a tag on every job so it stays current, then fall back
+        // to a local image if the registry is unreachable. Upgrade to
+        // IfNotPresent for tags when registry latency dominates.
         let mut authed_err = None;
         if creds.is_some() {
             match self.pull_once(&reference, creds).await {
@@ -152,6 +161,7 @@ impl Runtime for BollardRuntime {
                 memory_swap: spec.memory_bytes,
                 shm_size: spec.shm_bytes,
                 binds: (!spec.binds.is_empty()).then(|| spec.binds.clone()),
+                log_config: Some(log_config()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -206,6 +216,24 @@ impl Runtime for BollardRuntime {
             Ok(info) => Ok(info.state.and_then(|s| s.oom_killed).unwrap_or(false)),
             Err(err) if is_status(&err, 404) => Ok(false),
             Err(err) => Err(docker_err(err)),
+        }
+    }
+
+    async fn disk_written(&self, id: &str) -> Result<Option<u64>, RuntimeError> {
+        // Docker walks the container's layer to size it: bounded, since a
+        // job that wrote millions of files must not hold its own end.
+        let options = InspectContainerOptionsBuilder::new().size(true).build();
+        let read = tokio::time::timeout(
+            Duration::from_secs(20),
+            self.docker
+                .inspect_container(&container_ref(id), Some(options)),
+        )
+        .await;
+        match read {
+            Ok(Ok(info)) => Ok(info.size_rw.map(|bytes| bytes.max(0) as u64)),
+            Ok(Err(err)) if is_status(&err, 404) => Ok(None),
+            Ok(Err(err)) => Err(docker_err(err)),
+            Err(_) => Ok(None),
         }
     }
 
@@ -578,6 +606,24 @@ fn run_helper(helper: &str, server: &str) -> Result<RegistryAuth, String> {
     auth_from_helper_output(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// `repo@sha256:...`: the one image reference that cannot change.
+fn pinned(image: &str) -> bool {
+    image.contains("@sha256:")
+}
+
+/// What Docker keeps of a container's output: two files of 5 MB at most,
+/// so a job or a managed container that prints for days does not fill the
+/// disk. The job's own log file is the last 256 KiB of it.
+fn log_config() -> HostConfigLogConfig {
+    HostConfigLogConfig {
+        typ: Some("json-file".to_string()),
+        config: Some(HashMap::from([
+            ("max-size".to_string(), "5m".to_string()),
+            ("max-file".to_string(), "2".to_string()),
+        ])),
+    }
+}
+
 /// The job id is chosen before the image is pulled, so the container is named
 /// after it and addressed by that name. A 64 character id is a row written
 /// before this change, when the job id was the container id itself.
@@ -628,5 +674,27 @@ pub fn connect_docker() -> Result<bollard::Docker, String> {
             "DOCKER_HOST={host} is not a local socket. shutup-and-run only talks to a unix socket."
         )),
         Err(_) => bollard::Docker::connect_with_socket_defaults().map_err(|err| err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_digest_pins_an_image() {
+        assert!(pinned("ghcr.io/acme/job@sha256:0123abcd"));
+        assert!(pinned("alpine:3.20@sha256:0123abcd"));
+        assert!(!pinned("alpine:3.20"));
+        assert!(!pinned("alpine"));
+    }
+
+    #[test]
+    fn a_container_keeps_at_most_ten_megabytes_of_output() {
+        let config = log_config();
+        assert_eq!(config.typ.as_deref(), Some("json-file"));
+        let opts = config.config.unwrap();
+        assert_eq!(opts["max-size"], "5m");
+        assert_eq!(opts["max-file"], "2");
     }
 }

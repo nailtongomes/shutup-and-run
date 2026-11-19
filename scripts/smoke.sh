@@ -444,9 +444,9 @@ fi
 
 if wants 4 && needs_shell 4 timeout; then
   wait_used "$USED0" 60
-  # 10 s, not less: the pull shares the time limit (a registry round trip
-  # alone can take a few seconds), and the job sleeps far past it anyway.
-  sh_job "sleep 100" 10
+  # 2 s: the pull has a limit of its own, and the time limit counts from
+  # the container's start.
+  sh_job "sleep 100" 2
   id=$ID
   if [[ "$CODE" == 202 ]] && wait_exit "$id" 40 && [[ "$(field reason)" == timeout_kill ]]; then
     pass "4 job past timeout_secs was killed, reason timeout_kill"
