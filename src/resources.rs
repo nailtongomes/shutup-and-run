@@ -138,8 +138,9 @@ pub(crate) fn data_root(daemon_json: &str) -> Option<std::path::PathBuf> {
     ["data-root", "graph"]
         .iter()
         .find_map(|key| value[key].as_str())
+        // A Linux path, also when the test runs on Windows.
+        .filter(|p| p.starts_with('/'))
         .map(std::path::PathBuf::from)
-        .filter(|p| p.is_absolute())
 }
 
 /// Bytes an unprivileged process could still write under `path`.
