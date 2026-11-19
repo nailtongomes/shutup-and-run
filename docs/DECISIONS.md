@@ -598,3 +598,16 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** A job past its time holds its slot up to 10 seconds longer, and a stop on the page answers up to 10 seconds later. A job that really needs more than 4096 processes fails. The row's 137 hides that the job ended cleanly on SIGTERM; its log says so. A retry after an outage can come up to a quarter later.
 
+## Download progress, Docker's data-root, a capped credential helper, an update notice, the .wslconfig on uninstall (0.2.25)
+
+**Context.** A job whose image was downloading looked the same as one running: nothing said how far the pull was, and a 2 GB image on a slow line looked stuck. The free-disk reads assumed `/var/lib/docker`, so a machine whose Docker keeps its images on another disk was measured on the wrong one. A credential helper that hung (a keyring waiting for a prompt nobody sees) held the pull until its 30-minute limit. A PC on an old release had no way to hear of a new one but the operator. And `wsl uninstall` left the `.wslconfig` the install had written, so WSL2 stayed capped after the worker was gone.
+
+**Decision.**
+
+- While a pull lasts, Docker's per-layer messages are summed (bytes so far, size of the layers named so far) and written to the job's row at most every 3 seconds (`pull_done`, `pull_total`), cleared when the pull ends however it ended. `jobs`, the page and `status` show `downloading the image: X of Y`; `status.json` has `pulling`, which does not by itself make the file rewritten, so it is at most 30 seconds old. Not in the callback or the poll body.
+- The disk checks read `data-root` (or the old `graph`) from `/etc/docker/daemon.json`, then `/var/lib/docker`. A `--data-root` on dockerd's command line is not looked up (a shortcut).
+- A credential helper has 5 seconds; then it is killed and the pull goes on anonymously, as on any helper failure.
+- `wsl doctor` asks GitHub where `releases/latest` points (a HEAD, no redirect followed, 5 seconds) and warns `UPDATE_AVAILABLE` when that is newer than the `.exe`. No answer, no line. Only `doctor` asks; nothing updates by itself.
+- The install records the sha256 of the `.wslconfig` it writes. `wsl uninstall` removes that file only when it still has that hash and no other WSL distribution is left; any other file stays.
+
+**Cost.** One more write to the history every few seconds while an image downloads. The second number can grow during the pull, since Docker names layers as it goes. The doctor makes one request to github.com. A `.wslconfig` that `wsl limits --apply` rewrote after the install no longer matches and stays.

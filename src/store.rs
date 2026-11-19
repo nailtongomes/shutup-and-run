@@ -32,6 +32,10 @@ pub struct JobRecord {
     /// Bytes the job wrote inside its container (its layer, `SizeRw`), read
     /// as the container is removed. None: not read (also before 0.2.24).
     pub disk_bytes: Option<u64>,
+    /// While its image downloads: the bytes so far and the size of the
+    /// layers Docker has named until then, which grows as it names more.
+    /// None once the pull is over (and before 0.2.25).
+    pub pull: Option<(u64, u64)>,
 }
 
 /// Something that happened to the machine or to a job's resources, kept for
@@ -229,7 +233,8 @@ impl Store {
         // The same for `oom_killed`, added in 0.2.13: NULL reads as false,
         // and for `managed`: NULL is a pushed or polled job. `cpu_ms` and
         // `memory_peak`, 0.2.19, `network_bytes`, 0.2.23, and `disk_bytes`,
-        // 0.2.24: NULL is "not measured".
+        // 0.2.24: NULL is "not measured". `pull_done` and `pull_total`,
+        // 0.2.25, are NULL but while an image downloads.
         for column in [
             "callback_state TEXT",
             "oom_killed INTEGER",
@@ -238,6 +243,8 @@ impl Store {
             "memory_peak INTEGER",
             "network_bytes INTEGER",
             "disk_bytes INTEGER",
+            "pull_done INTEGER",
+            "pull_total INTEGER",
         ] {
             match conn.execute(&format!("ALTER TABLE jobs ADD COLUMN {column}"), []) {
                 Ok(_) => {}
@@ -257,7 +264,7 @@ impl Store {
 
     pub fn get(&self, id: &str) -> Result<Option<JobRecord>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
-        conn.query_row("SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes FROM jobs WHERE id = ?1", [id], map_job)
+        conn.query_row("SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes, pull_done, pull_total FROM jobs WHERE id = ?1", [id], map_job)
             .optional()
             .map_err(sql)
     }
@@ -266,7 +273,7 @@ impl Store {
     pub fn last_job(&self) -> Result<Option<JobRecord>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         conn.query_row(
-            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes FROM jobs ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes, pull_done, pull_total FROM jobs ORDER BY started_at DESC, rowid DESC LIMIT 1",
             [],
             map_job,
         )
@@ -277,7 +284,7 @@ impl Store {
     pub fn get_by_key(&self, key: &str) -> Result<Option<JobRecord>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         conn.query_row(
-            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes FROM jobs WHERE job_key = ?1",
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes, pull_done, pull_total FROM jobs WHERE job_key = ?1",
             [key],
             map_job,
         )
@@ -362,7 +369,7 @@ impl Store {
             return Ok(None);
         }
         conn.query_row(
-            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes FROM jobs WHERE id = ?1",
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes, pull_done, pull_total FROM jobs WHERE id = ?1",
             [id],
             map_job,
         )
@@ -387,7 +394,7 @@ impl Store {
         let conn = self.conn.lock().expect("sqlite");
         let mut stmt = conn
             .prepare(
-                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes
+                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes, pull_done, pull_total
                  FROM jobs WHERE callback_state = 'pending' AND ended_at BETWEEN ?1 AND ?2",
             )
             .map_err(sql)?;
@@ -443,6 +450,29 @@ impl Store {
         Ok(rows)
     }
 
+    /// The jobs whose image is downloading: id, bytes so far, size known so far.
+    pub fn pulling(&self) -> Result<Vec<(String, u64, u64)>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, pull_done, pull_total FROM jobs \
+                 WHERE ended_at IS NULL AND pull_total IS NOT NULL ORDER BY id",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                ))
+            })
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)?;
+        Ok(rows)
+    }
+
     /// Finished rows whose end time is strictly before `cutoff_unix`. Running rows stay.
     pub fn purge_finished_before(&self, cutoff_unix: i64) -> Result<usize, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
@@ -460,7 +490,7 @@ impl Store {
         let conn = self.conn.lock().expect("sqlite");
         let mut stmt = conn
             .prepare(
-                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes
+                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes, pull_done, pull_total
                  FROM jobs ORDER BY started_at DESC, rowid DESC LIMIT ?1",
             )
             .map_err(sql)?;
@@ -557,6 +587,18 @@ impl Store {
         conn.execute(
             "UPDATE jobs SET disk_bytes = ?2 WHERE id = ?1",
             params![id, bytes.min(i64::MAX as u64) as i64],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+
+    /// How far a job's image download is; None when it is over.
+    pub fn set_pull(&self, id: &str, pull: Option<(u64, u64)>) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let big = |v: u64| v.min(i64::MAX as u64) as i64;
+        conn.execute(
+            "UPDATE jobs SET pull_done = ?2, pull_total = ?3 WHERE id = ?1",
+            params![id, pull.map(|p| big(p.0)), pull.map(|p| big(p.1))],
         )
         .map_err(sql)?;
         Ok(())
@@ -953,7 +995,7 @@ impl Store {
     pub fn managed_last(&self, name: &str) -> Result<Option<JobRecord>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         conn.query_row(
-            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes
+            "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes, pull_done, pull_total
              FROM jobs WHERE managed = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
             [name],
             map_job,
@@ -1142,6 +1184,13 @@ fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
         memory_peak: row.get::<_, Option<i64>>(11)?.map(|v| v.max(0) as u64),
         network_bytes: row.get::<_, Option<i64>>(12)?.map(|v| v.max(0) as u64),
         disk_bytes: row.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u64),
+        pull: match (
+            row.get::<_, Option<i64>>(14)?,
+            row.get::<_, Option<i64>>(15)?,
+        ) {
+            (Some(done), Some(total)) => Some((done.max(0) as u64, total.max(0) as u64)),
+            _ => None,
+        },
     })
 }
 

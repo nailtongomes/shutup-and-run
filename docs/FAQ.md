@@ -171,7 +171,7 @@ For a while: the buttons **for 1 hour**, **for 3 hours** and **for the rest of t
 
 ### How much did a job use?
 
-Each job records its CPU time, the most memory it held, what it received and sent on the network and what it wrote inside its container: `shutup-and-run jobs` (a `used:` line), `jobs --json` (`cpu_ms`, `memory_peak_bytes`, `network_bytes`, `disk_bytes`) and the **CPU / memory / network / disk** column on the page. `jobs --summary` gives the network per job of each image, which is what a job of it costs a PC on a data plan, its pull aside, and the disk per job. The disk is read once, as the container is removed. They come from a reading every 30 seconds while it runs, and show while it runs too (`so far`), so a job shorter than that may have none, and a short peak can be missed. `shutup-and-run jobs --summary` sums up the last 20 and, with five measured or more and room on this PC, names the `max_job_memory` and `max_slots` that would fit more jobs at once; `doctor` says it too (`ROOM_FOR_MORE_SLOTS`). Nothing is changed by itself.
+Each job records its CPU time, the most memory it held, what it received and sent on the network and what it wrote inside its container: `shutup-and-run jobs` (a `used:` line), `jobs --json` (`cpu_ms`, `memory_peak_bytes`, `network_bytes`, `disk_bytes`) and the **CPU / memory / network / disk** column on the page. `jobs --summary` gives the network per job of each image, which is what a job of it costs a PC on a data plan, its pull aside, and the disk per job. The disk is read once, as the container is removed. While its image downloads, the same places say how far: `downloading the image: 120 MiB of 450 MiB`. They come from a reading every 30 seconds while it runs, and show while it runs too (`so far`), so a job shorter than that may have none, and a short peak can be missed. `shutup-and-run jobs --summary` sums up the last 20 and, with five measured or more and room on this PC, names the `max_job_memory` and `max_slots` that would fit more jobs at once; `doctor` says it too (`ROOM_FOR_MORE_SLOTS`). Nothing is changed by itself.
 
 ### What does the poll URL learn about this PC?
 
@@ -183,4 +183,4 @@ Run the install line again (`irm .../install.ps1 | iex` on Windows). It stops th
 
 ### How do I uninstall?
 
-`shutup-and-run wsl uninstall` removes the scheduled task and the WSL2 distribution with its containers and history; `--purge` also removes `C:\ProgramData\shutup-and-run`. On Linux, the uninstall of [the installer](../README.md#installers).
+`shutup-and-run wsl uninstall` removes the scheduled task and the WSL2 distribution with its containers and history; `--purge` also removes `C:\ProgramData\shutup-and-run`. The `%UserProfile%\.wslconfig` the install wrote goes too, when nobody changed it since and no other WSL distribution is left; any other is kept. On Linux, the uninstall of [the installer](../README.md#installers).
