@@ -71,3 +71,12 @@ O `check.ps1` cobre a maior parte; o que ele não mede:
 - [ ] **status.** `shutup-and-run status` mostra as linhas novas quando há o que dizer: pausa com fim, `lend_hours`, espera, bateria, memória, última limpeza.
 - [ ] **Resumo por imagem.** Depois de três tarefas da mesma imagem, `shutup-and-run jobs --summary` tem a linha dela com `ask for memory`.
 
+## 0.2.23: rede limitada, rede por tarefa, saída ao vivo
+
+O `check.ps1` mostra o custo da rede pelo Windows ao lado do `metered_network` do `status.json`, e com `-JobName` lê a saída da tarefa enquanto ela roda e mostra os bytes de rede no fim. O que ele não faz:
+
+- [ ] **Roteador do celular.** Ligue o notebook no roteador de um celular (ou marque o Wi-Fi como limitado em Configurações, Rede, Propriedades): a página diz **ESPERANDO** com "rede limitada", `status.json` tem `metered_network: true`, o código é `METERED_NETWORK` e o mock não recebe polls. Uma tarefa que já rodava continua. Volte para a rede de antes: os polls voltam sozinhos.
+- [ ] **Aceitar a rede limitada.** No roteador do celular, `shutup-and-run config set lend_on_metered true --apply` (ou a caixa **Emprestar também em rede limitada** na página): os polls voltam. `config unset lend_on_metered --apply` volta a esperar.
+- [ ] **Rede por tarefa.** Depois de uma tarefa que baixa algo (um `curl` de um arquivo conhecido), `shutup-and-run jobs` tem `network ...` na linha `used:` com um tamanho próximo, e a coluna **CPU / memória / rede** da página o mesmo.
+- [ ] **Saída ao vivo na página.** Com uma tarefa rodando, a página **Tarefas e logs** tem o link **até agora**; ele abre o que a tarefa imprimiu até aquele momento.
+

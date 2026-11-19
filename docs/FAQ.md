@@ -39,6 +39,10 @@ While Windows says the person is presenting, or has a program in full screen (a 
 
 To also wait while the person is typing or using the mouse: `shutup-and-run config set min_idle_secs 300 --apply` (five minutes without input).
 
+### And on a phone's hotspot?
+
+While Windows says the network is metered (a phone's hotspot, a mobile plan, a connection set as metered in Windows' settings, roaming or over its data limit), no new job starts and the worker does not ask for work, so no image is pulled on someone's data plan. A job already running goes on. On another network jobs start again by themselves. The code is `METERED_NETWORK`. If the person at the PC agrees that jobs spend that data: `shutup-and-run config set lend_on_metered true --apply`, or **Lend on a metered network too** on the page.
+
 ### What should I close when memory is short?
 
 When memory is what keeps the next job from starting, the page shows **Memory is short** with about how much to free, and, on Windows, the programs holding the most of it, each added up over its processes (`chrome 3.1 GiB (38 processes)`). Windows' own processes, the antivirus, WSL and the worker are never listed. Close one you do not need now, or just wait: jobs start again by themselves. The worker never closes anything. When it is WSL2 that is short, the memory is held by a running job and is freed when it ends.
@@ -130,7 +134,7 @@ The page's first line says why, and so do `shutup-and-run doctor` and `shutup-an
 | PAUSED | `WORKER_PAUSED` | when someone resumes; a pause for a while, at its end; any other, also at the next restart of the PC |
 | WAITING FOR YOUR AUTHORIZATION | `AUTHORIZATION_REQUIRED` | when the owner decides, see below |
 | NEW JOBS BLOCKED FOR SAFETY | `SAFETY_*` | by itself, when the PC recovers |
-| WAITING | `OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING` | by itself |
+| WAITING | `OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING`, `METERED_NETWORK` | by itself |
 | waiting: the PC is in use | `USER_ACTIVE` | by itself (`min_idle_secs`) |
 | waiting, not enough resources | `LOW_MEMORY`, `LOW_DISK` | by itself; **Memory is short** says how much to free |
 | busy, every slot is taken | `WORKER_BUSY` | when the running job ends |
@@ -162,11 +166,11 @@ For a while: the buttons **for 1 hour**, **for 3 hours** and **for the rest of t
 
 ### Where do I see what a job printed?
 
-`shutup-and-run jobs logs ID` (or `--last`), or **Jobs and logs** on the page, which can also download it. The last 256 KiB of each job are kept on the PC for 7 days, not masked, and are never sent anywhere.
+`shutup-and-run jobs logs ID` (or `--last`), or **Jobs and logs** on the page, which can also download it. The last 256 KiB of each job are kept on the PC for 7 days, not masked, and are never sent anywhere. For a job still running, the same command and the page's **so far** link show what it printed until now.
 
 ### How much did a job use?
 
-Each job records its CPU time and the most memory it held: `shutup-and-run jobs` (a `used:` line), `jobs --json` (`cpu_ms`, `memory_peak_bytes`) and the **CPU / memory** column on the page. They come from a reading every 30 seconds while it runs, and show while it runs too (`so far`), so a job shorter than that may have none, and a short peak can be missed. `shutup-and-run jobs --summary` sums up the last 20 and, with five measured or more and room on this PC, names the `max_job_memory` and `max_slots` that would fit more jobs at once; `doctor` says it too (`ROOM_FOR_MORE_SLOTS`). Nothing is changed by itself.
+Each job records its CPU time, the most memory it held and what it received and sent on the network: `shutup-and-run jobs` (a `used:` line), `jobs --json` (`cpu_ms`, `memory_peak_bytes`, `network_bytes`) and the **CPU / memory / network** column on the page. `jobs --summary` gives the network per job of each image, which is what a job of it costs a PC on a data plan, its pull aside. They come from a reading every 30 seconds while it runs, and show while it runs too (`so far`), so a job shorter than that may have none, and a short peak can be missed. `shutup-and-run jobs --summary` sums up the last 20 and, with five measured or more and room on this PC, names the `max_job_memory` and `max_slots` that would fit more jobs at once; `doctor` says it too (`ROOM_FOR_MORE_SLOTS`). Nothing is changed by itself.
 
 ### What does the poll URL learn about this PC?
 

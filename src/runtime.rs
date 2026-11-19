@@ -65,7 +65,7 @@ pub trait Runtime: Send + Sync {
         Ok(false)
     }
     /// One reading of a running container's counters: its CPU throttling,
-    /// the CPU time it has used and the memory it holds. None where the
+    /// the CPU time it has used, the memory it holds and the bytes it moved. None where the
     /// daemon does not say.
     async fn stats(&self, _id: &str) -> Result<Option<Stats>, RuntimeError> {
         Ok(None)
@@ -93,6 +93,9 @@ pub struct Stats {
     /// Memory in use now, without the page cache the kernel can drop
     /// (`usage` minus `inactive_file`, as `docker stats` shows it).
     pub memory_bytes: Option<u64>,
+    /// Bytes received and sent on its networks since it started, every
+    /// interface added up. A pull is not in it: the daemon makes that.
+    pub network_bytes: Option<u64>,
 }
 
 /// Counted by the kernel since the container started.

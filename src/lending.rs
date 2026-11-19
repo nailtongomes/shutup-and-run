@@ -7,7 +7,10 @@
 //! - on Windows, not on a battery below [`BATTERY_MIN_PERCENT`]. On a battery
 //!   above it a job starts, and the page says the PC is on its battery;
 //! - on Windows, not while the person at the PC presents or has a program in
-//!   full screen (a game, a video, a slide show, a call in full screen).
+//!   full screen (a game, a video, a slide show, a call in full screen);
+//! - on Windows, not on a metered network (a phone's hotspot, a mobile plan):
+//!   a pull and a job's traffic would spend the person's data. The person
+//!   may accept it with `lend_on_metered`.
 //!
 //! Each is a wait for a new job, read when a job asks to start and before a
 //! poll. A running job is never touched by any of them. A Windows reading
@@ -23,6 +26,7 @@ pub const BATTERY_MIN_PERCENT: u64 = 60;
 pub const OUTSIDE_LEND_HOURS: &str = "OUTSIDE_LEND_HOURS";
 pub const BATTERY_LOW: &str = "BATTERY_LOW";
 pub const USER_PRESENTING: &str = "USER_PRESENTING";
+pub const METERED_NETWORK: &str = "METERED_NETWORK";
 /// Not a wait: the PC is on its battery and above the minimum.
 pub const ON_BATTERY: &str = "ON_BATTERY";
 
@@ -39,8 +43,14 @@ impl std::fmt::Display for Hold {
     }
 }
 
-/// The first reason there is to wait, or None.
-pub fn hold(hours: Option<&LendHours>, feed: Option<Feed>, now_unix: i64) -> Option<Hold> {
+/// The first reason there is to wait, or None. `lend_on_metered`: the
+/// person accepted that jobs spend the data of a metered network.
+pub fn hold(
+    hours: Option<&LendHours>,
+    feed: Option<Feed>,
+    now_unix: i64,
+    lend_on_metered: bool,
+) -> Option<Hold> {
     let hold = |code: &str, detail: String| {
         Some(Hold {
             code: code.to_string(),
@@ -85,6 +95,12 @@ pub fn hold(hours: Option<&LendHours>, feed: Option<Feed>, now_unix: i64) -> Opt
         return hold(
             USER_PRESENTING,
             "the person at the PC is presenting or has a program in full screen".to_string(),
+        );
+    }
+    if feed.metered == Some(true) && !lend_on_metered {
+        return hold(
+            METERED_NETWORK,
+            "the PC is on a metered network (a phone's hotspot or a mobile plan)".to_string(),
         );
     }
     None
@@ -347,6 +363,10 @@ pub fn label(code: &str, portuguese: bool) -> &'static str {
             "The person at the PC is presenting or has a program in full screen",
             "Quem usa o PC está apresentando ou com um programa em tela cheia",
         ),
+        METERED_NETWORK => (
+            "The PC is on a metered network (a phone's hotspot or a mobile plan)",
+            "O PC está numa rede limitada (o roteador do celular ou um plano móvel)",
+        ),
         _ => ("Waiting", "Esperando"),
     };
     if portuguese {
@@ -436,7 +456,7 @@ mod tests {
             utc_offset_secs: Some(-3 * 3600),
             ..Feed::default()
         };
-        let held = hold(Some(&hours), Some(sao_paulo), now).unwrap();
+        let held = hold(Some(&hours), Some(sao_paulo), now, false).unwrap();
         assert_eq!(held.code, OUTSIDE_LEND_HOURS);
         assert_eq!(
             held.detail,
@@ -446,7 +466,7 @@ mod tests {
             utc_offset_secs: Some(0),
             ..Feed::default()
         };
-        assert_eq!(hold(Some(&hours), Some(utc), now), None);
+        assert_eq!(hold(Some(&hours), Some(utc), now, false), None);
         assert_eq!(offset_secs(Some(sao_paulo), now), -10_800);
         assert_eq!(clock(Some(sao_paulo), now), "wed 18:30, UTC-03:00");
         assert_eq!(hour_at(Some(sao_paulo), now + 3600), "19:30");
@@ -464,7 +484,7 @@ mod tests {
             presenting,
             ..Feed::default()
         };
-        let code = |f: Option<Feed>| hold(None, f, 0).map(|h| h.code);
+        let code = |f: Option<Feed>| hold(None, f, 0, false).map(|h| h.code);
         assert_eq!(
             code(Some(feed(Some(true), Some(59), None))).as_deref(),
             Some(BATTERY_LOW)
@@ -490,10 +510,30 @@ mod tests {
             Some(&never),
             Some(feed(Some(true), Some(10), None)),
             1_795_010_700,
+            false,
         );
         assert_eq!(held.unwrap().code, OUTSIDE_LEND_HOURS);
-        for code in [OUTSIDE_LEND_HOURS, BATTERY_LOW, USER_PRESENTING] {
+        for code in [
+            OUTSIDE_LEND_HOURS,
+            BATTERY_LOW,
+            USER_PRESENTING,
+            METERED_NETWORK,
+        ] {
             assert_ne!(label(code, false), "Waiting");
         }
+    }
+
+    #[test]
+    fn a_metered_network_holds_unless_the_person_accepted_it() {
+        let metered = |metered| Feed {
+            metered,
+            ..Feed::default()
+        };
+        let held = hold(None, Some(metered(Some(true))), 0, false).unwrap();
+        assert_eq!(held.code, METERED_NETWORK);
+        assert_eq!(hold(None, Some(metered(Some(true))), 0, true), None);
+        assert_eq!(hold(None, Some(metered(Some(false))), 0, false), None);
+        // Windows does not know what the network costs: no wait.
+        assert_eq!(hold(None, Some(metered(None)), 0, false), None);
     }
 }

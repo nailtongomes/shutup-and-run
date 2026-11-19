@@ -890,9 +890,7 @@ mod tests {
             | crate::launcher::LaunchOutcome::Existing(job) => job.id,
         };
         launcher.settled().await;
-        mock.set_output(&id, "line one\nresult: 42\n").await;
-        mock.stop(&id, 0).await;
-        launcher.on_exit(&id, 0).await;
+        mock.set_output(&id, "line one\n").await;
 
         let get = |uri: String, ip: [u8; 4]| {
             let app = app.clone();
@@ -914,6 +912,18 @@ mod tests {
                 )
             }
         };
+        // Running: no file yet; what it printed so far, from Docker.
+        let (_, _, list) = get("/local/logs".into(), LO).await;
+        assert!(
+            list.contains(&format!("<a href=\"/local/logs/{id}\">so far</a>")),
+            "{list}"
+        );
+        let (status, _, text) = get(format!("/local/logs/{id}"), LO).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "line one\n"));
+        mock.set_output(&id, "line one\nresult: 42\n").await;
+        mock.stop(&id, 0).await;
+        launcher.on_exit(&id, 0).await;
+
         let (status, _, home) = get("/".into(), LO).await;
         assert_eq!(status, StatusCode::OK);
         assert!(home.contains("/local/logs"));

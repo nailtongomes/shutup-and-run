@@ -58,6 +58,12 @@ pub struct Feed {
     /// one it is set back to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unix_ms: Option<i64>,
+    /// The network Windows uses is metered: a phone's hotspot, a mobile
+    /// plan, a connection the person set as metered, roaming, or over its
+    /// data limit (`GetNetworkConnectivityHint`). Missing when Windows does
+    /// not know what the network costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metered: Option<bool>,
 }
 
 /// How far the clock inside WSL2 may be from Windows before the service
@@ -235,6 +241,7 @@ mod tests {
             presenting: None,
             utc_offset_secs: Some(-10_800),
             unix_ms: Some(1_795_026_600_250),
+            metered: Some(true),
         };
         let text = line(&feed);
         assert!(text.starts_with("host-feed {") && text.ends_with("}\n"));

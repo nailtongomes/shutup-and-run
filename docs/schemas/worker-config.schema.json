@@ -158,6 +158,11 @@
       "minLength": 1,
       "description": "When the machine lends itself, on its own clock. One or more windows split by ';', each '[DAYS] HH[:MM]-HH[:MM]' or only DAYS for the whole day; DAYS like 'mon-fri' or 'sat,sun', every day without it. A window whose end comes before its start goes past midnight and belongs to the day it starts. Outside every window no new job starts and the worker does not poll; a running job is never stopped. Left out: at any time. Example: 'mon-fri 19-07; sat,sun'."
     },
+    "lend_on_metered": {
+      "type": "boolean",
+      "default": false,
+      "description": "Windows only. False: while the PC is on a metered network (a phone's hotspot, a mobile plan, a connection set as metered, roaming or over its data limit, as Windows says), no new job starts and the worker does not poll; a running job is never stopped. True: the person at the PC accepted that jobs spend that data. Does nothing on Linux, or where Windows does not know the network's cost."
+    },
     "certificate_enabled": {
       "type": "boolean",
       "default": false,
