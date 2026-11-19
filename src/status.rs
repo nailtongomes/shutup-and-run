@@ -572,8 +572,13 @@ async fn log_file(
         return StatusCode::NOT_FOUND.into_response();
     }
     let path = crate::joblogs::path(&launcher.settings().history_path, &id);
-    let Ok(bytes) = std::fs::read(&path) else {
-        return StatusCode::NOT_FOUND.into_response();
+    // A running job has no file yet: what it printed so far, from Docker.
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => match launcher.live_output(&id).await {
+            Some(bytes) => bytes,
+            None => return StatusCode::NOT_FOUND.into_response(),
+        },
     };
     let disposition = if query.contains_key("download") {
         format!("attachment; filename=\"shutup-and-run-{id}.log\"")
@@ -797,7 +802,7 @@ fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
         lang.t("Exit", "Saída"),
         lang.t("Log", "Log"),
     );
-    let l_used = lang.t("CPU / memory", "CPU / memória");
+    let l_used = lang.t("CPU / memory / network", "CPU / memória / rede");
     let body: String = rows
         .iter()
         .map(|row| {
@@ -810,6 +815,12 @@ fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
                     open = lang.t("open", "abrir"),
                     save = lang.t("download", "baixar"),
                     size = log_size(bytes),
+                ),
+                // Running: what it printed so far, read when opened.
+                None if job.is_some_and(|j| !j.is_finished()) => format!(
+                    "<a href=\"/local/logs/{id}\">{open}</a>",
+                    id = escape(id),
+                    open = lang.t("so far", "até agora"),
                 ),
                 None => "<span class=\"muted\">&ndash;</span>".to_string(),
             };
@@ -851,18 +862,22 @@ fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
     )
 }
 
-/// `5.5 s / 300 MiB`: the CPU time a job used and the most memory it held,
-/// from readings every 30 seconds. A dash for what was not read.
+/// `5.5 s / 300 MiB / 12 MiB`: the CPU time a job used, the most memory it
+/// held and what it moved on the network, from readings every 30 seconds.
+/// A dash for what was not read.
 fn used_cell(job: &JobRecord) -> String {
-    if job.cpu_ms.is_none() && job.memory_peak.is_none() {
+    if job.cpu_ms.is_none() && job.memory_peak.is_none() && job.network_bytes.is_none() {
         return "&ndash;".to_string();
     }
     format!(
-        "{} / {}",
+        "{} / {} / {}",
         job.cpu_ms
             .map(|ms| format!("{:.1} s", ms as f64 / 1000.0))
             .unwrap_or_else(|| "&ndash;".into()),
         job.memory_peak
+            .map(|bytes| escape(&crate::jobs::memory_text(bytes)))
+            .unwrap_or_else(|| "&ndash;".into()),
+        job.network_bytes
             .map(|bytes| escape(&crate::jobs::memory_text(bytes)))
             .unwrap_or_else(|| "&ndash;".into())
     )
@@ -1683,6 +1698,13 @@ fn field_text(name: &str, lang: Lang) -> (&'static str, &'static str) {
                 "Hora local, como mon-fri 19-07; sat,sun. Fora deles nenhuma tarefa nova começa. Vazio: a qualquer hora.",
             ),
         ),
+        "lend_on_metered" => (
+            lang.t("Lend on a metered network too", "Emprestar também em rede limitada"),
+            lang.t(
+                "Windows: on a phone's hotspot or a mobile plan, jobs start and spend its data. Off: they wait for another network.",
+                "Windows: no roteador do celular ou num plano móvel, as tarefas começam e gastam os dados dele. Desligado: esperam outra rede.",
+            ),
+        ),
         "allowlist" => (
             lang.t("Allowed images", "Imagens permitidas"),
             lang.t("One per line. A job with any other image is refused.", "Uma por linha. Uma tarefa com outra imagem é recusada."),
@@ -1758,7 +1780,12 @@ fn field_groups(lang: Lang) -> [(&'static str, &'static [&'static str]); 6] {
                 "How much this computer lends",
                 "Quanto este computador empresta",
             ),
-            &["max_slots", "min_idle_secs", "lend_hours"],
+            &[
+                "max_slots",
+                "min_idle_secs",
+                "lend_hours",
+                "lend_on_metered",
+            ],
         ),
         (
             lang.t("Which images may run", "Quais imagens podem rodar"),
@@ -3384,6 +3411,7 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
             "hold": live.computer.hold,
             "on_battery_percent": crate::lending::on_battery(live.computer.host),
             "battery_percent": crate::lending::battery(live.computer.host),
+            "metered_network": live.computer.host.and_then(|h| h.metered),
             "clock_skew_secs": crate::host::clock_skew_secs(),
             "utc_offset_secs": crate::lending::offset_secs(live.computer.host, now_unix),
         }),

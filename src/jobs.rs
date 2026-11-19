@@ -35,9 +35,10 @@ shutup-and-run jobs --summary [--limit N] [--json]
 shutup-and-run jobs logs ID|--last [--tail N] [--json]
     what a job printed (stdout and stderr): its last 256 KiB, kept for 7
     days in the logs folder next to the history. ID may be the start of an
-    id. --last is the most recent job that ended. --tail N prints only the
-    last N lines. Exit 1 with JOB_NOT_FOUND, JOB_ID_AMBIGUOUS or
-    JOB_LOG_MISSING."
+    id. --last is the most recent job that ended. A job still running
+    prints what it printed so far, read from Docker now (live: true in
+    --json). --tail N prints only the last N lines. Exit 1 with
+    JOB_NOT_FOUND, JOB_ID_AMBIGUOUS or JOB_LOG_MISSING."
 }
 
 /// `running`, `ok`, `failed`, `timeout`, `killed` or `interrupted`.
@@ -110,10 +111,12 @@ pub fn job_json(job: &JobRecord) -> Value {
         "oom_killed": job.oom_killed,
         "cpu_ms": job.cpu_ms,
         "memory_peak_bytes": job.memory_peak,
+        "network_bytes": job.network_bytes,
     })
 }
 
-/// `cpu 5.5 s, memory peak 300 MiB`, from what the readings saw; `so far`
+/// `cpu 5.5 s, memory peak 300 MiB, network 12 MiB`, from what the
+/// readings saw; `so far`
 /// while the job runs. None when the job was never read (it ran under 30
 /// seconds, or it has run less than that).
 pub fn usage_text(job: &JobRecord) -> Option<String> {
@@ -123,6 +126,9 @@ pub fn usage_text(job: &JobRecord) -> Option<String> {
     }
     if let Some(bytes) = job.memory_peak {
         parts.push(format!("memory peak {}", memory_text(bytes)));
+    }
+    if let Some(bytes) = job.network_bytes {
+        parts.push(format!("network {}", memory_text(bytes)));
     }
     let so_far = if job.ended_at.is_none() {
         " so far"
@@ -183,6 +189,9 @@ pub struct ImageSummary {
     /// The `memory` to ask in a request for this image: twice its highest
     /// peak, rounded up to 256 MiB. Only from `MIN_MEASURED_PER_IMAGE`.
     pub memory_to_ask: Option<u64>,
+    /// What one job of it received and sent on the network, on average:
+    /// what it costs a PC on a metered plan. Its pull is not in it.
+    pub network_bytes_mean: Option<u64>,
 }
 
 /// Fewer measured jobs of one image than this make no suggestion for it.
@@ -203,6 +212,7 @@ pub fn by_image(jobs: &[JobRecord]) -> Vec<ImageSummary> {
                     memory_peak_max: None,
                     memory_peak_mean: None,
                     memory_to_ask: None,
+                    network_bytes_mean: None,
                 });
                 images.len() - 1
             }
@@ -223,13 +233,20 @@ pub fn by_image(jobs: &[JobRecord]) -> Vec<ImageSummary> {
             .memory_peak_max
             .filter(|_| image.measured >= MIN_MEASURED_PER_IMAGE)
             .map(twice_rounded);
+        let network: Vec<u64> = jobs
+            .iter()
+            .filter(|j| j.is_finished() && j.image == image.image)
+            .filter_map(|j| j.network_bytes)
+            .collect();
+        image.network_bytes_mean =
+            (!network.is_empty()).then(|| network.iter().sum::<u64>() / network.len() as u64);
     }
     images.sort_by(|a, b| b.jobs.cmp(&a.jobs).then_with(|| a.image.cmp(&b.image)));
     images
 }
 
 /// `  alpine: 6 jobs, 5 measured, memory peak 380 MiB at most (210 MiB on
-/// average); ask for memory 768m`.
+/// average), network 40 MiB a job; ask for memory 768m`.
 pub fn image_text(image: &ImageSummary) -> String {
     let mut text = format!(
         "  {}: {} jobs, {} measured",
@@ -241,6 +258,9 @@ pub fn image_text(image: &ImageSummary) -> String {
             memory_text(max),
             memory_text(mean)
         ));
+    }
+    if let Some(bytes) = image.network_bytes_mean {
+        text.push_str(&format!(", network {} a job", memory_text(bytes)));
     }
     if let Some(ask) = image.memory_to_ask {
         text.push_str(&format!("; ask for memory {}", size_value(ask)));
@@ -457,8 +477,13 @@ fn coded(code: &str, error: String) -> Out {
     out
 }
 
-/// `jobs logs ID|--last [--tail N]`.
-pub fn logs_out(history: &Path, wanted: Option<&str>, tail: Option<usize>) -> Out {
+/// What a running job printed so far, read from Docker now: its id in,
+/// the end of its output out.
+pub type Live<'a> = &'a dyn Fn(&str) -> Result<Vec<u8>, String>;
+
+/// `jobs logs ID|--last [--tail N]`. A job that is still running has no
+/// file yet: what it printed so far comes from `live`.
+pub fn logs_out(history: &Path, wanted: Option<&str>, tail: Option<usize>, live: Live) -> Out {
     let store = if history.exists() {
         Store::open(history).ok()
     } else {
@@ -469,11 +494,12 @@ pub fn logs_out(history: &Path, wanted: Option<&str>, tail: Option<usize>) -> Ou
         Err(out) => return out,
     };
     let job = store.as_ref().and_then(|s| s.get(&id).ok().flatten());
-    let Some(info) = crate::joblogs::info(history, &id) else {
+    let info = crate::joblogs::info(history, &id);
+    if let (None, Some(running)) = (&info, job.as_ref().filter(|j| !j.is_finished())) {
+        return live_out(running, tail, live);
+    }
+    let Some(info) = info else {
         let why = match &job {
-            Some(job) if !job.is_finished() => {
-                "it is still running; its log is written when it ends"
-            }
             Some(job) if job.reason.as_deref() == Some(REASON_START_FAILED) => {
                 "it never started a container, so it printed nothing"
             }
@@ -495,6 +521,7 @@ pub fn logs_out(history: &Path, wanted: Option<&str>, tail: Option<usize>) -> Ou
         "path": info.path.display().to_string(),
         "bytes": info.bytes,
         "written_at": utc(info.written_at),
+        "live": false,
         "log": shown,
     });
     if let Some(job) = &job {
@@ -503,6 +530,66 @@ pub fn logs_out(history: &Path, wanted: Option<&str>, tail: Option<usize>) -> Ou
         value["exit_code"] = json!(job.exit_code);
     }
     Out::ok(value, shown.strip_suffix('\n').unwrap_or(shown))
+}
+
+/// A running job's output so far, from Docker; its log file is written
+/// when it ends.
+fn live_out(job: &JobRecord, tail: Option<usize>, live: Live) -> Out {
+    let bytes = match live(&job.id) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return coded(
+                "JOB_LOG_MISSING",
+                format!(
+                    "job {} is running and Docker did not give what it printed so far: {err}",
+                    job.id
+                ),
+            )
+        }
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let shown = match tail {
+        Some(n) => crate::joblogs::tail_lines(&text, n),
+        None => &text,
+    };
+    let value = json!({
+        "id": job.id,
+        "path": null,
+        "bytes": bytes.len(),
+        "written_at": null,
+        "live": true,
+        "log": shown,
+        "image": job.image,
+        "status": status_of(job),
+        "exit_code": null,
+    });
+    Out::ok(value, shown.strip_suffix('\n').unwrap_or(shown))
+}
+
+/// The end of a running container's output, asked of Docker on a thread of
+/// its own: the CLI may already be inside a runtime.
+fn docker_output(id: &str) -> Result<Vec<u8>, String> {
+    use crate::runtime::Runtime;
+    let id = id.to_string();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())?;
+        runtime.block_on(async {
+            let docker = crate::bollard_rt::connect_docker()?;
+            let docker = crate::bollard_rt::BollardRuntime::new(docker, None);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                docker.output(&id, crate::joblogs::MAX_BYTES),
+            )
+            .await
+            .map_err(|_| "no answer in 20 s".to_string())?
+            .map_err(|err| err.to_string())
+        })
+    })
+    .join()
+    .unwrap_or_else(|_| Err("the thread that asked Docker failed".into()))
 }
 
 fn logs_cli(args: &[String], as_json: bool) -> ExitCode {
@@ -545,7 +632,7 @@ fn logs_cli(args: &[String], as_json: bool) -> ExitCode {
         );
     }
     let out = match crate::config::Settings::history_path() {
-        Ok(path) => logs_out(&path, wanted, tail),
+        Ok(path) => logs_out(&path, wanted, tail, &docker_output),
         Err(err) => Out::fail(EXIT_FAILED, err.0),
     };
     emit(out, as_json)
@@ -718,6 +805,7 @@ mod tests {
             oom_killed: false,
             cpu_ms: None,
             memory_peak: peak.map(|p| p * mib),
+            network_bytes: peak.map(|p| p * mib / 10),
         };
         let jobs = vec![
             job(1, "rpa", Some(900)),
@@ -743,7 +831,7 @@ mod tests {
         assert_eq!(images[1].memory_to_ask, None);
         assert_eq!(
             image_text(&images[1]),
-            "  report: 2 jobs, 1 measured, memory peak 200 MiB at most (200 MiB on average)"
+            "  report: 2 jobs, 1 measured, memory peak 200 MiB at most (200 MiB on average), network 20 MiB a job"
         );
     }
 
@@ -773,7 +861,9 @@ mod tests {
                 .finish(&id, n * 1000 + 100, Some(0), crate::REASON_EXITED, "")
                 .unwrap();
             // 40 s of processor in 100 s: 0.4 of one.
-            store.set_usage(&id, Some(40_000), Some(peak)).unwrap();
+            store
+                .set_usage(&id, Some(40_000), Some(peak), None)
+                .unwrap();
         };
         for n in 1..=4 {
             add(n, (100 + 70 * n as u64) * mib);
@@ -871,7 +961,7 @@ mod tests {
             .finish("a-ok", 1_030, Some(0), crate::REASON_EXITED, noisy)
             .unwrap();
         store
-            .set_usage("a-ok", Some(12_345), Some(300 << 20))
+            .set_usage("a-ok", Some(12_345), Some(300 << 20), Some(12 << 20))
             .unwrap();
         start("b-failed", 1_100);
         store
@@ -927,7 +1017,10 @@ mod tests {
             (json!(12_345), json!(300 << 20))
         );
         assert!(jobs[4]["cpu_ms"].is_null() && jobs[4]["memory_peak_bytes"].is_null());
-        assert!(out.text.contains("used: cpu 12.3 s, memory peak 300 MiB"));
+        assert_eq!(ok["network_bytes"], json!(12 << 20));
+        assert!(out
+            .text
+            .contains("used: cpu 12.3 s, memory peak 300 MiB, network 12 MiB"));
         assert_eq!(jobs[4]["failure"], "the container exited with code 3");
         assert_eq!(jobs[1]["failure"], "did not start: failed to pull image");
         assert!(jobs[1]["exit_code"].is_null());
@@ -950,6 +1043,7 @@ mod tests {
                 "image",
                 "log",
                 "memory_peak_bytes",
+                "network_bytes",
                 "oom_killed",
                 "started_at",
                 "status"

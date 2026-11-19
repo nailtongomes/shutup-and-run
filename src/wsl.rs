@@ -3084,6 +3084,7 @@ fn host_feed(cpu_busy_percent: Option<u64>) -> crate::host::Feed {
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .map(|d| d.as_millis() as i64),
+        metered: host_metered(),
     }
 }
 
@@ -3275,6 +3276,53 @@ pub(crate) fn utc_offset_of(which: u32, bias: i32, standard: i32, daylight: i32)
         _ => return None,
     };
     Some(-i64::from(minutes) * 60)
+}
+
+/// Whether the network Windows uses now is metered, from
+/// `GetNetworkConnectivityHint` (Windows 10 2004 and later). None when the
+/// call fails or Windows does not know the cost.
+#[cfg(windows)]
+fn host_metered() -> Option<bool> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct ConnectivityHint {
+        level: i32,
+        cost: i32,
+        approaching_data_limit: u8,
+        over_data_limit: u8,
+        roaming: u8,
+    }
+    #[link(name = "iphlpapi")]
+    extern "system" {
+        fn GetNetworkConnectivityHint(hint: *mut ConnectivityHint) -> i32;
+    }
+    let mut hint = ConnectivityHint::default();
+    // SAFETY: one NL_NETWORK_CONNECTIVITY_HINT of our own, laid out as
+    // documented, written by the call and read only when it returned 0.
+    if unsafe { GetNetworkConnectivityHint(&mut hint) } != 0 {
+        return None;
+    }
+    metered_of(hint.cost, hint.over_data_limit != 0, hint.roaming != 0)
+}
+
+#[cfg(not(windows))]
+fn host_metered() -> Option<bool> {
+    None
+}
+
+/// NetworkConnectivityCostHint: 0 unknown, 1 unrestricted, 2 fixed (a plan
+/// with a data cap), 3 variable (paid by the byte). Roaming or over the
+/// limit is metered whatever the cost says.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn metered_of(cost: i32, over_data_limit: bool, roaming: bool) -> Option<bool> {
+    if over_data_limit || roaming {
+        return Some(true);
+    }
+    match cost {
+        1 => Some(false),
+        2 | 3 => Some(true),
+        _ => None,
+    }
 }
 
 /// Whether the person presents or has a program in full screen, from
@@ -4613,6 +4661,12 @@ mod tests {
         assert_eq!(utc_offset_of(1, -330, 0, 0), Some(5 * 3600 + 1800));
         assert_eq!(utc_offset_of(u32::MAX, 0, 0, 0), None);
         assert!(presenting_of(2) && presenting_of(3) && presenting_of(4));
+        assert_eq!(metered_of(1, false, false), Some(false));
+        assert_eq!(metered_of(2, false, false), Some(true));
+        assert_eq!(metered_of(3, false, false), Some(true));
+        assert_eq!(metered_of(0, false, false), None);
+        assert_eq!(metered_of(1, false, true), Some(true));
+        assert_eq!(metered_of(0, true, false), Some(true));
         assert!(!presenting_of(1) && !presenting_of(5) && !presenting_of(6) && !presenting_of(7));
     }
 }

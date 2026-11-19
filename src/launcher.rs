@@ -67,7 +67,8 @@ pub enum LaunchError {
     /// `min_idle_secs` is set and the person at the PC is using it.
     #[error("{0}")]
     UserActive(UserActive),
-    /// Outside `lend_hours`, a PC on a low battery, or a person presenting.
+    /// Outside `lend_hours`, a PC on a low battery, a person presenting, or a
+    /// metered network.
     /// It clears by itself; nothing was stored.
     #[error("{0}")]
     NotLending(crate::lending::Hold),
@@ -119,6 +120,7 @@ pub struct Sampled {
     pub throttling: Option<crate::runtime::Throttling>,
     pub cpu_ns: Option<u64>,
     pub memory_peak: Option<u64>,
+    pub network_bytes: Option<u64>,
 }
 
 impl Sampled {
@@ -126,6 +128,7 @@ impl Sampled {
         self.throttling = read.throttling.or(self.throttling);
         self.cpu_ns = self.cpu_ns.max(read.cpu_ns);
         self.memory_peak = self.memory_peak.max(read.memory_bytes);
+        self.network_bytes = self.network_bytes.max(read.network_bytes);
     }
 }
 
@@ -512,7 +515,9 @@ impl Launcher {
                     *sampled
                 };
                 let cpu_ms = sampled.cpu_ns.map(|ns| ns / 1_000_000);
-                let _ = self.store.set_usage(&id, cpu_ms, sampled.memory_peak);
+                let _ =
+                    self.store
+                        .set_usage(&id, cpu_ms, sampled.memory_peak, sampled.network_bytes);
             }
         }
     }
@@ -524,13 +529,14 @@ impl Launcher {
         user_active(self.settings.min_idle_secs, crate::host::current())
     }
 
-    /// Outside `lend_hours`, on a battery below the minimum, or while the
-    /// person presents (`src/lending.rs`).
+    /// Outside `lend_hours`, on a battery below the minimum, while the
+    /// person presents, or on a metered network (`src/lending.rs`).
     pub fn lending_hold(&self) -> Option<crate::lending::Hold> {
         crate::lending::hold(
             self.settings.lend_hours.as_ref(),
             crate::host::current(),
             self.clock.now_unix() as i64,
+            self.settings.lend_on_metered,
         )
     }
 
@@ -1119,7 +1125,12 @@ impl Launcher {
                 let sampled = self.samples.lock().expect("samples").remove(id);
                 if let Some(sampled) = sampled {
                     let cpu_ms = sampled.cpu_ns.map(|ns| ns / 1_000_000);
-                    let _ = self.store.set_usage(id, cpu_ms, sampled.memory_peak);
+                    let _ = self.store.set_usage(
+                        id,
+                        cpu_ms,
+                        sampled.memory_peak,
+                        sampled.network_bytes,
+                    );
                 }
                 self.note_resource_incidents(&job, sampled.and_then(|s| s.throttling));
                 // Before the container goes, with its output.
@@ -1176,6 +1187,19 @@ impl Launcher {
         if let Err(err) = crate::joblogs::save(&self.settings.history_path, id, &output) {
             tracing::warn!(%id, error = %err, "job log: could not write it");
         }
+    }
+
+    /// What a running job printed so far, from Docker, for the local page.
+    /// None for a job that is not running: its log file has it.
+    pub async fn live_output(&self, id: &str) -> Option<Vec<u8>> {
+        let job = self.store.get(id).ok().flatten()?;
+        if job.is_finished() {
+            return None;
+        }
+        self.runtime
+            .output(id, crate::joblogs::MAX_BYTES)
+            .await
+            .ok()
     }
 
     /// Recent jobs, newest first, for the local page.
@@ -1953,6 +1977,25 @@ mod tests {
     async fn every_job_that_ran_leaves_its_output_in_a_log_file_and_the_doctor_names_it() {
         let (launcher, mock, _clock) = harness(3);
         let history = launcher.settings().history_path.clone();
+        let no_docker = |_: &str| -> Result<Vec<u8>, String> { Err("no docker here".into()) };
+
+        // Running: what it printed so far, from Docker, and no file yet.
+        let running = started(&launcher, job("alpine", None)).await;
+        let live = |id: &str| -> Result<Vec<u8>, String> {
+            assert_eq!(id, running);
+            Ok(b"step 1\nstep 2\n".to_vec())
+        };
+        let out = crate::jobs::logs_out(&history, Some(&running), Some(1), &live);
+        assert_eq!(out.code, 0, "{}", out.json);
+        assert_eq!(
+            (out.json["live"].clone(), out.json["status"].clone()),
+            (json!(true), json!("running"))
+        );
+        assert_eq!(out.text, "step 2");
+        let out = crate::jobs::logs_out(&history, Some(&running), None, &no_docker);
+        assert_eq!(out.json["code"], "JOB_LOG_MISSING");
+        assert!(out.text.contains("no docker here"), "{}", out.text);
+        assert!(launcher.stop(&running).await.unwrap());
 
         let ok = started(&launcher, job("alpine", None)).await;
         mock.set_output(&ok, "hello from the job\n").await;
@@ -1970,12 +2013,12 @@ mod tests {
         mock.stop(&bad, 3).await;
         launcher.on_exit(&bad, 3).await;
         // By the start of its id, and --last, with --tail.
-        let out = crate::jobs::logs_out(&history, Some(&bad[..8]), None);
+        let out = crate::jobs::logs_out(&history, Some(&bad[..8]), None, &no_docker);
         assert_eq!(out.code, 0, "{}", out.json);
         assert_eq!(out.json["status"], "failed");
         assert_eq!(out.json["exit_code"], 3);
         assert!(out.text.contains("Traceback: boom"));
-        let last = crate::jobs::logs_out(&history, None, Some(1));
+        let last = crate::jobs::logs_out(&history, None, Some(1), &no_docker);
         assert_eq!(last.json["id"], bad.as_str());
         assert_eq!(last.text, "Traceback: boom");
         // `jobs --json` says where, and the doctor which command reads it.
@@ -2001,7 +2044,7 @@ mod tests {
         assert!(crate::joblogs::info(&history, &stopped).is_some());
 
         // Not there: an unknown id, a job that never started a container.
-        let unknown = crate::jobs::logs_out(&history, Some("nope"), None);
+        let unknown = crate::jobs::logs_out(&history, Some("nope"), None, &no_docker);
         assert_eq!(
             (unknown.code, unknown.json["code"].as_str()),
             (1, Some("JOB_NOT_FOUND"))
@@ -2009,7 +2052,7 @@ mod tests {
         mock.fail_start(true).await;
         let never = started(&launcher, job("alpine", None)).await;
         mock.fail_start(false).await;
-        let missing = crate::jobs::logs_out(&history, Some(&never), None);
+        let missing = crate::jobs::logs_out(&history, Some(&never), None, &no_docker);
         assert_eq!(missing.json["code"], "JOB_LOG_MISSING");
         assert!(missing.text.contains("never started"));
         assert_eq!(
@@ -3026,13 +3069,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_job_records_its_cpu_time_and_its_memory_peak() {
+    async fn a_job_records_its_cpu_time_its_memory_peak_and_its_network() {
         use crate::runtime::Stats;
         let (launcher, mock) = harness_with(2, |_| {});
         let id = started(&launcher, job("alpine", None)).await;
         let read = |cpu_ns, memory| Stats {
             cpu_ns: Some(cpu_ns),
             memory_bytes: Some(memory),
+            network_bytes: Some(cpu_ns / 100),
             ..Stats::default()
         };
         mock.set_stats(Some(read(2_000_000_000, 300 << 20))).await;
@@ -3045,7 +3089,7 @@ mod tests {
         );
         assert_eq!(
             crate::jobs::usage_text(&row).as_deref(),
-            Some("cpu 2.0 s, memory peak 300 MiB so far")
+            Some("cpu 2.0 s, memory peak 300 MiB, network 19 MiB so far")
         );
         // The peak is the most any reading saw; the CPU time, the last.
         mock.set_stats(Some(read(5_500_000_000, 120 << 20))).await;
@@ -3054,8 +3098,8 @@ mod tests {
         launcher.on_exit(&id, 0).await;
         let row = launcher.store.get(&id).unwrap().unwrap();
         assert_eq!(
-            (row.cpu_ms, row.memory_peak),
-            (Some(5_500), Some(300 << 20))
+            (row.cpu_ms, row.memory_peak, row.network_bytes),
+            (Some(5_500), Some(300 << 20), Some(55_000_000))
         );
         // Never read: nothing is made up.
         mock.set_stats(None).await;
@@ -3063,7 +3107,10 @@ mod tests {
         mock.stop(&quick, 0).await;
         launcher.on_exit(&quick, 0).await;
         let row = launcher.store.get(&quick).unwrap().unwrap();
-        assert_eq!((row.cpu_ms, row.memory_peak), (None, None));
+        assert_eq!(
+            (row.cpu_ms, row.memory_peak, row.network_bytes),
+            (None, None, None)
+        );
     }
 
     #[tokio::test]

@@ -116,6 +116,9 @@ pub struct Settings {
     pub min_idle_secs: u64,
     /// When the machine lends itself. None: at any time.
     pub lend_hours: Option<crate::lending::LendHours>,
+    /// Windows: jobs start on a metered network too. Off: they wait for
+    /// another network, so a job does not spend the person's mobile data.
+    pub lend_on_metered: bool,
     /// Certificate passthrough: every container of this machine gets the
     /// owner's PKCS#12 file and its password. Off unless the owner turned it
     /// on and accepted that in the config.
@@ -194,6 +197,7 @@ struct FileConfig {
     min_free_disk: Option<String>,
     min_idle_secs: Option<u64>,
     lend_hours: Option<String>,
+    lend_on_metered: Option<bool>,
     certificate_enabled: Option<bool>,
     certificate_consent: Option<bool>,
     certificate_name: Option<String>,
@@ -545,6 +549,9 @@ impl Settings {
         let lend_hours = take_string(env, "SHUTUP_AND_RUN_LEND_HOURS", file.lend_hours)
             .map(|text| crate::lending::LendHours::parse(&text).map_err(ConfigError))
             .transpose()?;
+        let lend_on_metered =
+            take_bool(env, "SHUTUP_AND_RUN_LEND_ON_METERED", file.lend_on_metered)?
+                .unwrap_or(false);
         let certificate_enabled = file.certificate_enabled.unwrap_or(false);
         if certificate_enabled && !file.certificate_consent.unwrap_or(false) {
             return Err(ConfigError(
@@ -640,6 +647,7 @@ impl Settings {
             min_free_disk,
             min_idle_secs,
             lend_hours,
+            lend_on_metered,
             certificate_enabled,
             certificate_name,
             certificate_dir: PathBuf::from(CERTIFICATE_DIR),
@@ -754,6 +762,7 @@ pub const KEYS: &[Key] = &[
     key("min_free_disk", Kind::Text, OnPage::Locked),
     key("min_idle_secs", Kind::Int, OnPage::Open),
     key("lend_hours", Kind::Text, OnPage::Open),
+    key("lend_on_metered", Kind::Bool, OnPage::Open),
     key("certificate_enabled", Kind::Bool, OnPage::No),
     key("certificate_consent", Kind::Bool, OnPage::No),
     key("certificate_name", Kind::Text, OnPage::No),

@@ -39,6 +39,10 @@ Enquanto o Windows disser que a pessoa está apresentando, ou com um programa em
 
 Para esperar também enquanto a pessoa digita ou usa o mouse: `shutup-and-run config set min_idle_secs 300 --apply` (cinco minutos sem uso).
 
+### E no roteador do celular?
+
+Enquanto o Windows disser que a rede é limitada (o roteador do celular, um plano móvel, uma conexão marcada como limitada nas configurações do Windows, roaming ou acima do limite de dados), nenhuma tarefa nova começa e o worker não pede trabalho, então nenhuma imagem é baixada no plano de dados de alguém. A tarefa que já está rodando continua. Em outra rede as tarefas voltam sozinhas. O código é `METERED_NETWORK`. Se quem usa o PC aceitar que as tarefas gastem esses dados: `shutup-and-run config set lend_on_metered true --apply`, ou **Emprestar também em rede limitada** na página.
+
 ### O que fecho quando falta memória?
 
 Quando é a memória que impede a próxima tarefa, a página mostra **Falta memória** com quanto liberar, mais ou menos, e, no Windows, os programas que mais ocupam, somados por programa (`chrome 3.1 GiB (38 processos)`). Processos do próprio Windows, o antivírus, o WSL e o worker nunca aparecem. Feche um que não precisa agora, ou só espere: as tarefas voltam sozinhas. O worker nunca fecha nada. Quando quem está sem memória é o WSL2, ela está com uma tarefa em execução e volta quando ela termina.
@@ -130,7 +134,7 @@ A primeira linha da página diz o porquê, assim como `shutup-and-run doctor` e 
 | PAUSADO | `WORKER_PAUSED` | quando alguém retoma; uma pausa por um tempo, no fim dela; qualquer outra, também no próximo reinício do PC |
 | ESPERANDO A SUA AUTORIZAÇÃO | `AUTHORIZATION_REQUIRED` | quando o dono decide, veja abaixo |
 | TAREFAS NOVAS BLOQUEADAS POR SEGURANÇA | `SAFETY_*` | sozinho, quando o PC se recupera |
-| ESPERANDO | `OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING` | sozinho |
+| ESPERANDO | `OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING`, `METERED_NETWORK` | sozinho |
 | esperando: o PC está em uso | `USER_ACTIVE` | sozinho (`min_idle_secs`) |
 | esperando, recursos insuficientes | `LOW_MEMORY`, `LOW_DISK` | sozinho; **Falta memória** diz quanto liberar |
 | ocupado, todas as vagas em uso | `WORKER_BUSY` | quando a tarefa em execução termina |
@@ -162,11 +166,11 @@ Por um tempo: os botões **por 1 hora**, **por 3 horas** e **pelo resto do dia**
 
 ### Onde vejo o que uma tarefa imprimiu?
 
-`shutup-and-run jobs logs ID` (ou `--last`), ou **Tarefas e logs** na página, que também baixa o arquivo. Os últimos 256 KiB de cada tarefa ficam no PC por 7 dias, sem máscara, e nunca são enviados a lugar nenhum.
+`shutup-and-run jobs logs ID` (ou `--last`), ou **Tarefas e logs** na página, que também baixa o arquivo. Os últimos 256 KiB de cada tarefa ficam no PC por 7 dias, sem máscara, e nunca são enviados a lugar nenhum. Para uma tarefa ainda rodando, o mesmo comando e o link **até agora** da página mostram o que ela imprimiu até o momento.
 
 ### Quanto uma tarefa gastou?
 
-Cada tarefa registra o tempo de CPU e o máximo de memória que ocupou: `shutup-and-run jobs` (uma linha `used:`), `jobs --json` (`cpu_ms`, `memory_peak_bytes`) e a coluna **CPU / memória** na página. Os números vêm de uma leitura a cada 30 segundos enquanto ela roda, e já aparecem durante a execução (`so far`), então uma tarefa mais curta que isso pode não ter nenhum, e um pico curto pode escapar. `shutup-and-run jobs --summary` resume as últimas 20 e, com cinco medidas ou mais e espaço neste PC, sugere o `max_job_memory` e o `max_slots` que caberiam mais tarefas ao mesmo tempo; o `doctor` também diz (`ROOM_FOR_MORE_SLOTS`). Nada muda sozinho.
+Cada tarefa registra o tempo de CPU, o máximo de memória que ocupou e o que recebeu e enviou pela rede: `shutup-and-run jobs` (uma linha `used:`), `jobs --json` (`cpu_ms`, `memory_peak_bytes`, `network_bytes`) e a coluna **CPU / memória / rede** na página. O `jobs --summary` dá a rede por tarefa de cada imagem, que é quanto uma tarefa dela custa num PC com plano de dados, fora o pull. Os números vêm de uma leitura a cada 30 segundos enquanto ela roda, e já aparecem durante a execução (`so far`), então uma tarefa mais curta que isso pode não ter nenhum, e um pico curto pode escapar. `shutup-and-run jobs --summary` resume as últimas 20 e, com cinco medidas ou mais e espaço neste PC, sugere o `max_job_memory` e o `max_slots` que caberiam mais tarefas ao mesmo tempo; o `doctor` também diz (`ROOM_FOR_MORE_SLOTS`). Nada muda sozinho.
 
 ### O que a URL de poll fica sabendo deste PC?
 

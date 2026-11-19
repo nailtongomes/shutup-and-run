@@ -558,3 +558,14 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** An image used once a month is pulled again each time. An image pulled before 0.2.22 whose jobs were already purged from the history is not known, and stays. Until someone compacts it, the disk file on Windows keeps its largest size.
 
+## Not on a metered network; network per job; a running job's output (0.2.23)
+
+**Context.** A notebook on a phone's hotspot pulled images of hundreds of MB and ran jobs on the person's data plan. Nobody could tell how much data a job of an image moves. And what a job printed was only readable after it ended, so a job that seemed stuck could not be looked into.
+
+**Decision.**
+
+- A fourth wait in `src/lending.rs`: `METERED_NETWORK`. The supervisor reads `GetNetworkConnectivityHint` and sends `metered` on the host feed: a fixed or variable cost, roaming, or over the data limit. Like the others it stops admission and the poll, never a running job, and an unknown cost does not hold. Unlike the battery, it can be lifted: `lend_on_metered`, on the open form, because the data is the person's and some have a plan that does not care. Off by default.
+- The 30-second `docker stats` reading also gives the bytes received and sent on the container's networks; the most a reading saw is `network_bytes` in the row, in `jobs`, on the page and per image in `jobs --summary`. The pull is the daemon's and is not counted; a job shorter than 30 seconds has no number.
+- `jobs logs ID` and the page read a running job's output from Docker at that moment (`live: true`); the file is still written only when the job ends. Same content, same readers, nothing kept.
+
+**Cost.** A Wi-Fi that Windows does not know is a phone's hotspot counts as unmetered unless the person marks it. A job that only waits on a metered network waits until the PC changes network. The network number misses up to 30 seconds of traffic at the end of a job.

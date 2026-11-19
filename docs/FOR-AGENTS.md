@@ -102,6 +102,7 @@ The JSON also carries `fix`. It is the same sentence under the name 0.2.8 used; 
 | `BATTERY_LOW` | The PC is on its battery below 60%; plug it in and jobs start again by themselves. Nothing changes this limit. | O PC está na bateria abaixo de 60%; ligue na tomada e as tarefas voltam sozinhas. Nada muda esse limite. |
 | `ON_BATTERY` | Jobs still start; on the battery below 60% they wait. Plug the PC in to keep it from draining. | As tarefas ainda começam; na bateria abaixo de 60% elas esperam. Ligue o PC na tomada para não descarregar. |
 | `USER_PRESENTING` | The person at the PC is presenting or has a program in full screen; jobs start again by themselves when that ends. | Quem usa o PC está apresentando ou com um programa em tela cheia; as tarefas voltam sozinhas quando isso acabar. |
+| `METERED_NETWORK` | The PC is on a metered network (a phone's hotspot or a mobile plan); jobs start again by themselves on another network. If the PC's owner agrees to spend that data: `shutup-and-run config set lend_on_metered true --apply`. | O PC está numa rede limitada (o roteador do celular ou um plano móvel); as tarefas voltam sozinhas em outra rede. Se o dono do PC aceitar gastar esses dados: `shutup-and-run config set lend_on_metered true --apply`. |
 | `AUTHORIZATION_REQUIRED` | When the owner agreed in the contract, record it: `shutup-and-run safety authorize --owner-consent`; otherwise ask the person at this computer to open http://127.0.0.1:8787/ and authorize, or to run `shutup-and-run safety authorize`. | Se o dono concordou no contrato, registre: `shutup-and-run safety authorize --owner-consent`; senão, peça à pessoa neste computador para abrir http://127.0.0.1:8787/ e autorizar, ou rodar `shutup-and-run safety authorize`. |
 | `SAFETY_BLOCKED` | It clears by itself when the computer recovers; no authorization lifts it. `shutup-and-run safety` shows which reading is critical. | Passa sozinho quando o computador se recupera; nenhuma autorização libera. `shutup-and-run safety` mostra qual leitura está crítica. |
 | `SAFETY_TELEMETRY_MISSING` | The worker could not read memory, disk or load, so it starts nothing. Run `shutup-and-run doctor --report` and open the issue link. | O worker não conseguiu ler memória, disco ou carga, então não inicia nada. Rode `shutup-and-run doctor --report` e abra o link de issue. |
@@ -236,6 +237,7 @@ shutup-and-run config set resource_profile shared-pc --apply
 | `min_free_memory` | `2g` | No new job starts with less memory available. `0`: not checked. |
 | `min_free_disk` | `5g` | The same for the disk Docker writes to. |
 | `min_idle_secs` | `0` | Windows only: a new job waits until the PC was not used for this many seconds. `0`: off. A running job is never stopped for it. |
+| `lend_on_metered` | `false` | Windows only: `false` waits on a metered network (`METERED_NETWORK`); `true` only when the person at the PC accepts that jobs spend its data. |
 
 Where the service sees under 4 GiB of memory, the two memory defaults are half of what it sees. Change one figure with `config set KEY VALUE --apply`; go back to the default with `config unset KEY --apply`. `resource_profile none` removes the defaults, and the four keys still work one by one.
 
@@ -316,8 +318,10 @@ Every job that ran a container leaves its output on the machine: the last 256 Ki
 ```bash
 shutup-and-run jobs logs 9f2c            # the start of an id is enough
 shutup-and-run jobs logs --last --tail 50
-shutup-and-run jobs logs 9f2c --json     # {"id", "path", "bytes", "written_at", "image", "status", "exit_code", "log"}
+shutup-and-run jobs logs 9f2c --json     # {"id", "path", "bytes", "written_at", "live", "image", "status", "exit_code", "log"}
 ```
+
+A job still running has no file yet: `jobs logs` reads what it printed so far from Docker, with `"live": true` and `path` null.
 
 On Windows the same commands run in PowerShell; the `.exe` forwards them into the distribution. An id that matches nothing is `JOB_NOT_FOUND`, one that matches several is `JOB_ID_AMBIGUOUS`, and a job with no log is `JOB_LOG_MISSING`; each exits 1 with its hint. When the last job did not end well, the doctor warns with `LAST_JOB_FAILED` and its hint is the exact `jobs logs` command for that job. The person at the PC has the same files on the local page: `http://127.0.0.1:8787/local/logs`, to open or download.
 

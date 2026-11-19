@@ -247,6 +247,12 @@ impl Runtime for BollardRuntime {
                         .and_then(|m| m.usage)
                         .filter(|bytes| *bytes > 0)
                         .map(|bytes| bytes.saturating_sub(cache)),
+                    network_bytes: stats.networks.as_ref().map(|networks| {
+                        networks
+                            .values()
+                            .map(|n| n.rx_bytes.unwrap_or(0) + n.tx_bytes.unwrap_or(0))
+                            .sum()
+                    }),
                 }))
             }
             Ok(Some(Err(err))) if is_status(&err, 404) => Ok(None),

@@ -78,7 +78,7 @@ $status = $null
 try { $status = $raw | ConvertFrom-Json } catch { }
 if ($status) {
     $missing = @()
-    foreach ($k in @("battery_percent", "utc_offset_secs", "clock_skew_secs")) {
+    foreach ($k in @("battery_percent", "utc_offset_secs", "clock_skew_secs", "metered_network")) {
         if (-not (Test-Has $status.lending $k)) { $missing += "lending.$k" }
     }
     foreach ($k in @("memory", "cleanup")) {
@@ -175,6 +175,16 @@ if ($battery) {
     Add-Result "bateria" "ver" "Win32_Battery $($battery.EstimatedChargeRemaining)%, status.json battery_percent=$worker (nulo na tomada)"
 }
 
+# The network: what Windows says it costs, and what the worker read.
+$cost = "?"
+try {
+    $null = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]
+    $netProfile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+    if ($netProfile) { $cost = $netProfile.GetConnectionCost().NetworkCostType } else { $cost = "sem conexão" }
+} catch { }
+$metered = if ($status) { $status.lending.metered_network } else { "?" }
+Add-Result "rede limitada" "ver" "Windows NetworkCostType=$cost (Unrestricted: não limitada), status.json metered_network=$metered"
+
 # What the service logged that a round looks for.
 if ($log) {
     $counts = @()
@@ -196,6 +206,7 @@ if ($JobName) {
     } else {
         $peak = $before
         $soFar = ""
+        $live = ""
         $job = $null
         $deadline = (Get-Date).AddMinutes($JobTimeoutMinutes)
         while ((Get-Date) -lt $deadline) {
@@ -207,13 +218,18 @@ if ($JobName) {
             if ($job.status -eq "running") {
                 $text = (Invoke-Sar @("jobs", "--limit", "1")).Text
                 if ($text -match "used: .* so far") { $soFar = $Matches[0] }
+                if (-not $live) {
+                    $logs = Invoke-Sar @("jobs", "logs", $job.id, "--tail", "3", "--json")
+                    try { $l = $logs.Text | ConvertFrom-Json; if ($l.live) { $live = "$($l.bytes) bytes até agora" } } catch { }
+                }
             } else { break }
         }
         Add-Result "uso durante a tarefa" $(if ($soFar) { "ok" } else { "ver" }) $(if ($soFar) { $soFar } else { "sem 'so far' (a tarefa durou menos de 30 s?)" })
+        Add-Result "saída durante a tarefa" $(if ($live) { "ok" } else { "ver" }) $(if ($live) { "jobs logs: $live" } else { "jobs logs não leu ao vivo (a tarefa durou menos de 10 s?)" })
         if ($job -and $job.status -ne "running") {
             Start-Sleep -Seconds 60
             $after = Get-Vmmem
-            Add-Result "tarefa $JobName" "ver" ("status $($job.status); VmmemWSL antes " + (Format-Size $before) + ", pico " + (Format-Size $peak) + ", 60 s depois " + (Format-Size $after))
+            Add-Result "tarefa $JobName" "ver" ("status $($job.status); rede $($job.network_bytes) bytes; VmmemWSL antes " + (Format-Size $before) + ", pico " + (Format-Size $peak) + ", 60 s depois " + (Format-Size $after))
         } else {
             Add-Result "tarefa $JobName" "falhou" "não terminou em $JobTimeoutMinutes min"
         }
