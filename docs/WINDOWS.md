@@ -232,7 +232,7 @@ wsl -d shutup-and-run -u root -- sh -c 'curl -s -H "Authorization: Bearer $(shut
 | `shutup-and-run wsl logs` | The end of `%ProgramData%\shutup-and-run\supervisor.log`: the supervisor's lines and the service's own log. `--lines 500` for more. The file rotates once at 10 MiB. |
 | `shutup-and-run wsl stop` | Ends the task, stops the service, gives each running container SIGTERM and 10 seconds, then terminates the distribution. On a Linux server, stopping the service leaves containers alone; here the VM goes away with the service. |
 | `shutup-and-run wsl start` | Starts the task again. |
-| `shutup-and-run wsl uninstall` | Deletes the task and the distribution, with its images and job history. `--purge` also removes `%ProgramData%\shutup-and-run`. `%UserProfile%\.wslconfig` is left as it is: delete it, or its `memory=` and `processors=` lines, to give WSL2 back its defaults. |
+| `shutup-and-run wsl uninstall` | Deletes the task and the distribution, with its images and job history. `--purge` also removes `%ProgramData%\shutup-and-run`. `%UserProfile%\.wslconfig` is removed only when the install wrote it, it is unchanged since (its sha256 is in `%ProgramData%\shutup-and-run\wslconfig.sha256`) and no other WSL distribution is left; any other is left as it is: delete it, or its `memory=` and `processors=` lines, to give WSL2 back its defaults. |
 | `shutup-and-run wsl limits` | How much of the PC WSL2 may take. See [Sharing the PC](#sharing-the-pc). |
 | `shutup-and-run jobs logs --last` | What the last job printed. `jobs logs ID` for another one (the start of the id is enough), `--tail 50` for its end, `--json` for an agent. |
 | `wsl -d shutup-and-run -u root` | A root shell in the distribution. `docker ps`. |
@@ -313,6 +313,7 @@ If a running job matters, pause the worker on the local page first and wait unti
 | The `.exe` | `shutup-and-run version --json` | `"version"` |
 | The service in the distribution | `shutup-and-run status --json`, or `C:\ProgramData\shutup-and-run\status.json` | `"version"`, written by the running service; `"state"` should be `idle` or `active` |
 | Both | `shutup-and-run doctor` | the `version` line: `<version> on Windows and in shutup-and-run`, or `VERSION_MISMATCH` |
+| The newest release | `shutup-and-run doctor` | the `update` line, from GitHub's `releases/latest` (5 seconds at most, no line without an answer): `<version> is the newest release`, or `UPDATE_AVAILABLE` with the install line to run |
 
 ### When it goes wrong
 

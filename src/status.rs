@@ -834,7 +834,7 @@ fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
                      <td class=\"num\" data-label=\"{l_used}\">{used}</td>\
                      <td class=\"num\" data-label=\"{l_exit}\">{exit}</td><td data-label=\"{l_log}\"><span>{links}</span></td></tr>",
                     status = job_status(job, lang),
-                    used = used_cell(job),
+                    used = used_cell(job, lang),
                     image = short_image(&job.image),
                     short = escape(&id[..id.len().min(12)]),
                     started = when(job.started_at),
@@ -869,7 +869,10 @@ fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
 /// memory it held and what it moved on the network, from readings every 30
 /// seconds, and what it wrote to its disk, read at its end. A dash for what
 /// was not read.
-fn used_cell(job: &JobRecord) -> String {
+fn used_cell(job: &JobRecord, lang: Lang) -> String {
+    if let Some(text) = crate::jobs::pull_text(job, lang == Lang::Pt) {
+        return escape(&text);
+    }
     let parts = [
         job.cpu_ms.map(|ms| format!("{:.1} s", ms as f64 / 1000.0)),
         job.memory_peak.map(crate::jobs::memory_text),
@@ -3129,6 +3132,8 @@ pub struct Live {
     /// When a pause for a while ends by itself.
     pub paused_until: Option<i64>,
     pub job_ids: Vec<String>,
+    /// Jobs whose image is downloading: id, bytes so far, size known so far.
+    pub pulling: Vec<(String, u64, u64)>,
     /// What memory keeps from starting, and how long it did.
     pub memory: crate::memory::View,
     pub last_job_at: Option<i64>,
@@ -3359,6 +3364,10 @@ struct FileBody<'a> {
     slots_total: Option<u64>,
     slots_used: Option<u64>,
     job_ids: &'a [String],
+    /// The jobs among them still downloading their image: the bytes so far
+    /// and the size of the layers known so far. Not part of what makes the
+    /// file rewritten at once, so it is at most 30 seconds old.
+    pulling: Vec<serde_json::Value>,
     last_job_at: Option<String>,
     last_error: Option<String>,
     poll_error: Option<String>,
@@ -3418,6 +3427,13 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
         slots_total: live.slots_total,
         slots_used: live.slots_used,
         job_ids: &live.job_ids,
+        pulling: live
+            .pulling
+            .iter()
+            .map(|(id, done, total)| {
+                serde_json::json!({"id": id, "done_bytes": done, "total_bytes": total})
+            })
+            .collect(),
         last_job_at: live.last_job_at.map(unix_to_iso),
         last_error: err,
         poll_error: live.poll_error.as_deref().map(one_line),
@@ -3477,6 +3493,7 @@ fn empty_live() -> Live {
         draining: false,
         paused_until: None,
         job_ids: Vec::new(),
+        pulling: Vec::new(),
         memory: Default::default(),
         last_job_at: None,
         last_job_error: None,
@@ -4182,6 +4199,7 @@ mod tests {
             draining: false,
             paused_until: None,
             job_ids: vec!["abc".into(), "def".into()],
+            pulling: vec![("def".into(), 10 << 20, 300 << 20)],
             memory: Default::default(),
             last_job_at: Some(1_700_000_000),
             last_job_error: None,
@@ -4227,6 +4245,10 @@ mod tests {
         assert_eq!(value["slots_total"], 2);
         assert_eq!(value["slots_used"], 1);
         assert_eq!(value["job_ids"], serde_json::json!(["abc", "def"]));
+        assert_eq!(
+            value["pulling"],
+            serde_json::json!([{"id": "def", "done_bytes": 10485760, "total_bytes": 314572800}])
+        );
         assert_eq!(value["last_job_at"], "2023-11-14T22:13:20Z");
         assert!(value["last_error"].is_null());
         // Is it asking for work? When the last poll went out and how it ended.

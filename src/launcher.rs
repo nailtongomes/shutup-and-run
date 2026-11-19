@@ -665,6 +665,7 @@ impl Launcher {
         };
         let mut job_ids = self.store.running_ids().unwrap_or_default();
         job_ids.sort();
+        let pulling = self.store.pulling().unwrap_or_default();
         let last = self.last_job().ok().flatten();
         let machine = self.read_machine();
         let mut safety = self.safety_with(&machine);
@@ -687,6 +688,7 @@ impl Launcher {
             draining: slots.is_some_and(|s| s.draining),
             paused_until: self.paused_until(),
             job_ids,
+            pulling,
             last_job_at: last
                 .as_ref()
                 .map(|job| job.ended_at.unwrap_or(job.started_at)),
@@ -948,7 +950,13 @@ impl Launcher {
         // own, not the job's: a short job of a big image on a slow line still
         // starts, and a long job does not let a stuck pull hold the slot.
         let limit = std::time::Duration::from_secs(PULL_LIMIT_SECS);
-        let pulled = tokio::time::timeout(limit, self.runtime.pull(&spec.image)).await;
+        // How far the download is, on the job's row for `jobs`, the page
+        // and `status`; cleared once the pull is over, however it ended.
+        let progress = |done: u64, total: u64| {
+            let _ = self.store.set_pull(&id, Some((done, total)));
+        };
+        let pulled = tokio::time::timeout(limit, self.runtime.pull(&spec.image, &progress)).await;
+        let _ = self.store.set_pull(&id, None);
         let stopped = self.stops.lock().await.remove(&id);
         let failure = match pulled {
             _ if stopped => Some("stopped before it started"),
@@ -3110,6 +3118,40 @@ mod tests {
         clock.set(T0 + 33 * 86_400 + CLEANUP_EVERY_SECS as u64);
         assert_eq!(launcher.clean_unused().await.unwrap().unwrap().images, 0);
         assert_eq!(mock.removed_images().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_download_in_progress_is_on_the_job_row_until_it_ends() {
+        let (launcher, mock) = harness_with(2, |_| {});
+        mock.hold_pull(120 << 20, 450 << 20).await;
+        let id = match launcher.launch(job("alpine", None)).await.unwrap() {
+            LaunchOutcome::Created(job) | LaunchOutcome::Existing(job) => job.id,
+        };
+        let mut row = launcher.store.get(&id).unwrap().unwrap();
+        for _ in 0..200 {
+            if row.pull.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            row = launcher.store.get(&id).unwrap().unwrap();
+        }
+        assert_eq!(
+            crate::jobs::pull_text(&row, false).as_deref(),
+            Some("downloading the image: 120 MiB of 450 MiB")
+        );
+        assert_eq!(
+            crate::jobs::pull_text(&row, true).as_deref(),
+            Some("baixando a imagem: 120 MiB de 450 MiB")
+        );
+        assert_eq!(
+            launcher.live_status().await.pulling,
+            vec![(id.clone(), 120 << 20, 450 << 20)]
+        );
+        mock.release_pull().await;
+        launcher.settled().await;
+        let row = launcher.store.get(&id).unwrap().unwrap();
+        assert_eq!(row.pull, None);
+        assert!(launcher.live_status().await.pulling.is_empty());
     }
 
     #[tokio::test]

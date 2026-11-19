@@ -3,7 +3,7 @@ use crate::registry::{
     auth_from_docker_config, auth_from_helper_output, default_docker_config_path, pull_reference,
     valid_helper_name, AuthSource, RegistryAuth,
 };
-use crate::runtime::{Inspected, Runtime, RuntimeError, StartSpec};
+use crate::runtime::{Inspected, Progress, Runtime, RuntimeError, StartSpec};
 use crate::{DEADLINE_KEY, LABEL_KEY, LABEL_VALUE, NAME_PREFIX};
 use async_trait::async_trait;
 use bollard::auth::DockerCredentials;
@@ -56,13 +56,21 @@ impl BollardRuntime {
         &self,
         reference: &str,
         creds: Option<DockerCredentials>,
+        progress: &Progress<'_>,
     ) -> Result<(), RuntimeError> {
         let options = CreateImageOptionsBuilder::new()
             .from_image(reference)
             .build();
         let mut stream = self.docker.create_image(Some(options), None, creds);
+        let mut tally = PullTally::default();
+        let mut told = std::time::Instant::now();
         while let Some(item) = stream.next().await {
-            item.map_err(docker_err)?;
+            let info = item.map_err(docker_err)?;
+            if tally.note(&info) && told.elapsed() >= PROGRESS_EVERY {
+                told = std::time::Instant::now();
+                let (done, total) = tally.sums();
+                progress(done, total);
+            }
         }
         Ok(())
     }
@@ -92,7 +100,7 @@ impl BollardRuntime {
 
 #[async_trait]
 impl Runtime for BollardRuntime {
-    async fn pull(&self, image: &str) -> Result<(), RuntimeError> {
+    async fn pull(&self, image: &str, progress: &Progress<'_>) -> Result<(), RuntimeError> {
         let reference = pull_reference(image);
         // An image named by its digest cannot change: once here, the
         // registry is not asked again, so no network and no wait.
@@ -108,7 +116,7 @@ impl Runtime for BollardRuntime {
         // IfNotPresent for tags when registry latency dominates.
         let mut authed_err = None;
         if creds.is_some() {
-            match self.pull_once(&reference, creds).await {
+            match self.pull_once(&reference, creds, progress).await {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     tracing::warn!(error = %err, %image, "authenticated pull failed; trying anonymous");
@@ -116,7 +124,7 @@ impl Runtime for BollardRuntime {
                 }
             }
         }
-        match self.pull_once(&reference, None).await {
+        match self.pull_once(&reference, None, progress).await {
             Ok(()) => Ok(()),
             Err(err) => {
                 let err = authed_err.unwrap_or(err);
@@ -601,30 +609,67 @@ fn to_docker_credentials(auth: RegistryAuth, image: &str) -> DockerCredentials {
     }
 }
 
+/// How long a credential helper may take before the pull goes on without it.
+const HELPER_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn run_helper(helper: &str, server: &str) -> Result<RegistryAuth, String> {
     if !valid_helper_name(helper) {
         return Err("invalid credential helper name".into());
     }
-    // shortcut: no timeout around the helper. Upgrade with a 5s cap if one hangs.
     // The server name goes on stdin, never on the command line.
     let bin = format!("docker-credential-{helper}");
     let mut child = std::process::Command::new(&bin)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|err| format!("could not run {bin}: {err}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         let _ = stdin.write_all(server.as_bytes());
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("credential helper: {err}"))?;
-    if !output.status.success() {
-        return Err(format!("credential helper exited with {}", output.status));
+    let stdout = wait_capped(&mut child, HELPER_LIMIT)?;
+    auth_from_helper_output(&String::from_utf8_lossy(&stdout))
+}
+
+/// What `child` printed, once it exits with 0 within `limit`. One that
+/// takes longer is killed: a helper waiting on a prompt or a dead keyring
+/// must not hold the job's pull.
+fn wait_capped(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        if let Some(pipe) = stdout.as_mut() {
+            let _ = pipe.read_to_end(&mut out);
+        }
+        out
+    });
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "credential helper took more than {}s",
+                    limit.as_secs_f32()
+                ));
+            }
+            Err(err) => return Err(format!("credential helper: {err}")),
+        }
+    };
+    if !status.success() {
+        return Err(format!("credential helper exited with {status}"));
     }
-    auth_from_helper_output(&String::from_utf8_lossy(&output.stdout))
+    Ok(reader.join().unwrap_or_default())
 }
 
 /// The most processes one container may hold. A constant: it keeps a job
@@ -633,6 +678,50 @@ const PIDS_LIMIT: i64 = 4096;
 
 /// Seconds between SIGTERM and SIGKILL at a timeout or a stop.
 pub const KILL_GRACE_SECS: i32 = 10;
+
+/// How often a download in progress is reported: the job's row is written
+/// each time.
+const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The bytes of an image download, layer by layer, from Docker's messages:
+/// `Downloading` carries a layer's bytes so far and its size, and a layer
+/// that is through (`Download complete`, `Pull complete`) counts whole. A
+/// layer already here is not downloaded and does not count.
+#[derive(Default)]
+struct PullTally {
+    layers: HashMap<String, (u64, u64)>,
+}
+
+impl PullTally {
+    /// True when the sums changed.
+    fn note(&mut self, info: &bollard::models::CreateImageInfo) -> bool {
+        let (Some(id), Some(status)) = (info.id.as_deref(), info.status.as_deref()) else {
+            return false;
+        };
+        let detail = info.progress_detail.as_ref();
+        let read = |v: Option<i64>| v.unwrap_or(0).max(0) as u64;
+        let next = match status {
+            "Downloading" => match detail {
+                Some(d) => (read(d.current), read(d.total)),
+                None => return false,
+            },
+            "Download complete" | "Verifying Checksum" | "Pull complete" => {
+                match self.layers.get(id) {
+                    Some(&(_, total)) => (total, total),
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+        self.layers.insert(id.to_string(), next) != Some(next)
+    }
+
+    fn sums(&self) -> (u64, u64) {
+        self.layers.values().fold((0, 0), |(d, t), &(done, total)| {
+            (d + done.min(total), t + total)
+        })
+    }
+}
 
 /// `repo@sha256:...`: the one image reference that cannot change.
 fn pinned(image: &str) -> bool {
@@ -708,6 +797,52 @@ pub fn connect_docker() -> Result<bollard::Docker, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_helper_gets_a_few_seconds() {
+        let spawn = |script: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let limit = std::time::Duration::from_millis(300);
+        let quick = wait_capped(&mut spawn("echo '{}'"), limit).unwrap();
+        assert_eq!(String::from_utf8_lossy(&quick).trim(), "{}");
+        let started = std::time::Instant::now();
+        let slow = wait_capped(&mut spawn("sleep 5"), limit).unwrap_err();
+        assert!(slow.contains("more than"), "{slow}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(wait_capped(&mut spawn("exit 1"), limit).is_err());
+    }
+
+    #[test]
+    fn a_download_counts_the_bytes_of_the_layers_it_fetches() {
+        let info =
+            |id: &str, status: &str, detail: Option<(i64, i64)>| bollard::models::CreateImageInfo {
+                id: Some(id.into()),
+                status: Some(status.into()),
+                progress_detail: detail.map(|(current, total)| bollard::models::ProgressDetail {
+                    current: Some(current),
+                    total: Some(total),
+                }),
+                ..Default::default()
+            };
+        let mut tally = PullTally::default();
+        assert!(!tally.note(&info("a", "Already exists", None)));
+        assert!(!tally.note(&info("b", "Pulling fs layer", None)));
+        assert!(tally.note(&info("b", "Downloading", Some((10, 100)))));
+        assert!(!tally.note(&info("b", "Downloading", Some((10, 100)))));
+        assert!(tally.note(&info("c", "Downloading", Some((5, 50)))));
+        assert_eq!(tally.sums(), (15, 150));
+        assert!(tally.note(&info("b", "Download complete", None)));
+        assert_eq!(tally.sums(), (105, 150));
+        // Extracting has its own counts; the download does not go back.
+        assert!(!tally.note(&info("b", "Extracting", Some((1, 100)))));
+        assert_eq!(tally.sums(), (105, 150));
+    }
 
     #[test]
     fn only_a_digest_pins_an_image() {

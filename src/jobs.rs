@@ -113,7 +113,28 @@ pub fn job_json(job: &JobRecord) -> Value {
         "memory_peak_bytes": job.memory_peak,
         "network_bytes": job.network_bytes,
         "disk_bytes": job.disk_bytes,
+        "pull": pulling(job).map(|(done, total)| json!({"done_bytes": done, "total_bytes": total})),
     })
+}
+
+/// While a job's image downloads: the bytes so far and the size known so far.
+pub fn pulling(job: &JobRecord) -> Option<(u64, u64)> {
+    job.pull.filter(|_| !job.is_finished())
+}
+
+/// `downloading the image: 120 MiB of 450 MiB`, while it does.
+pub fn pull_text(job: &JobRecord, portuguese: bool) -> Option<String> {
+    let (done, total) = pulling(job)?;
+    let (what, of) = if portuguese {
+        ("baixando a imagem", "de")
+    } else {
+        ("downloading the image", "of")
+    };
+    Some(format!(
+        "{what}: {} {of} {}",
+        memory_text(done),
+        memory_text(total)
+    ))
 }
 
 /// `cpu 5.5 s, memory peak 300 MiB, network 12 MiB, disk 700 MiB`, from
@@ -410,8 +431,9 @@ pub fn jobs_out(history: &Path, limit: usize) -> Out {
                 .unwrap_or_else(|| "-".into()),
             job.id,
             job.image,
-            usage_text(job)
-                .map(|used| format!("\n    used: {used}"))
+            pull_text(job, false)
+                .or_else(|| usage_text(job).map(|used| format!("used: {used}")))
+                .map(|line| format!("\n    {line}"))
                 .unwrap_or_default(),
             failure_of(job)
                 .map(|why| format!("\n    why: {why}"))
@@ -820,6 +842,7 @@ mod tests {
             memory_peak: peak.map(|p| p * mib),
             network_bytes: peak.map(|p| p * mib / 10),
             disk_bytes: peak.map(|p| p * mib * 2),
+            pull: None,
         };
         let jobs = vec![
             job(1, "rpa", Some(900)),
@@ -1060,6 +1083,7 @@ mod tests {
                 "memory_peak_bytes",
                 "network_bytes",
                 "oom_killed",
+                "pull",
                 "started_at",
                 "status"
             ]

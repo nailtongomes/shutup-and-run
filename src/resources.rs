@@ -107,20 +107,40 @@ pub fn trim_disk() {
     }
 }
 
-/// Where Docker keeps images, when it is in the usual place; otherwise the
-/// folder given (the job history's).
-/// shortcut: a Docker `data-root` somewhere else is not looked up. Upgrade to
-/// `docker info` if a machine moves it.
+/// Where Docker keeps images: the `data-root` of `/etc/docker/daemon.json`,
+/// or the usual place; otherwise the folder given (the job history's).
+/// shortcut: a `--data-root` on dockerd's command line is not looked up.
+/// Upgrade to `docker info` if a machine sets it that way.
 pub fn disk_path(fallback: &Path) -> std::path::PathBuf {
-    let docker = Path::new("/var/lib/docker");
-    if docker.exists() {
-        return docker.to_path_buf();
+    let configured = std::fs::read_to_string("/etc/docker/daemon.json")
+        .ok()
+        .and_then(|text| data_root(&text));
+    for docker in configured
+        .iter()
+        .map(|p| p.as_path())
+        .chain([Path::new("/var/lib/docker")])
+    {
+        if docker.exists() {
+            return docker.to_path_buf();
+        }
     }
     fallback
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .to_path_buf()
+}
+
+/// `data-root` (or `graph`, its name before Docker 17.05) from a
+/// `daemon.json`. None when the file does not set an absolute one.
+pub(crate) fn data_root(daemon_json: &str) -> Option<std::path::PathBuf> {
+    let value: serde_json::Value = serde_json::from_str(daemon_json).ok()?;
+    ["data-root", "graph"]
+        .iter()
+        .find_map(|key| value[key].as_str())
+        // A Linux path, also when the test runs on Windows.
+        .filter(|p| p.starts_with('/'))
+        .map(std::path::PathBuf::from)
 }
 
 /// Bytes an unprivileged process could still write under `path`.
@@ -157,6 +177,21 @@ pub fn human(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_disk_checked_is_where_docker_keeps_its_images() {
+        assert_eq!(
+            data_root(r#"{"data-root": "/srv/docker", "log-level": "warn"}"#),
+            Some(std::path::PathBuf::from("/srv/docker"))
+        );
+        assert_eq!(
+            data_root(r#"{"graph": "/mnt/d"}"#),
+            Some(std::path::PathBuf::from("/mnt/d"))
+        );
+        assert_eq!(data_root(r#"{"data-root": "docker"}"#), None);
+        assert_eq!(data_root(r#"{"log-level": "warn"}"#), None);
+        assert_eq!(data_root("not json"), None);
+    }
 
     #[test]
     fn a_small_machine_gets_a_smaller_job() {

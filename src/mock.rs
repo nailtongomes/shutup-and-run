@@ -1,4 +1,4 @@
-use crate::runtime::{Inspected, Runtime, RuntimeError, StartSpec};
+use crate::runtime::{Inspected, Progress, Runtime, RuntimeError, StartSpec};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
@@ -12,6 +12,8 @@ struct Inner {
     removed: Vec<String>,
     removed_images: Vec<String>,
     pulls: Vec<String>,
+    /// What a pull reports before it waits for `release_pull`.
+    held_pull: Option<(u64, u64)>,
     starts: u64,
     specs: Vec<StartSpec>,
     fail_list: bool,
@@ -25,6 +27,7 @@ struct Inner {
 
 pub struct MockRuntime {
     inner: Mutex<Inner>,
+    pull_gate: tokio::sync::Notify,
 }
 
 impl Default for MockRuntime {
@@ -36,6 +39,7 @@ impl Default for MockRuntime {
 impl MockRuntime {
     pub fn new() -> Self {
         Self {
+            pull_gate: tokio::sync::Notify::new(),
             inner: Mutex::new(Inner {
                 running: HashMap::new(),
                 stopped: HashMap::new(),
@@ -45,6 +49,7 @@ impl MockRuntime {
                 removed: Vec::new(),
                 removed_images: Vec::new(),
                 pulls: Vec::new(),
+                held_pull: None,
                 starts: 0,
                 specs: Vec::new(),
                 fail_list: false,
@@ -85,6 +90,16 @@ impl MockRuntime {
     /// What each started container was given, in start order.
     pub async fn specs(&self) -> Vec<StartSpec> {
         self.inner.lock().await.specs.clone()
+    }
+
+    /// The next pulls report `done` of `total` and wait for `release_pull`.
+    pub async fn hold_pull(&self, done: u64, total: u64) {
+        self.inner.lock().await.held_pull = Some((done, total));
+    }
+
+    pub async fn release_pull(&self) {
+        self.inner.lock().await.held_pull = None;
+        self.pull_gate.notify_one();
     }
 
     pub async fn pulls(&self) -> Vec<String> {
@@ -160,8 +175,16 @@ impl MockRuntime {
 
 #[async_trait]
 impl Runtime for MockRuntime {
-    async fn pull(&self, image: &str) -> Result<(), RuntimeError> {
-        self.inner.lock().await.pulls.push(image.to_string());
+    async fn pull(&self, image: &str, progress: &Progress<'_>) -> Result<(), RuntimeError> {
+        let held = {
+            let mut inner = self.inner.lock().await;
+            inner.pulls.push(image.to_string());
+            inner.held_pull
+        };
+        if let Some((done, total)) = held {
+            progress(done, total);
+            self.pull_gate.notified().await;
+        }
         Ok(())
     }
 

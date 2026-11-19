@@ -94,3 +94,9 @@ O `check.ps1` com `-JobName` mostra também o disco gravado pela tarefa. O que e
 - [ ] **Limite de processos.** Dentro da distribuição, `docker inspect` de uma tarefa rodando tem `PidsLimit` 4096 e `Init` true.
 - [ ] **Volumes.** Depois de uma tarefa de uma imagem com `VOLUME` (por exemplo `postgres`, com um comando curto), `docker volume ls` dentro da distribuição não tem um volume novo.
 - [ ] **Journal.** Depois do `wsl update`, `journalctl --disk-usage` dentro da distribuição fica abaixo de 100 MB, e existe `/etc/systemd/journald.conf.d/shutup-and-run.conf`.
+
+## 0.2.25: progresso do download, data-root, credential helper, aviso de versão nova, .wslconfig no uninstall
+
+- [ ] **Progresso do download.** Uma tarefa de uma imagem grande ainda não baixada: enquanto baixa, `shutup-and-run jobs` mostra `downloading the image: X of Y` no lugar de `used:`, a página mostra `baixando a imagem: X de Y` na coluna de uso, e `shutup-and-run status` uma linha `downloading the image of ID`. Quando o container começa, a linha volta a ser `used:`.
+- [ ] **Versão nova.** Com o `.exe` de uma versão anterior à última release, `shutup-and-run doctor` tem a linha `update` com `UPDATE_AVAILABLE` e a dica da linha de instalação; na última versão, `<versão> is the newest release`. Sem internet, a linha não aparece e o doctor não demora mais que 5 segundos por isso.
+- [ ] **.wslconfig no uninstall.** Num PC sem `%UserProfile%\.wslconfig` e sem outra distribuição, `wsl install` escreve o arquivo e `%ProgramData%\shutup-and-run\wslconfig.sha256`; `wsl uninstall` diz `removed ... which the install wrote` e o arquivo some. Repita mudando uma linha do arquivo antes do uninstall: ele diz `kept ...: it changed` e o arquivo fica. Com outra distribuição (um Ubuntu): `kept ...: other WSL distributions are under it`.

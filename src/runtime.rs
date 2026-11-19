@@ -39,9 +39,14 @@ impl RuntimeError {
     }
 }
 
+/// Bytes so far, and the size known so far, of an image download.
+pub type Progress<'a> = dyn Fn(u64, u64) + Send + Sync + 'a;
+
 #[async_trait]
 pub trait Runtime: Send + Sync {
-    async fn pull(&self, image: &str) -> Result<(), RuntimeError>;
+    /// `progress` hears the bytes downloaded so far and the size of the
+    /// layers known until then, now and then while a download lasts.
+    async fn pull(&self, image: &str, progress: &Progress<'_>) -> Result<(), RuntimeError>;
     async fn running_count(&self) -> Result<usize, RuntimeError>;
     /// `id` is the job id. The container is named after it, and every other
     /// call takes that same id.

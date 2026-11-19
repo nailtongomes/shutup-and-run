@@ -235,7 +235,7 @@ pub async fn cli(args: &[String]) -> ExitCode {
         }
     };
     let result = match sub {
-        "doctor" => doctor_cli(rest),
+        "doctor" => doctor_cli(rest).await,
         "install" => install_cli(rest).await,
         "update" => update_cli(rest).await,
         "reset" => reset_cli(rest).await,
@@ -368,6 +368,10 @@ pub(crate) fn data_dir() -> PathBuf {
 fn log_path() -> PathBuf {
     data_dir().join(LOG_FILE)
 }
+
+/// The sha256 of the `.wslconfig` the install wrote, kept next to the
+/// config. Only a file that still has it is removed by the uninstall.
+const WSLCONFIG_MARK: &str = "wslconfig.sha256";
 
 fn wslconfig_path() -> Option<PathBuf> {
     std::env::var("USERPROFILE")
@@ -1386,10 +1390,17 @@ async fn obtain_musl(client: &reqwest::Client, flags: &Flags) -> WslResult<PathB
 // ---------------------------------------------------------------------------
 // doctor
 
-fn doctor_cli(args: &[String]) -> WslResult<ExitCode> {
+async fn doctor_cli(args: &[String]) -> WslResult<ExitCode> {
     let flags = parse_flags(args, &["--smoke-image"], &["--json", "--report"])?;
     let image = flags.get("--smoke-image").unwrap_or(DEFAULT_SMOKE_IMAGE);
-    let (checks, inner) = doctor(image, SERVICE_WAIT_SECS)?;
+    let (mut checks, inner) = doctor(image, SERVICE_WAIT_SECS)?;
+    // Only on a PC the doctor got through: one without WSL keeps its one line.
+    if inner.is_some() {
+        checks.extend(update_check(
+            env!("CARGO_PKG_VERSION"),
+            latest_release().await.as_deref(),
+        ));
+    }
     // The inner doctor masked its own secrets; the lines added here have none.
     let out = crate::cli::doctor_out(
         "windows (WSL2)",
@@ -1805,6 +1816,12 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
         }
         Some(path) if !path.exists() => {
             apply_wsl_limits(&limits, true)?;
+            // So the uninstall knows the file is the one written here.
+            if let Ok(text) = std::fs::read(&path) {
+                let _ = std::fs::create_dir_all(data_dir());
+                let _ =
+                    std::fs::write(data_dir().join(WSLCONFIG_MARK), hex(&Sha256::digest(&text)));
+            }
             println!(
                 "    wrote {}: memory={}MB, processors={}, autoMemoryReclaim=dropcache",
                 path.display(),
@@ -2119,6 +2136,58 @@ pub(crate) fn version_check(exe: &str, inner: Option<&str>) -> Check {
         )
         .coded("VERSION_MISMATCH"),
     }
+}
+
+/// Where GitHub sends a request for the newest release: `.../tag/v0.2.25`.
+const LATEST_URL: &str = "https://github.com/nailtongomes/shutup-and-run/releases/latest";
+
+/// The version of the newest release, from where `LATEST_URL` points.
+/// None when GitHub does not answer within a few seconds: then the doctor
+/// says nothing about it.
+async fn latest_release() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .user_agent(concat!("shutup-and-run/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()?;
+    let response = client.head(LATEST_URL).send().await.ok()?;
+    let location = response.headers().get(reqwest::header::LOCATION)?;
+    version_in_location(location.to_str().ok()?)
+}
+
+/// `0.2.25` from `https://github.com/o/r/releases/tag/v0.2.25`.
+pub(crate) fn version_in_location(location: &str) -> Option<String> {
+    let version = location.rsplit('/').next()?.strip_prefix('v')?;
+    version_parts(version).map(|_| version.to_string())
+}
+
+fn version_parts(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(Some(a)), Some(Some(b)), Some(Some(c)), None) => Some((a, b, c)),
+        _ => None,
+    }
+}
+
+/// A warning when a newer release than this .exe is out. Nothing when
+/// GitHub was not reached.
+pub(crate) fn update_check(exe: &str, latest: Option<&str>) -> Option<Check> {
+    let latest = latest?;
+    let newer = matches!(
+        (version_parts(latest), version_parts(exe)),
+        (Some(l), Some(e)) if l > e
+    );
+    Some(if newer {
+        soft(
+            "update",
+            false,
+            format!("{latest} is out; this PC runs {exe}"),
+        )
+        .coded("UPDATE_AVAILABLE")
+    } else {
+        soft("update", true, format!("{exe} is the newest release"))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3820,6 +3889,7 @@ fn uninstall_cli(args: &[String]) -> WslResult<ExitCode> {
     } else {
         println!("{DISTRO} was not registered");
     }
+    remove_our_wslconfig();
     if flags.has("--purge") {
         let data = data_dir();
         match std::fs::remove_dir_all(&data) {
@@ -3840,9 +3910,56 @@ fn uninstall_cli(args: &[String]) -> WslResult<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The `.wslconfig` goes with the worker when the install wrote it, nobody
+/// changed it since, and no other WSL distribution is left for it to limit.
+/// Any other file is the user's and stays.
+fn remove_our_wslconfig() {
+    let mark = data_dir().join(WSLCONFIG_MARK);
+    let (Some(path), Ok(recorded)) = (wslconfig_path(), std::fs::read_to_string(&mark)) else {
+        return;
+    };
+    let others =
+        list_distros().map(|list| list.iter().any(|d| !d.name.eq_ignore_ascii_case(DISTRO)));
+    match std::fs::read(&path) {
+        Ok(text) if !wslconfig_is_ours(&text, &recorded) => {
+            println!(
+                "kept {}: it changed after the install wrote it",
+                path.display()
+            )
+        }
+        Ok(_) if others.as_ref().map_or(true, |&any| any) => println!(
+            "kept {}: other WSL distributions are under it",
+            path.display()
+        ),
+        Ok(_) => match std::fs::remove_file(&path) {
+            Ok(()) => println!("removed {}, which the install wrote", path.display()),
+            Err(e) => println!("{}: {e}", path.display()),
+        },
+        Err(_) => {}
+    }
+    if !path.exists() {
+        let _ = std::fs::remove_file(&mark);
+    }
+}
+
+/// True when `text` is the file whose sha256 the install recorded.
+pub(crate) fn wslconfig_is_ours(text: &[u8], recorded: &str) -> bool {
+    hex(&Sha256::digest(text)) == recorded.trim()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_uninstall_takes_only_the_wslconfig_the_install_wrote() {
+        let written = with_reclaim(&merge_wslconfig("", "3276MB", 2));
+        let mark = hex(&Sha256::digest(written.as_bytes()));
+        assert!(wslconfig_is_ours(written.as_bytes(), &format!("{mark}\n")));
+        let edited = format!("{written}[experimental]\nsparseVhd=true\n");
+        assert!(!wslconfig_is_ours(edited.as_bytes(), &mark));
+        assert!(!wslconfig_is_ours(written.as_bytes(), ""));
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -4590,6 +4707,27 @@ mod tests {
         assert_eq!(silent.code, "VERSION_MISMATCH");
         // The doctor's line points at the command that aligns them.
         assert!(crate::hints::hint("VERSION_MISMATCH").contains("wsl update"));
+
+        assert_eq!(
+            version_in_location(
+                "https://github.com/nailtongomes/shutup-and-run/releases/tag/v0.2.25"
+            )
+            .as_deref(),
+            Some("0.2.25")
+        );
+        assert_eq!(version_in_location("https://github.com/x/y/releases"), None);
+        assert_eq!(version_in_location("/releases/tag/v1.2"), None);
+        let behind = update_check("0.2.9", Some("0.2.10")).unwrap();
+        assert_eq!(
+            (behind.ok, behind.code.as_str()),
+            (false, "UPDATE_AVAILABLE")
+        );
+        assert!(behind.detail.contains("0.2.10 is out"));
+        assert!(crate::hints::hint("UPDATE_AVAILABLE").contains("install.ps1"));
+        assert!(update_check("0.2.10", Some("0.2.10")).unwrap().ok);
+        // A build newer than the release (a branch, a test) is not behind.
+        assert!(update_check("0.3.0", Some("0.2.10")).unwrap().ok);
+        assert!(update_check("0.2.10", None).is_none());
         assert!(usage().contains("wsl update"));
     }
 

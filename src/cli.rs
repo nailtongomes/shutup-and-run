@@ -1046,6 +1046,14 @@ pub fn status_out(path: &Path, now: i64) -> Out {
 /// battery, memory to free, a WSL2 clock that is off, the last cleanup.
 fn status_more(status: &Value) -> String {
     let mut lines = Vec::new();
+    for pull in status["pulling"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "downloading the image of {}: {} of {}",
+            pull["id"].as_str().unwrap_or("?"),
+            crate::resources::human(pull["done_bytes"].as_u64().unwrap_or(0)),
+            crate::resources::human(pull["total_bytes"].as_u64().unwrap_or(0))
+        ));
+    }
     if let Some(until) = status["paused_until"].as_str() {
         lines.push(format!("paused until: {until}"));
     }
