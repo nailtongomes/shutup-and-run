@@ -2,7 +2,7 @@
 
 [TESTING.pt-BR.md](TESTING.pt-BR.md) tem o roteiro completo. Esta lista é só o que o CI não alcança: o runner do Windows instala, atualiza e faz rollback, mas não tem bateria, não tem tela, não tem programas de usuário abertos e não roda uma tarefa de verdade dentro do WSL2. Cada item diz o que conferir e onde. Ao terminar, anote o resultado (ok, falhou, com a saída) em [TESTING.pt-BR.md](TESTING.pt-BR.md) e apague daqui o que passou.
 
-Um PC Windows 11 com WSL2, instalado ou atualizado para a 0.2.20 com `irm .../install.ps1 | iex` (`shutup-and-run version` diz 0.2.20), a página em `http://127.0.0.1:8787/` e o mock de poll do roteiro ([TESTING.pt-BR.md, seção 2](TESTING.pt-BR.md#2-uma-url-de-poll-para-testar)) servindo jobs curtos. Sem URL de poll, o modo gerenciado serve: um container `once` (`managed apply`, `managed mode on`) e `managed start NOME` para cada tarefa que um item pedir. Um container desabilitado não começa nem com `start`: `enable`, `start`, `disable`.
+Um PC Windows 11 com WSL2, instalado ou atualizado para a 0.2.21 com `irm .../install.ps1 | iex` (`shutup-and-run version` diz 0.2.21), a página em `http://127.0.0.1:8787/` e o mock de poll do roteiro ([TESTING.pt-BR.md, seção 2](TESTING.pt-BR.md#2-uma-url-de-poll-para-testar)) servindo jobs curtos. Sem URL de poll, o modo gerenciado serve: um container `once` (`managed apply`, `managed mode on`) e `managed start NOME` para cada tarefa que um item pedir. Um container desabilitado não começa nem com `start`: `enable`, `start`, `disable`.
 
 Para um agente que lê a página com um script: um POST para `/local/*` vindo de fora da própria página recebe 403 de propósito (só a página, no navegador, muda algo). Para pausar, autorizar ou mudar config por script, use a CLI (`shutup-and-run pause`, `safety authorize`, `config set`).
 
@@ -45,7 +45,7 @@ Prepare um PC com pouca memória livre: abra o Chrome com muitas abas, o Teams e
 - [ ] Depois de `wsl --shutdown` (num momento sem tarefa e sem outro uso do WSL), confira que o WSL ainda sobe e que o `autoMemoryReclaim` é aceito pela versão instalada: `wsl --version` e nenhum aviso de chave desconhecida ao abrir a distribuição. Anote a versão do WSL. Se a sua versão aceitar a chave em `[wsl2]` e não em `[experimental]`, registre isso.
 - [ ] Um `.wslconfig` com `autoMemoryReclaim=disabled` (escolha do dono) fica como está depois do `--apply`.
 
-## Depois da 0.2.20: o que a rodada 3 encontrou
+## 0.2.21: o que a rodada 3 encontrou
 
 Rodada 3 (0.2.20): ok o WSL devolvendo a memória (VmmemWSL de ~2,4 GiB para 720 MiB menos de 20 s depois do log `gave the memory of the last job back to Windows`) e o `SAFETY_MEMORY_CRITICAL` que bloqueou sem matar o job em curso. O que ela achou e mudou depois:
 
