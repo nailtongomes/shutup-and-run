@@ -94,6 +94,19 @@ pub(crate) fn meminfo_field(text: &str, field: &str) -> Option<u64> {
     kib.checked_mul(1024)
 }
 
+/// Tells the disk which blocks are free (`fstrim /`), so a sparse WSL2
+/// disk hands them back to Windows. A failure only goes to the log.
+pub fn trim_disk() {
+    match std::process::Command::new("fstrim").arg("/").output() {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => tracing::warn!(
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "fstrim failed"
+        ),
+        Err(err) => tracing::warn!(error = %err, "fstrim could not run"),
+    }
+}
+
 /// Where Docker keeps images, when it is in the usual place; otherwise the
 /// folder given (the job history's).
 /// shortcut: a Docker `data-root` somewhere else is not looked up. Upgrade to

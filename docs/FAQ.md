@@ -59,6 +59,10 @@ shutup-and-run config set lend_hours "mon-fri 19-07; sat,sun" --apply
 
 That is weekday nights and all weekend. A window whose end is before its start runs past midnight and belongs to the day it starts (`fri 19-07` ends Saturday at 7). Outside the windows no new job starts, the worker does not ask for work, and the page says **WAITING** (`OUTSIDE_LEND_HOURS`). A running job goes on past the end of the window. `config unset lend_hours --apply` lends at any time again. The page and `shutup-and-run doctor` show the window and the time now with its zone (`now wed 21:00, UTC-03:00`), so a wrong clock is easy to see.
 
+### Does it fill my disk with leftovers?
+
+No. Once a day the worker removes the images no job used for 30 days (on Windows also the old copies an image pulled again leaves behind), job logs go after 7 days and finished jobs after 30. On Windows the disk file of WSL2 does not shrink by itself: when it is much bigger than what is in use, `shutup-and-run wsl doctor` says `WSL_DISK_TO_COMPACT`, and [docs/WINDOWS.md](WINDOWS.md#give-the-wsl2-disks-space-back) shows how to compact it, by hand, with WSL stopped. The page's **Cleanup** row says when the last pass ran and what it freed.
+
 ### Can a job see my files?
 
 No. A job gets no folder of the PC: no mount, no Windows drive (WSL2 is installed without them), no port. It sees its own container and the network. The one exception is a certificate the owner chooses to share, which every job can then read; it is off unless the owner turns it on, on the PC.

@@ -172,6 +172,89 @@ pub fn summary(jobs: &[JobRecord]) -> Summary {
     }
 }
 
+/// What the jobs of one image used, from the same readings.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ImageSummary {
+    pub image: String,
+    pub jobs: usize,
+    pub measured: usize,
+    pub memory_peak_max: Option<u64>,
+    pub memory_peak_mean: Option<u64>,
+    /// The `memory` to ask in a request for this image: twice its highest
+    /// peak, rounded up to 256 MiB. Only from `MIN_MEASURED_PER_IMAGE`.
+    pub memory_to_ask: Option<u64>,
+}
+
+/// Fewer measured jobs of one image than this make no suggestion for it.
+pub const MIN_MEASURED_PER_IMAGE: usize = 3;
+
+/// One summary per image, most jobs first: a `max_job_memory` fits the
+/// heaviest, and each request can ask for what its own image needs.
+pub fn by_image(jobs: &[JobRecord]) -> Vec<ImageSummary> {
+    let mut images: Vec<ImageSummary> = Vec::new();
+    for job in jobs.iter().filter(|j| j.is_finished()) {
+        let at = match images.iter().position(|i| i.image == job.image) {
+            Some(at) => at,
+            None => {
+                images.push(ImageSummary {
+                    image: job.image.clone(),
+                    jobs: 0,
+                    measured: 0,
+                    memory_peak_max: None,
+                    memory_peak_mean: None,
+                    memory_to_ask: None,
+                });
+                images.len() - 1
+            }
+        };
+        images[at].jobs += 1;
+    }
+    for image in &mut images {
+        let peaks: Vec<u64> = jobs
+            .iter()
+            .filter(|j| j.is_finished() && j.image == image.image)
+            .filter_map(|j| j.memory_peak)
+            .collect();
+        image.measured = peaks.len();
+        image.memory_peak_max = peaks.iter().copied().max();
+        image.memory_peak_mean =
+            (!peaks.is_empty()).then(|| peaks.iter().sum::<u64>() / peaks.len() as u64);
+        image.memory_to_ask = image
+            .memory_peak_max
+            .filter(|_| image.measured >= MIN_MEASURED_PER_IMAGE)
+            .map(twice_rounded);
+    }
+    images.sort_by(|a, b| b.jobs.cmp(&a.jobs).then_with(|| a.image.cmp(&b.image)));
+    images
+}
+
+/// `  alpine: 6 jobs, 5 measured, memory peak 380 MiB at most (210 MiB on
+/// average); ask for memory 768m`.
+pub fn image_text(image: &ImageSummary) -> String {
+    let mut text = format!(
+        "  {}: {} jobs, {} measured",
+        image.image, image.jobs, image.measured
+    );
+    if let (Some(max), Some(mean)) = (image.memory_peak_max, image.memory_peak_mean) {
+        text.push_str(&format!(
+            ", memory peak {} at most ({} on average)",
+            memory_text(max),
+            memory_text(mean)
+        ));
+    }
+    if let Some(ask) = image.memory_to_ask {
+        text.push_str(&format!("; ask for memory {}", size_value(ask)));
+    }
+    text
+}
+
+/// Twice a peak, rounded up to 256 MiB: room for a peak the readings
+/// every 30 seconds missed.
+fn twice_rounded(peak: u64) -> u64 {
+    let step = 256 * MIB;
+    (peak * 2).div_ceil(step).max(1) * step
+}
+
 /// A `max_job_memory` that fits what the jobs used, and how many slots it
 /// and `max_job_cpus` leave room for on this machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -198,9 +281,7 @@ pub fn capacity(
         return None;
     }
     let limit = max_job_memory?;
-    let step = 256 * MIB;
-    let wanted = (summary.memory_peak_max? * 2).div_ceil(step).max(1) * step;
-    let memory = wanted.min(limit);
+    let memory = twice_rounded(summary.memory_peak_max?).min(limit);
     let mut slots = memory_total? / memory;
     if let Some(per_job) = max_job_cpus.filter(|c| *c > 0.0) {
         slots = slots.min((cpus as f64 / per_job).floor() as u64);
@@ -571,8 +652,14 @@ pub fn summary_out(
         Vec::new()
     };
     let summary = summary(&jobs);
+    let images = by_image(&jobs);
     let mut text = summary_text(&summary);
-    let mut value = json!({"summary": summary, "limit": limit, "suggestion": null});
+    for image in &images {
+        text.push('\n');
+        text.push_str(&image_text(image));
+    }
+    let mut value =
+        json!({"summary": summary, "images": images, "limit": limit, "suggestion": null});
     if let Some(settings) = settings {
         let limits = json!({
             "max_job_memory_bytes": settings.max_job_memory,
@@ -614,6 +701,51 @@ pub fn summary_out(
 mod tests {
     use super::*;
     use crate::store::NewJob;
+
+    #[test]
+    fn each_image_gets_its_own_peak_and_the_memory_to_ask_for() {
+        let mib = 1024 * 1024;
+        let job = |n: i64, image: &str, peak: Option<u64>| JobRecord {
+            id: format!("job-{n}"),
+            image: image.into(),
+            job_key: None,
+            started_at: n * 1000,
+            ended_at: Some(n * 1000 + 60),
+            exit_code: Some(0),
+            reason: None,
+            callback_url: None,
+            logs: None,
+            oom_killed: false,
+            cpu_ms: None,
+            memory_peak: peak.map(|p| p * mib),
+        };
+        let jobs = vec![
+            job(1, "rpa", Some(900)),
+            job(2, "rpa", Some(1100)),
+            job(3, "rpa", Some(1000)),
+            job(4, "report", Some(200)),
+            job(5, "report", None),
+            JobRecord {
+                ended_at: None,
+                ..job(6, "report", Some(5000))
+            },
+        ];
+        let images = by_image(&jobs);
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].image, "rpa");
+        assert_eq!((images[0].jobs, images[0].measured), (3, 3));
+        assert_eq!(images[0].memory_peak_max, Some(1100 * mib));
+        // Twice 1100 MiB is 2200, rounded up to 2304.
+        assert_eq!(images[0].memory_to_ask, Some(2304 * mib));
+        // Two finished jobs, one measured: numbers, no suggestion; the
+        // running one is not counted.
+        assert_eq!((images[1].jobs, images[1].measured), (2, 1));
+        assert_eq!(images[1].memory_to_ask, None);
+        assert_eq!(
+            image_text(&images[1]),
+            "  report: 2 jobs, 1 measured, memory peak 200 MiB at most (200 MiB on average)"
+        );
+    }
 
     #[test]
     fn the_summary_suggests_a_memory_limit_and_slots_only_from_enough_readings() {
@@ -701,6 +833,15 @@ mod tests {
         );
         assert_eq!(capacity(&summary, None, None, 1, Some(2048 * mib), 4), None);
         assert_eq!(size_value(2048 * mib), "2g");
+        // One line per image: here one image, five measured.
+        assert_eq!(
+            out.json["images"][0]["image"],
+            "registry.example/protocol:1"
+        );
+        assert_eq!(out.json["images"][0]["memory_to_ask"], 768 * mib);
+        assert!(out.text.contains(
+            "\n  registry.example/protocol:1: 5 jobs, 5 measured, memory peak 380 MiB at most (296 MiB on average); ask for memory 768m"
+        ), "{}", out.text);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

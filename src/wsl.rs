@@ -1563,8 +1563,71 @@ fn doctor(
     ) {
         checks.push(check);
     }
+    if let Some((file, sparse)) = vhd_file() {
+        checks.push(vhd_check(file, distro_disk_used(), sparse));
+    }
 
     Ok((checks, inner))
+}
+
+/// The WSL2 disk file grows as images come and does not shrink when they go;
+/// worth compacting by hand once it holds at least this much more than the
+/// distribution uses, and twice as much.
+const VHD_SLACK_BYTES: u64 = 5 << 30;
+
+/// The size of the WSL2 disk on Windows next to what the distribution uses.
+/// A sparse disk gives freed space back by itself (the daily cleanup trims
+/// it); one that is not is compacted by a person, with WSL stopped.
+pub(crate) fn vhd_check(file: u64, used: Option<u64>, sparse: bool) -> Check {
+    use crate::resources::human;
+    let used_text = used
+        .map(|u| format!(", {} of it in use", human(u)))
+        .unwrap_or_default();
+    let detail = format!("the WSL2 disk is {} on Windows{used_text}", human(file));
+    match used {
+        Some(used)
+            if !sparse && file > used.saturating_mul(2) && file - used >= VHD_SLACK_BYTES =>
+        {
+            soft(
+                "wsl-disk",
+                false,
+                format!("{detail}: {} could go back to Windows", human(file - used)),
+            )
+            .coded("WSL_DISK_TO_COMPACT")
+        }
+        _ => soft(
+            "wsl-disk",
+            true,
+            if sparse {
+                format!("{detail}; sparse, so freed space goes back to Windows by itself")
+            } else {
+                detail
+            },
+        ),
+    }
+}
+
+/// The distribution's disk file: its size, and whether it is sparse.
+#[cfg(windows)]
+fn vhd_file() -> Option<(u64, bool)> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+    let meta = std::fs::metadata(data_dir().join("vhd").join("ext4.vhdx")).ok()?;
+    Some((
+        meta.len(),
+        meta.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE != 0,
+    ))
+}
+
+#[cfg(not(windows))]
+fn vhd_file() -> Option<(u64, bool)> {
+    None
+}
+
+/// Bytes in use on the distribution's own disk.
+fn distro_disk_used() -> Option<u64> {
+    let out = sh_in_distro("df -B1 --output=used / | tail -n 1", None, SHORT).ok()?;
+    out.text().trim().parse().ok()
 }
 
 /// While the PC is what is short of memory, the programs holding the most
@@ -4017,6 +4080,23 @@ mod tests {
         assert!(programs_check(Some(&vm), list).is_none());
         assert!(programs_check(None, list).is_none());
         assert!(programs_check(Some(&pc), Vec::new).is_none());
+    }
+
+    #[test]
+    fn a_wsl2_disk_much_bigger_than_its_use_is_worth_compacting() {
+        let big = vhd_check(24 * GIB, Some(6 * GIB), false);
+        assert_eq!(big.code(), "WSL_DISK_TO_COMPACT");
+        assert_eq!(
+            big.detail,
+            "the WSL2 disk is 24.0 GiB on Windows, 6.0 GiB of it in use: 18.0 GiB could go back to Windows"
+        );
+        assert!(big.hint().contains("docs/WINDOWS.md"));
+        // Under 5 GiB of slack, or under twice the use: nothing to do.
+        assert!(vhd_check(7 * GIB, Some(3 * GIB), false).ok);
+        assert!(vhd_check(30 * GIB, Some(20 * GIB), false).ok);
+        // Sparse gives it back by itself; an unknown use says only the size.
+        assert!(vhd_check(24 * GIB, Some(6 * GIB), true).ok);
+        assert!(vhd_check(24 * GIB, None, false).ok);
     }
 
     #[test]

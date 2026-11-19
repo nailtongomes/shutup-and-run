@@ -247,6 +247,27 @@ shutup-and-run doctor
 
 **What a job printed.** Docker removes a job's container when it ends, so `docker ps -a` is empty. Its output is kept instead: the last 256 KiB of stdout and stderr, one file per job, in `/var/lib/shutup-and-run/logs/` inside the distribution, for 7 days. Nothing in it is masked. `shutup-and-run jobs logs --last` prints it, and the local page lists the last ones under "Job output (logs)", each with a link to open it in the browser and one to download it.
 
+**What the worker leaves on the PC.** Once a day the service removes the images no job used for 30 days, and the images no tag points at any more (an image pulled again leaves its old copy behind), then trims the distribution's disk. Job logs go after 7 days and finished jobs after `history_days` (30 by default). Neither the 30 days nor the pass can be turned off: the PC is the client's. The page has a **Cleanup** row and `doctor` a `cleanup` line with the last pass, what it removed and about how much it freed; `status.json` has `cleanup`.
+
+### Give the WSL2 disk's space back
+
+What the cleanup frees is free again inside WSL2 at once, but the disk file on Windows, `%ProgramData%\shutup-and-run\vhd\ext4.vhdx`, does not shrink by itself. `shutup-and-run wsl doctor` has a `wsl-disk` line with its size and what is in use, and says `WSL_DISK_TO_COMPACT` when the file is twice what is in use and holds 5 GiB more. Recent WSL versions turned off the sparse disk that would hand the space back by itself, over a risk of corrupting it, so the worker does not make its disk sparse; it is compacted by hand. With no job running and the owner agreeing, in a PowerShell run as administrator:
+
+```powershell
+shutup-and-run wsl stop
+wsl --shutdown
+@"
+select vdisk file="$env:ProgramData\shutup-and-run\vhd\ext4.vhdx"
+attach vdisk readonly
+compact vdisk
+detach vdisk
+"@ | Set-Content -Encoding ASCII "$env:TEMP\compact-wsl.txt"
+diskpart /s "$env:TEMP\compact-wsl.txt"
+shutup-and-run wsl start
+```
+
+`wsl --shutdown` stops every WSL2 distribution on the PC, not only this one. The worker never runs it, and never compacts by itself.
+
 When the machine itself broke (a power cut, a damaged distribution), `shutup-and-run wsl reset` deletes the distribution and installs it again, keeping the config and the machine's poll token. `--factory` forgets those too.
 
 To update to a new release, see [Update and repair](#update-and-repair). `wsl install` run again is a re-install: it keeps the distribution, its job history and the whole config, the poll token included, and changes only the options you pass. An install from 0.2.4 or earlier has its `config.toml` and env file carried over into `config.json`. A worker that was paused with no end resumes; a pause for a while keeps its end.

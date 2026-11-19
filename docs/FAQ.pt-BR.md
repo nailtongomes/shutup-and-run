@@ -59,6 +59,10 @@ shutup-and-run config set lend_hours "mon-fri 19-07; sat,sun" --apply
 
 Isso é: noites de dias úteis e o fim de semana inteiro. Os dias são `mon` a `sun`. Uma janela cujo fim vem antes do início passa da meia-noite e pertence ao dia em que começa (`fri 19-07` termina no sábado às 7). Fora das janelas nenhuma tarefa nova começa, o worker não pede trabalho e a página diz **ESPERANDO** (`OUTSIDE_LEND_HOURS`). Uma tarefa em execução continua depois do fim da janela. `config unset lend_hours --apply` volta a emprestar a qualquer hora. A página e o `shutup-and-run doctor` mostram a janela e a hora agora com o fuso (`now wed 21:00, UTC-03:00`), então um relógio errado aparece logo.
 
+### Ele enche meu disco de sobras?
+
+Não. Uma vez por dia o worker remove as imagens que nenhuma tarefa usou em 30 dias (no Windows também as cópias velhas que uma imagem baixada de novo deixa para trás), os logs das tarefas saem depois de 7 dias e as tarefas terminadas depois de 30. No Windows o arquivo de disco do WSL2 não diminui sozinho: quando ele fica bem maior do que o que está em uso, o `shutup-and-run wsl doctor` diz `WSL_DISK_TO_COMPACT`, e o [docs/WINDOWS.md](WINDOWS.md#give-the-wsl2-disks-space-back) mostra como compactar, à mão, com o WSL parado. A linha **Limpeza** da página diz quando foi a última passada e quanto ela liberou.
+
 ### Uma tarefa consegue ver meus arquivos?
 
 Não. Uma tarefa não recebe nenhuma pasta do PC: nenhum mount, nenhum drive do Windows (o WSL2 é instalado sem eles), nenhuma porta. Ela vê o próprio container e a rede. A única exceção é um certificado que o dono decide compartilhar, que toda tarefa passa a poder ler; isso fica desligado até o dono ligar, no próprio PC.

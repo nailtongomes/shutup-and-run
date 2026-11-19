@@ -100,6 +100,13 @@ fn codes_of(findings: &[crate::safety::Finding]) -> String {
         .join(", ")
 }
 
+/// An image no job used for this many days is removed. A constant, like
+/// the 7 days of job logs: the PC is the client's, and the worker does not
+/// leave its leftovers on it.
+pub const UNUSED_DAYS: i64 = 30;
+/// How often that is looked at.
+pub const CLEANUP_EVERY_SECS: i64 = 86_400;
+
 /// How often a running job's counters are read (CPU throttling, CPU time,
 /// memory): once per job every this long, one small Docker call, kept in
 /// memory until the job ends.
@@ -547,6 +554,78 @@ impl Launcher {
 
     pub fn delivery(&self) -> crate::store::Delivery {
         self.store.delivery().unwrap_or_default()
+    }
+
+    pub fn last_cleanup(&self) -> Option<crate::store::Cleanup> {
+        self.store.cleanup().ok().flatten()
+    }
+
+    /// Once a day: removes the images no job used for `UNUSED_DAYS`, and on
+    /// a Windows PC the images no tag points at any more, then trims the
+    /// WSL2 disk so a sparse one gives the space back to Windows. Not while
+    /// a job is starting, which may be pulling one of them. None when it
+    /// was not due.
+    pub async fn clean_unused(&self) -> Result<Option<crate::store::Cleanup>, LaunchError> {
+        let now = self.clock.now_unix() as i64;
+        let due = self
+            .store
+            .cleanup()
+            .map_err(store_err)?
+            .is_none_or(|last| now - last.at >= CLEANUP_EVERY_SECS);
+        if !due || !self.starting.lock().await.is_empty() {
+            return Ok(None);
+        }
+        let disk = crate::resources::disk_path(&self.settings.history_path);
+        let before = crate::resources::read(&disk).disk;
+        let mut images = 0u64;
+        let cutoff = now - UNUSED_DAYS * 86_400;
+        for image in self.store.images_unused_since(cutoff).map_err(store_err)? {
+            match self.runtime.image_in_use(&image).await {
+                Ok(true) => {}
+                Ok(false) => match self.runtime.remove_image(&image).await {
+                    Ok(()) => {
+                        let _ = self.store.forget_image(&image);
+                        images += 1;
+                    }
+                    Err(err) => {
+                        tracing::warn!(%image, error = %err, "could not remove an unused image")
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(%image, error = %err, "could not tell if an image is in use")
+                }
+            }
+        }
+        let mut dangling = 0;
+        if self.settings.worker_os == "windows" {
+            // The distribution and its Docker are the worker's own; on a
+            // Linux machine the daemon is the owner's, and so are its
+            // untagged images.
+            dangling = self.runtime.prune_dangling().await.unwrap_or_else(|err| {
+                tracing::warn!(error = %err, "could not remove untagged images");
+                0
+            });
+            let _ = tokio::task::spawn_blocking(crate::resources::trim_disk).await;
+        }
+        let after = crate::resources::read(&disk).disk;
+        let freed = match (before, after) {
+            (Some(before), Some(after)) => after.saturating_sub(before).max(dangling),
+            _ => dangling,
+        };
+        let cleanup = crate::store::Cleanup {
+            at: now,
+            images,
+            freed_bytes: freed,
+        };
+        self.store.set_cleanup(&cleanup).map_err(store_err)?;
+        if images > 0 || freed > 0 {
+            tracing::info!(
+                images,
+                freed = %crate::resources::human(freed),
+                "removed what no job used for {UNUSED_DAYS} days"
+            );
+        }
+        Ok(Some(cleanup))
     }
 
     /// Resolves when a job that ran has ended since the last call.
@@ -1315,12 +1394,22 @@ pub fn spawn_maintenance(launcher: Arc<Launcher>) {
         let mut since_reap = std::time::Duration::ZERO;
         let mut since_purge = std::time::Duration::ZERO;
         let mut since_prune = std::time::Duration::ZERO;
+        // The first look ten minutes after a start, then every hour; the
+        // pass itself runs once a day.
+        let mut since_cleanup = std::time::Duration::from_secs(50 * 60);
         loop {
             ticks.tick().await;
             let step = std::time::Duration::from_secs(1);
             since_reap += step;
             since_purge += step;
             since_prune += step;
+            since_cleanup += step;
+            if since_cleanup >= std::time::Duration::from_secs(3600) {
+                since_cleanup = std::time::Duration::ZERO;
+                if let Err(err) = launcher.clean_unused().await {
+                    tracing::warn!(error = %err, "cleanup");
+                }
+            }
             if since_reap >= reaper {
                 since_reap = std::time::Duration::ZERO;
                 if let Err(err) = launcher.reap_once().await {
@@ -2902,6 +2991,38 @@ mod tests {
             throttled_periods: 400
         }
         .significant());
+    }
+
+    #[tokio::test]
+    async fn images_no_job_used_for_30_days_are_removed_once_a_day() {
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let clock = Arc::new(FakeClock::new(T0));
+        let launcher = Launcher::with_clock(settings(2), runtime, clock.clone()).unwrap();
+        let old = started(&launcher, job("alpine", None)).await;
+        mock.stop(&old, 0).await;
+        launcher.on_exit(&old, 0).await;
+        // 29 days later another image is used; alpine is not yet 30 days old.
+        clock.set(T0 + 29 * 86_400);
+        let recent = started(&launcher, job("ghcr.io/owner/selenium-worker", None)).await;
+        mock.stop(&recent, 0).await;
+        launcher.on_exit(&recent, 0).await;
+        let first = launcher.clean_unused().await.unwrap().unwrap();
+        assert_eq!(first.images, 0);
+        assert!(mock.removed_images().await.is_empty());
+        // Already looked at today.
+        clock.set(T0 + 29 * 86_400 + 3600);
+        assert_eq!(launcher.clean_unused().await.unwrap(), None);
+        // Two days later: alpine goes, the image used two days ago stays.
+        clock.set(T0 + 31 * 86_400);
+        let next = launcher.clean_unused().await.unwrap().unwrap();
+        assert_eq!(next.images, 1);
+        assert_eq!(mock.removed_images().await, vec!["alpine".to_string()]);
+        assert_eq!(launcher.last_cleanup(), Some(next));
+        // Forgotten once removed: not tried again.
+        clock.set(T0 + 33 * 86_400 + CLEANUP_EVERY_SECS as u64);
+        assert_eq!(launcher.clean_unused().await.unwrap().unwrap().images, 0);
+        assert_eq!(mock.removed_images().await.len(), 1);
     }
 
     #[tokio::test]

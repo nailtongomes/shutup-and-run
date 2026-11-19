@@ -260,6 +260,8 @@ Num notebook Windows, com o mock servindo jobs curtos (`--image alpine --command
 Resultado da rodada 3 (0.2.20, notebook na bateria, modo gerenciado): ok a bateria acima de 60% (quadro, linha **Energia**, `ON_BATTERY`, job começou com 95%) e abaixo (`BATTERY_LOW` com o Windows em 58%: a carga do `GetSystemPowerStatus` pode ficar 1% atrás do `Win32_Battery`, e vale a primeira); ok o `used:` (`cpu 173.4 s, memory peak 1.1 GiB`, igual no `jobs --json` e na página) e o `jobs logs --last`; `USER_PRESENTING` só visto no log. Ficaram para a próxima rodada: um job rodando ao cruzar 60%, voltar à tomada, Teams em tela cheia, `lend_hours` e `--owner-consent`.
 
 
+`tests/windows-round/check.ps1` roda num PC real a parte desse roteiro que não precisa de uma pessoa e escreve uma tabela em Markdown; o CI só confere que ele é um PowerShell válido.
+
 O que nenhum CI alcança num PC Windows real desde então (o relógio do Windows, a pausa por um tempo, a memória e os programas que a ocupam, o cache do WSL2) está em [WINDOWS-PENDING.md](WINDOWS-PENDING.md).
 
 ### Repasse de certificado e as demos

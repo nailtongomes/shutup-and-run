@@ -544,3 +544,17 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - A running job's readings go to its row as they come, so its CPU time and memory show while it runs (`so far`).
 
 **Cost.** The service changes a clock other distributions on the PC also read; it only ever moves it toward Windows'. A Windows clock that is wrong is now wrong inside WSL2 too. Three days of readings is a short week.
+
+## The worker cleans up after itself; the WSL2 disk is compacted by a person (0.2.22)
+
+**Context.** Images were removed only with `prune_interval_secs`, off by default, and then every image of every finished job, so the next job pulled it again. On a client's PC the images of jobs that stopped coming stayed for good, and so did the old copy an image pulled again under the same tag leaves behind. On Windows the WSL2 disk file grows with them and never shrinks: what is deleted inside is free for WSL2, not for Windows. The owner wants a worker that does not pile up leftovers on someone else's PC.
+
+**Decision.**
+
+- The history keeps each image's last use (`images`: the start of its last job; filled from the jobs on the first start of 0.2.22). Once a day the service removes the images unused for 30 days that no container uses, and forgets them. 30 days is a constant, always on, like the 7 days of job logs. On a Windows PC, where the distribution and its Docker are the worker's own, it also removes the untagged images and runs `fstrim /`; on Linux the daemon is the owner's, and so are its untagged images. `status.json` (`cleanup`), the page (**Cleanup**) and `doctor` (`cleanup`) say when it last ran and about how much it freed: free disk after minus before, which other writes can blur.
+- The WSL2 disk file is not made sparse. A sparse disk would hand freed space back to Windows by itself, but recent WSL versions refuse it without `--allow-unsafe`, over a risk of corrupting the disk, and the worker does not take that risk on a client's PC. `wsl doctor` shows the file's size next to what is in use and says `WSL_DISK_TO_COMPACT` when the file is twice that and 5 GiB more; compacting needs `wsl --shutdown` and an administrator's `diskpart`, so a person does it (docs/WINDOWS.md).
+- `status` prints the rest of `status.json` that has something to say. `jobs --summary` adds one line per image, with the `memory` to ask for it from three jobs measured.
+- `tests/windows-round/check.ps1` runs the part of a Windows hand test no person is needed for and writes a Markdown table; CI only checks that it parses.
+
+**Cost.** An image used once a month is pulled again each time. An image pulled before 0.2.22 whose jobs were already purged from the history is not known, and stays. Until someone compacts it, the disk file on Windows keeps its largest size.
+
