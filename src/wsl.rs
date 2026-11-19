@@ -84,6 +84,22 @@ const DOCKER_STEPS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The systemd journal of the distribution (dockerd, systemd) keeps up to
+/// 10% of the disk, 4 GB, by default. On a client's PC it keeps 100 MB, the
+/// oldest going first. Written by the install and by every update, so a PC
+/// installed before has it too; a failure is a warning.
+pub(crate) const JOURNAL_CAP_SCRIPT: &str = "mkdir -p /etc/systemd/journald.conf.d && \
+     printf '[Journal]\\nSystemMaxUse=100M\\nRuntimeMaxUse=50M\\n' \
+     > /etc/systemd/journald.conf.d/shutup-and-run.conf && \
+     systemctl restart systemd-journald";
+
+fn cap_journal() {
+    match sh_in_distro(JOURNAL_CAP_SCRIPT, None, SHORT) {
+        Ok(out) if out.ok() => println!("    the system journal keeps 100 MB at most"),
+        _ => println!("    warning: could not cap the system journal; it keeps its default size"),
+    }
+}
+
 /// Run inside the distribution before the VM goes away: by `wsl stop` with
 /// 10 seconds, and at sign-out or shutdown with the 3 that Windows leaves.
 /// The service goes first so it takes no new task.
@@ -1882,6 +1898,7 @@ async fn install_cli(args: &[String]) -> WslResult<ExitCode> {
         }
     }
     println!("    installed and running");
+    cap_journal();
 
     println!("[5/8] the Linux binary");
     let musl = obtain_musl(&client, &flags).await?;
@@ -2170,6 +2187,8 @@ async fn update_cli(args: &[String]) -> WslResult<ExitCode> {
             });
         }
     }
+
+    cap_journal();
 
     println!("[2/4] the Linux binary {version}");
     let new = format!("{INNER_BIN}.new");
@@ -4088,6 +4107,8 @@ mod tests {
         assert!(DOCKER_STEPS
             .iter()
             .any(|(_, s)| s.contains("systemctl enable --now docker")));
+        assert!(JOURNAL_CAP_SCRIPT.contains("/etc/systemd/journald.conf.d/shutup-and-run.conf"));
+        assert!(JOURNAL_CAP_SCRIPT.contains("'[Journal]\\nSystemMaxUse=100M\\n"));
         let script = render_serve_script();
         assert!(script.contains("systemctl start docker"));
         assert!(script.starts_with("#!/bin/sh\n"));

@@ -61,8 +61,10 @@ pub fn spawn_poller(launcher: Arc<Launcher>) {
     };
     tracing::info!(%host, interval_secs = interval.as_secs(), "pull mode on");
     tokio::spawn(async move {
-        // shortcut: double the wait up to 5 minutes, in this task, no jitter.
-        // Upgrade if many machines poll one URL and you need to spread them out.
+        // Double the wait up to 5 minutes. After a failure each machine adds
+        // up to a quarter more at random, so a fleet whose poll URL was down
+        // does not come back on the same second; once it succeeds, each
+        // keeps polling from where it landed, spread out.
         let mut wait = interval;
         loop {
             let failed = match poll_once(&launcher, &client).await {
@@ -77,7 +79,12 @@ pub fn spawn_poller(launcher: Arc<Launcher>) {
                 }
             };
             wait = next_wait(wait, interval, failed);
-            rest(&launcher, wait, failed).await;
+            let pause = if failed {
+                spread(wait, random_u64())
+            } else {
+                wait
+            };
+            rest(&launcher, pause, failed).await;
         }
     });
 }
@@ -99,6 +106,27 @@ pub(crate) async fn rest(launcher: &Launcher, wait: Duration, failed: bool) {
             tokio::time::sleep(REPOLL_GAP.min(wait)).await;
         }
     }
+}
+
+/// `wait` plus up to a quarter of it, from `roll`. Never less than `wait`,
+/// so never under the minimum interval.
+pub(crate) fn spread(wait: Duration, roll: u64) -> Duration {
+    let quarter = (wait.as_millis() / 4).min(u64::MAX as u128) as u64;
+    wait + Duration::from_millis(roll % (quarter + 1))
+}
+
+/// A random number from the standard library's per-process hash seed and
+/// the clock: enough to keep machines apart, no crate for it.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    hasher.finish()
 }
 
 pub(crate) fn client() -> Result<reqwest::Client, String> {
@@ -837,6 +865,16 @@ mod tests {
             next_wait(Duration::from_secs(3600), Duration::from_secs(3600), true),
             Duration::from_secs(3600)
         );
+        // After a failure: the wait, plus up to a quarter, never less.
+        let wait = Duration::from_secs(120);
+        assert_eq!(spread(wait, 0), wait);
+        assert_eq!(spread(wait, 30_000), Duration::from_secs(150));
+        assert_eq!(spread(wait, 30_001), wait);
+        assert!((0..1000).all(|_| {
+            let pause = spread(wait, random_u64());
+            pause >= wait && pause <= Duration::from_secs(150)
+        }));
+        assert_ne!(random_u64(), random_u64());
     }
 
     /// Re-poll: the end of a job is followed by a poll at once; an empty

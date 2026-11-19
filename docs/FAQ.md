@@ -65,7 +65,7 @@ That is weekday nights and all weekend. A window whose end is before its start r
 
 ### Does it fill my disk with leftovers?
 
-No. Once a day the worker removes the images no job used for 30 days (on Windows also the old copies an image pulled again leaves behind), job logs go after 7 days and finished jobs after 30. Docker keeps at most 10 MB of what a container printed. On Windows the disk file of WSL2 does not shrink by itself: when it is much bigger than what is in use, `shutup-and-run wsl doctor` says `WSL_DISK_TO_COMPACT`, and [docs/WINDOWS.md](WINDOWS.md#give-the-wsl2-disks-space-back) shows how to compact it, by hand, with WSL stopped. The page's **Cleanup** row says when the last pass ran and what it freed.
+No. Once a day the worker removes the images no job used for 30 days (on Windows also the old copies an image pulled again leaves behind), job logs go after 7 days and finished jobs after 30. Docker keeps at most 10 MB of what a container printed, a container's anonymous volumes go with it, and on Windows the system journal inside WSL2 keeps 100 MB. On Windows the disk file of WSL2 does not shrink by itself: when it is much bigger than what is in use, `shutup-and-run wsl doctor` says `WSL_DISK_TO_COMPACT`, and [docs/WINDOWS.md](WINDOWS.md#give-the-wsl2-disks-space-back) shows how to compact it, by hand, with WSL stopped. The page's **Cleanup** row says when the last pass ran and what it freed.
 
 ### Can a job see my files?
 
@@ -87,9 +87,10 @@ These can:
 
 | What | What happens to the job | How it is reported |
 | --- | --- | --- |
-| Its time limit (`timeout_secs`) | killed | `reason` `timeout` |
+| Its time limit (`timeout_secs`) | SIGTERM, then 10 seconds, then killed | `reason` `timeout` |
 | Its memory limit | killed by the kernel at once | `oom_killed: true` |
 | Its CPU limit | slowed down, not stopped | an incident `cpu_throttled` |
+| 4096 processes | a new one cannot start (`fork` fails); the PC is not touched | how it exited |
 | The PC shuts down, restarts or signs out | Windows asks first while a job runs; "shut down anyway" ends it | `reason` `interrupted`, reported once, not run again |
 | A power cut, a crash of the PC or of Docker | it ends | `interrupted` |
 | `shutup-and-run wsl stop`, an update, an uninstall | SIGTERM, then 10 seconds, then killed | `interrupted`, or how it exited |

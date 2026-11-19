@@ -27,7 +27,7 @@ Um runner de jobs Docker pequeno e auto-hospedado, em Rust. Um orquestrador que 
 | Inicia uma imagem da allowlist com o env, o comando, o timeout e os limites que a tarefa informa | Fila, retry ou encadeamento de tarefas. Isso é do seu orquestrador |
 | Ou, no [modo gerenciado](#containers-gerenciados), roda containers definidos na própria máquina: uma vez, em intervalo, ou sempre | Substitui Compose, Kubernetes ou um motor de workflow. Um container gerenciado é uma imagem e quando rodar |
 | Recebe trabalho de dois jeitos: **push** (`POST /v1/jobs`) e **pull** (o worker consulta uma URL sua) | Coordena máquinas. Cada worker só conhece a si mesmo |
-| Limita concorrência (`max_slots`), tempo (`timeout_secs`, depois SIGKILL), CPU e memória por job | Isola o job como sandbox. O container tem os privilégios e a rede padrão do Docker |
+| Limita concorrência (`max_slots`), tempo (`timeout_secs`, depois SIGTERM e SIGKILL 10 segundos mais tarde), CPU e memória por job | Isola o job como sandbox. O container tem os privilégios e a rede padrão do Docker |
 | Recusa trabalho quando está cheio, em drenagem, ou com pouca memória ou disco | Monta pastas do host, publica portas ou roda privilegiado. Esses campos não existem |
 | Guarda o histórico dos jobs em SQLite e chama um webhook quando o job termina | Devolve a saída do job para você. O job informa um código de saída e os dados, o próprio container envia; o que ele imprimiu fica na máquina por 7 dias |
 | Mostra uma página local com status e configuração, só na própria máquina | Oferece dashboard, ou qualquer página acessível pela rede |
@@ -500,7 +500,7 @@ A imagem precisa de `sh` e `sleep`; a padrão é `ghcr.io/nailtongomes/shutup-an
 
 - Um processo por daemon do Docker. Dois podem passar de `max_slots`.
 - No Linux, parar o serviço não para os containers, e enquanto ele está parado ninguém aplica os timeouts.
-- Timeout é SIGKILL, sem período de tolerância.
+- Timeout é SIGTERM, e SIGKILL 10 segundos depois; o `exit_code` do job é 137 nos dois casos.
 - `job_key` vale por máquina. Outra máquina não a conhece.
 - Sem cancelamento, sem fila, sem retry de job que falhou. Um container gerenciado não tem expressão cron, dependências nem captura de saída; um `always` que continua falhando é tentado a cada 15 minutos até alguém parar ou desativar.
 - Modo gerenciado e push/pull são exclusivos em uma máquina. Para os dois, use duas máquinas.

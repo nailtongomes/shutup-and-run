@@ -61,7 +61,7 @@ The smallest one is `{"image": "ghcr.io/nailtongomes/shutup-and-run-smoke"}`.
 | `job_key` | no | string, 1 to 200 of `A-Z a-z 0-9 . _ : -` | none | Idempotency on this one machine. See [section 6](#6-idempotency-and-delivery). |
 | `env` | no | object of string to string, at most 128 entries | `{}` | A name matches `^[A-Za-z_][A-Za-z0-9_]*$`, at most 256 bytes. A value is at most 16384 bytes and has no NUL. |
 | `command` | no | array of at most 32 strings, each 1 to 4096 bytes, no NUL | the image's own | Docker `Cmd`. It replaces the image's default command, not its entrypoint. `[]` is the same as leaving it out. |
-| `timeout_secs` | no | integer, 1 to the machine's `max_timeout_secs` | the machine's `default_timeout_secs` (3600) | `max_timeout_secs` is 21600 by default and never above 604800. Counted from the container's start. Then SIGKILL, with no grace. The image pull has the same limit, separately. |
+| `timeout_secs` | no | integer, 1 to the machine's `max_timeout_secs` | the machine's `default_timeout_secs` (3600) | `max_timeout_secs` is 21600 by default and never above 604800. Counted from the container's start. Then SIGTERM, and SIGKILL 10 seconds later; `exit_code` is 137 either way. The image pull has its own limit, 30 minutes. |
 | `cpu` | no | number, above 0, at most 128 and at most the machine's `max_job_cpus` | the machine's `max_job_cpus`; no limit when it has none | Cores. `0.5`, `1`. A shared PC allows 1 by default. |
 | `memory` | no | positive integer of bytes, or a string such as `512m`, `1.5g`, `2GiB`, at most the machine's `max_job_memory` | the machine's `max_job_memory`; no limit when it has none | Units `b k kb kib m mb mib g gb gib`, any case, all powers of 1024. Swap is set to the same value, so the container gets no swap beyond it. A shared PC allows `2g` by default, less on a small one. See [Resource limits](#resource-limits-of-a-machine). |
 | `shm` | no | as `memory` | Docker's 64 MiB | Size of `/dev/shm`. A browser usually needs `1g` or more. |
@@ -406,7 +406,7 @@ The body is the [JobResult](#jobresult) of a job that has ended: the same nine k
 | `exited` | the container's | The container ended by itself. `0` is the image's own idea of success. |
 | `exited` | not `0`, often `137` | The runner saw the container end that way: the image's own failure, `docker kill`, the kernel out of memory. |
 | `interrupted` | `null`, or not `0` (often `137`, `143` or `255`) | Something stopped under the job and the runner cannot say how it ended: the PC was shut down, signed out or lost power, WSL or Docker stopped, or the runner itself was not running. Either the container was gone (`null`), or it was found stopped with that code when the runner started again. Whether the work was done is unknown. **The runner does not start it again**: the orchestrator decides. |
-| `timeout_kill` | `137` | SIGKILL at `timeout_secs`. |
+| `timeout_kill` | `137` | SIGTERM at `timeout_secs`, SIGKILL 10 seconds later. 137 even when the job exited on SIGTERM. |
 | `start_failed` | `null` | The image could not be pulled, or the container could not be started. Nothing ran. |
 
 **Delivery.**
