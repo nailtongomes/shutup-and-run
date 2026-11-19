@@ -2,7 +2,9 @@
 
 [TESTING.pt-BR.md](TESTING.pt-BR.md) tem o roteiro completo. Esta lista é só o que o CI não alcança: o runner do Windows instala, atualiza e faz rollback, mas não tem bateria, não tem tela, não tem programas de usuário abertos e não roda uma tarefa de verdade dentro do WSL2. Cada item diz o que conferir e onde. Ao terminar, anote o resultado (ok, falhou, com a saída) em [TESTING.pt-BR.md](TESTING.pt-BR.md) e apague daqui o que passou.
 
-Um PC Windows 11 com WSL2, instalado ou atualizado para a 0.2.21 com `irm .../install.ps1 | iex` (`shutup-and-run version` diz 0.2.21), a página em `http://127.0.0.1:8787/` e o mock de poll do roteiro ([TESTING.pt-BR.md, seção 2](TESTING.pt-BR.md#2-uma-url-de-poll-para-testar)) servindo jobs curtos. Sem URL de poll, o modo gerenciado serve: um container `once` (`managed apply`, `managed mode on`) e `managed start NOME` para cada tarefa que um item pedir. Um container desabilitado não começa nem com `start`: `enable`, `start`, `disable`.
+Antes de tudo, rode `.\tests\windows-round\check.ps1` (ou `check.ps1 -JobName NOME` com um container gerenciado `once`, para medir uma tarefa): ele confere sozinho o que não precisa de uma pessoa e escreve `rodada-AAAAMMDD-HHMM.md` com ok/falhou/ver por item. Junte esse arquivo ao relatório.
+
+Um PC Windows 11 com WSL2, instalado ou atualizado para a 0.2.22 com `irm .../install.ps1 | iex` (`shutup-and-run version` diz 0.2.22), a página em `http://127.0.0.1:8787/` e o mock de poll do roteiro ([TESTING.pt-BR.md, seção 2](TESTING.pt-BR.md#2-uma-url-de-poll-para-testar)) servindo jobs curtos. Sem URL de poll, o modo gerenciado serve: um container `once` (`managed apply`, `managed mode on`) e `managed start NOME` para cada tarefa que um item pedir. Um container desabilitado não começa nem com `start`: `enable`, `start`, `disable`.
 
 Para um agente que lê a página com um script: um POST para `/local/*` vindo de fora da própria página recebe 403 de propósito (só a página, no navegador, muda algo). Para pausar, autorizar ou mudar config por script, use a CLI (`shutup-and-run pause`, `safety authorize`, `config set`).
 
@@ -58,3 +60,14 @@ Rodada 3 (0.2.20): ok o WSL devolvendo a memória (VmmemWSL de ~2,4 GiB para 720
 - [ ] **Bateria no `status.json`.** Na bateria, abaixo e acima de 60%, `lending.battery_percent` tem a carga; na tomada, nulo. `on_battery_percent` continua como antes (só acima de 60%).
 - [ ] **Consumo durante a tarefa.** Com um job de mais de 30 s rodando, a coluna **CPU / memória** da página e o `shutup-and-run jobs` (`used: ... so far`) já mostram números; no fim, os finais.
 - [ ] **Horas de memória curta.** Com menos de três dias instalado, a linha **Memória curta, 7 dias** pode aparecer, mas o doctor não sugere `lend_hours` (sem `MEMORY_SHORT_HOURS`).
+
+## 0.2.22: limpeza, disco do WSL2, status, resumo por imagem
+
+O `check.ps1` cobre a maior parte; o que ele não mede:
+
+- [ ] **Limpeza diária.** Uns 10 minutos depois de o serviço subir, a linha **Limpeza** da página e a linha `cleanup` do doctor dizem a hora da última passada (a primeira roda nesse momento). As imagens usadas nos últimos 30 dias continuam em `wsl -d shutup-and-run -u root docker images`. A remoção depois de 30 dias está nos testes; num PC instalado há mais de um mês, o log tem `removed what no job used for 30 days` quando há o que remover.
+- [ ] **Imagens sem tag.** Rode duas vezes, com uma versão nova no meio, a mesma imagem `:latest`: a cópia velha (`<none>` em `docker images`) some na passada seguinte.
+- [ ] **Disco do WSL2.** `shutup-and-run wsl doctor` tem a linha `wsl-disk` com o tamanho do `ext4.vhdx` e o que está em uso. Se aparecer `WSL_DISK_TO_COMPACT`, siga "Give the WSL2 disk's space back" do `docs/WINDOWS.md` como administrador, sem tarefa rodando, e anote o tamanho antes e depois.
+- [ ] **status.** `shutup-and-run status` mostra as linhas novas quando há o que dizer: pausa com fim, `lend_hours`, espera, bateria, memória, última limpeza.
+- [ ] **Resumo por imagem.** Depois de três tarefas da mesma imagem, `shutup-and-run jobs --summary` tem a linha dela com `ask for memory`.
+

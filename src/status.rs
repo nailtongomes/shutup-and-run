@@ -1497,6 +1497,28 @@ fn computer_section(view: &View) -> String {
             ),
         },
     ));
+    rows.push((
+        lang.t("Cleanup", "Limpeza"),
+        format!(
+            "{} &middot; {}",
+            lang.t(
+                "every day, the images no job used for 30 days",
+                "todo dia, as imagens que nenhuma tarefa usou em 30 dias",
+            ),
+            match computer.cleanup {
+                None => lang.t("not run yet", "ainda não rodou").to_string(),
+                Some(c) => format!(
+                    "{} {}: {} {}, {} {}",
+                    lang.t("last", "última"),
+                    when(c.at),
+                    c.images,
+                    lang.t("removed", "removidas"),
+                    crate::resources::human(c.freed_bytes),
+                    lang.t("freed", "liberados"),
+                ),
+            }
+        ),
+    ));
     if !view.programs.is_empty() {
         // The list comes while the PC's memory is tight (under 20%), which may
         // not stop a job: then there is no "Memory is short" box to explain it.
@@ -3102,6 +3124,8 @@ pub struct Computer {
     /// The time on the clock `lend_hours` is read on: `wed 18:30, UTC-03:00`.
     pub clock: String,
     pub delivery: crate::store::Delivery,
+    /// The last daily pass over images no job used for 30 days.
+    pub cleanup: Option<crate::store::Cleanup>,
 }
 
 impl Computer {
@@ -3121,6 +3145,7 @@ impl Computer {
                 .map(|h| h.text.clone()),
             clock: crate::lending::clock(machine.host.or_else(crate::host::current), now_unix()),
             delivery: launcher.delivery(),
+            cleanup: launcher.last_cleanup(),
         }
     }
 }
@@ -3310,6 +3335,10 @@ struct FileBody<'a> {
     /// new jobs waited for it, and the hours it ran short in 7 days. Never
     /// which programs hold it: that stays on the page.
     memory: serde_json::Value,
+    /// The last daily pass over images no job used for 30 days: when, how
+    /// many it removed and about how much disk it gave back. Null before
+    /// the first.
+    cleanup: serde_json::Value,
     /// Interrupted jobs and callbacks not answered, over the history.
     callbacks: &'a crate::store::Delivery,
     /// Whether a new job may start for the sake of this computer's owner:
@@ -3359,6 +3388,14 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
             "utc_offset_secs": crate::lending::offset_secs(live.computer.host, now_unix),
         }),
         memory: memory_json(&live.memory),
+        cleanup: live.computer.cleanup.map_or(serde_json::Value::Null, |c| {
+            serde_json::json!({
+                "at": unix_to_iso(c.at),
+                "images": c.images,
+                "freed_bytes": c.freed_bytes,
+                "unused_days": crate::launcher::UNUSED_DAYS,
+            })
+        }),
         callbacks: &live.computer.delivery,
         safety: &live.safety,
         mode: if live.managed_mode { "managed" } else { "jobs" },
@@ -3798,6 +3835,11 @@ mod tests {
                 pending: 1,
                 failed: 3,
             },
+            cleanup: Some(crate::store::Cleanup {
+                at: 1_795_026_600,
+                images: 2,
+                freed_bytes: 1536 << 20,
+            }),
         };
         let mut v = view(Lang::Pt, Some((0, 1)), false);
         v.limits = Some(&limits);
@@ -3860,6 +3902,8 @@ mod tests {
             "<td>Power</td><td>on the battery, 72% (below 60% no new job starts)</td>",
             "<td>Lends itself</td><td><code>mon-fri 19-07</code> &middot; now wed 18:30, UTC-03:00</td>",
             "waiting: Outside the hours this machine lends itself (lend_hours)",
+            "<td>Cleanup</td><td>every day, the images no job used for 30 days &middot; last <time datetime=\"2026-11-18T18:30:00Z\">",
+            "</time>: 2 removed, 1.5 GiB freed</td>",
         ] {
             assert!(page.contains(text), "{text}\n{page}");
         }

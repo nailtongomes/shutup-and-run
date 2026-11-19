@@ -70,6 +70,11 @@ pub trait Runtime: Send + Sync {
     async fn stats(&self, _id: &str) -> Result<Option<Stats>, RuntimeError> {
         Ok(None)
     }
+    /// Removes images no tag points at any more (a tag pulled again leaves
+    /// the old one behind) and that no container uses. The bytes it freed.
+    async fn prune_dangling(&self) -> Result<u64, RuntimeError> {
+        Ok(0)
+    }
     /// The end of a container's stdout and stderr, at most `max_bytes`, for
     /// the job's log file. A runtime that streams overrides this.
     async fn output(&self, id: &str, max_bytes: usize) -> Result<Vec<u8>, RuntimeError> {

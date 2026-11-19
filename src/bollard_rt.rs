@@ -419,11 +419,24 @@ impl Runtime for BollardRuntime {
         let options = bollard::query_parameters::RemoveImageOptionsBuilder::new()
             .force(false)
             .build();
-        self.docker
-            .remove_image(image, Some(options), None)
+        match self.docker.remove_image(image, Some(options), None).await {
+            Ok(_) => Ok(()),
+            // Already gone, removed by hand or by an earlier pass.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(err) => Err(docker_err(err)),
+        }
+    }
+
+    async fn prune_dangling(&self) -> Result<u64, RuntimeError> {
+        // With no filter Docker prunes dangling images only.
+        let answer = self
+            .docker
+            .prune_images(None::<bollard::query_parameters::PruneImagesOptions>)
             .await
-            .map(|_| ())
-            .map_err(docker_err)
+            .map_err(docker_err)?;
+        Ok(answer.space_reclaimed.unwrap_or(0).max(0) as u64)
     }
 }
 

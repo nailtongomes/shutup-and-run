@@ -1026,6 +1026,7 @@ pub fn status_out(path: &Path, now: i64) -> Out {
             text.push_str(&format!("{field}: {value}\n"));
         }
     }
+    text.push_str(&status_more(&status));
     let running = !stale && matches!(state.as_str(), "idle" | "active" | "draining");
     let mut out = Out::ok(status, text.trim_end());
     if !running {
@@ -1038,6 +1039,59 @@ pub fn status_out(path: &Path, now: i64) -> Out {
         out.text = format!("{}\nRun `shutup-and-run doctor`.", out.text);
     }
     out
+}
+
+/// The rest of `status.json` worth a line, each only when there is
+/// something to say: a pause with an end, `lend_hours` and its clock, the
+/// battery, memory to free, a WSL2 clock that is off, the last cleanup.
+fn status_more(status: &Value) -> String {
+    let mut lines = Vec::new();
+    if let Some(until) = status["paused_until"].as_str() {
+        lines.push(format!("paused until: {until}"));
+    }
+    let lending = &status["lending"];
+    if let Some(hours) = lending["lend_hours"].as_str() {
+        lines.push(format!(
+            "lend_hours: {hours} (now {})",
+            lending["clock"].as_str().unwrap_or("?")
+        ));
+    }
+    if let Some(hold) = lending["hold"]["code"].as_str() {
+        lines.push(format!(
+            "not lending now: {hold} ({})",
+            lending["hold"]["detail"].as_str().unwrap_or("")
+        ));
+    }
+    if let Some(percent) = lending["battery_percent"].as_u64() {
+        lines.push(format!("on the battery: {percent}%"));
+    }
+    if let Some(skew) = lending["clock_skew_secs"].as_i64() {
+        lines.push(format!("clock: WSL2 is {skew} s off Windows"));
+    }
+    let memory = &status["memory"];
+    if let Some(place) = memory["short_of"].as_str() {
+        lines.push(format!(
+            "memory: free about {} ({place})",
+            crate::resources::human(memory["to_free_bytes"].as_u64().unwrap_or(0))
+        ));
+    }
+    let waited = memory["waited_today_secs"].as_u64().unwrap_or(0);
+    if waited > 0 {
+        lines.push(format!(
+            "waited for memory today: {}",
+            crate::memory::duration_text(waited)
+        ));
+    }
+    if let (Some(at), Some(images)) = (
+        status["cleanup"]["at"].as_str(),
+        status["cleanup"]["images"].as_u64(),
+    ) {
+        lines.push(format!(
+            "last cleanup: {at}, {images} images removed, {} freed",
+            crate::resources::human(status["cleanup"]["freed_bytes"].as_u64().unwrap_or(0))
+        ));
+    }
+    lines.iter().map(|l| format!("{l}\n")).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1608,6 +1662,24 @@ pub fn memory_checks(memory: &Value) -> Vec<Check> {
     checks
 }
 
+/// The daily pass over images no job used for 30 days: always on, so this
+/// line only says when it last ran and what it gave back.
+pub fn cleanup_check(cleanup: &Value) -> Check {
+    let days = crate::launcher::UNUSED_DAYS;
+    let last = match (cleanup["at"].as_str(), cleanup["images"].as_u64()) {
+        (Some(at), Some(images)) => format!(
+            "last {at}: {images} removed, {} freed",
+            crate::resources::human(cleanup["freed_bytes"].as_u64().unwrap_or(0))
+        ),
+        _ => "not run yet".to_string(),
+    };
+    check(
+        "cleanup",
+        true,
+        format!("every day, the images no job used for {days} days are removed; {last}"),
+    )
+}
+
 /// The clock inside WSL2 that the service could not set back to Windows'.
 pub fn clock_check(lending: &Value) -> Option<Check> {
     let skew = lending["clock_skew_secs"].as_i64()?;
@@ -1722,6 +1794,7 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
     }
     if let Some(status) = fresh {
         checks.extend(memory_checks(&status["memory"]));
+        checks.push(cleanup_check(&status["cleanup"]));
     }
     if let Some(warning) = &settings.config_warning {
         checks.push(soft("config-in-use", false, warning.clone()).coded("CONFIG_FALLBACK_IN_USE"));
@@ -2070,6 +2143,22 @@ mod tests {
             "inside lend_hours mon-fri 19-07 (now wed 21:00, UTC-03:00)"
         );
         assert!(lending_check(&json!({"lend_hours": null, "hold": null})).is_none());
+    }
+
+    #[test]
+    fn the_doctor_says_when_unused_images_were_last_removed() {
+        let done = cleanup_check(&json!({
+            "at": "2026-11-19T01:00:00Z",
+            "images": 2,
+            "freed_bytes": 1536u64 << 20,
+            "unused_days": 30,
+        }));
+        assert!(done.ok);
+        assert_eq!(
+            done.detail,
+            "every day, the images no job used for 30 days are removed; last 2026-11-19T01:00:00Z: 2 removed, 1.5 GiB freed"
+        );
+        assert!(cleanup_check(&Value::Null).detail.ends_with("not run yet"));
     }
 
     #[test]
@@ -2677,6 +2766,38 @@ mod tests {
             .contains("limits: profile shared-pc; per job: cpu 1, memory 2.0 GiB"));
         assert!(out.text.contains("waiting_for: low on memory"));
         assert_eq!(out.json["limits"]["max_job_cpus"], 1.0);
+    }
+
+    #[test]
+    fn status_says_in_one_screen_what_status_json_holds() {
+        let more = status_more(&json!({
+            "paused_until": "2026-11-19T03:00:00Z",
+            "lending": {
+                "lend_hours": "mon-fri 19-07",
+                "clock": "wed 18:30, UTC-03:00",
+                "hold": {"code": "BATTERY_LOW", "detail": "on its battery at 52%"},
+                "battery_percent": 52,
+                "clock_skew_secs": 35,
+            },
+            "memory": {"short_of": "pc", "to_free_bytes": 1610612736u64, "waited_today_secs": 720},
+            "cleanup": {"at": "2026-11-19T01:00:00Z", "images": 2, "freed_bytes": 1610612736u64},
+        }));
+        assert_eq!(
+            more,
+            "paused until: 2026-11-19T03:00:00Z\n\
+             lend_hours: mon-fri 19-07 (now wed 18:30, UTC-03:00)\n\
+             not lending now: BATTERY_LOW (on its battery at 52%)\n\
+             on the battery: 52%\n\
+             clock: WSL2 is 35 s off Windows\n\
+             memory: free about 1.5 GiB (pc)\n\
+             waited for memory today: 12 min\n\
+             last cleanup: 2026-11-19T01:00:00Z, 2 images removed, 1.5 GiB freed\n"
+        );
+        // Nothing to say: nothing added.
+        assert_eq!(
+            status_more(&json!({"lending": {}, "memory": {}, "cleanup": null})),
+            ""
+        );
     }
 
     #[test]

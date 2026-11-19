@@ -203,7 +203,19 @@ impl Store {
                 day INTEGER PRIMARY KEY,
                 secs INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS images (
+                image TEXT PRIMARY KEY,
+                last_used INTEGER NOT NULL
+            );
             ",
+        )
+        .map_err(sql)?;
+        // The images of a history older than 0.2.22 are known from its jobs;
+        // an image whose jobs were already purged is not, and stays.
+        conn.execute(
+            "INSERT OR IGNORE INTO images (image, last_used)
+             SELECT image, MAX(started_at) FROM jobs GROUP BY image",
+            [],
         )
         .map_err(sql)?;
         // A history written before 0.2.11 has no such column. Its rows keep
@@ -290,7 +302,7 @@ impl Store {
         );
         match result {
             Ok(0) => Err(StoreError::Mode),
-            Ok(_) => Ok(()),
+            Ok(_) => note_image(&conn, &job.image, job.started_at),
             Err(err) if is_constraint(&err) && err.to_string().contains("job_key") => {
                 Err(StoreError::Conflict)
             }
@@ -637,6 +649,44 @@ impl Store {
     }
 
     /// When the jobs killed for memory since `since` ended.
+    /// The images whose last job started before `cutoff`: unused since.
+    pub fn images_unused_since(&self, cutoff: i64) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn
+            .prepare("SELECT image FROM images WHERE last_used < ?1 ORDER BY image")
+            .map_err(sql)?;
+        let rows = stmt.query_map([cutoff], |row| row.get(0)).map_err(sql)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sql)
+    }
+
+    /// An image that was removed: a later job with it is a new first use.
+    pub fn forget_image(&self, image: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute("DELETE FROM images WHERE image = ?1", [image])
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    /// The last pass that removed what was unused: when, how many images,
+    /// and the disk it gave back.
+    pub fn cleanup(&self) -> Result<Option<Cleanup>, StoreError> {
+        Ok(self
+            .meta("cleanup")?
+            .and_then(|text| serde_json::from_str(&text).ok()))
+    }
+
+    pub fn set_cleanup(&self, cleanup: &Cleanup) -> Result<(), StoreError> {
+        let text = serde_json::to_string(cleanup).map_err(|e| StoreError::Sql(e.to_string()))?;
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('cleanup', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            [text],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+
     pub fn oom_times(&self, since: i64) -> Result<Vec<i64>, StoreError> {
         let conn = self.conn.lock().expect("sqlite");
         let mut stmt = conn
@@ -1106,6 +1156,25 @@ fn is_constraint(err: &rusqlite::Error) -> bool {
         rusqlite::Error::SqliteFailure(code, _)
             if code.code == rusqlite::ErrorCode::ConstraintViolation
     )
+}
+
+/// A job with this image started at `at`: its last use.
+fn note_image(conn: &Connection, image: &str, at: i64) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO images (image, last_used) VALUES (?1, ?2)
+         ON CONFLICT(image) DO UPDATE SET last_used = MAX(last_used, ?2)",
+        params![image, at],
+    )
+    .map_err(sql)?;
+    Ok(())
+}
+
+/// What the daily pass over unused images did last.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Cleanup {
+    pub at: i64,
+    pub images: u64,
+    pub freed_bytes: u64,
 }
 
 #[cfg(test)]

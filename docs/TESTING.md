@@ -258,6 +258,8 @@ On a Windows laptop with the mock serving short jobs (`--image alpine --command 
 - [ ] On a small PC (or one where the page asks for an authorization), `shutup-and-run wsl uninstall`, then `shutup-and-run wsl install --poll-url URL --owner-consent`: it prints `recorded the owner's consent from the contract`, the page is **RUNNING** and never asks, and **Safety** shows the authorization on the `contract`. **Withdraw** on the page: it asks again.
 
 
+`tests/windows-round/check.ps1` runs, on a real PC, the part of that list no person is needed for, and writes a Markdown table; CI only checks that it parses.
+
 What no CI run reaches on a real Windows PC since then (the Windows clock, a pause for a while, memory and the programs holding it, the WSL2 cache) is listed, in Portuguese, in [WINDOWS-PENDING.md](WINDOWS-PENDING.md).
 
 ### Certificate passthrough and the demos

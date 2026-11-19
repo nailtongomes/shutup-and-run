@@ -46,6 +46,18 @@ jobs:
           # The commands above are meant to exit 1 and 3, and the step would end
           # with the last exit code.
           exit 0
+      # The hand-test scripts have no linter; at least they parse in Windows
+      # PowerShell 5.1, the one every PC has.
+      - name: the PowerShell test scripts parse
+        shell: powershell
+        run: |
+          $bad = 0
+          foreach ($file in Get-ChildItem -Recurse tests -Filter *.ps1) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { Write-Host "$($file.Name):$($e.Extent.StartLineNumber): $($e.Message)"; $bad++ }
+          }
+          if ($bad -gt 0) { throw "$bad parse error(s)" }
       # The runner has the Visual C++ Redistributable, so an .exe that needs
       # it runs here and fails on a clean PC. Read the file instead.
       - name: the .exe is a console program, needs no VC++ runtime, and prints
