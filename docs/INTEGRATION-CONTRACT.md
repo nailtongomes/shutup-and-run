@@ -427,7 +427,7 @@ The body is the [JobResult](#jobresult) of a job that has ended: the same nine k
 
 - Answer `2xx` at once and do the work afterwards.
 - Process each `id` once. Store the ids already handled and ignore a repeat.
-- Do not wait for a callback forever. Give each job a deadline of your own, a little over `timeout_secs` plus the time a pull can take.
+- Do not wait for a callback forever. Give each job a deadline of your own, a little over `timeout_secs` plus the time a pull can take (30 minutes at most).
 - For anything that matters, have the container report its own result to a URL passed in `env`, and reconcile against the external system.
 
 ## 6. Idempotency and delivery

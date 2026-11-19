@@ -802,7 +802,10 @@ fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
         lang.t("Exit", "Saída"),
         lang.t("Log", "Log"),
     );
-    let l_used = lang.t("CPU / memory / network", "CPU / memória / rede");
+    let l_used = lang.t(
+        "CPU / memory / network / disk",
+        "CPU / memória / rede / disco",
+    );
     let body: String = rows
         .iter()
         .map(|row| {
@@ -862,25 +865,25 @@ fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
     )
 }
 
-/// `5.5 s / 300 MiB / 12 MiB`: the CPU time a job used, the most memory it
-/// held and what it moved on the network, from readings every 30 seconds.
-/// A dash for what was not read.
+/// `5.5 s / 300 MiB / 12 MiB / 700 MiB`: the CPU time a job used, the most
+/// memory it held and what it moved on the network, from readings every 30
+/// seconds, and what it wrote to its disk, read at its end. A dash for what
+/// was not read.
 fn used_cell(job: &JobRecord) -> String {
-    if job.cpu_ms.is_none() && job.memory_peak.is_none() && job.network_bytes.is_none() {
+    let parts = [
+        job.cpu_ms.map(|ms| format!("{:.1} s", ms as f64 / 1000.0)),
+        job.memory_peak.map(crate::jobs::memory_text),
+        job.network_bytes.map(crate::jobs::memory_text),
+        job.disk_bytes.map(crate::jobs::memory_text),
+    ];
+    if parts.iter().all(Option::is_none) {
         return "&ndash;".to_string();
     }
-    format!(
-        "{} / {} / {}",
-        job.cpu_ms
-            .map(|ms| format!("{:.1} s", ms as f64 / 1000.0))
-            .unwrap_or_else(|| "&ndash;".into()),
-        job.memory_peak
-            .map(|bytes| escape(&crate::jobs::memory_text(bytes)))
-            .unwrap_or_else(|| "&ndash;".into()),
-        job.network_bytes
-            .map(|bytes| escape(&crate::jobs::memory_text(bytes)))
-            .unwrap_or_else(|| "&ndash;".into())
-    )
+    parts
+        .iter()
+        .map(|part| part.as_deref().map_or_else(|| "&ndash;".into(), escape))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// Everything around a page's body: one language, and a link to the other.
@@ -1017,10 +1020,26 @@ pub(crate) fn render(view: &View) -> String {
                     format!(
                         "{}. {}",
                         crate::lending::label(&hold.code, lang == Lang::Pt),
-                        lang.t(
-                            "New jobs start again by themselves.",
-                            "As tarefas novas voltam sozinhas."
-                        )
+                        match hold.resumes_at {
+                            Some(at) => format!(
+                                "{} {}.",
+                                lang.t(
+                                    "New jobs start again by themselves at",
+                                    "As tarefas novas voltam sozinhas"
+                                ),
+                                crate::lending::day_hour(
+                                    view.computer.and_then(|c| c.host),
+                                    at,
+                                    lang == Lang::Pt
+                                )
+                            ),
+                            None => lang
+                                .t(
+                                    "New jobs start again by themselves.",
+                                    "As tarefas novas voltam sozinhas."
+                                )
+                                .to_string(),
+                        }
                     ),
                 ),
                 None => (
@@ -3354,7 +3373,8 @@ struct FileBody<'a> {
     paused_until: Option<String>,
     /// When the machine lends itself: `lend_hours`, the time on the clock it
     /// is read on (`wed 18:30, UTC-03:00`), the wait there is now
-    /// (`OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING`), and the
+    /// (`OUTSIDE_LEND_HOURS`, `BATTERY_LOW`, `USER_PRESENTING`,
+    /// `METERED_NETWORK`), when the next window opens (`resumes_at`), and the
     /// battery's charge while a Windows PC runs on it and jobs still start.
     lending: serde_json::Value,
     /// Memory: how much to free before the next job (`short_of`, `pc`,
@@ -3409,6 +3429,7 @@ pub fn document(live: &Live, now_unix: i64, stopped: bool, failed: Option<&str>)
             "lend_hours": live.computer.lend_hours,
             "clock": live.computer.clock,
             "hold": live.computer.hold,
+            "resumes_at": live.computer.hold.as_ref().and_then(|h| h.resumes_at).map(unix_to_iso),
             "on_battery_percent": crate::lending::on_battery(live.computer.host),
             "battery_percent": crate::lending::battery(live.computer.host),
             "metered_network": live.computer.host.and_then(|h| h.metered),
@@ -3912,12 +3933,16 @@ mod tests {
         computer.host = Some(Feed {
             on_battery: Some(true),
             battery_percent: Some(72),
+            utc_offset_secs: Some(-3 * 3600),
             ..Feed::default()
         });
         computer.lend_hours = Some("mon-fri 19-07".into());
         computer.hold = Some(crate::lending::Hold {
             code: crate::lending::OUTSIDE_LEND_HOURS.into(),
-            detail: "outside lend_hours mon-fri 19-07 (now wed 14:05)".into(),
+            detail: "outside lend_hours mon-fri 19-07 (now wed 14:05); next window wed 19:00"
+                .into(),
+            // Wednesday 22:00 UTC: 19:00 on the PC's clock.
+            resumes_at: Some(1_795_039_200),
         });
         let mut v = view(Lang::En, Some((0, 1)), false);
         v.limits = Some(&limits);
@@ -3930,6 +3955,7 @@ mod tests {
             "<td>Power</td><td>on the battery, 72% (below 60% no new job starts)</td>",
             "<td>Lends itself</td><td><code>mon-fri 19-07</code> &middot; now wed 18:30, UTC-03:00</td>",
             "waiting: Outside the hours this machine lends itself (lend_hours)",
+            "New jobs start again by themselves at wed 19:00.",
             "<td>Cleanup</td><td>every day, the images no job used for 30 days &middot; last <time datetime=\"2026-11-18T18:30:00Z\">",
             "</time>: 2 removed, 1.5 GiB freed</td>",
         ] {

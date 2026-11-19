@@ -112,11 +112,12 @@ pub fn job_json(job: &JobRecord) -> Value {
         "cpu_ms": job.cpu_ms,
         "memory_peak_bytes": job.memory_peak,
         "network_bytes": job.network_bytes,
+        "disk_bytes": job.disk_bytes,
     })
 }
 
-/// `cpu 5.5 s, memory peak 300 MiB, network 12 MiB`, from what the
-/// readings saw; `so far`
+/// `cpu 5.5 s, memory peak 300 MiB, network 12 MiB, disk 700 MiB`, from
+/// what the readings saw (the disk is read at the end); `so far`
 /// while the job runs. None when the job was never read (it ran under 30
 /// seconds, or it has run less than that).
 pub fn usage_text(job: &JobRecord) -> Option<String> {
@@ -129,6 +130,9 @@ pub fn usage_text(job: &JobRecord) -> Option<String> {
     }
     if let Some(bytes) = job.network_bytes {
         parts.push(format!("network {}", memory_text(bytes)));
+    }
+    if let Some(bytes) = job.disk_bytes {
+        parts.push(format!("disk {}", memory_text(bytes)));
     }
     let so_far = if job.ended_at.is_none() {
         " so far"
@@ -192,6 +196,8 @@ pub struct ImageSummary {
     /// What one job of it received and sent on the network, on average:
     /// what it costs a PC on a metered plan. Its pull is not in it.
     pub network_bytes_mean: Option<u64>,
+    /// What one job of it wrote inside its container, on average.
+    pub disk_bytes_mean: Option<u64>,
 }
 
 /// Fewer measured jobs of one image than this make no suggestion for it.
@@ -213,6 +219,7 @@ pub fn by_image(jobs: &[JobRecord]) -> Vec<ImageSummary> {
                     memory_peak_mean: None,
                     memory_to_ask: None,
                     network_bytes_mean: None,
+                    disk_bytes_mean: None,
                 });
                 images.len() - 1
             }
@@ -233,20 +240,23 @@ pub fn by_image(jobs: &[JobRecord]) -> Vec<ImageSummary> {
             .memory_peak_max
             .filter(|_| image.measured >= MIN_MEASURED_PER_IMAGE)
             .map(twice_rounded);
-        let network: Vec<u64> = jobs
-            .iter()
-            .filter(|j| j.is_finished() && j.image == image.image)
-            .filter_map(|j| j.network_bytes)
-            .collect();
-        image.network_bytes_mean =
-            (!network.is_empty()).then(|| network.iter().sum::<u64>() / network.len() as u64);
+        let mean = |of: fn(&JobRecord) -> Option<u64>| {
+            let values: Vec<u64> = jobs
+                .iter()
+                .filter(|j| j.is_finished() && j.image == image.image)
+                .filter_map(of)
+                .collect();
+            (!values.is_empty()).then(|| values.iter().sum::<u64>() / values.len() as u64)
+        };
+        image.network_bytes_mean = mean(|j| j.network_bytes);
+        image.disk_bytes_mean = mean(|j| j.disk_bytes);
     }
     images.sort_by(|a, b| b.jobs.cmp(&a.jobs).then_with(|| a.image.cmp(&b.image)));
     images
 }
 
 /// `  alpine: 6 jobs, 5 measured, memory peak 380 MiB at most (210 MiB on
-/// average), network 40 MiB a job; ask for memory 768m`.
+/// average), network 40 MiB a job, disk 1.2 GiB a job; ask for memory 768m`.
 pub fn image_text(image: &ImageSummary) -> String {
     let mut text = format!(
         "  {}: {} jobs, {} measured",
@@ -261,6 +271,9 @@ pub fn image_text(image: &ImageSummary) -> String {
     }
     if let Some(bytes) = image.network_bytes_mean {
         text.push_str(&format!(", network {} a job", memory_text(bytes)));
+    }
+    if let Some(bytes) = image.disk_bytes_mean {
+        text.push_str(&format!(", disk {} a job", memory_text(bytes)));
     }
     if let Some(ask) = image.memory_to_ask {
         text.push_str(&format!("; ask for memory {}", size_value(ask)));
@@ -806,6 +819,7 @@ mod tests {
             cpu_ms: None,
             memory_peak: peak.map(|p| p * mib),
             network_bytes: peak.map(|p| p * mib / 10),
+            disk_bytes: peak.map(|p| p * mib * 2),
         };
         let jobs = vec![
             job(1, "rpa", Some(900)),
@@ -831,7 +845,7 @@ mod tests {
         assert_eq!(images[1].memory_to_ask, None);
         assert_eq!(
             image_text(&images[1]),
-            "  report: 2 jobs, 1 measured, memory peak 200 MiB at most (200 MiB on average), network 20 MiB a job"
+            "  report: 2 jobs, 1 measured, memory peak 200 MiB at most (200 MiB on average), network 20 MiB a job, disk 400 MiB a job"
         );
     }
 
@@ -1035,6 +1049,7 @@ mod tests {
             fields,
             [
                 "cpu_ms",
+                "disk_bytes",
                 "duration_secs",
                 "ended_at",
                 "exit_code",

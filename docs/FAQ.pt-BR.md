@@ -65,7 +65,7 @@ Isso é: noites de dias úteis e o fim de semana inteiro. Os dias são `mon` a `
 
 ### Ele enche meu disco de sobras?
 
-Não. Uma vez por dia o worker remove as imagens que nenhuma tarefa usou em 30 dias (no Windows também as cópias velhas que uma imagem baixada de novo deixa para trás), os logs das tarefas saem depois de 7 dias e as tarefas terminadas depois de 30. No Windows o arquivo de disco do WSL2 não diminui sozinho: quando ele fica bem maior do que o que está em uso, o `shutup-and-run wsl doctor` diz `WSL_DISK_TO_COMPACT`, e o [docs/WINDOWS.md](WINDOWS.md#give-the-wsl2-disks-space-back) mostra como compactar, à mão, com o WSL parado. A linha **Limpeza** da página diz quando foi a última passada e quanto ela liberou.
+Não. Uma vez por dia o worker remove as imagens que nenhuma tarefa usou em 30 dias (no Windows também as cópias velhas que uma imagem baixada de novo deixa para trás), os logs das tarefas saem depois de 7 dias e as tarefas terminadas depois de 30. O Docker guarda no máximo 10 MB do que um container imprimiu. No Windows o arquivo de disco do WSL2 não diminui sozinho: quando ele fica bem maior do que o que está em uso, o `shutup-and-run wsl doctor` diz `WSL_DISK_TO_COMPACT`, e o [docs/WINDOWS.md](WINDOWS.md#give-the-wsl2-disks-space-back) mostra como compactar, à mão, com o WSL parado. A linha **Limpeza** da página diz quando foi a última passada e quanto ela liberou.
 
 ### Uma tarefa consegue ver meus arquivos?
 
@@ -170,7 +170,7 @@ Por um tempo: os botões **por 1 hora**, **por 3 horas** e **pelo resto do dia**
 
 ### Quanto uma tarefa gastou?
 
-Cada tarefa registra o tempo de CPU, o máximo de memória que ocupou e o que recebeu e enviou pela rede: `shutup-and-run jobs` (uma linha `used:`), `jobs --json` (`cpu_ms`, `memory_peak_bytes`, `network_bytes`) e a coluna **CPU / memória / rede** na página. O `jobs --summary` dá a rede por tarefa de cada imagem, que é quanto uma tarefa dela custa num PC com plano de dados, fora o pull. Os números vêm de uma leitura a cada 30 segundos enquanto ela roda, e já aparecem durante a execução (`so far`), então uma tarefa mais curta que isso pode não ter nenhum, e um pico curto pode escapar. `shutup-and-run jobs --summary` resume as últimas 20 e, com cinco medidas ou mais e espaço neste PC, sugere o `max_job_memory` e o `max_slots` que caberiam mais tarefas ao mesmo tempo; o `doctor` também diz (`ROOM_FOR_MORE_SLOTS`). Nada muda sozinho.
+Cada tarefa registra o tempo de CPU, o máximo de memória que ocupou, o que recebeu e enviou pela rede e o que gravou dentro do container: `shutup-and-run jobs` (uma linha `used:`), `jobs --json` (`cpu_ms`, `memory_peak_bytes`, `network_bytes`, `disk_bytes`) e a coluna **CPU / memória / rede / disco** na página. O `jobs --summary` dá a rede por tarefa de cada imagem, que é quanto uma tarefa dela custa num PC com plano de dados, fora o pull, e o disco por tarefa. O disco é lido uma vez, quando o container é removido. Os números vêm de uma leitura a cada 30 segundos enquanto ela roda, e já aparecem durante a execução (`so far`), então uma tarefa mais curta que isso pode não ter nenhum, e um pico curto pode escapar. `shutup-and-run jobs --summary` resume as últimas 20 e, com cinco medidas ou mais e espaço neste PC, sugere o `max_job_memory` e o `max_slots` que caberiam mais tarefas ao mesmo tempo; o `doctor` também diz (`ROOM_FOR_MORE_SLOTS`). Nada muda sozinho.
 
 ### O que a URL de poll fica sabendo deste PC?
 

@@ -70,6 +70,11 @@ pub trait Runtime: Send + Sync {
     async fn stats(&self, _id: &str) -> Result<Option<Stats>, RuntimeError> {
         Ok(None)
     }
+    /// What a stopped container wrote to its own layer (`SizeRw`), read
+    /// just before it is removed. None where the daemon does not say.
+    async fn disk_written(&self, _id: &str) -> Result<Option<u64>, RuntimeError> {
+        Ok(None)
+    }
     /// Removes images no tag points at any more (a tag pulled again leaves
     /// the old one behind) and that no container uses. The bytes it freed.
     async fn prune_dangling(&self) -> Result<u64, RuntimeError> {

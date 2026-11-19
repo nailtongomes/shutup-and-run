@@ -229,7 +229,7 @@ if ($JobName) {
         if ($job -and $job.status -ne "running") {
             Start-Sleep -Seconds 60
             $after = Get-Vmmem
-            Add-Result "tarefa $JobName" "ver" ("status $($job.status); rede $($job.network_bytes) bytes; VmmemWSL antes " + (Format-Size $before) + ", pico " + (Format-Size $peak) + ", 60 s depois " + (Format-Size $after))
+            Add-Result "tarefa $JobName" "ver" ("status $($job.status); rede $($job.network_bytes) bytes; disco $($job.disk_bytes) bytes; VmmemWSL antes " + (Format-Size $before) + ", pico " + (Format-Size $peak) + ", 60 s depois " + (Format-Size $after))
         } else {
             Add-Result "tarefa $JobName" "falhou" "não terminou em $JobTimeoutMinutes min"
         }

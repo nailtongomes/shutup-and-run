@@ -80,3 +80,13 @@ O `check.ps1` mostra o custo da rede pelo Windows ao lado do `metered_network` d
 - [ ] **Rede por tarefa.** Depois de uma tarefa que baixa algo (um `curl` de um arquivo conhecido), `shutup-and-run jobs` tem `network ...` na linha `used:` com um tamanho próximo, e a coluna **CPU / memória / rede** da página o mesmo.
 - [ ] **Saída ao vivo na página.** Com uma tarefa rodando, a página **Tarefas e logs** tem o link **até agora**; ele abre o que a tarefa imprimiu até aquele momento.
 
+
+## 0.2.24: prazo do download, log limitado, disco por tarefa, digest, volta às
+
+O `check.ps1` com `-JobName` mostra também o disco gravado pela tarefa. O que ele não faz:
+
+- [ ] **Download lento.** Numa conexão lenta, uma tarefa de `timeout_secs` 30 com uma imagem grande ainda não baixada começa depois do download e roda os seus 30 segundos; antes ela terminava em `start_failed` ("image pull timed out").
+- [ ] **Log limitado.** Uma tarefa que imprime sem parar (`sh -c 'yes'` por um minuto): `docker inspect` do container, dentro da distribuição, tem `LogConfig` `json-file` com `max-size` 5m e `max-file` 2, e o arquivo de log dele em `/var/lib/docker/containers/` não passa de 5 MB.
+- [ ] **Disco por tarefa.** Depois de uma tarefa que grava um arquivo conhecido (`dd if=/dev/zero of=/tmp/x bs=1M count=500`), `shutup-and-run jobs` tem `disk 500 MiB` na linha `used:`, e a coluna **CPU / memória / rede / disco** da página o mesmo.
+- [ ] **Imagem por digest.** Com o Wi-Fi desligado, uma tarefa de uma imagem pedida como `repo@sha256:...` que já está no PC começa na hora, sem esperar o registro.
+- [ ] **Volta às.** Fora de `lend_hours`, a página diz **ESPERANDO** e "As tarefas novas voltam sozinhas qua 19:00" com o dia e a hora da próxima janela; `status.json` tem `lending.resumes_at`.

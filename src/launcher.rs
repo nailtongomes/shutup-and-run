@@ -108,6 +108,10 @@ pub const UNUSED_DAYS: i64 = 30;
 /// How often that is looked at.
 pub const CLEANUP_EVERY_SECS: i64 = 86_400;
 
+/// The most a job's image pull may take. A constant, apart from the job's
+/// `timeout_secs`, which counts from the container's start.
+pub const PULL_LIMIT_SECS: u64 = 1800;
+
 /// How often a running job's counters are read (CPU throttling, CPU time,
 /// memory): once per job every this long, one small Docker call, kept in
 /// memory until the job ends.
@@ -940,8 +944,10 @@ impl Launcher {
     }
 
     async fn pull_and_start(&self, id: String, mut spec: StartSpec, timeout: u64) {
-        // A pull that hangs would hold the slot forever, so it gets the job's own time limit.
-        let limit = std::time::Duration::from_secs(timeout);
+        // A pull that hangs would hold the slot forever. Its limit is its
+        // own, not the job's: a short job of a big image on a slow line still
+        // starts, and a long job does not let a stuck pull hold the slot.
+        let limit = std::time::Duration::from_secs(PULL_LIMIT_SECS);
         let pulled = tokio::time::timeout(limit, self.runtime.pull(&spec.image)).await;
         let stopped = self.stops.lock().await.remove(&id);
         let failure = match pulled {
@@ -1133,8 +1139,12 @@ impl Launcher {
                     );
                 }
                 self.note_resource_incidents(&job, sampled.and_then(|s| s.throttling));
-                // Before the container goes, with its output.
+                // Before the container goes, with its output and what it
+                // wrote to its own disk.
                 self.save_output(id).await;
+                if let Ok(Some(bytes)) = self.runtime.disk_written(id).await {
+                    let _ = self.store.set_disk(id, bytes);
+                }
                 self.timeouts.lock().await.remove(id);
                 self.stops.lock().await.remove(id);
                 let _ = self.runtime.remove(id).await;
@@ -3069,7 +3079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_job_records_its_cpu_time_its_memory_peak_and_its_network() {
+    async fn a_job_records_its_cpu_time_its_memory_peak_its_network_and_its_disk() {
         use crate::runtime::Stats;
         let (launcher, mock) = harness_with(2, |_| {});
         let id = started(&launcher, job("alpine", None)).await;
@@ -3094,22 +3104,44 @@ mod tests {
         // The peak is the most any reading saw; the CPU time, the last.
         mock.set_stats(Some(read(5_500_000_000, 120 << 20))).await;
         launcher.sample_throttling().await;
+        // What it wrote to its disk is read once, as its container goes.
+        mock.set_disk(Some(700 << 20)).await;
         mock.stop(&id, 0).await;
         launcher.on_exit(&id, 0).await;
         let row = launcher.store.get(&id).unwrap().unwrap();
         assert_eq!(
-            (row.cpu_ms, row.memory_peak, row.network_bytes),
-            (Some(5_500), Some(300 << 20), Some(55_000_000))
+            (
+                row.cpu_ms,
+                row.memory_peak,
+                row.network_bytes,
+                row.disk_bytes
+            ),
+            (
+                Some(5_500),
+                Some(300 << 20),
+                Some(55_000_000),
+                Some(700 << 20)
+            )
+        );
+        assert_eq!(
+            crate::jobs::usage_text(&row).as_deref(),
+            Some("cpu 5.5 s, memory peak 300 MiB, network 52 MiB, disk 700 MiB")
         );
         // Never read: nothing is made up.
         mock.set_stats(None).await;
+        mock.set_disk(None).await;
         let quick = started(&launcher, job("alpine", None)).await;
         mock.stop(&quick, 0).await;
         launcher.on_exit(&quick, 0).await;
         let row = launcher.store.get(&quick).unwrap().unwrap();
         assert_eq!(
-            (row.cpu_ms, row.memory_peak, row.network_bytes),
-            (None, None, None)
+            (
+                row.cpu_ms,
+                row.memory_peak,
+                row.network_bytes,
+                row.disk_bytes
+            ),
+            (None, None, None, None)
         );
     }
 
