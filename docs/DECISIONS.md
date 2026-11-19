@@ -530,7 +530,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** The program list is a guess at what closing a program frees: shared memory is not counted, and a process of another user or of the system cannot be read. The hour map shows the last seven days, not a typical week. Dropping the cache makes the next job read its image from disk again. `autoMemoryReclaim` is an experimental WSL key; a WSL that moves or drops it ignores the line.
 
-## The WSL2 clock follows Windows, and what Windows testing found
+## The WSL2 clock follows Windows, and what Windows testing found (0.2.21)
 
 **Context.** A hand test on a Windows notebook found the clock inside WSL2 35 seconds ahead of Windows, which is a known WSL2 drift after the PC sleeps; times on the page, `lend_hours` and the end of a pause were off by that much. The page wrote its times in UTC until JavaScript changed them, so a script or an agent reading the page saw UTC under a footer that says the PC's time. The doctor said `ok, authorized` and a minute later `AUTHORIZATION_REQUIRED`, both true: another warning had come up, and nothing said which was already agreed to. A day of memory readings was enough for a `lend_hours` suggestion, since an hour never read counted as one with memory to spare.
 
