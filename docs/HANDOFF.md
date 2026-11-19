@@ -24,7 +24,7 @@ When `poll_url` is set, the same process also asks that URL for one task on an i
 
 `POST /v1/jobs` parses a body with `deny_unknown_fields` and calls `Launcher::launch`. Launch checks the image name, the allowlist, timeout, env, command, `job_key`, and `callback_url`. Then it holds one process mutex while it checks drain, the key, and the slot count, writes the row, and answers `202`. A spawned task pulls the image and creates the container, named `shutup-and-run-<job id>`. A pull or start that fails closes the row with `start_failed`. The ids of jobs between `202` and a running container are in `Launcher::starting`; they count as used slots. The host config sets cpu, memory, memory swap equal to memory, and shm. It does not set mounts, ports, or privileged.
 
-A background task reaps containers past the deadline label with SIGKILL, purges old rows, and optionally prunes. Docker events and a reconcile pass on startup close rows when a container exits. An optional `callback_url` is POSTed three times with no redirects and does not hold a slot.
+A background task reaps containers past the deadline label with SIGTERM and, 10 seconds later, SIGKILL, purges old rows, and optionally prunes. Docker events and a reconcile pass on startup close rows when a container exits. An optional `callback_url` is POSTed three times with no redirects and does not hold a slot.
 
 `shutup-and-run bans` and `shutup-and-run bans lift <ip>` read the same SQLite file over SSH. They do not open the HTTP port. They load only `history_path`, not the full settings, because the token is in the systemd env file and an SSH shell does not have it.
 
@@ -182,7 +182,7 @@ These are accepted, not a bug list. A review should confirm they are still true 
 - `scripts/install.sh` listens on `0.0.0.0` and generates a self-signed certificate. The downloaded binary is checked against `SHA256SUMS`. A binary passed in `SHUTUP_AND_RUN_BIN` is not.
 - Log lines kept in SQLite can contain secrets the container printed.
 - Two shutup-and-run processes on one daemon can exceed `max_slots`.
-- Stopping the service does not kill containers. A timeout is SIGKILL only. While the service is stopped nothing enforces a timeout.
+- Stopping the service does not kill containers. A timeout is SIGTERM, then SIGKILL 10 seconds later. While the service is stopped nothing enforces a timeout.
 - A client that keeps reconnecting can still hold connections on the TLS listener. It sends no token, so it is not banned. The defense is a firewall rule ([RECIPES.md](RECIPES.md)).
 - Four medium and six low findings in [REVIEW-2026-11-11.md](REVIEW-2026-11-11.md) are open. The allowlist ones are fixed.
 - There is no cancel call, by decision. Ending a job early needs a shell on the machine.

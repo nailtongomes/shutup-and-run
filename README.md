@@ -27,7 +27,7 @@ A small, self-hosted Docker job runner, in Rust. An orchestrator you already use
 | Start an allowlisted container image with the env, command, timeout and limits a task names | Queue, retry or chain tasks. Your orchestrator does that |
 | Or, in [managed mode](#managed-containers), run containers defined on the machine: once, on an interval, or always | Replace Compose, Kubernetes or a workflow engine. A managed container is one image and when to run it |
 | Take work two ways: **push** (`POST /v1/jobs`) and **pull** (the worker polls a URL of yours) | Coordinate machines. Each worker knows only itself |
-| Cap concurrency (`max_slots`), time (`timeout_secs`, then SIGKILL), CPU and memory per job | Sandbox the job. A container has Docker's default privileges and network |
+| Cap concurrency (`max_slots`), time (`timeout_secs`, then SIGTERM and SIGKILL 10 seconds later), CPU and memory per job | Sandbox the job. A container has Docker's default privileges and network |
 | Refuse work when full, draining, or short of memory or disk | Mount host folders, publish ports, or run privileged. There are no such fields |
 | Keep a job history in SQLite and call a webhook when a job ends | Return a job's output to you. A job reports an exit code and its data is sent by the container; what it printed stays on the machine for 7 days |
 | Show a local page with status and settings, on the machine only | Offer a dashboard, or any page reachable from the network |
@@ -500,7 +500,7 @@ The image needs `sh` and `sleep`; the default is `ghcr.io/nailtongomes/shutup-an
 
 - One process per Docker daemon. Two can exceed `max_slots`.
 - On Linux, stopping the service does not stop containers, and while it is stopped nothing enforces timeouts.
-- A timeout is SIGKILL, with no grace period.
+- A timeout is SIGTERM, then SIGKILL 10 seconds later; the job's `exit_code` is 137 either way.
 - `job_key` is per machine. Another machine does not know it.
 - No cancel call, no queue, no retry of a job that failed. A managed container has no cron expression, no dependencies and no output capture; an `always` one that keeps failing is retried every 15 minutes until someone stops or disables it.
 - Managed mode and push/pull are exclusive on a machine. A machine that should do both needs two machines.

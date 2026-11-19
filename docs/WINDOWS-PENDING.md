@@ -81,7 +81,7 @@ O `check.ps1` mostra o custo da rede pelo Windows ao lado do `metered_network` d
 - [ ] **Saída ao vivo na página.** Com uma tarefa rodando, a página **Tarefas e logs** tem o link **até agora**; ele abre o que a tarefa imprimiu até aquele momento.
 
 
-## 0.2.24: prazo do download, log limitado, disco por tarefa, digest, volta às
+## 0.2.24: prazo do download, log limitado, disco por tarefa, digest, volta às, SIGTERM, processos, volumes, journal
 
 O `check.ps1` com `-JobName` mostra também o disco gravado pela tarefa. O que ele não faz:
 
@@ -90,3 +90,7 @@ O `check.ps1` com `-JobName` mostra também o disco gravado pela tarefa. O que e
 - [ ] **Disco por tarefa.** Depois de uma tarefa que grava um arquivo conhecido (`dd if=/dev/zero of=/tmp/x bs=1M count=500`), `shutup-and-run jobs` tem `disk 500 MiB` na linha `used:`, e a coluna **CPU / memória / rede / disco** da página o mesmo.
 - [ ] **Imagem por digest.** Com o Wi-Fi desligado, uma tarefa de uma imagem pedida como `repo@sha256:...` que já está no PC começa na hora, sem esperar o registro.
 - [ ] **Volta às.** Fora de `lend_hours`, a página diz **ESPERANDO** e "As tarefas novas voltam sozinhas qua 19:00" com o dia e a hora da próxima janela; `status.json` tem `lending.resumes_at`.
+- [ ] **SIGTERM antes do SIGKILL.** Uma tarefa `sh -c 'trap "echo saindo; exit 0" TERM; while true; do sleep 1; done'` com `timeout_secs` 20: ao fim, o log dela (`jobs logs ID`) tem `saindo`, e o `jobs` diz `timeout` com saída 137.
+- [ ] **Limite de processos.** Dentro da distribuição, `docker inspect` de uma tarefa rodando tem `PidsLimit` 4096 e `Init` true.
+- [ ] **Volumes.** Depois de uma tarefa de uma imagem com `VOLUME` (por exemplo `postgres`, com um comando curto), `docker volume ls` dentro da distribuição não tem um volume novo.
+- [ ] **Journal.** Depois do `wsl update`, `journalctl --disk-usage` dentro da distribuição fica abaixo de 100 MB, e existe `/etc/systemd/journald.conf.d/shutup-and-run.conf`.

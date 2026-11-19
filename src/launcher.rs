@@ -1004,7 +1004,8 @@ impl Launcher {
         }
     }
 
-    /// Stops a job on a person's word: SIGKILL, and the row says
+    /// Stops a job on a person's word: SIGTERM, SIGKILL 10 seconds later
+    /// (`bollard_rt::KILL_GRACE_SECS`), and the row says
     /// `launcher_kill`. A job still pulling its image ends before it starts.
     /// `Ok(false)` when there is no such unfinished job.
     pub async fn stop(&self, id: &str) -> Result<bool, LaunchError> {
@@ -1120,7 +1121,14 @@ impl Launcher {
             .await
             .unwrap_or_default();
         let logs = clip_logs(&logs, self.settings.log_lines);
-        let code = exit_code.or(if timed_out { Some(137) } else { None });
+        // A timeout or a stop sends SIGTERM and, 10 seconds later, SIGKILL.
+        // The row says 137 either way, as it did when it was SIGKILL alone,
+        // whatever the job answered to SIGTERM: callers read 137 as killed.
+        let code = if timed_out || reason == REASON_LAUNCHER {
+            Some(137)
+        } else {
+            exit_code
+        };
         let ended = self.clock.now_unix() as i64;
         // The container has stopped, so its copies of the certificate go.
         crate::certificate::unstage(&self.settings, id);
@@ -2422,6 +2430,32 @@ mod tests {
         let err = launcher.launch(job("alpine", None)).await.unwrap_err();
         assert!(matches!(err, LaunchError::NoSlots { used: 2, total: 2 }));
         assert_eq!(mock.start_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_job_that_answers_sigterm_during_the_grace_still_reads_as_killed() {
+        let (launcher, mock, _clock) = harness(2);
+        // Its time ran out: the reaper marked it and sent SIGTERM, and the
+        // job exited 0 by itself before SIGKILL; the die event comes first.
+        let late = started(&launcher, job("alpine", Some(10))).await;
+        launcher.timeouts.lock().await.insert(late.clone());
+        mock.stop(&late, 0).await;
+        launcher.on_exit(&late, 0).await;
+        let row = launcher.job(&late, false).await.unwrap().unwrap();
+        assert_eq!(
+            (row.reason.as_deref(), row.exit_code),
+            (Some(REASON_TIMEOUT), Some(137))
+        );
+        // Stopped on a person's word, it answered SIGTERM with 143.
+        let asked = started(&launcher, job("alpine", None)).await;
+        launcher.stops.lock().await.insert(asked.clone());
+        mock.stop(&asked, 143).await;
+        launcher.on_exit(&asked, 143).await;
+        let row = launcher.job(&asked, false).await.unwrap().unwrap();
+        assert_eq!(
+            (row.reason.as_deref(), row.exit_code),
+            (Some(REASON_LAUNCHER), Some(137))
+        );
     }
 
     #[tokio::test]

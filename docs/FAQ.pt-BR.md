@@ -65,7 +65,7 @@ Isso é: noites de dias úteis e o fim de semana inteiro. Os dias são `mon` a `
 
 ### Ele enche meu disco de sobras?
 
-Não. Uma vez por dia o worker remove as imagens que nenhuma tarefa usou em 30 dias (no Windows também as cópias velhas que uma imagem baixada de novo deixa para trás), os logs das tarefas saem depois de 7 dias e as tarefas terminadas depois de 30. O Docker guarda no máximo 10 MB do que um container imprimiu. No Windows o arquivo de disco do WSL2 não diminui sozinho: quando ele fica bem maior do que o que está em uso, o `shutup-and-run wsl doctor` diz `WSL_DISK_TO_COMPACT`, e o [docs/WINDOWS.md](WINDOWS.md#give-the-wsl2-disks-space-back) mostra como compactar, à mão, com o WSL parado. A linha **Limpeza** da página diz quando foi a última passada e quanto ela liberou.
+Não. Uma vez por dia o worker remove as imagens que nenhuma tarefa usou em 30 dias (no Windows também as cópias velhas que uma imagem baixada de novo deixa para trás), os logs das tarefas saem depois de 7 dias e as tarefas terminadas depois de 30. O Docker guarda no máximo 10 MB do que um container imprimiu, os volumes anônimos de um container saem junto com ele, e no Windows o journal do sistema dentro do WSL2 guarda 100 MB. No Windows o arquivo de disco do WSL2 não diminui sozinho: quando ele fica bem maior do que o que está em uso, o `shutup-and-run wsl doctor` diz `WSL_DISK_TO_COMPACT`, e o [docs/WINDOWS.md](WINDOWS.md#give-the-wsl2-disks-space-back) mostra como compactar, à mão, com o WSL parado. A linha **Limpeza** da página diz quando foi a última passada e quanto ela liberou.
 
 ### Uma tarefa consegue ver meus arquivos?
 
@@ -87,9 +87,10 @@ Isto pode:
 
 | O quê | O que acontece com a tarefa | Como é informado |
 | --- | --- | --- |
-| O tempo limite (`timeout_secs`) | é encerrada | `reason` `timeout` |
+| O tempo limite (`timeout_secs`) | SIGTERM, 10 segundos, depois encerrada | `reason` `timeout` |
 | O limite de memória | o kernel encerra na hora | `oom_killed: true` |
 | O limite de CPU | fica mais lenta, não para | um incidente `cpu_throttled` |
+| 4096 processos | um novo não começa (o `fork` falha); o PC não é afetado | como ela saiu |
 | O PC desliga, reinicia ou sai da sessão | o Windows pergunta antes enquanto uma tarefa roda; "desligar assim mesmo" encerra | `reason` `interrupted`, informado uma vez, não roda de novo |
 | Queda de energia, travamento do PC ou do Docker | ela termina | `interrupted` |
 | `shutup-and-run wsl stop`, uma atualização, uma desinstalação | SIGTERM, 10 segundos, depois encerrada | `interrupted`, ou como ela saiu |

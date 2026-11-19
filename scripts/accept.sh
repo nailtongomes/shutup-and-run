@@ -357,6 +357,13 @@ if [[ "$limits" == "1000000000 268435456 268435456" ]]; then
 else
   fail "default limits on the container (got '${limits}')"
 fi
+# Every container: a process limit, an init, and Docker's copy of its output capped.
+guard=$(docker inspect -f '{{.HostConfig.PidsLimit}} {{.HostConfig.Init}} {{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "max-size"}}' "shutup-and-run-$LONG" 2>/dev/null || true)
+if [[ "$guard" == "4096 true json-file 5m" ]]; then
+  pass "process limit, init and capped log on the container"
+else
+  fail "process limit, init and capped log on the container (got '${guard}')"
+fi
 post '{"image":"alpine","command":["sh","-c","echo shutup-and-run-log-marker; sleep 180"],"job_key":"accept-key"}'
 replay_code=$CODE
 REPLAY=$(job_id || true)

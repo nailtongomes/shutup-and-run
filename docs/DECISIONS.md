@@ -583,3 +583,18 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - Outside `lend_hours`, the wait says when the next window opens: `; next window wed 19:00` in its detail, the time on the page's state line, and `lending.resumes_at` in `status.json`. The other waits have no known end and say nothing new.
 
 **Cost.** A pull that really needs more than 30 minutes now fails where a long job used to let it finish. A job that prints more than 10 MB keeps only the last part in Docker (the log file kept 256 KiB anyway). Sizing the layer walks it, which on a job that wrote many files takes a while at its end. A digest is trusted to be what is on the machine.
+
+## SIGTERM before SIGKILL, process limit and init, no leftover volumes or journal, spread-out retries (0.2.24)
+
+**Context.** A timeout or a stop was SIGKILL at once, so a job could not write its result or close its browser, and a Chrome profile was left half written. Nothing limited a container's processes: a job that forked without end slowed the whole PC down within its CPU and memory limits, and the zombies a browser leaves piled up. A container was removed without its anonymous volumes, so every job of an image with a `VOLUME` left one on the WSL2 disk for good. The distribution's systemd journal could grow to 4 GB. And after an outage of the poll URL every PC retried on the same doubling schedule, so a fleet came back in waves on the same second.
+
+**Decision.**
+
+- A timeout and a stop send SIGTERM (or the image's `STOPSIGNAL`) through `docker stop`, and SIGKILL 10 seconds later (`bollard_rt::KILL_GRACE_SECS`). The row keeps `exit_code` 137 for `timeout_kill` and `launcher_kill` whatever the job answered, so a caller that reads 137 as killed does not change.
+- Every container gets `PidsLimit` 4096 and Docker's `init` as its first process, under any profile: a constant, not a setting, and not a request field. `docker.io` on Ubuntu ships `docker-init`.
+- A container is removed with `v`, so its anonymous volumes go with it. Named volumes cannot exist: a request has no mounts.
+- `wsl install` and `wsl update` write `/etc/systemd/journald.conf.d/shutup-and-run.conf` (`SystemMaxUse=100M`) in the distribution; a failure is a warning.
+- After a failed poll each machine waits the doubled time plus up to a quarter more at random. A success goes back to the plain interval from where it landed, so the fleet stays spread. Never under the 30-second minimum.
+
+**Cost.** A job past its time holds its slot up to 10 seconds longer, and a stop on the page answers up to 10 seconds later. A job that really needs more than 4096 processes fails. The row's 137 hides that the job ended cleanly on SIGTERM; its log says so. A retry after an outage can come up to a quarter later.
+

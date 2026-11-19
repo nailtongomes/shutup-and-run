@@ -52,7 +52,8 @@ A request cannot override these. Unknown JSON fields are rejected. The container
 - No PID, IPC, UTS, or network mode is set. The container joins the default bridge.
 - No restart policy. A container that exits stays stopped.
 - When `memory` is set, `MemorySwap` is set to the same value, so there is no extra swap.
-- The deadline is a label. The reaper sends SIGKILL. There is no SIGTERM grace.
+- The deadline is a label. The reaper sends SIGTERM (or the image's `STOPSIGNAL`), then SIGKILL 10 seconds later. The job's `exit_code` is 137 either way.
+- Every container has a limit of 4096 processes and Docker's `init` as its first process. Its anonymous volumes are removed with it.
 - The image name must pass `validate_image_name` (lowercase, no spaces, no `..`) and match an allowlist entry. An entry that names a tag or a digest matches only that exact string. Nothing after the entry may contain a `/`.
 - `callback_url`, and `poll_url` when you set it, must be `http` or `https` with a host. Redirects are not followed. `poll_url` must not carry a username or password.
 - Every HTTP route on this process requires the bearer token, with one exception you turn on: `status_page = true` serves a read-only status page and a pause button at `/` to a browser on the machine itself, and to nothing else. Failed attempts are counted per peer address and then banned. The ban survives a restart.

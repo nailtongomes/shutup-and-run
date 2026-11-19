@@ -13,9 +13,9 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, EventsOptionsBuilder,
-    InspectContainerOptions, InspectContainerOptionsBuilder, KillContainerOptionsBuilder,
-    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
-    StatsOptionsBuilder,
+    InspectContainerOptions, InspectContainerOptionsBuilder, ListContainersOptionsBuilder,
+    RemoveContainerOptionsBuilder, StartContainerOptions, StatsOptionsBuilder,
+    StopContainerOptionsBuilder,
 };
 use bollard::Docker;
 use futures_util::StreamExt;
@@ -162,6 +162,11 @@ impl Runtime for BollardRuntime {
                 shm_size: spec.shm_bytes,
                 binds: (!spec.binds.is_empty()).then(|| spec.binds.clone()),
                 log_config: Some(log_config()),
+                // A job that forks without end (a loop, a browser spawning
+                // itself) stops at this many processes, not at the PC's
+                // limit; and a small init reaps the zombies a browser leaves.
+                pids_limit: Some(PIDS_LIMIT),
+                init: Some(true),
                 ..Default::default()
             }),
             ..Default::default()
@@ -182,7 +187,10 @@ impl Runtime for BollardRuntime {
             .start_container(&created.id, None::<StartContainerOptions>)
             .await
         {
-            let remove = RemoveContainerOptionsBuilder::new().force(true).build();
+            let remove = RemoveContainerOptionsBuilder::new()
+                .force(true)
+                .v(true)
+                .build();
             if let Err(rm) = self
                 .docker
                 .remove_container(&created.id, Some(remove))
@@ -330,16 +338,21 @@ impl Runtime for BollardRuntime {
     }
 
     async fn kill(&self, id: &str) -> Result<(), RuntimeError> {
-        // shortcut: SIGKILL, no SIGTERM grace. A hung Chrome will not flush.
-        // Upgrade to stop-then-kill if jobs need a chance to write their result.
-        let options = KillContainerOptionsBuilder::new().signal("SIGKILL").build();
+        // SIGTERM (or the image's STOPSIGNAL), then SIGKILL after the grace:
+        // a job gets the chance to write its result and close its browser.
+        let options = StopContainerOptionsBuilder::new()
+            .t(KILL_GRACE_SECS)
+            .build();
         match self
             .docker
-            .kill_container(&container_ref(id), Some(options))
+            .stop_container(&container_ref(id), Some(options))
             .await
         {
             Ok(()) => Ok(()),
-            Err(err) if is_status(&err, 404) || is_status(&err, 409) => Ok(()),
+            // Gone, or already stopped.
+            Err(err) if is_status(&err, 404) || is_status(&err, 304) || is_status(&err, 409) => {
+                Ok(())
+            }
             Err(err) => Err(docker_err(err)),
         }
     }
@@ -354,7 +367,10 @@ impl Runtime for BollardRuntime {
                 continue;
             }
             let Some(id) = container.id else { continue };
-            let options = RemoveContainerOptionsBuilder::new().force(true).build();
+            let options = RemoveContainerOptionsBuilder::new()
+                .force(true)
+                .v(true)
+                .build();
             self.docker
                 .remove_container(&id, Some(options))
                 .await
@@ -408,7 +424,12 @@ impl Runtime for BollardRuntime {
     }
 
     async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
-        let options = RemoveContainerOptionsBuilder::new().force(true).build();
+        // `v`: the anonymous volumes an image's VOLUME made go with it, or
+        // they would stay on the PC's disk after every job.
+        let options = RemoveContainerOptionsBuilder::new()
+            .force(true)
+            .v(true)
+            .build();
         match self
             .docker
             .remove_container(&container_ref(id), Some(options))
@@ -605,6 +626,13 @@ fn run_helper(helper: &str, server: &str) -> Result<RegistryAuth, String> {
     }
     auth_from_helper_output(&String::from_utf8_lossy(&output.stdout))
 }
+
+/// The most processes one container may hold. A constant: it keeps a job
+/// that forks without end from taking the PC with it.
+const PIDS_LIMIT: i64 = 4096;
+
+/// Seconds between SIGTERM and SIGKILL at a timeout or a stop.
+pub const KILL_GRACE_SECS: i32 = 10;
 
 /// `repo@sha256:...`: the one image reference that cannot change.
 fn pinned(image: &str) -> bool {
