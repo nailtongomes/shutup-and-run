@@ -1511,6 +1511,8 @@ async fn examine() -> Found {
     if let Some(settings) = settings {
         service_checks(&mut found, &settings).await;
     }
+    // Internet sharing, only on a machine where it was turned on.
+    found.checks.extend(crate::internet::checks_if_configured());
     found
 }
 

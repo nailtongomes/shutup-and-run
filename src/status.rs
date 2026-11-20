@@ -51,7 +51,7 @@ pub fn router(launcher: Arc<Launcher>) -> Router {
         .with_state(launcher)
 }
 
-async fn local_only(request: Request<Body>, next: Next) -> Response {
+pub(crate) async fn local_only(request: Request<Body>, next: Next) -> Response {
     // The socket peer, never X-Forwarded-For. The Host check keeps out a
     // proxy on this machine that forwards a public name, and DNS rebinding.
     let peer_is_local = request
@@ -3618,7 +3618,7 @@ pub fn unix_to_iso(secs: i64) -> String {
     )
 }
 
-fn iso_to_unix(text: &str) -> Option<i64> {
+pub(crate) fn iso_to_unix(text: &str) -> Option<i64> {
     let text = text.trim().strip_suffix('Z')?;
     let (date, time) = text.split_once('T')?;
     let mut date = date.split('-');

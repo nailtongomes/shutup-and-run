@@ -611,3 +611,19 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - The install records the sha256 of the `.wslconfig` it writes. `wsl uninstall` removes that file only when it still has that hash and no other WSL distribution is left; any other file stays.
 
 **Cost.** One more write to the history every few seconds while an image downloads. The second number can grow during the pull, since Docker names layers as it goes. The doctor makes one request to github.com. A `.wslconfig` that `wsl limits --apply` rewrote after the install no longer matches and stays.
+
+## Internet sharing: a reverse connection pool in the binary (alpha, 0.2.26)
+
+**Context.** Many clients' PCs are too weak for containers or cannot run WSL2, but the operator's automations still need to reach courts and sites from the client's residential address, not the datacenter's. The PC is behind NAT or CGNAT, so the connection has to start from it. Chrome takes no SOCKS5 login and no proxy login on its command line. Security was explicitly not a goal of the first version: the client accepts the risks in the contract.
+
+**Decision.**
+
+- A mode of its own, `internet on|off|status|credentials|serve`, apart from the worker: its own file `internet.json` beside the supervisor's files (Windows) or the history (Linux), its own process run by a logon task or a systemd unit, and a read-only page on 127.0.0.1:8788. It must run on a PC with no worker, no WSL and no Docker, and while the worker lends nothing.
+- The PC keeps 4 idle TCP connections to the operator's relay (`shutup-and-run relay`, the same binary). One connection per stream, no multiplexing: the relay sends `C host:port`, the PC dials the site and both copy bytes. Pings every 20 s; 60 s of silence and the connection is dialed again, with a backoff from 1 to 30 s.
+- The relay is an HTTP proxy (`CONNECT` and `http://`) whose login names the PC; `--open PORT=ID:SECRET` gives Chrome a port with no login. It keeps nothing on disk.
+- The PC refuses destinations on its own network, on the address it dials.
+- New streams wait like new jobs for the worker's pause, hours, battery, presenting and a metered network; never for memory or the safety levels, which this mode does not load. An open stream is never cut.
+- Bytes are counted on the site's side of each stream, kept across restarts in the status file.
+- OpenSSH's `ssh -R`, chisel, frp, gost and rathole were weighed in docs/INTERNET.md: a second program, a key per PC, no byte count, and Defender's HackTool alerts cost more than about 1,600 lines of Rust with no new crate.
+
+**Cost.** Plain TCP between the PC and the relay: the password and the names of the sites can be read on the way; HTTPS content cannot. Any PC can connect to the relay, and after a relay restart the first to connect sets an id's password. One TCP connection per stream means one round trip to the relay before each stream, and four idle connections per PC on the relay. UDP, QUIC and WebRTC do not go through. A second page and a second file to keep in step with the worker's, and `doctor` on a Windows PC without WSL still fails on its first line (`internet status` is the check there).

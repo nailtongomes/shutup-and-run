@@ -189,7 +189,23 @@ The JSON also carries `fix`. It is the same sentence under the name 0.2.8 used; 
 | `WSL_LIMITS_WARNING` | Run `shutup-and-run wsl limits` to see what WSL2 may take; `shutup-and-run wsl limits --apply` sets the budget. | Rode `shutup-and-run wsl limits` para ver quanto o WSL2 pode usar; `shutup-and-run wsl limits --apply` define o limite. |
 | `WSL_LIMITS_ABOVE_BUDGET` | Run `shutup-and-run wsl limits --apply` (it keeps every other line of .wslconfig), then restart WSL yourself: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`. | Rode `shutup-and-run wsl limits --apply` (mantém as outras linhas do .wslconfig) e reinicie o WSL você mesmo: `shutup-and-run wsl stop`, `wsl --shutdown`, `shutup-and-run wsl start`. |
 | `WSL_LIMITS_NOT_IN_EFFECT` | The limits apply when WSL restarts: `shutup-and-run wsl stop`, `wsl --shutdown` (it stops every WSL distribution of this user), `shutup-and-run wsl start`. | Os limites valem quando o WSL reinicia: `shutup-and-run wsl stop`, `wsl --shutdown` (para todas as distribuições WSL deste usuário), `shutup-and-run wsl start`. |
+| `INTERNET_NOT_RUNNING` | Run `shutup-and-run internet on --relay HOST:PORT` again with the same relay: it starts the process and its logon task (Linux: its systemd unit). | Rode `shutup-and-run internet on --relay HOST:PORTA` de novo com o mesmo relay: ele inicia o processo e a tarefa de logon (Linux: a unidade do systemd). |
+| `INTERNET_RELAY_UNREACHABLE` | Check that this PC reaches {} (`Test-NetConnection HOST -Port PORT` on Windows, `nc -vz HOST PORT` on Linux) and that the relay runs; it reconnects by itself. | Confira se este PC alcança {} (`Test-NetConnection HOST -Port PORTA` no Windows, `nc -vz HOST PORTA` no Linux) e se o relay está no ar; ele reconecta sozinho. |
+| `INTERNET_REFUSED` | Another PC uses this id: `shutup-and-run internet on --relay HOST:PORT --id NEW-NAME`, then send the operator `shutup-and-run internet credentials`. | Outro PC usa este id: `shutup-and-run internet on --relay HOST:PORTA --id NOVO-NOME` e envie ao operador `shutup-and-run internet credentials`. |
+| `INTERNET_WAITING` | New connections resume by themselves when the reason on this line ends. `shutup-and-run resume` ends a pause; `internet on ... --metered` accepts a metered network. | Novas conexões voltam sozinhas quando o motivo desta linha acabar. `shutup-and-run resume` encerra uma pausa; `internet on ... --metered` aceita rede limitada. |
 | any other | Run `shutup-and-run doctor --report` and open the issue link it prints. | Rode `shutup-and-run doctor --report` e abra o link de issue que ele imprime. |
+
+## Internet sharing (a PC with no WSL, or too weak for jobs)
+
+When the operator asks to lend only this PC's connection, run as the PC's user, no administrator, no WSL needed:
+
+```bash
+shutup-and-run internet on --relay HOST:PORT --json   # HOST:PORT from the operator; it starts now and at every logon
+shutup-and-run internet status --json                 # wait for "state":"connected"; exit 1 and a hint otherwise
+shutup-and-run internet credentials --json            # "proxy": send this to the operator, and nowhere else
+```
+
+`--hours "mon-fri 19-07"` limits when; `--metered` lets it use a metered network, only if the PC's owner agreed. `internet off --forget` undoes all of it. Turning it on is the owner's consent: do it only when the owner asked. docs/INTERNET.md has the risks to tell them.
 
 ## Managed containers (work with no poll URL)
 
