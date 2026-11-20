@@ -35,7 +35,7 @@ docker compose logs -f relay        # "PC <id> connected from <ip>", one line pe
 - `8080` is the proxy. It is **not** published: containers on the compose network `egress` use `http://ID:SECRET@relay:8080`. A container in another datacenter reaches it only over a private address or a VPN; never publish it on the internet.
 - For Chrome, uncomment `--open=8101=${PC_ID}:${PC_SECRET}` and put `PC_ID` and `PC_SECRET` in a `.env` beside `compose.yml`; then Chrome uses `--proxy-server=http://relay:8101`.
 
-The Dockerfile takes the latest release's binary, so it needs a release that has internet sharing (after 0.2.25). Before that, build the musl binary (AGENTS.md), copy it beside `compose.yml` and replace the Dockerfile's first stage with `COPY shutup-and-run /shutup-and-run`.
+The Dockerfile takes the latest release's binary, which has the relay from 0.2.26 on. To run a build of your own, build the musl binary (AGENTS.md), copy it beside `compose.yml` and replace the Dockerfile's first stage with `COPY shutup-and-run /shutup-and-run`.
 
 The relay keeps nothing on disk. A restart drops every stream; the PCs come back by themselves within seconds.
 

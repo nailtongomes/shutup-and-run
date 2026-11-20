@@ -318,7 +318,7 @@ docker run --rm --network relay_egress curlimages/curl -s -x http://ID:SENHA@rel
 
 - [ ] O comando imprime o IP do PC, não o do servidor. O log do relay tem `PC ID connected` e uma linha `api.ipify.org:443 sent ... received ...`.
 - [ ] Chrome: pare o relay, descomente `--open=8101=${PC_ID}:${PC_SECRET}` no `compose.yml`, crie `.env` com `PC_ID=ID` e `PC_SECRET=SENHA`, `docker compose up -d`, e rode o `zenika/alpine-chrome ... --dump-dom https://api.ipify.org` de docs/INTERNET.md: o `<body>` tem o IP do PC.
-- [ ] O resto da lista está em [WINDOWS-PENDING.md](WINDOWS-PENDING.md#compartilhar-só-a-internet-alpha-ainda-sem-versão): Defender, sono, relay reiniciado, esperas, rede do PC recusada, bytes, com o worker, desligar, logon.
+- [ ] O resto da lista está em [WINDOWS-PENDING.md](WINDOWS-PENDING.md#0226-compartilhar-só-a-internet-alpha): Defender, sono, relay reiniciado, esperas, rede do PC recusada, bytes, com o worker, desligar, logon.
 
 Num Linux só (prova o caminho e a reconexão, não o IP): `sudo bash tests/internet/local.sh target/release/shutup-and-run`.
 

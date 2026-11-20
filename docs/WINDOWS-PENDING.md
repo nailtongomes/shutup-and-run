@@ -101,7 +101,7 @@ O `check.ps1` com `-JobName` mostra também o disco gravado pela tarefa. O que e
 - [ ] **Versão nova.** Com o `.exe` de uma versão anterior à última release, `shutup-and-run doctor` tem a linha `update` com `UPDATE_AVAILABLE` e a dica da linha de instalação; na última versão, `<versão> is the newest release`. Sem internet, a linha não aparece e o doctor não demora mais que 5 segundos por isso.
 - [ ] **.wslconfig no uninstall.** Num PC sem `%UserProfile%\.wslconfig` e sem outra distribuição, `wsl install` escreve o arquivo e `%ProgramData%\shutup-and-run\wslconfig.sha256`; `wsl uninstall` diz `removed ... which the install wrote` e o arquivo some. Repita mudando uma linha do arquivo antes do uninstall: ele diz `kept ...: it changed` e o arquivo fica. Com outra distribuição (um Ubuntu): `kept ...: other WSL distributions are under it`.
 
-## Compartilhar só a internet (alpha, ainda sem versão)
+## 0.2.26: compartilhar só a internet (alpha)
 
 O roteiro completo está em [TESTING.pt-BR.md, "Compartilhar só a internet"](TESTING.pt-BR.md#compartilhar-só-a-internet-sem-wsl). Precisa de um relay no ar (`examples/relay`, `docker compose up -d --build` num servidor com a porta 7000 aberta) e de **dois** PCs Windows 11: um **sem WSL** (ou com WSL desligado, `wsl --list` vazio) e um com o worker instalado.
 
