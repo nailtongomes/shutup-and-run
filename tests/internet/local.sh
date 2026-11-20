@@ -25,8 +25,12 @@ finish() {
 }
 trap finish EXIT
 
+token=local-test-token-1234
+printf '%s\n' "$token" >"$work/token"
+
 start_relay() {
-  "$bin" relay --agents "$agents" --proxy "127.0.0.1:$proxy_port" >>"$work/relay.log" 2>&1 &
+  "$bin" relay --agents "$agents" --proxy "127.0.0.1:$proxy_port" --token-file "$work/token" \
+    >>"$work/relay.log" 2>&1 &
   relay_pid=$!
 }
 
@@ -43,7 +47,7 @@ wait_connected() {
 }
 
 start_relay
-"$bin" internet on --relay "$agents" --id local-test
+"$bin" internet on --relay "$agents" --id local-test --token "$token"
 if ! pgrep -f "internet serve" >/dev/null; then
   "$bin" internet serve >"$work/serve.log" 2>&1 &
   serve_pid=$!
@@ -56,6 +60,10 @@ through=$(curl -s --noproxy '' -x "$url" https://api.ipify.org || true)
 echo "direct:        $direct"
 echo "through relay: $through"
 [ -n "$through" ] || { echo "FAIL: nothing through the relay" >&2; exit 1; }
+
+status=$(curl -s --noproxy '*' "$url/status")
+echo "relay status:  $status"
+case $status in *'"connected":true'*) ;; *) echo "FAIL: /status does not say connected" >&2; exit 1 ;; esac
 
 echo "restarting the relay"
 kill "$relay_pid"

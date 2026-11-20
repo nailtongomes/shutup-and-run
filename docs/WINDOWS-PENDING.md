@@ -117,3 +117,18 @@ O roteiro completo está em [TESTING.pt-BR.md, "Compartilhar só a internet"](TE
 - [ ] **Com o worker.** No PC com WSL, `internet on` funciona igual, a página do worker continua em 8787, e `shutup-and-run pause` faz `internet status` dizer `WORKER_PAUSED`; `resume`, volta.
 - [ ] **Desligar.** `internet off`: a tarefa some do Agendador, o processo some do Gerenciador de Tarefas em 5 s, a página 8788 não abre. `internet off --forget` apaga `internet.json`, `internet-status.json` e `internet.log` de `C:\ProgramData\shutup-and-run\`.
 - [ ] **Logon.** Com a internet ligada, reinicie o PC e entre: sem fazer nada, `internet status` volta a `ok`.
+
+## Compartilhar só a internet: resiliência, token, limite diário, instalação em uma linha (ainda sem versão)
+
+Com o relay do `examples/relay` atual (que agora pede `relay_token`):
+
+- [ ] **Instalação em uma linha.** Num PC sem WSL, `$env:SHUTUP_AND_RUN_RELAY = "SERVIDOR:7000"`, `$env:SHUTUP_AND_RUN_RELAY_TOKEN = "TOKEN"`, `irm .../install.ps1 | iex`: sem administrador, termina com `internet sharing is on`; `internet status` diz `ok` em até 10 s. Sem o token, ou com um errado: `INTERNET_REFUSED` com `wrong or missing relay token`.
+- [ ] **Atualização.** Rode a linha de novo: o `.exe` é trocado, `internet status` volta a `ok` sem fazer nada, e o `wsl update` não roda (não há WSL).
+- [ ] **Acordar sem 502.** Com um curl em laço no servidor (`while true; do curl -s -o /dev/null -w '%{http_code}\n' -x http://ID:SENHA@relay:8080 https://api.ipify.org; sleep 2; done`), durma o PC 2 minutos e acorde: depois de alguns `503` enquanto ele está fora, os pedidos voltam a `200` sem `502` no meio. Troque de Wi-Fi com o laço rodando: o mesmo.
+- [ ] **IPv4.** Num PC com IPv6, `curl.exe https://api64.ipify.org` mostra um IPv6, mas pelo proxy `https://api64.ipify.org` mostra o IPv4 do PC. Com o IPv6 do roteador quebrado, uma página pelo proxy não demora mais que sem ele.
+- [ ] **Chrome.** A primeira página de um tribunal pelo `--open` carrega no tempo normal (16 conexões esperando).
+- [ ] **Limite diário.** `internet on ... --max-day 100m`, baixe 150 MB pelo proxy: o download em curso termina, `internet status` diz `waits: INTERNET_DAILY_LIMIT` com o uso e `again at midnight`, e o próximo pedido recebe 503. Depois da meia-noite (ou mudando o relógio do Windows), volta.
+- [ ] **Queda do processo.** Termine `shutup-and-run.exe` (o da internet) no Gerenciador de Tarefas: em até 2 minutos ele volta sozinho, sem logon. Faça o mesmo com o worker.
+- [ ] **Id guardado.** Com o PC dormindo 3 minutos, um segundo PC com o mesmo `--id` e outra senha é recusado (`id in use`); o primeiro, ao acordar, volta.
+- [ ] **Uninstall.** `shutup-and-run wsl uninstall --purge` num PC com a internet ligada: a tarefa `shutup-and-run-internet` some e os arquivos `internet.*` também.
+- [ ] **Status pelo relay.** No servidor, `curl -s http://ID:SENHA@relay:8080/status` diz `"connected":true` com o PC ligado e `false` com ele desligado.

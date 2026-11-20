@@ -296,6 +296,7 @@ No servidor:
 
 ```bash
 git clone https://github.com/nailtongomes/shutup-and-run && cd shutup-and-run/examples/relay
+head -c 24 /dev/urandom | base64 | tr -d '/+=' > relay_token   # o TOKEN
 docker compose up -d --build
 docker compose logs -f relay          # deixe aberto
 curl -s https://api.ipify.org; echo   # o IP do servidor, para comparar
@@ -304,7 +305,7 @@ curl -s https://api.ipify.org; echo   # o IP do servidor, para comparar
 No PC, num PowerShell comum (não de administrador), na pasta onde baixou o `.exe` da última release, salvo como `shutup-and-run.exe`:
 
 ```powershell
-.\shutup-and-run.exe internet on --relay IP_DO_SERVIDOR:7000
+.\shutup-and-run.exe internet on --relay IP_DO_SERVIDOR:7000 --token TOKEN
 .\shutup-and-run.exe internet status        # ok ... connected
 .\shutup-and-run.exe internet credentials   # anote ID e SENHA
 curl.exe -s https://api.ipify.org           # o IP do PC
@@ -318,7 +319,8 @@ docker run --rm --network relay_egress curlimages/curl -s -x http://ID:SENHA@rel
 
 - [ ] O comando imprime o IP do PC, não o do servidor. O log do relay tem `PC ID connected` e uma linha `api.ipify.org:443 sent ... received ...`.
 - [ ] Chrome: pare o relay, descomente `--open=8101=${PC_ID}:${PC_SECRET}` no `compose.yml`, crie `.env` com `PC_ID=ID` e `PC_SECRET=SENHA`, `docker compose up -d`, e rode o `zenika/alpine-chrome ... --dump-dom https://api.ipify.org` de docs/INTERNET.md: o `<body>` tem o IP do PC.
-- [ ] O resto da lista está em [WINDOWS-PENDING.md](WINDOWS-PENDING.md#0226-compartilhar-só-a-internet-alpha): Defender, sono, relay reiniciado, esperas, rede do PC recusada, bytes, com o worker, desligar, logon.
+- [ ] Uma tarefa de um worker em outro servidor, com `HTTPS_PROXY` no `env` (`internet credentials --env`, com o endereço que o worker alcança), imprime o IP do PC: `{"image": "curlimages/curl", "command": ["curl", "-s", "https://api.ipify.org"], "env": {"HTTPS_PROXY": "http://ID:SENHA@ENDERECO:8080"}}`.
+- [ ] O resto da lista está em [WINDOWS-PENDING.md](WINDOWS-PENDING.md#0226-compartilhar-só-a-internet-alpha) e na seção seguinte dele (resiliência, token, limite diário): Defender, sono, relay reiniciado, esperas, rede do PC recusada, bytes, com o worker, desligar, logon.
 
 Num Linux só (prova o caminho e a reconexão, não o IP): `sudo bash tests/internet/local.sh target/release/shutup-and-run`.
 

@@ -23,7 +23,15 @@
 # config, the poll token and the job history are kept. On any failure the
 # previous .exe is put back and started, and no download is left behind.
 #
-# Needs WSL2 already enabled: `wsl --install --no-distribution` as
+# Internet sharing only (a PC with no WSL, or too weak for jobs; no
+# administrator, no WSL needed):
+#   $env:SHUTUP_AND_RUN_RELAY = "relay.example.com:7000"
+#   $env:SHUTUP_AND_RUN_RELAY_TOKEN = "<token>"   # only when the relay asks for one
+#   irm .../install.ps1 | iex
+# runs `shutup-and-run internet on --relay ...` instead of the WSL install.
+# An update over it starts the task shutup-and-run-internet again.
+#
+# For the worker it needs WSL2 already enabled: `wsl --install --no-distribution` as
 # administrator, then a reboot. This script does not need administrator.
 
 $ErrorActionPreference = "Stop"
@@ -57,9 +65,14 @@ function Describe-Exit([int]$Code) {
 # Native commands go through cmd: with $ErrorActionPreference = "Stop",
 # Windows PowerShell 5.1 turns the stderr of a native command redirected with
 # 2> into an error, and a task that does not exist would end this script.
-function Test-Task {
-    cmd.exe /c "schtasks.exe /Query /TN shutup-and-run >nul 2>&1"
+function Test-Task([string]$Name = "shutup-and-run") {
+    cmd.exe /c "schtasks.exe /Query /TN $Name >nul 2>&1"
     return ($LASTEXITCODE -eq 0)
+}
+
+# Internet sharing runs this same .exe; Stop-Worker ended it with the rest.
+function Start-Internet {
+    if ($Internet) { cmd.exe /c "schtasks.exe /Run /TN shutup-and-run-internet >nul 2>&1" }
 }
 
 # Stop the worker this folder runs: the clean way first (the task ends, each
@@ -80,6 +93,7 @@ function Stop-Worker {
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 $Had = Test-Path $Exe
 $Task = $Had -and (Test-Task)
+$Internet = $Had -and (Test-Task "shutup-and-run-internet")
 $Stopped = $false
 $Swapped = $false
 try {
@@ -128,10 +142,16 @@ try {
     }
     if (-not ($env:Path -split ";" | Where-Object { $_ -eq $Dir })) { $env:Path = "$env:Path;$Dir" }
 
-    if ($env:SHUTUP_AND_RUN_POLL_URL) {
+    if ($env:SHUTUP_AND_RUN_RELAY) {
+        $On = @("internet", "on", "--relay", $env:SHUTUP_AND_RUN_RELAY)
+        if ($env:SHUTUP_AND_RUN_RELAY_TOKEN) { $On += @("--token", $env:SHUTUP_AND_RUN_RELAY_TOKEN) }
+        & $Exe @On
+        if ($LASTEXITCODE -ne 0) { throw "shutup-and-run internet on failed: exit code $(Describe-Exit $LASTEXITCODE)" }
+        Write-Host "give the operator what this prints: shutup-and-run internet credentials"
+    } elseif ($env:SHUTUP_AND_RUN_POLL_URL) {
         & $Exe wsl install --poll-url $env:SHUTUP_AND_RUN_POLL_URL
         if ($LASTEXITCODE -ne 0) { throw "shutup-and-run wsl install failed: exit code $(Describe-Exit $LASTEXITCODE)" }
-    } elseif ($Had) {
+    } elseif ($Had -and ($Task -or -not $Internet)) {
         & $Exe wsl update
         # Exit 2 is the usage: a release older than `wsl update`. Its install
         # keeps the config and puts in the Linux binary of its own version.
@@ -144,6 +164,7 @@ try {
         Write-Host "or, to only check this machine (no polling, smoke test only):"
         Write-Host "  shutup-and-run wsl install"
     }
+    Start-Internet
     # The old file can stay locked for a moment after its process ended.
     for ($i = 0; ($i -lt 10) -and (Test-Path $Old); $i++) {
         Remove-Item -Force -ErrorAction SilentlyContinue $Old
@@ -166,6 +187,7 @@ try {
             cmd.exe /c "schtasks.exe /Run /TN shutup-and-run >nul 2>&1"
             Write-Host "started the previous version again"
         }
+        Start-Internet
     }
     Write-Host "hint: nothing of the new version was left behind; read the error below, then follow $Help"
     throw $Why

@@ -6,7 +6,7 @@ A PC that cannot run containers (no WSL, too little memory, a weak machine) can 
 container (datacenter) --HTTP proxy--> relay (operator's server) <--TCP, opened by the PC-- PC (client's home) --> site
 ```
 
-The PC dials out to a relay the operator runs and keeps 4 idle connections open to it. Nothing is opened on the PC or its router, so it works behind NAT and CGNAT. When a container asks the relay's proxy for `host:port`, the relay sends that line down one idle connection; the PC resolves the name with its own DNS, dials the site and copies the bytes both ways. No Docker and no WSL: the `.exe` alone does it, and the same binary does it on Linux.
+The PC dials out to a relay the operator runs and keeps 16 idle connections open to it (Chrome opens 10 to 30 for one page). Nothing is opened on the PC or its router, so it works behind NAT and CGNAT. When a container asks the relay's proxy for `host:port`, the relay sends that line down one idle connection; the PC resolves the name with its own DNS, dials the site and copies the bytes both ways. No Docker and no WSL: the `.exe` alone does it, and the same binary does it on Linux.
 
 Alpha. Read [Risks](#risks-and-what-is-left-out) before turning it on for a client.
 
@@ -27,17 +27,20 @@ On a Linux server with Docker that the PCs can reach on one TCP port:
 
 ```bash
 cd examples/relay
+head -c 24 /dev/urandom | base64 | tr -d '/+=' > relay_token   # what every PC must send
 docker compose up -d --build        # the release's musl binary, checked against SHA256SUMS
-docker compose logs -f relay        # "PC <id> connected from <ip>", one line per stream
+docker compose logs -f relay        # "PC <id> connected from <ip>", a line per stream, a summary per minute
 ```
 
-- `7000` is published: the PCs dial in there. Open it in the server's firewall.
+- The token keeps unknown PCs out: without it anyone who finds port 7000 can connect one. Give it to the client with the relay's address (`internet on --relay HOST:7000 --token TOKEN`). To run without one, take `--token-file` and the `secrets` out of `compose.yml`.
+
+- `7000` is published: the PCs dial in there, with the token. Open it in the server's firewall.
 - `8080` is the proxy. It is **not** published: containers on the compose network `egress` use `http://ID:SECRET@relay:8080`. A container in another datacenter reaches it only over a private address or a VPN; never publish it on the internet.
 - For Chrome, uncomment `--open=8101=${PC_ID}:${PC_SECRET}` and put `PC_ID` and `PC_SECRET` in a `.env` beside `compose.yml`; then Chrome uses `--proxy-server=http://relay:8101`.
 
 The Dockerfile takes the latest release's binary, which has the relay from 0.2.26 on. To run a build of your own, build the musl binary (AGENTS.md), copy it beside `compose.yml` and replace the Dockerfile's first stage with `COPY shutup-and-run /shutup-and-run`.
 
-The relay keeps nothing on disk. A restart drops every stream; the PCs come back by themselves within seconds.
+The relay keeps nothing on disk. A restart drops every stream; the PCs come back by themselves within seconds. Once a minute the log has a line per PC whose numbers changed: `relay: PC <id>: 16 idle, 2 open`.
 
 Without Docker: `shutup-and-run relay --agents 0.0.0.0:7000 --proxy 10.0.0.5:8080` (the proxy on a private address).
 
@@ -46,19 +49,21 @@ Without Docker: `shutup-and-run relay --agents 0.0.0.0:7000 --proxy 10.0.0.5:808
 The operator tells the client, or the client's AI agent, one line. Windows (PowerShell, as the user, no administrator, no WSL needed), with the `.exe` downloaded from the [latest release](https://github.com/nailtongomes/shutup-and-run/releases/latest):
 
 ```powershell
-.\shutup-and-run-x86_64-pc-windows-msvc.exe internet on --relay relay.example.com:7000
+$env:SHUTUP_AND_RUN_RELAY = "relay.example.com:7000"
+$env:SHUTUP_AND_RUN_RELAY_TOKEN = "TOKEN"     # only when the relay asks for one
+irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
 ```
 
-It copies the `.exe` to `C:\ProgramData\shutup-and-run\`, registers the logon task `shutup-and-run-internet` (under `conhost --headless`, no window) and starts it. On a PC that already runs the worker, the same `.exe` does it; the worker and this mode are independent.
+The install line downloads the `.exe`, checks it against `SHA256SUMS`, puts it on the PATH and runs `shutup-and-run internet on --relay ... --token ...` instead of the WSL install. Run again, it is the update, and it starts internet sharing again on the new `.exe`. `internet on` itself copies the `.exe` to `C:\ProgramData\shutup-and-run\`, registers the logon task `shutup-and-run-internet` (under `conhost --headless`, no window) and starts it. On a PC that already runs the worker, the same `.exe` does it; the worker and this mode are independent.
 
 Linux (root): `shutup-and-run internet on --relay relay.example.com:7000` writes and starts the systemd unit `shutup-and-run-internet`. Without systemd, keep `shutup-and-run internet serve` running.
 
 | Command | What it does |
 | --- | --- |
-| `internet on --relay HOST:PORT [--id NAME] [--hours "mon-fri 19-07"] [--metered]` | turn on, or change; keeps the id and password of a previous `on` |
-| `internet status [--json]` | `ok`, or why not, with a `hint`; bytes carried. Exit 1 when on and not working |
-| `internet credentials [--json]` | the proxy address with the password, for the operator |
-| `internet off [--forget]` | stop and remove the task or unit; `--forget` also deletes the id and password |
+| `internet on --relay HOST:PORT [--id NAME] [--token TOKEN] [--hours "mon-fri 19-07"] [--max-day 5g] [--metered]` | turn on, or change; keeps the id, the password and the token of a previous `on` |
+| `internet status [--json]` | `ok`, or why not, with a `hint`; bytes carried, and today's against `--max-day`. Exit 1 when on and not working |
+| `internet credentials [--json \| --env]` | the proxy address with the password, for the operator; `--env` as `HTTPS_PROXY=` and `HTTP_PROXY=` lines, for a task's env |
+| `internet off [--forget]` | stop and remove the task or unit; `--forget` also deletes the id and password. `wsl uninstall` does both |
 | `http://127.0.0.1:8788/` | the same, on a page, refreshed every 10 seconds. Read-only |
 
 `doctor` shows the same `internet` line on a machine where it was turned on. Codes: `INTERNET_NOT_RUNNING`, `INTERNET_RELAY_UNREACHABLE`, `INTERNET_REFUSED`, `INTERNET_WAITING` (hints in [FOR-AGENTS.md](FOR-AGENTS.md#codes-and-hints)).
@@ -75,10 +80,13 @@ The files are in `C:\ProgramData\shutup-and-run\` on Windows and `/var/lib/shutu
 | Battery under 60% | Yes (Windows). |
 | Presenting or full screen | Yes (Windows). |
 | Metered network | Yes (Windows): it waits unless `--metered`. |
+| Data a day | Yes, its own: `--max-day 5g`. Past it, new streams wait until midnight on the PC's clock (`INTERNET_DAILY_LIMIT`). Off unless set. |
 | Memory, disk, CPU limits, `safety` | No: this mode takes a few MB of memory and no disk, and is meant for the PC that cannot lend those. |
 | `min_idle_secs` | No. |
 
 A wait closes the idle connections, so the relay answers `503` (or `502`, for a request already on its way) until it ends. **A stream already open is never cut** by any of them, as a running job is not.
+
+The PC dials a site's IPv4 addresses first, 3 seconds each, and its IPv6 ones only when no IPv4 answers: a home with broken IPv6 costs no delay, and the address a site sees is the one `api.ipify.org` shows (`api64.ipify.org` shows the IPv6 one).
 
 Every stream to the PC's own network is refused: loopback, `10/8`, `172.16/12`, `192.168/16`, link-local, the carrier's `100.64/10`, IPv6 ULA and link-local. The PC checks the address it dials, not the name, so a name that resolves to the router cannot get through. The operator never reaches the client's router, printer, NAS or the worker's own page.
 
@@ -86,20 +94,52 @@ Every stream to the PC's own network is refused: loopback, `10/8`, `172.16/12`, 
 
 The PC counts what crosses the site's side of each stream: `bytes_received` (from the sites) and `bytes_sent` (to the sites), kept across restarts since `counting_since`, in `internet status --json`, the page and `internet-status.json`. The PC's network card sees about twice that: each byte comes in from one side and goes out on the other. The relay logs the same per stream.
 
-## Reconnection
+## Reconnection and what keeps it working
 
-- The relay closes or restarts: each idle connection sees the end at once and dials again after 1 s, doubling up to 30 s, with up to 1 s at random so the four do not knock together.
-- The PC sleeps, its Wi-Fi changes, the internet drops: an idle connection pings every 20 s and the relay echoes; 60 s without a word and it is dropped and dialed again. After a sleep the PC is back within about a minute; a stream that was open then is lost (the site's TCP connection went with it).
-- The process itself: the logon task (Windows) or `Restart=always` (systemd).
+- The relay closes or restarts: each idle connection sees the end at once and dials again after 1 s, doubling up to 30 s, with up to 1 s at random so they do not knock together.
+- The PC sleeps, its Wi-Fi changes, the internet drops: an idle connection pings every 10 s and the relay echoes; 30 s without a word and the PC drops it and dials again (the relay drops its end after 35 s).
+- In between, the relay may still hold connections that are dead. It tries first the one heard from in the last 15 s, and a claimed connection must answer `A` within 3 s; one that does not is skipped for the next, up to 3, so a request right after a wake costs a few seconds, not a `502`.
+- A stream with no byte either way for 10 minutes is closed on both sides: after a sleep its other end is gone, and it would hold one of the PC's 256 places for good.
+- An id keeps its password on the relay for 10 minutes after its last connection is gone: a PC that slept gets its id back, not whoever connected first. A relay restart forgets it; the token is what keeps others out then.
+- The process itself: the logon task (Windows), which also starts it again a minute after it ends with an error, up to 999 times; `Restart=always` (systemd).
 
-`cargo test relay::` runs all three against a real relay in the process: one that restarts on the same port, one that greets and then goes silent, and a wait that closes and reopens.
+`cargo test relay::` runs these against a real relay in the process: one that restarts on the same port, one that greets and then goes silent, a dead connection skipped for a live one, an id kept while its PC is away, and a wait that closes and reopens.
+
+## A task that goes out through a client's connection
+
+The case this is for: an agent or a person makes a task where the client works, and the client's PC cannot run it. The task goes to a worker of the operator, anywhere (a server in Germany will do), and still reaches the court from the client's home address. A request has no proxy field, and needs none: the address goes in the task's `env`.
+
+1. On the client's PC, once: `internet on` (or the install line above), then `shutup-and-run internet credentials --env` prints
+
+   ```
+   HTTPS_PROXY=http://ID:SECRET@relay.example.com:8080
+   HTTP_PROXY=http://ID:SECRET@relay.example.com:8080
+   ```
+
+   with the relay's host as the PC knows it. Replace it with the address the worker's containers reach the proxy at (below).
+2. The agent sends the task to the operator's worker with those in `env`, as any push or poll task:
+
+   ```json
+   {"image": "registry.example.com/court-robot:1",
+    "env": {"HTTPS_PROXY": "http://ID:SECRET@10.8.0.1:8080",
+            "HTTP_PROXY": "http://ID:SECRET@10.8.0.1:8080",
+            "PROXY_STATUS_URL": "http://ID:SECRET@10.8.0.1:8080/status"},
+    "timeout_secs": 1800}
+   ```
+
+   `requests`, `httpx`, `curl` and most HTTP libraries read `HTTPS_PROXY` by themselves. Chrome does not: the image starts it with `--proxy-server` (the relay's `--open` port for that PC), or SeleniumBase with `proxy="ID:SECRET@10.8.0.1:8080"`.
+3. When the worker starts it, the task can first ask whether the PC is there: `curl -s $PROXY_STATUS_URL` answers `{"id":"ID","connected":true,"idle":16,"open":0,"seen_secs_ago":4}`, or `401` for a wrong login. Not connected: the proxy answers `503` for 10 seconds per request; the task waits and tries again, or ends and is sent again later. The worker does not retry a job.
+
+The worker's containers must reach the proxy port. On the relay's own host, bind it on Docker's bridge (`--proxy 172.17.0.1:8080`) and the worker's containers there use `172.17.0.1:8080`. On another server, put the relay and the worker on a VPN (WireGuard, Tailscale) and bind the proxy on the VPN address. Published on the internet, the password is all that guards the client's connection, and it crosses in the clear.
+
+The proxy password then sits in the job's env on the worker. A Linux worker is the operator's and trusted; never send it to a task on another client's PC.
 
 ## A test from another network
 
 The proof that matters: from a container in the datacenter, the site sees the PC's IP.
 
 1. Server: `docker compose up -d --build` in `examples/relay`, with `7000` open.
-2. PC: `internet on --relay SERVER:7000`, then `internet status` says `ok ... connected`. `internet credentials` gives `ID` and `SECRET`.
+2. PC: `internet on --relay SERVER:7000 --token TOKEN` (the content of `relay_token`), then `internet status` says `ok ... connected`. `internet credentials` gives `ID` and `SECRET`.
 3. PC: `curl https://api.ipify.org` (Windows: `curl.exe`) prints the PC's public IP, say `177.x.y.z`.
 4. Server, the datacenter's IP for comparison: `curl https://api.ipify.org`.
 5. Server, through the PC:
@@ -144,7 +184,7 @@ The client accepted these in the contract; this is the list to point at.
 
 - **The client's IP is on every request.** A site that blocks or reports the traffic blocks or reports the client's address. The client's ISP may forbid sharing the connection in its terms. Nothing here limits which sites are reached (no allowlist of destinations).
 - **The link from the PC to the relay is plain TCP.** HTTPS stays encrypted end to end, but the password, the names of the sites and any plain-`http://` page cross the internet readable. An observer between the PC and the relay could copy the password and use the client's connection through the relay.
-- **The relay accepts any PC.** Anyone who finds port 7000 can connect a PC under an id that is not in use. They cannot take an id that is connected with another password, and a container only reaches a PC with its exact password. After a relay restart the first to connect sets an id's password.
+- **Without `--token-file`, the relay accepts any PC.** Anyone who finds port 7000 can connect a PC under an id that is not in use. They cannot take an id that is connected with another password, or was in the last 10 minutes, and a container only reaches a PC with its exact password. After a relay restart, the first to connect sets an id's password. The token closes that; it crosses in the clear, like the password, until TLS.
 - **The proxy port is the client's connection.** With the password, anyone who reaches `8080` uses it; an `--open` port needs no password at all. Keep both on a private network.
 - **Chrome may leak the datacenter's IP through WebRTC** (UDP is not carried). `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` stops that. UDP and QUIC do not go through the PC.
 - **The password is readable on the PC** (`internet.json`, the page, `internet credentials`). Anyone at the PC can read it, as they can the poll token.
@@ -156,6 +196,6 @@ Left out on purpose: an allowlist of destinations, strong authentication, severa
 In this order, each a small patch:
 
 1. TLS on the link, with the relay's certificate pinned in `internet.json` (`rustls` is already a dependency through `reqwest` and `axum-server`).
-2. A relay token: a PC connects only with a token the operator gave, `internet on --relay ... --token ...`.
+2. ~~A relay token~~: done, `relay --token-file` and `internet on --token`.
 3. A password per container instead of per PC, issued by the relay, and the `--open` ports bound to one container's network.
-4. Per-PC limits on the relay: streams at once, bytes per day; and a list of destinations if the contract asks for one.
+4. Per-PC limits on the relay: streams at once; and a list of destinations if the contract asks for one. (Bytes a day are limited on the PC: `--max-day`.)

@@ -286,6 +286,8 @@ shutup-and-run relay                                         # on the operator's
 
 New connections wait while the worker is paused, outside `--hours`, on a battery under 60%, while the person presents, and on a metered network; one already open is never cut. Destinations on the PC's own network are refused. The link to the relay is plain TCP in this version. The choice, the risks, a test from another network and what comes next: [docs/INTERNET.md](docs/INTERNET.md).
 
+A task sent to one of your workers elsewhere goes out through a client's PC by its `env`: `HTTPS_PROXY=http://ID:SECRET@...` (`shutup-and-run internet credentials --env`). On Windows the install line does it all: `$env:SHUTUP_AND_RUN_RELAY = "relay.example.com:7000"` before `irm .../install.ps1 | iex`.
+
 ## Configuration
 
 A machine has one config source.
