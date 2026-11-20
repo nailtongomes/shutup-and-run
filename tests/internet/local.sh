@@ -25,8 +25,12 @@ finish() {
 }
 trap finish EXIT
 
+token=local-test-token-1234
+printf '%s\n' "$token" >"$work/token"
+
 start_relay() {
-  "$bin" relay --agents "$agents" --proxy "127.0.0.1:$proxy_port" >>"$work/relay.log" 2>&1 &
+  "$bin" relay --agents "$agents" --proxy "127.0.0.1:$proxy_port" --token-file "$work/token" \
+    >>"$work/relay.log" 2>&1 &
   relay_pid=$!
 }
 
@@ -43,19 +47,40 @@ wait_connected() {
 }
 
 start_relay
-"$bin" internet on --relay "$agents" --id local-test
+# The login the operator's backend chose (made-up), as an agent passes it.
+login=local-test:local-test-password-0123
+"$bin" internet on --relay "$agents" --login "$login" --token "$token"
 if ! pgrep -f "internet serve" >/dev/null; then
   "$bin" internet serve >"$work/serve.log" 2>&1 &
   serve_pid=$!
 fi
+# The one command an agent runs: it returns once connected.
+"$bin" internet on --relay "$agents" --login "$login" --token "$token" --wait 60 --json
 wait_connected
 url=$("$bin" internet credentials --json | sed -n 's/.*"proxy":"\([^"]*\)".*/\1/p')
+case $url in http://local-test:local-test-password-0123@*) ;; *) echo "FAIL: not the login given" >&2; exit 1 ;; esac
 
 direct=$(curl -s https://api.ipify.org)
 through=$(curl -s --noproxy '' -x "$url" https://api.ipify.org || true)
 echo "direct:        $direct"
 echo "through relay: $through"
 [ -n "$through" ] || { echo "FAIL: nothing through the relay" >&2; exit 1; }
+
+status=$(curl -s --noproxy '*' "$url/status")
+echo "relay status:  $status"
+case $status in *'"connected":true'*) ;; *) echo "FAIL: /status does not say connected" >&2; exit 1 ;; esac
+
+echo "pausing: a new request waits"
+"$bin" internet pause --for 1h
+sleep 12
+if curl -sf --noproxy '' -x "$url" https://api.ipify.org >/dev/null; then
+  echo "FAIL: a request went through a paused PC" >&2
+  exit 1
+fi
+"$bin" internet resume
+sleep 6
+wait_connected
+"$bin" status || true
 
 echo "restarting the relay"
 kill "$relay_pid"

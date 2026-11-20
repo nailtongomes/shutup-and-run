@@ -609,6 +609,16 @@ fn wsl_status() -> WslResult<Output> {
     run("wsl.exe", &["--status"], None, SHORT)
 }
 
+/// WSL2 answers `wsl --status`, or what it said instead: the doctor's
+/// first line, for `fit`.
+pub(crate) fn wsl_ready() -> Result<(), String> {
+    match wsl_status() {
+        Ok(out) if out.ok() => Ok(()),
+        Ok(out) => Err(out.one_line()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn list_distros() -> WslResult<Vec<Distro>> {
     // With no distribution at all wsl.exe prints a localized message and
     // exits non-zero. That parses as no distributions, which is the answer.
@@ -779,7 +789,7 @@ pub(crate) fn wsl_budget(ram_bytes: u64, cpus: u64) -> (u64, u64) {
 }
 
 /// Physical RAM of this PC. None when it cannot be read.
-fn host_memory_bytes() -> Option<u64> {
+pub(crate) fn host_memory_bytes() -> Option<u64> {
     host_memory().map(|(total, _)| total)
 }
 
@@ -818,7 +828,7 @@ fn host_memory() -> Option<(u64, u64)> {
     ))
 }
 
-fn host_cpus() -> u64 {
+pub(crate) fn host_cpus() -> u64 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u64)
         .unwrap_or(1)
@@ -2845,6 +2855,8 @@ pub(crate) fn install_exe_copy(data: &Path) -> WslResult<PathBuf> {
 ///
 /// The settings undo defaults meant for a short job: do not start on battery,
 /// stop on battery, end after 72 hours. A second run of the task is ignored.
+/// A process that ends with an error is started again a minute later, up to
+/// 999 times, instead of at the next logon.
 ///
 /// The action is `conhost.exe --headless <exe> wsl serve --background`. The
 /// `.exe` is a console program, so started directly it gets a console
@@ -2870,7 +2882,8 @@ pub(crate) fn task_script(exe: &Path, name: &str, args: &str) -> String {
          -Argument ('--headless ' + $q + '{exe}' + $q + ' {args}'); \
          $t = New-ScheduledTaskTrigger -AtLogOn -User $u; \
          $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
-         -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew; \
+         -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew \
+         -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1); \
          Register-ScheduledTask -TaskName '{name}' -Action $a -Trigger $t -Settings $s \
          -RunLevel Limited -Force | Out-Null"
     )
@@ -2915,6 +2928,12 @@ fn remove_task() {
 /// What happened, in one line.
 pub(crate) fn remove_named_task(name: &str) -> String {
     let _ = run("schtasks.exe", &["/End", "/TN", name], None, SHORT);
+    delete_named_task(name)
+}
+
+/// Delete the logon task and leave its running process be: for that process
+/// itself, which `/End` would end before the `/Delete`.
+pub(crate) fn delete_named_task(name: &str) -> String {
     match run("schtasks.exe", &["/Delete", "/F", "/TN", name], None, SHORT) {
         Ok(out) if out.ok() => format!("deleted task {name}"),
         Ok(out) => format!("task {name}: {}", out.one_line()),
@@ -3893,6 +3912,11 @@ fn uninstall_cli(args: &[String]) -> WslResult<ExitCode> {
     let flags = parse_flags(args, &[], &["--purge"])?;
     remove_task();
     remove_shortcut();
+    // Internet sharing runs from the same folder: it goes too, before WSL is
+    // asked anything, so a PC without WSL is cleaned as well.
+    for line in crate::internet::remove_if_installed() {
+        println!("{line}");
+    }
     if our_distro()?.is_some() {
         let _ = run("wsl.exe", &["--terminate", DISTRO], None, SHORT);
         let out = run("wsl.exe", &["--unregister", DISTRO], None, APT)?;
@@ -4567,6 +4591,7 @@ mod tests {
         assert!(script.contains("-DontStopIfGoingOnBatteries"));
         assert!(script.contains("[TimeSpan]::Zero"));
         assert!(script.contains("IgnoreNew"));
+        assert!(script.contains("-RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)"));
         assert!(!script.contains('"'));
         assert!(!script.contains("ONLOGON"));
 

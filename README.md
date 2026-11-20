@@ -273,18 +273,21 @@ How it is kept. `certificate set` checks the file first (it must open with the p
 
 What this is not. It is not isolation and not a vault. The imported password is a plain file that root on the machine can read; on Windows that machine is the WSL2 distribution, and its user is root there. Deleting a file does not erase it from the disk. `certificate validate` says the file is usable, not that a court's or a bank's system accepts it. `demo sign` makes a basic PDF signature (`adbe.pkcs7.detached`) and verifies it with openssl; it is not PAdES and says nothing about ICP-Brasil.
 
-## Lending only the internet (alpha)
+## Lending the internet (alpha)
 
-A PC too weak for containers, or with no WSL, can lend its **internet connection** instead: the operator's containers in a datacenter go out through the client's home connection, so a site sees the client's residential IP. The PC dials out to a relay the operator runs (no port opened on the PC or its router, works behind CGNAT); the relay is an HTTP proxy for `requests`, `curl` and Chrome. No Docker, no WSL: the `.exe` alone.
+A PC can lend its **internet connection**, beside the worker or alone when it is too weak for containers or has no WSL: the operator's containers in a datacenter go out through the client's home connection, so a site sees the client's residential IP. The PC dials out to a relay the operator runs (no port opened on the PC or its router, works behind CGNAT); the relay is an HTTP proxy for `requests`, `curl` and Chrome. No Docker, no WSL: the `.exe` alone.
 
 ```
-shutup-and-run internet on --relay relay.example.com:7000   # on the PC: starts now and at every logon
+shutup-and-run fit                                           # what this PC can lend: both, or the internet only
+shutup-and-run internet on --relay relay.example.com:7000 --login ID:PASSWORD --wait 60   # on the PC: starts now and at every logon
 shutup-and-run internet credentials                          # the proxy address and password, for the operator
 shutup-and-run internet status                               # connected or why not, bytes carried; http://127.0.0.1:8788/
 shutup-and-run relay                                         # on the operator's server (examples/relay)
 ```
 
 New connections wait while the worker is paused, outside `--hours`, on a battery under 60%, while the person presents, and on a metered network; one already open is never cut. Destinations on the PC's own network are refused. The link to the relay is plain TCP in this version. The choice, the risks, a test from another network and what comes next: [docs/INTERNET.md](docs/INTERNET.md).
+
+A task sent to one of your workers elsewhere goes out through a client's PC by its `env`: `HTTPS_PROXY=http://ID:SECRET@...` (`shutup-and-run internet credentials --env`). On Windows the install line does it all: `$env:SHUTUP_AND_RUN_RELAY = "relay.example.com:7000"` (and `$env:SHUTUP_AND_RUN_POLL_URL` for the worker too) before `irm .../install.ps1 | iex`; `install.sh` takes the same. The person at the PC pauses or stops it with the buttons on http://127.0.0.1:8788/, or `shutup-and-run internet pause --for 1h` and `internet off`. An agent's steps: [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#a-task-from-the-operator-run-it-here-lend-the-internet-or-both). Using the proxy from curl, requests, Selenium, Playwright, Puppeteer, Node or n8n: [examples](docs/INTERNET.md#examples-curl-requests-selenium-playwright-puppeteer-node-n8n).
 
 ## Configuration
 

@@ -117,3 +117,28 @@ O roteiro completo está em [TESTING.pt-BR.md, "Compartilhar só a internet"](TE
 - [ ] **Com o worker.** No PC com WSL, `internet on` funciona igual, a página do worker continua em 8787, e `shutup-and-run pause` faz `internet status` dizer `WORKER_PAUSED`; `resume`, volta.
 - [ ] **Desligar.** `internet off`: a tarefa some do Agendador, o processo some do Gerenciador de Tarefas em 5 s, a página 8788 não abre. `internet off --forget` apaga `internet.json`, `internet-status.json` e `internet.log` de `C:\ProgramData\shutup-and-run\`.
 - [ ] **Logon.** Com a internet ligada, reinicie o PC e entre: sem fazer nada, `internet status` volta a `ok`.
+
+## 0.2.27: compartilhar a internet, resiliência, token, limite diário, instalação em uma linha
+
+Com o relay do `examples/relay` atual (que agora pede `relay_token`):
+
+- [ ] **Instalação em uma linha.** Num PC sem WSL, `$env:SHUTUP_AND_RUN_RELAY = "SERVIDOR:7000"`, `$env:SHUTUP_AND_RUN_RELAY_TOKEN = "TOKEN"`, `irm .../install.ps1 | iex`: sem administrador, termina com `internet sharing is on`; `internet status` diz `ok` em até 10 s. Sem o token, ou com um errado: `INTERNET_REFUSED` com `wrong or missing relay token`.
+- [ ] **Atualização.** Rode a linha de novo: o `.exe` é trocado, `internet status` volta a `ok` sem fazer nada, e o `wsl update` não roda (não há WSL).
+- [ ] **Acordar sem 502.** Com um curl em laço no servidor (`while true; do curl -s -o /dev/null -w '%{http_code}\n' -x http://ID:SENHA@relay:8080 https://api.ipify.org; sleep 2; done`), durma o PC 2 minutos e acorde: depois de alguns `503` enquanto ele está fora, os pedidos voltam a `200` sem `502` no meio. Troque de Wi-Fi com o laço rodando: o mesmo.
+- [ ] **IPv4.** Num PC com IPv6, `curl.exe https://api64.ipify.org` mostra um IPv6, mas pelo proxy `https://api64.ipify.org` mostra o IPv4 do PC. Com o IPv6 do roteador quebrado, uma página pelo proxy não demora mais que sem ele.
+- [ ] **Chrome.** A primeira página de um tribunal pelo `--open` carrega no tempo normal (16 conexões esperando).
+- [ ] **Limite diário.** `internet on ... --max-day 100m`, baixe 150 MB pelo proxy: o download em curso termina, `internet status` diz `waits: INTERNET_DAILY_LIMIT` com o uso e `again at midnight`, e o próximo pedido recebe 503. Depois da meia-noite (ou mudando o relógio do Windows), volta.
+- [ ] **Queda do processo.** Termine `shutup-and-run.exe` (o da internet) no Gerenciador de Tarefas: em até 2 minutos ele volta sozinho, sem logon. Faça o mesmo com o worker.
+- [ ] **Id guardado.** Com o PC dormindo 3 minutos, um segundo PC com o mesmo `--id` e outra senha é recusado (`id in use`); o primeiro, ao acordar, volta.
+- [ ] **Uninstall.** `shutup-and-run wsl uninstall --purge` num PC com a internet ligada: a tarefa `shutup-and-run-internet` some e os arquivos `internet.*` também.
+- [ ] **Status pelo relay.** No servidor, `curl -s http://ID:SENHA@relay:8080/status` diz `"connected":true` com o PC ligado e `false` com ele desligado.
+
+## 0.2.27: internet ao lado do worker, um comando para a IA, login do operador, pausar e parar pela página
+
+- [ ] **`fit`.** Num PC sem WSL, `shutup-and-run fit` diz `lend: internet` e `WSL_UNAVAILABLE` com "administrator and a restart"; num PC com WSL2 e 16 GB, `lend: both`; num de 8 GB ou menos, `lend: internet` com `SAFETY_SMALL_MACHINE`.
+- [ ] **Um comando.** `shutup-and-run internet on --relay SERVIDOR:7000 --token TOKEN --login pc-teste-01:SENHA-DE-16-OU-MAIS --wait 60 --json` volta em segundos com `"connected":true`. Com o token errado, volta em menos de 10 s com `INTERNET_REFUSED`; com o relay parado, depois de 60 s com `INTERNET_RELAY_UNREACHABLE`. No servidor, `curl -s http://pc-teste-01:SENHA@relay:8080/status` diz `"connected":true` sem ninguém ter copiado nada do PC.
+- [ ] **Instalação com os dois.** Num PC com WSL2: `$env:SHUTUP_AND_RUN_RELAY`, `$env:SHUTUP_AND_RUN_RELAY_TOKEN`, `$env:SHUTUP_AND_RUN_INTERNET_LOGIN` e `$env:SHUTUP_AND_RUN_POLL_URL`, depois `irm .../install.ps1 | iex`: a internet conecta e o `wsl install` roda. `shutup-and-run status` mostra o worker e a linha `internet:`. Num PC sem WSL, a mesma linha empresta a internet e diz `the worker waits: no WSL2 here yet` com a dica; rodar de novo depois de instalar o WSL e reiniciar instala o worker sem derrubar a internet.
+- [ ] **Atualização com os dois.** Rode a linha de novo sem variáveis: o worker volta (`wsl update`) e a internet também.
+- [ ] **Botões da página.** Em http://127.0.0.1:8788/, "Pausar 1 hora": `internet status` diz `waits: INTERNET_PAUSED`, um download em curso termina e o próximo pedido recebe 503; "Retomar agora" volta. "Parar de compartilhar": a página diz que desligou, some em alguns segundos, a tarefa `shutup-and-run-internet` não existe mais (`schtasks /Query /TN shutup-and-run-internet` falha) e ela não volta no próximo logon.
+- [ ] **Pausa pela linha de comando.** `shutup-and-run internet pause --for 30m` e `internet resume`: o mesmo, num PC só com internet.
+- [ ] **Status num PC só com internet.** `shutup-and-run status --json` diz `"worker":"not installed"`, traz `internet`, e sai 0 com ela conectada, 1 com ela parada.

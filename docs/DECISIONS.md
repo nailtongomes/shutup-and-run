@@ -627,3 +627,39 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - OpenSSH's `ssh -R`, chisel, frp, gost and rathole were weighed in docs/INTERNET.md: a second program, a key per PC, no byte count, and Defender's HackTool alerts cost more than about 1,600 lines of Rust with no new crate.
 
 **Cost.** Plain TCP between the PC and the relay: the password and the names of the sites can be read on the way; HTTPS content cannot. Any PC can connect to the relay, and after a relay restart the first to connect sets an id's password. One TCP connection per stream means one round trip to the relay before each stream, and four idle connections per PC on the relay. UDP, QUIC and WebRTC do not go through. A second page and a second file to keep in step with the worker's, and `doctor` on a Windows PC without WSL still fails on its first line (`internet status` is the check there).
+
+## Internet sharing: a dead link skipped, IPv4 first, a token, a limit a day, one-line install (0.2.27)
+
+**Context.** In the first days of the alpha: right after a PC woke or changed its Wi-Fi, the relay handed a request to a connection that was already dead and answered `502` after 15 seconds. A home with broken IPv6 spent up to 10 seconds per stream on it, and a site could see an IPv6 address other than the one a test showed. Four idle connections were too few for one Chrome page. An id lost its password the moment its PC slept past a minute. A crash of the process waited for the next logon. After a sleep, streams whose far end was gone stayed open for good. And a client had to download the `.exe` by hand.
+
+**Decision.**
+
+- A claimed connection answers `A` at once; without it in 3 s the relay tries the next one, up to 3. The relay tries first the connection heard from in the last 15 s. The greeting is now `SAR2`; a 0.2.26 PC is told to update.
+- Pings every 10 s, a link silent for 30 s (35 s on the relay) is dropped.
+- IPv4 first, 3 s per address, IPv6 only when no IPv4 answers.
+- 16 idle connections per PC.
+- An id keeps its password 10 minutes after its last connection.
+- `relay --token-file`: only PCs that send that token connect (`internet on --token`).
+- A stream with no byte either way for 10 minutes is closed, on the PC and on the relay.
+- `--max-day`: past it, new streams wait until midnight on the PC's clock.
+- The logon tasks (the worker's and this one) restart a process that ended with an error a minute later, up to 999 times.
+- `install.ps1` with `SHUTUP_AND_RUN_RELAY` runs `internet on`, and restarts internet sharing after an update. `wsl uninstall` removes it too.
+- `GET /status` on the proxy port, with a PC's login, says whether it is connected; once a minute the relay logs each PC whose numbers changed.
+- A task goes out through a PC by its `env` (`HTTPS_PROXY`); the request has no proxy field.
+
+**Cost.** One more round trip before each stream. A 0.2.26 PC stops connecting until it is updated. A site reached only over IPv6 waits for the IPv4 attempts first, 3 s each. A WebSocket or a long poll silent for 10 minutes is closed. An id whose PC changed its password waits 10 minutes. A task that keeps failing at once restarts every minute instead of stopping.
+
+## Internet sharing beside the worker: one command for an agent, a login from the operator, a pause and a stop on the page (0.2.27)
+
+**Context.** The PCs are clients the operator trusts, who trust the operator; their own AI agent sets things up. The agent had to combine three documents, run `on`, poll `status` until connected, and send the generated password back to the operator's backend. The install line lent either the internet or containers, never both. A PC that only lent its internet had no pause, and the person at it could stop it only from a terminal.
+
+**Decision.**
+
+- `fit --json`: `both` or `internet`, from what the doctor and the safety levels already read: WSL2 on Windows (`WSL_UNAVAILABLE`), and a PC above the small-machine line (`SAFETY_SMALL_MACHINE`, which would need the owner's authorization for jobs). No new code.
+- `internet on --login ID:PASSWORD`: the operator's backend chooses the login, so nothing comes back from the PC; the backend checks the PC with the relay's `GET /status`. `--wait SECONDS` returns once connected, or exits 1 with the code and the hint (`INTERNET_REFUSED`, `INTERNET_WAITING`, `INTERNET_RELAY_UNREACHABLE`). It takes only a status written after it began, and for a new login a connection made after it began.
+- The install lines (`install.ps1`, `install.sh`) do both: `SHUTUP_AND_RUN_RELAY` turns on the internet, and `SHUTUP_AND_RUN_POLL_URL` the worker too, on Windows only where `fit` says containers. Not connected within 60 s is not a failed install. `install.sh` gets `SHUTUP_AND_RUN_INTERNET_ONLY=1` (no Docker).
+- `status` shows the internet line and an `internet` section; with no worker it says `"worker": "not installed"` and takes the internet's exit code.
+- Its own pause (`internet pause --for`, `internet resume`, `paused_until` in `internet.json`), and on the page two buttons: pause 1 hour (or resume) and stop sharing, behind the same loopback and same-origin check as the worker's page. The stop deletes the task or unit without ending the process, which sees the file and exits cleanly; the systemd unit is now `Restart=on-failure`, so a clean exit stays stopped.
+- Nothing was cut: `--open` ports, the page, plain TCP and a relay without a token stay as options, with their risks in docs/INTERNET.md.
+
+**Cost.** The page is no longer read-only: anyone at the PC can stop the sharing, which is the point. The backend holds every PC's password (`--login`). An older binary refuses an `internet.json` with `paused_until` (unknown fields stay refused), so going back a version after a pause needs `internet on` again. `fit` on Linux does not look for Docker: the install puts it there.

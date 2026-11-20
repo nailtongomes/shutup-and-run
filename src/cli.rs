@@ -979,11 +979,41 @@ pub fn status_cli(args: &[String]) -> ExitCode {
             .map(|history| crate::status::status_path(&history))
             .map_err(|e| e.0)
     };
+    let worker_missing = path.as_ref().is_ok_and(|p| !p.exists());
     let out = match path {
         Ok(path) => status_out(&path, crate::status::now_unix()),
         Err(msg) => Out::fail(EXIT_FAILED, msg),
     };
-    emit(out, parsed.json)
+    emit(
+        with_internet(out, worker_missing, crate::internet::summary()),
+        parsed.json,
+    )
+}
+
+/// `status` on a PC that also lends its internet connection: its section
+/// and one line. On a PC that only lends it, that is the whole answer.
+pub fn with_internet(
+    mut out: Out,
+    worker_missing: bool,
+    internet: Option<(Value, String, bool)>,
+) -> Out {
+    let Some((value, line, healthy)) = internet else {
+        return out;
+    };
+    if worker_missing {
+        out = Out::ok(json!({"worker": "not installed"}), "worker: not installed");
+        if !healthy {
+            out.code = EXIT_FAILED;
+            out.json["ok"] = Value::Bool(false);
+            out.json["error"] = Value::String(format!("internet sharing: {line}"));
+            if let Some(code) = value["checks"][0]["code"].as_str() {
+                out.json["code"] = Value::String(code.to_string());
+            }
+        }
+    }
+    out.json["internet"] = value;
+    out.text = format!("{}\ninternet: {line}", out.text);
+    out
 }
 
 pub fn status_out(path: &Path, now: i64) -> Out {
@@ -2062,6 +2092,44 @@ pub(crate) async fn reach(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_on_a_pc_that_lends_only_its_internet_is_the_internets() {
+        let missing = Out::fail(EXIT_FAILED, "status.json is missing");
+        let ok = (
+            json!({"ok": true, "checks": []}),
+            "connected".to_string(),
+            true,
+        );
+        let out = with_internet(missing, true, Some(ok));
+        assert_eq!(out.code, 0);
+        assert_eq!(out.json["worker"], "not installed");
+        assert!(out.text.ends_with("internet: connected"));
+        let bad = (
+            json!({"ok": false, "checks": [{"code": "INTERNET_REFUSED"}]}),
+            "refused".to_string(),
+            false,
+        );
+        let out = with_internet(Out::fail(EXIT_FAILED, "x"), true, Some(bad));
+        assert_eq!(out.code, EXIT_FAILED);
+        assert_eq!(out.json["code"], "INTERNET_REFUSED");
+        // Beside a worker, the worker's answer stays and gains the section.
+        let worker = Out::ok(json!({"state": "idle"}), "state: idle");
+        let out = with_internet(
+            worker,
+            false,
+            Some((json!({"ok": false}), "x".to_string(), false)),
+        );
+        assert_eq!(out.code, 0);
+        assert_eq!(out.json["state"], "idle");
+        assert_eq!(out.json["internet"]["ok"], false);
+        assert_eq!(
+            with_internet(Out::ok(json!({}), ""), false, None)
+                .json
+                .get("internet"),
+            None
+        );
+    }
 
     #[test]
     fn a_pause_for_a_while_takes_minutes_hours_or_days_up_to_a_week() {

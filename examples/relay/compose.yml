@@ -2,7 +2,8 @@
 #
 #   docker compose up -d --build
 #
-# PCs dial in on 7000, the one port published. Your containers join the
+# PCs dial in on 7000, the one port published, with the token in
+# ./relay_token. Your containers join the
 # network `egress` and use the proxy http://ID:SECRET@relay:8080, where ID
 # and SECRET are what `shutup-and-run internet credentials` prints on the PC.
 # 8080 is not published: only containers on `egress` reach it. To reach it
@@ -14,11 +15,15 @@ services:
     command:
       - --agents=0.0.0.0:7000
       - --proxy=0.0.0.0:8080
+      # Only PCs with this token connect (`internet on --token`). Make it:
+      #   head -c 24 /dev/urandom | base64 | tr -d '/+=' > relay_token
+      - --token-file=/run/secrets/relay_token
       # Chrome takes no proxy login. A port with none, through one PC, from
       # a .env file beside this one (PC_ID=..., PC_SECRET=...):
       # - --open=8101=${PC_ID}:${PC_SECRET}
     ports:
       - "7000:7000"
+    secrets: [relay_token]
     networks: [egress]
     restart: unless-stopped
     read_only: true
@@ -26,3 +31,7 @@ services:
 
 networks:
   egress: {}
+
+secrets:
+  relay_token:
+    file: ./relay_token

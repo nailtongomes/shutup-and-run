@@ -17,14 +17,14 @@
 //! It keeps nothing on disk. Alpha: plain TCP, see docs/INTERNET.md.
 
 use crate::internet::{
-    read_line, read_until_capped, take_line, valid_target, valid_word, Counted, HELLO,
-    REPLY_TIMEOUT,
+    read_line, read_until_capped, splice, take_line, valid_target, valid_word, HELLO,
+    REPLY_TIMEOUT, STREAM_IDLE,
 };
 use base64::Engine;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -33,27 +33,58 @@ use tokio::sync::{oneshot, Notify};
 
 /// How long a container's request waits for a PC's idle connection.
 const CLAIM_WAIT: Duration = Duration::from_secs(10);
-/// An idle connection that says nothing for this long is gone.
-const SILENT_MAX: Duration = Duration::from_secs(60);
+/// An idle connection that says nothing for this long is gone. PCs ping
+/// every 10 s.
+const SILENT_MAX: Duration = Duration::from_secs(35);
+/// An idle connection heard from this recently is tried first.
+const FRESH_MS: u64 = 15_000;
+/// A PC says `A` at once when a connection is claimed. Without it the
+/// connection is dead (the PC slept, its Wi-Fi changed) and another is tried.
+const ACK_TIMEOUT: Duration = Duration::from_secs(3);
+const ATTEMPTS: usize = 3;
+/// The PC's answer once it dialed the site: DNS, then 3 s per address.
+const DIAL_REPLY: Duration = Duration::from_secs(30);
+/// After a PC's last connection is gone, its id keeps its password this
+/// long: a PC that slept a while gets its id back, not someone else.
+const RESERVE: Duration = Duration::from_secs(10 * 60);
 /// Idle connections one PC may leave here.
 const IDLE_MAX: usize = 64;
 const HEAD_MAX: usize = 16 * 1024;
+const SUMMARY_EVERY: Duration = Duration::from_secs(60);
 
 type Link = BufReader<TcpStream>;
 type Claim = oneshot::Sender<oneshot::Sender<Link>>;
+
+/// An idle connection: the way to claim it, and when its PC last pinged.
+struct Idle {
+    claim: Claim,
+    heard: Arc<AtomicU64>,
+}
+
+/// What a PC carries now, and when any of its connections was last alive,
+/// in milliseconds since the relay started.
+#[derive(Default)]
+pub(crate) struct Stats {
+    open: AtomicUsize,
+    seen: AtomicU64,
+}
 
 /// One PC: its password and its idle connections, each held by a task that
 /// hands the connection over when asked.
 struct Pool {
     secret: String,
-    idle: Vec<Claim>,
+    idle: Vec<Idle>,
     arrived: Arc<Notify>,
+    stats: Arc<Stats>,
 }
 
-#[derive(Default)]
 pub(crate) struct Relay {
     pools: Mutex<HashMap<String, Pool>>,
     proxy_port: u16,
+    /// What every PC must send, when the operator set one.
+    token: Option<String>,
+    reserve: Duration,
+    started: tokio::time::Instant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -63,31 +94,60 @@ enum ClaimError {
 }
 
 impl Relay {
-    pub(crate) fn new(proxy_port: u16) -> Arc<Self> {
+    pub(crate) fn new(proxy_port: u16, token: Option<String>) -> Arc<Self> {
+        Self::with_reserve(proxy_port, token, RESERVE)
+    }
+
+    pub(crate) fn with_reserve(
+        proxy_port: u16,
+        token: Option<String>,
+        reserve: Duration,
+    ) -> Arc<Self> {
         Arc::new(Relay {
             pools: Mutex::new(HashMap::new()),
             proxy_port,
+            token,
+            reserve,
+            started: tokio::time::Instant::now(),
         })
     }
 
-    /// Takes in an idle connection, or says why not. The first connection
-    /// of an id, or the first after all of its last ones closed, sets its
-    /// password.
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Takes in an idle connection, or says why not. A new password for an
+    /// id is taken only when none of its connections is alive and none was
+    /// for `reserve`.
+    #[allow(clippy::type_complexity)]
     fn register(
         &self,
         id: &str,
         secret: &str,
-    ) -> Result<(oneshot::Receiver<oneshot::Sender<Link>>, bool), &'static str> {
+    ) -> Result<
+        (
+            oneshot::Receiver<oneshot::Sender<Link>>,
+            Arc<AtomicU64>,
+            Arc<Stats>,
+            bool,
+        ),
+        &'static str,
+    > {
+        let now = self.now_ms();
         let mut pools = self.pools.lock().unwrap();
+        let fresh_pool = !pools.contains_key(id);
         let pool = pools.entry(id.to_string()).or_insert_with(|| Pool {
             secret: secret.to_string(),
             idle: Vec::new(),
             arrived: Arc::new(Notify::new()),
+            stats: Arc::new(Stats::default()),
         });
-        pool.idle.retain(|claim| !claim.is_closed());
+        pool.idle.retain(|idle| !idle.claim.is_closed());
         let first = pool.idle.is_empty();
         if !same(&pool.secret, secret) {
-            if !first {
+            let alive = !first || pool.stats.open.load(Ordering::Relaxed) > 0;
+            let quiet_ms = now.saturating_sub(pool.stats.seen.load(Ordering::Relaxed));
+            if alive || (!fresh_pool && quiet_ms < self.reserve.as_millis() as u64) {
                 return Err("id in use by another PC");
             }
             pool.secret = secret.to_string();
@@ -96,29 +156,48 @@ impl Relay {
             return Err("too many connections");
         }
         let (tx, rx) = oneshot::channel();
-        pool.idle.push(tx);
+        let heard = Arc::new(AtomicU64::new(now));
+        pool.stats.seen.store(now, Ordering::Relaxed);
+        pool.idle.push(Idle {
+            claim: tx,
+            heard: heard.clone(),
+        });
         pool.arrived.notify_one();
-        Ok((rx, first))
+        Ok((rx, heard, pool.stats.clone(), first))
     }
 
-    /// An idle connection of the PC `id`, when `secret` is its password.
-    async fn claim(&self, id: &str, secret: &str) -> Result<Link, ClaimError> {
+    /// An idle connection of the PC `id`, when `secret` is its password:
+    /// the newest one heard from lately, else the newest.
+    async fn claim(&self, id: &str, secret: &str) -> Result<(Link, Arc<Stats>), ClaimError> {
         let deadline = tokio::time::Instant::now() + CLAIM_WAIT;
         loop {
-            let (next, arrived) = {
+            let (next, arrived, stats) = {
+                let now = self.now_ms();
                 let mut pools = self.pools.lock().unwrap();
                 let pool = pools
                     .get_mut(id)
                     .filter(|pool| same(&pool.secret, secret))
                     .ok_or(ClaimError::Login)?;
-                (pool.idle.pop(), pool.arrived.clone())
+                pool.idle.retain(|idle| !idle.claim.is_closed());
+                let pick = pool
+                    .idle
+                    .iter()
+                    .rposition(|idle| {
+                        now.saturating_sub(idle.heard.load(Ordering::Relaxed)) <= FRESH_MS
+                    })
+                    .or_else(|| pool.idle.len().checked_sub(1));
+                (
+                    pick.map(|i| pool.idle.remove(i)),
+                    pool.arrived.clone(),
+                    pool.stats.clone(),
+                )
             };
             match next {
-                Some(claim) => {
+                Some(idle) => {
                     let (tx, rx) = oneshot::channel();
-                    if claim.send(tx).is_ok() {
+                    if idle.claim.send(tx).is_ok() {
                         if let Ok(link) = rx.await {
-                            return Ok(link);
+                            return Ok((link, stats));
                         }
                     }
                 }
@@ -133,11 +212,56 @@ impl Relay {
             }
         }
     }
+
+    /// The PC's state, for `GET /status` with its login.
+    fn status(&self, id: &str, secret: &str) -> Option<serde_json::Value> {
+        let now = self.now_ms();
+        let mut pools = self.pools.lock().unwrap();
+        let pool = pools
+            .get_mut(id)
+            .filter(|pool| same(&pool.secret, secret))?;
+        pool.idle.retain(|idle| !idle.claim.is_closed());
+        let open = pool.stats.open.load(Ordering::Relaxed);
+        let seen = pool.stats.seen.load(Ordering::Relaxed);
+        Some(serde_json::json!({
+            "id": id,
+            "connected": !pool.idle.is_empty(),
+            "idle": pool.idle.len(),
+            "open": open,
+            "seen_secs_ago": now.saturating_sub(seen) / 1000,
+        }))
+    }
+
+    /// One line per PC whose numbers changed: `id: idle N, open M`.
+    fn summary(&self, last: &mut HashMap<String, (usize, usize)>) -> Vec<String> {
+        let mut pools = self.pools.lock().unwrap();
+        let mut lines = Vec::new();
+        for (id, pool) in pools.iter_mut() {
+            pool.idle.retain(|idle| !idle.claim.is_closed());
+            let now = (pool.idle.len(), pool.stats.open.load(Ordering::Relaxed));
+            if last.get(id) != Some(&now) {
+                lines.push(format!("relay: PC {id}: {} idle, {} open", now.0, now.1));
+                last.insert(id.clone(), now);
+            }
+        }
+        lines.sort();
+        lines
+    }
 }
 
 fn same(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
+async fn summaries(relay: Arc<Relay>) {
+    let mut last = HashMap::new();
+    loop {
+        tokio::time::sleep(SUMMARY_EVERY).await;
+        for line in relay.summary(&mut last) {
+            println!("{line}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,33 +277,48 @@ pub(crate) async fn accept_agents(relay: Arc<Relay>, listener: TcpListener) {
     }
 }
 
+/// The PC's id and secret from its greeting, or why it is refused.
+fn greeting(hello: &str, token: Option<&str>) -> Result<(String, String), &'static str> {
+    let words: Vec<&str> = hello.split(' ').collect();
+    let (id, secret, given) = match words.as_slice() {
+        [word, ..] if *word == "SAR1" => {
+            return Err("this PC runs shutup-and-run 0.2.26: update it");
+        }
+        [word, id, secret] if *word == HELLO => (*id, *secret, None),
+        [word, id, secret, given] if *word == HELLO => (*id, *secret, Some(*given)),
+        _ => return Err("not a shutup-and-run PC"),
+    };
+    if !valid_word(id, 1..=64) || !valid_word(secret, 16..=128) {
+        return Err("not a shutup-and-run PC");
+    }
+    if let Some(token) = token {
+        if !given.is_some_and(|given| same(given, token)) {
+            return Err("wrong or missing relay token");
+        }
+    }
+    Ok((id.to_string(), secret.to_string()))
+}
+
 async fn agent(relay: Arc<Relay>, stream: TcpStream, peer: SocketAddr) {
     let _ = stream.set_nodelay(true);
     let mut link = BufReader::new(stream);
     let Ok(Ok(hello)) = tokio::time::timeout(REPLY_TIMEOUT, read_line(&mut link)).await else {
         return;
     };
-    let words: Vec<&str> = hello.split(' ').collect();
-    let (id, secret) = match words.as_slice() {
-        [word, id, secret]
-            if *word == HELLO && valid_word(id, 1..=64) && valid_word(secret, 16..=128) =>
-        {
-            (id.to_string(), secret.to_string())
-        }
-        _ => {
-            let _ = link.write_all(b"NO not a shutup-and-run PC\n").await;
-            return;
-        }
-    };
-    let claimed = match relay.register(&id, &secret) {
-        Ok((claimed, first)) => {
+    let registered = greeting(&hello, relay.token.as_deref()).and_then(|(id, secret)| {
+        relay
+            .register(&id, &secret)
+            .map(|registered| (id, registered))
+    });
+    let (claimed, heard, stats) = match registered {
+        Ok((id, (claimed, heard, stats, first))) => {
             if first {
                 println!("relay: PC {id} connected from {}", peer.ip());
             }
-            claimed
+            (claimed, heard, stats)
         }
         Err(reason) => {
-            println!("relay: refused PC {id} from {}: {reason}", peer.ip());
+            println!("relay: refused a PC from {}: {reason}", peer.ip());
             let _ = link.write_all(format!("NO {reason}\n").as_bytes()).await;
             return;
         }
@@ -191,7 +330,7 @@ async fn agent(relay: Arc<Relay>, stream: TcpStream, peer: SocketAddr) {
     {
         return;
     }
-    hold_idle(link, claimed).await;
+    hold_idle(&relay, link, claimed, &heard, &stats).await;
 }
 
 enum Event {
@@ -200,7 +339,13 @@ enum Event {
 }
 
 /// Answers the PC's pings until a container claims the connection.
-async fn hold_idle(mut link: Link, mut claimed: oneshot::Receiver<oneshot::Sender<Link>>) {
+async fn hold_idle(
+    relay: &Relay,
+    mut link: Link,
+    mut claimed: oneshot::Receiver<oneshot::Sender<Link>>,
+    heard: &AtomicU64,
+    stats: &Stats,
+) {
     let mut buf = Vec::new();
     loop {
         let event = tokio::select! {
@@ -217,6 +362,9 @@ async fn hold_idle(mut link: Link, mut claimed: oneshot::Receiver<oneshot::Sende
                 if take_line(&mut buf) != "P" || link.write_all(b"P\n").await.is_err() {
                     return;
                 }
+                let now = relay.now_ms();
+                heard.store(now, Ordering::Relaxed);
+                stats.seen.store(now, Ordering::Relaxed);
             }
             Event::Read(_) => return,
         }
@@ -243,6 +391,8 @@ pub(crate) async fn accept_proxy(
 
 struct Request {
     connect: bool,
+    /// `GET /status`, sent to the relay itself: the PC's state.
+    status: bool,
     target: String,
     /// The head to send on, for a plain `http://` request.
     head: Vec<u8>,
@@ -258,31 +408,47 @@ fn parse_head(lines: &[String]) -> Result<Request, &'static str> {
         return Err("bad request line");
     };
     let mut login = None;
+    let mut site_login = None;
     let mut kept = Vec::new();
+    let basic = |value: &str| {
+        value
+            .trim()
+            .strip_prefix("Basic ")
+            .and_then(|b64| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64.trim())
+                    .ok()
+            })
+            .and_then(|raw| String::from_utf8(raw).ok())
+            .and_then(|text| {
+                text.split_once(':')
+                    .map(|(user, pass)| (user.to_string(), pass.to_string()))
+            })
+    };
     for line in &lines[1..] {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
         let name_lower = name.trim().to_ascii_lowercase();
         match name_lower.as_str() {
-            "proxy-authorization" => {
-                login = value
-                    .trim()
-                    .strip_prefix("Basic ")
-                    .and_then(|b64| {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(b64.trim())
-                            .ok()
-                    })
-                    .and_then(|raw| String::from_utf8(raw).ok())
-                    .and_then(|text| {
-                        text.split_once(':')
-                            .map(|(user, pass)| (user.to_string(), pass.to_string()))
-                    });
+            "proxy-authorization" => login = basic(value),
+            // The site's own login, sent on; read only for `GET /status`.
+            "authorization" => {
+                site_login = basic(value);
+                kept.push(line.clone());
             }
             "proxy-connection" | "connection" | "keep-alive" => {}
             _ => kept.push(line.clone()),
         }
+    }
+    if *method == "GET" && *uri == "/status" {
+        return Ok(Request {
+            connect: false,
+            status: true,
+            target: String::new(),
+            head: Vec::new(),
+            login: login.or(site_login),
+        });
     }
     if *method == "CONNECT" {
         if !valid_target(uri) {
@@ -290,6 +456,7 @@ fn parse_head(lines: &[String]) -> Result<Request, &'static str> {
         }
         return Ok(Request {
             connect: true,
+            status: false,
             target: uri.to_string(),
             head: Vec::new(),
             login,
@@ -322,6 +489,7 @@ fn parse_head(lines: &[String]) -> Result<Request, &'static str> {
     head.push_str("Connection: close\r\n\r\n");
     Ok(Request {
         connect: false,
+        status: false,
         target,
         head: head.into_bytes(),
         login,
@@ -383,46 +551,82 @@ async fn proxy(relay: Arc<Relay>, stream: TcpStream, preset: Option<(String, Str
         )
         .await;
     };
-    let mut link = match relay.claim(&id, &secret).await {
-        Ok(link) => link,
-        Err(ClaimError::Login) => {
-            return answer(
-                &mut client,
-                "407 Proxy Authentication Required",
-                "Proxy-Authenticate: Basic realm=\"shutup-and-run\"\r\n",
-                "no PC with that id and password",
-            )
+    if request.status {
+        return match relay.status(&id, &secret) {
+            Some(state) => {
+                let body = format!("{state}\n");
+                let _ = client
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+            None => {
+                answer(
+                    &mut client,
+                    "401 Unauthorized",
+                    "WWW-Authenticate: Basic realm=\"shutup-and-run\"\r\n",
+                    "no PC with that id and password",
+                )
+                .await
+            }
+        };
+    }
+    // A connection that does not say `A` at once is dead: the next one is
+    // tried, so a PC that just woke or changed its Wi-Fi costs a few
+    // seconds, not a 502.
+    let mut attempt = 0;
+    let (mut link, stats) = loop {
+        attempt += 1;
+        let (mut link, stats) = match relay.claim(&id, &secret).await {
+            Ok(claimed) => claimed,
+            Err(ClaimError::Login) => {
+                return answer(
+                    &mut client,
+                    "407 Proxy Authentication Required",
+                    "Proxy-Authenticate: Basic realm=\"shutup-and-run\"\r\n",
+                    "no PC with that id and password",
+                )
+                .await
+            }
+            Err(ClaimError::NotConnected) => {
+                return answer(
+                    &mut client,
+                    "503 Service Unavailable",
+                    "",
+                    &format!("PC {id} is not connected now"),
+                )
+                .await
+            }
+        };
+        let acked = link
+            .write_all(format!("C {}\n", request.target).as_bytes())
             .await
+            .is_ok()
+            && matches!(
+                tokio::time::timeout(ACK_TIMEOUT, next_line(&mut link)).await,
+                Ok(Ok(line)) if line == "A"
+            );
+        if acked {
+            break (link, stats);
         }
-        Err(ClaimError::NotConnected) => {
+        if attempt >= ATTEMPTS {
             return answer(
                 &mut client,
-                "503 Service Unavailable",
+                "502 Bad Gateway",
                 "",
-                &format!("PC {id} is not connected now"),
+                &format!("PC {id}: {ATTEMPTS} of its connections did not answer"),
             )
-            .await
+            .await;
         }
     };
-    if link
-        .write_all(format!("C {}\n", request.target).as_bytes())
-        .await
-        .is_err()
-    {
-        return answer(
-            &mut client,
-            "502 Bad Gateway",
-            "",
-            "the PC's connection closed",
-        )
-        .await;
-    }
-    let reply = loop {
-        match tokio::time::timeout(REPLY_TIMEOUT, read_line(&mut link)).await {
-            Ok(Ok(line)) if line == "P" => continue,
-            Ok(Ok(line)) => break line,
-            _ => break "NO the PC did not answer".to_string(),
-        }
+    let reply = match tokio::time::timeout(DIAL_REPLY, next_line(&mut link)).await {
+        Ok(Ok(line)) => line,
+        _ => "NO the PC did not answer".to_string(),
     };
     if reply != "OK" {
         let why = reply.strip_prefix("NO ").unwrap_or(&reply);
@@ -444,20 +648,21 @@ async fn proxy(relay: Arc<Relay>, stream: TcpStream, preset: Option<(String, Str
     if sent.is_err() {
         return;
     }
-    let (sent, received) = (AtomicU64::new(0), AtomicU64::new(0));
-    let mut link = Counted {
-        inner: link,
-        read: &received,
-        written: &sent,
-    };
+    stats.open.fetch_add(1, Ordering::Relaxed);
     // A reset at the end is how many sites close; the bytes still count.
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut link).await;
-    println!(
-        "relay: {id} {} sent {} received {}",
-        request.target,
-        sent.load(Ordering::Relaxed),
-        received.load(Ordering::Relaxed)
-    );
+    let (up, down) = splice(&mut client, &mut link, STREAM_IDLE).await;
+    stats.open.fetch_sub(1, Ordering::Relaxed);
+    println!("relay: {id} {} sent {up} received {down}", request.target);
+}
+
+/// The next line from a PC that is not a ping.
+async fn next_line(link: &mut Link) -> Result<String, String> {
+    loop {
+        let line = read_line(link).await?;
+        if line != "P" {
+            return Ok(line);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,12 +671,16 @@ async fn proxy(relay: Arc<Relay>, stream: TcpStream, preset: Option<(String, Str
 pub fn usage() -> &'static str {
     "\
 shutup-and-run relay [--agents 0.0.0.0:7000] [--proxy 127.0.0.1:8080] [--open PORT=ID:SECRET,...]
+        [--token-file PATH]
     the operator's side of `internet on`: PCs dial in on --agents; containers
     use --proxy as an HTTP proxy with user = the PC's id, password = its
     secret. --open adds a port with no login that always goes out through
     one PC (for Chrome, which takes no proxy login), on the address of
     --proxy. The proxy listens on loopback unless told otherwise: put it on
-    a network only your containers reach. docs/INTERNET.md."
+    a network only your containers reach. --token-file: a PC connects only
+    with the token in that file (`internet on --token`). `GET /status` on
+    the proxy port, with a PC's login, says whether it is connected.
+    docs/INTERNET.md."
 }
 
 /// `8101=pc-natal:SECRET`.
@@ -501,8 +710,27 @@ pub async fn cli(args: &[String]) -> ExitCode {
 }
 
 async fn run(args: &[String]) -> Result<(), String> {
-    let flags =
-        crate::wsl::parse_flags(args, &["--agents", "--proxy", "--open"], &[]).map_err(|e| e.0)?;
+    let flags = crate::wsl::parse_flags(
+        args,
+        &["--agents", "--proxy", "--open", "--token-file"],
+        &[],
+    )
+    .map_err(|e| e.0)?;
+    // From a file, so it is not on the command line for `ps` to show.
+    let token = match flags.get("--token-file") {
+        Some(path) => {
+            let text =
+                std::fs::read_to_string(path).map_err(|e| format!("--token-file {path}: {e}"))?;
+            let token = text.trim().to_string();
+            if !valid_word(&token, 8..=256) {
+                return Err(format!(
+                    "--token-file {path}: 8 to 256 letters, digits, '-', '_' or '.'"
+                ));
+            }
+            Some(token)
+        }
+        None => None,
+    };
     let agents_addr = flags.get("--agents").unwrap_or("0.0.0.0:7000");
     let proxy_addr: SocketAddr = flags
         .get("--proxy")
@@ -524,11 +752,17 @@ async fn run(args: &[String]) -> Result<(), String> {
     let proxy = TcpListener::bind(proxy_addr)
         .await
         .map_err(|e| format!("{proxy_addr}: {e}"))?;
-    let relay = Relay::new(proxy_addr.port());
+    let relay = Relay::new(proxy_addr.port(), token.clone());
     println!(
-        "relay {}: PCs on {agents_addr}, proxy on {proxy_addr}",
-        env!("CARGO_PKG_VERSION")
+        "relay {}: PCs on {agents_addr}{}, proxy on {proxy_addr}",
+        env!("CARGO_PKG_VERSION"),
+        if token.is_some() {
+            " with a token"
+        } else {
+            ", any PC"
+        }
     );
+    tokio::spawn(summaries(relay.clone()));
     for (port, id, secret) in open {
         let addr = SocketAddr::new(proxy_addr.ip(), port);
         let listener = TcpListener::bind(addr)
@@ -559,7 +793,10 @@ mod tests {
             secret: SECRET.to_string(),
             lend_hours: None,
             metered: false,
+            max_day_bytes: None,
+            relay_token: None,
             consent_at: "2026-01-01T00:00:00Z".to_string(),
+            paused_until: None,
         }
     }
 
@@ -593,7 +830,7 @@ mod tests {
     async fn relay_on(agents: TcpListener) -> SocketAddr {
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = proxy.local_addr().unwrap();
-        let relay = Relay::new(addr.port());
+        let relay = Relay::new(addr.port(), None);
         tokio::spawn(accept_agents(relay.clone(), agents));
         tokio::spawn(accept_proxy(relay, proxy, None));
         addr
@@ -779,7 +1016,7 @@ mod tests {
         let first = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let relay = Relay::new(proxy_addr.port());
+                let relay = Relay::new(proxy_addr.port(), None);
                 tokio::spawn(accept_agents(
                     relay.clone(),
                     TcpListener::from_std(agents_std).unwrap(),
@@ -813,7 +1050,7 @@ mod tests {
 
         let agents = TcpListener::bind(agents_addr).await.unwrap();
         let proxy = TcpListener::bind(proxy_addr).await.unwrap();
-        let relay = Relay::new(proxy_addr.port());
+        let relay = Relay::new(proxy_addr.port(), None);
         tokio::spawn(accept_agents(relay.clone(), agents));
         tokio::spawn(accept_proxy(relay, proxy, None));
         for _ in 0..300 {
@@ -829,23 +1066,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_id_in_use_with_another_password_is_refused() {
-        let relay = Relay::new(8080);
-        let (_first, _) = relay.register("pc-a", SECRET).unwrap();
-        assert!(relay
-            .register("pc-a", "ffffffffffffffffffffffffffffffff")
-            .is_err());
+    async fn an_id_keeps_its_password_while_its_pc_is_away_a_while() {
+        const OTHER: &str = "ffffffffffffffffffffffffffffffff";
+        let relay = Relay::with_reserve(8080, None, Duration::from_millis(300));
+        let (first, ..) = relay.register("pc-a", SECRET).unwrap();
+        assert!(
+            relay.register("pc-a", OTHER).is_err(),
+            "taken while connected"
+        );
         assert!(relay.register("pc-a", SECRET).is_ok());
         assert_eq!(
-            relay
-                .claim("pc-a", "ffffffffffffffffffffffffffffffff")
-                .await
-                .err(),
+            relay.claim("pc-a", OTHER).await.err(),
             Some(ClaimError::Login)
         );
         assert_eq!(
             relay.claim("pc-b", SECRET).await.err(),
             Some(ClaimError::Login)
+        );
+        // Every connection of pc-a gone: still its id for the reserve.
+        drop(first);
+        relay
+            .pools
+            .lock()
+            .unwrap()
+            .get_mut("pc-a")
+            .unwrap()
+            .idle
+            .clear();
+        assert!(
+            relay.register("pc-a", OTHER).is_err(),
+            "taken right after it left"
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            relay.register("pc-a", OTHER).is_ok(),
+            "free after the reserve"
+        );
+    }
+
+    #[test]
+    fn a_relay_with_a_token_takes_only_the_pcs_that_send_it() {
+        let token = Some("tok-12345678");
+        let hello = format!("{HELLO} pc-a {SECRET}");
+        assert!(greeting(&hello, None).is_ok());
+        assert_eq!(greeting(&hello, token), Err("wrong or missing relay token"));
+        assert!(greeting(&format!("{hello} tok-87654321"), token).is_err());
+        assert_eq!(
+            greeting(&format!("{hello} tok-12345678"), token).unwrap().0,
+            "pc-a"
+        );
+        assert!(greeting(&format!("SAR1 pc-a {SECRET}"), None)
+            .unwrap_err()
+            .contains("update"));
+        assert!(greeting("SAR2 pc a", None).is_err());
+    }
+
+    /// A connection the PC no longer answers on (it slept, its Wi-Fi
+    /// changed) is skipped for a live one: the request still works.
+    #[tokio::test]
+    async fn a_dead_connection_is_skipped_for_a_live_one() {
+        let site = site().await;
+        let agents = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agents_addr = agents.local_addr().unwrap();
+        let proxy = relay_on(agents).await;
+        let (_s_tx, s_rx) = watch::channel(settings(agents_addr));
+        let (_h_tx, h_rx) = watch::channel(None);
+        let shared = Arc::new(Shared::default());
+        spawn_links(s_rx, h_rx, shared.clone(), test_opts());
+        wait_idle(&shared).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The newest connection, and one that will never say `A`.
+        let mut dead = BufReader::new(TcpStream::connect(agents_addr).await.unwrap());
+        dead.write_all(format!("{HELLO} pc-test {SECRET}\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(read_line(&mut dead).await.unwrap().starts_with("OK"));
+        let auth = login("pc-test", SECRET);
+        let began = std::time::Instant::now();
+        let out = ask(proxy, format!("GET http://{site}/ HTTP/1.1\r\nHost: {site}\r\nProxy-Authorization: Basic {auth}\r\n\r\n")).await;
+        assert!(out.ends_with("hello"), "{out}");
+        assert!(began.elapsed() < Duration::from_secs(8));
+        let mut line = String::new();
+        let _ = dead.read_line(&mut line).await;
+        assert!(
+            line.starts_with("C "),
+            "the dead one was tried first: {line:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_container_asks_the_relay_whether_its_pc_is_connected() {
+        let agents = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agents_addr = agents.local_addr().unwrap();
+        let proxy = relay_on(agents).await;
+        let (_s_tx, s_rx) = watch::channel(settings(agents_addr));
+        let (_h_tx, h_rx) = watch::channel(None);
+        let shared = Arc::new(Shared::default());
+        spawn_links(s_rx, h_rx, shared.clone(), test_opts());
+        wait_idle(&shared).await;
+        let auth = login("pc-test", SECRET);
+        let out = ask(
+            proxy,
+            format!("GET /status HTTP/1.1\r\nAuthorization: Basic {auth}\r\n\r\n"),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert!(out.contains("\"connected\":true"), "{out}");
+        let wrong = login("pc-test", "ffffffffffffffffffffffffffffffff");
+        let out = ask(
+            proxy,
+            format!("GET /status HTTP/1.1\r\nAuthorization: Basic {wrong}\r\n\r\n"),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 401"), "{out}");
+    }
+
+    #[test]
+    fn the_log_says_each_pcs_numbers_when_they_change() {
+        let relay = Relay::new(1, None);
+        let (_kept, ..) = relay.register("pc-a", SECRET).unwrap();
+        let mut last = HashMap::new();
+        assert_eq!(
+            relay.summary(&mut last),
+            vec!["relay: PC pc-a: 1 idle, 0 open".to_string()]
+        );
+        assert!(
+            relay.summary(&mut last).is_empty(),
+            "nothing changed, nothing logged"
         );
     }
 

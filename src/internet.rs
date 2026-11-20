@@ -12,10 +12,11 @@
 //! The line protocol, one connection per proxied stream, no multiplexing:
 //!
 //! ```text
-//! PC    -> relay  SAR1 <id> <secret>
+//! PC    -> relay  SAR2 <id> <secret> [<relay token>]
 //! relay -> PC     OK <proxy port>      | NO <reason>
-//! PC    -> relay  P                    (every 20 s while idle; the relay echoes it)
+//! PC    -> relay  P                    (every 10 s while idle; the relay echoes it)
 //! relay -> PC     C <host>:<port>
+//! PC    -> relay  A                    (at once: the link is alive; else the relay tries another)
 //! PC    -> relay  OK                   | NO <reason>
 //! ...the raw bytes of the stream, both ways, until either side closes
 //! ```
@@ -48,14 +49,20 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 
 /// The first word a PC sends. A new protocol gets a new word.
-pub(crate) const HELLO: &str = "SAR1";
+pub(crate) const HELLO: &str = "SAR2";
 /// The page of this mode. 8787 is the worker's.
 pub const PAGE_LISTEN: &str = "127.0.0.1:8788";
 /// Idle connections kept open to the relay, each ready for one stream.
-const IDLE_CONNECTIONS: usize = 4;
+/// Chrome opens 10 to 30 for one page; an idle one costs a socket.
+const IDLE_CONNECTIONS: usize = 16;
 /// Streams open at once. Above it no idle connection is replaced.
 const MAX_STREAMS: usize = 256;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per address of a site: a home with broken IPv6 must not cost 10 s a stream.
+const ADDRESS_TIMEOUT: Duration = Duration::from_secs(3);
+/// A stream with no byte either way for this long is closed: after a sleep
+/// its other end is gone, and it would hold a place under MAX_STREAMS.
+pub(crate) const STREAM_IDLE: Duration = Duration::from_secs(10 * 60);
 pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -81,6 +88,10 @@ pub const NOT_RUNNING: &str = "INTERNET_NOT_RUNNING";
 pub const RELAY_UNREACHABLE: &str = "INTERNET_RELAY_UNREACHABLE";
 pub const REFUSED: &str = "INTERNET_REFUSED";
 pub const WAITING: &str = "INTERNET_WAITING";
+/// A wait of this mode only: the day's bytes reached `--max-day`.
+pub const DAILY_LIMIT: &str = "INTERNET_DAILY_LIMIT";
+/// The hold code of `internet pause` and the page's button.
+pub const PAUSED: &str = "INTERNET_PAUSED";
 
 /// Where this mode keeps its files: beside the supervisor's on Windows,
 /// beside the job history on Linux.
@@ -113,8 +124,29 @@ pub struct Settings {
     /// The person accepted that streams spend a metered network's data.
     #[serde(default)]
     pub metered: bool,
+    /// At most this many bytes a day (received and sent), on the PC's clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_day_bytes: Option<u64>,
+    /// What the operator's relay asks of every PC, when it asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_token: Option<String>,
     /// When it was turned on at this PC: the person's consent.
     pub consent_at: String,
+    /// New streams wait until then (unix seconds): `internet pause`, or the
+    /// page's button. `on` and `resume` clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_until: Option<i64>,
+}
+
+impl Settings {
+    /// The fields a connection to the relay is made of: when one changes,
+    /// every link starts over.
+    fn same_link(&self, other: &Settings) -> bool {
+        self.relay == other.relay
+            && self.id == other.id
+            && self.secret == other.secret
+            && self.relay_token == other.relay_token
+    }
 }
 
 pub fn read_settings(dir: &Path) -> Option<Settings> {
@@ -200,6 +232,11 @@ pub struct Status {
     /// Bytes from the PC to the sites.
     pub bytes_sent: u64,
     pub counting_since: String,
+    /// The PC's day (days since 1970 on its clock) and the bytes of that day.
+    #[serde(default)]
+    pub day: i64,
+    #[serde(default)]
+    pub day_bytes: u64,
     pub connected_since: Option<String>,
     pub last_error: Option<String>,
     pub hold: Option<Hold>,
@@ -288,8 +325,8 @@ impl Default for Opts {
     fn default() -> Self {
         Opts {
             private_ok: false,
-            ping: Duration::from_secs(20),
-            silent: Duration::from_secs(60),
+            ping: Duration::from_secs(10),
+            silent: Duration::from_secs(30),
         }
     }
 }
@@ -369,7 +406,11 @@ async fn link(
         .map_err(|e| format!("the relay {}: {e}", current.relay))?;
     let _ = stream.set_nodelay(true);
     let mut s = tokio::io::BufReader::new(stream);
-    s.write_all(format!("{HELLO} {} {}\n", current.id, current.secret).as_bytes())
+    let token = current
+        .relay_token
+        .as_deref()
+        .map_or(String::new(), |t| format!(" {t}"));
+    s.write_all(format!("{HELLO} {} {}{token}\n", current.id, current.secret).as_bytes())
         .await
         .map_err(|e| format!("the relay {}: {e}", current.relay))?;
     let reply = tokio::time::timeout(REPLY_TIMEOUT, read_line(&mut s))
@@ -420,6 +461,11 @@ async fn link(
                     return Err(format!("the relay sent {line:?}"));
                 };
                 drop(idle);
+                // At once, before the site is dialed: the relay tries another
+                // link when this one does not say it is alive.
+                s.write_all(b"A\n")
+                    .await
+                    .map_err(|e| format!("the relay: {e}"))?;
                 let shared = shared.clone();
                 let waiting = hold.borrow().clone();
                 tokio::spawn(async move { carry(s, target, waiting, shared, opts).await });
@@ -458,7 +504,40 @@ async fn carry(
         read: &shared.received,
         written: &shared.sent,
     };
-    let _ = tokio::io::copy_bidirectional(&mut relay, &mut site).await;
+    splice(&mut relay, &mut site, STREAM_IDLE).await;
+}
+
+/// Copies both ways until both ends close, or until no byte has crossed
+/// either way for `idle`. What it copied, a to b and b to a.
+pub(crate) async fn splice<A, B>(a: &mut A, b: &mut B, idle: Duration) -> (u64, u64)
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (from_a, to_a) = (AtomicU64::new(0), AtomicU64::new(0));
+    let mut a = Counted {
+        inner: a,
+        read: &from_a,
+        written: &to_a,
+    };
+    let copy = tokio::io::copy_bidirectional(&mut a, b);
+    tokio::pin!(copy);
+    // Checked once every `idle`: a stream is closed between one and two
+    // `idle` after its last byte.
+    let mut seen = 0;
+    loop {
+        tokio::select! {
+            _ = &mut copy => break,
+            _ = tokio::time::sleep(idle) => {
+                let now = from_a.load(Ordering::Relaxed) + to_a.load(Ordering::Relaxed);
+                if now == seen {
+                    break;
+                }
+                seen = now;
+            }
+        }
+    }
+    (from_a.load(Ordering::Relaxed), to_a.load(Ordering::Relaxed))
 }
 
 /// The site's first address that is on the internet, connected. One on this
@@ -474,11 +553,15 @@ async fn dial(target: &str, private_ok: bool) -> Result<TcpStream, String> {
             .map_err(|_| format!("{target}: no DNS answer in 10s"))?
             .map_err(|e| format!("{target}: {e}"))?
             .collect();
-    let allowed: Vec<SocketAddr> = addrs
+    // IPv4 first: a home with broken IPv6 is common, and the address a site
+    // sees should be the one `api.ipify.org` shows. IPv6 only when there is
+    // no IPv4 that answers.
+    let mut allowed: Vec<SocketAddr> = addrs
         .iter()
         .copied()
         .filter(|a| private_ok || is_public(a.ip()))
         .collect();
+    allowed.sort_by_key(|a| a.is_ipv6());
     if allowed.is_empty() {
         return Err(if addrs.is_empty() {
             format!("{target}: no address")
@@ -488,13 +571,13 @@ async fn dial(target: &str, private_ok: bool) -> Result<TcpStream, String> {
     }
     let mut last = String::new();
     for addr in allowed {
-        match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
+        match tokio::time::timeout(ADDRESS_TIMEOUT, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => {
                 let _ = stream.set_nodelay(true);
                 return Ok(stream);
             }
             Ok(Err(e)) => last = format!("{target}: {e}"),
-            Err(_) => last = format!("{target}: no answer in 10s"),
+            Err(_) => last = format!("{target} ({addr}): no answer in 3s"),
         }
     }
     Err(last)
@@ -639,8 +722,24 @@ where
 // ---------------------------------------------------------------------------
 // The waits
 
+/// What Windows says that only it knows; a Linux machine reads its own clock.
+fn feed() -> Option<crate::host::Feed> {
+    cfg!(windows).then(|| crate::wsl::host_feed(None))
+}
+
+/// Days since 1970 on the PC's clock.
+fn today(feed: Option<crate::host::Feed>, now: i64) -> i64 {
+    (now + crate::lending::offset_secs(feed, now)).div_euclid(86_400)
+}
+
 /// The first reason a new stream waits, or None.
-fn hold_now(settings: &Settings, worker_status: Option<&Path>, now: i64) -> Option<Hold> {
+fn hold_now(
+    settings: &Settings,
+    worker_status: Option<&Path>,
+    feed: Option<crate::host::Feed>,
+    now: i64,
+    day_bytes: u64,
+) -> Option<Hold> {
     if worker_status.is_some_and(|path| worker_paused(path, now)) {
         return Some(Hold {
             code: "WORKER_PAUSED".to_string(),
@@ -648,13 +747,32 @@ fn hold_now(settings: &Settings, worker_status: Option<&Path>, now: i64) -> Opti
             resumes_at: None,
         });
     }
+    if let Some(until) = settings.paused_until.filter(|until| *until > now) {
+        return Some(Hold {
+            code: PAUSED.to_string(),
+            detail: format!("paused until {} (UTC)", crate::status::unix_to_iso(until)),
+            resumes_at: Some(until),
+        });
+    }
     let hours = settings
         .lend_hours
         .as_deref()
         .and_then(|text| crate::lending::LendHours::parse(text).ok());
-    // Windows says what only it knows; a Linux machine reads its own clock.
-    let feed = cfg!(windows).then(|| crate::wsl::host_feed(None));
-    crate::lending::hold(hours.as_ref(), feed, now, settings.metered)
+    if let Some(hold) = crate::lending::hold(hours.as_ref(), feed, now, settings.metered) {
+        return Some(hold);
+    }
+    match settings.max_day_bytes {
+        Some(max) if day_bytes >= max => Some(Hold {
+            code: DAILY_LIMIT.to_string(),
+            detail: format!(
+                "{} of the {} a day used; again at midnight",
+                bytes_text(day_bytes),
+                bytes_text(max)
+            ),
+            resumes_at: Some(now + crate::lending::secs_to_midnight(feed, now) as i64),
+        }),
+        _ => None,
+    }
 }
 
 /// The worker's status file says it is paused, and is fresh.
@@ -697,19 +815,32 @@ pub async fn serve(dir: &Path, background: bool) -> Result<ExitCode, String> {
     ));
     let worker_status = worker_status_path();
     let now = crate::status::now_unix();
-    let (settings_tx, settings_rx) = watch::channel(first.clone());
-    let (hold_tx, hold_rx) = watch::channel(hold_now(&first, worker_status.as_deref(), now));
-    let shared = Arc::new(Shared::default());
-    // The totals go on from where the last run left them.
-    let before = read_status(dir);
+    // The totals, and the day's, go on from where the last run left them.
+    let before = read_status(dir).filter(|s| s.id == first.id);
     let counting_since = before
         .as_ref()
-        .filter(|s| s.id == first.id)
         .map(|s| s.counting_since.clone())
         .unwrap_or_else(|| crate::status::unix_to_iso(now));
     let (base_received, base_sent) = before
-        .filter(|s| s.id == first.id)
+        .as_ref()
         .map_or((0, 0), |s| (s.bytes_received, s.bytes_sent));
+    let mut day = today(feed(), now);
+    let mut day_start = (base_received + base_sent).saturating_sub(
+        before
+            .as_ref()
+            .filter(|s| s.day == day)
+            .map_or(0, |s| s.day_bytes),
+    );
+    let (settings_tx, settings_rx) = watch::channel(first.clone());
+    let first_hold = hold_now(
+        &first,
+        worker_status.as_deref(),
+        feed(),
+        now,
+        base_received + base_sent - day_start,
+    );
+    let (hold_tx, hold_rx) = watch::channel(first_hold);
+    let shared = Arc::new(Shared::default());
 
     let page = Page {
         dir: dir.to_path_buf(),
@@ -745,19 +876,31 @@ pub async fn serve(dir: &Path, background: bool) -> Result<ExitCode, String> {
                 "internet: settings changed; relay {}, id {}",
                 current.relay, current.id
             ));
-            if settings_tx.borrow().id != current.id {
+            // A new login or relay: what the old links said is not the
+            // answer for the new one (`internet on --wait` reads it).
+            if !settings_tx.borrow().same_link(&current) {
                 *shared.connected_since.lock().unwrap() = None;
+                *shared.refused.lock().unwrap() = None;
+                *shared.last_error.lock().unwrap() = None;
             }
             settings_tx.send_replace(current.clone());
+            written = None;
         }
-        let hold = hold_now(&current, worker_status.as_deref(), now);
+        let (received, sent) = shared.bytes();
+        let total = base_received + received + base_sent + sent;
+        let feed = feed();
+        if today(feed, now) != day {
+            day = today(feed, now);
+            day_start = total;
+        }
+        let day_bytes = total - day_start;
+        let hold = hold_now(&current, worker_status.as_deref(), feed, now, day_bytes);
         if *hold_tx.borrow() != hold {
             hold_tx.send_replace(hold.clone());
         }
         if shared.idle() == 0 && shared.streams.load(Ordering::Relaxed) == 0 {
             *shared.connected_since.lock().unwrap() = None;
         }
-        let (received, sent) = shared.bytes();
         let status = Status {
             version: env!("CARGO_PKG_VERSION").to_string(),
             pid: std::process::id(),
@@ -770,6 +913,8 @@ pub async fn serve(dir: &Path, background: bool) -> Result<ExitCode, String> {
             bytes_received: base_received + received,
             bytes_sent: base_sent + sent,
             counting_since: counting_since.clone(),
+            day,
+            day_bytes,
             connected_since: shared
                 .connected_since
                 .lock()
@@ -906,22 +1051,32 @@ pub fn proxy_url(settings: &Settings, proxy_port: Option<u16>, reveal: bool) -> 
 
 pub fn usage() -> &'static str {
     "\
-shutup-and-run internet on --relay HOST:PORT [--id NAME] [--hours \"mon-fri 19-07\"] [--metered]
+shutup-and-run internet on --relay HOST:PORT [--login ID:PASSWORD | --id NAME]
+        [--token TOKEN] [--hours \"mon-fri 19-07\"] [--max-day 5g] [--metered]
+        [--wait SECONDS] [--json]
     lend this PC's internet connection to the operator's containers, through
-    the relay the operator runs. No WSL, no Docker. It starts now and at
-    every logon (Windows: task shutup-and-run-internet; Linux: a systemd
-    unit). Turning it on here is the PC owner's consent. New connections
-    wait while the worker is paused, outside --hours, on a battery under
-    60%, while the person presents, and on a metered network unless
-    --metered. One already open is never cut.
+    the relay the operator runs. No WSL, no Docker; a worker on this PC may
+    run beside it. It starts now and at every logon (Windows: task
+    shutup-and-run-internet; Linux: a systemd unit). Turning it on here is
+    the PC owner's consent. New connections wait while the worker or this
+    mode is paused, outside --hours, on a battery under 60%, while the person
+    presents, on a metered network unless --metered, and once the day's bytes
+    reach --max-day. One already open is never cut. --login takes the id and
+    the password the operator chose (else they are made here). --token is
+    what the operator's relay asks of every PC, when it asks. --wait returns
+    once connected, or exits 1 with the reason.
+shutup-and-run internet pause [--for 1h] | resume
+    new connections wait (30m, 2h, 1d, day; 1h when not given), or stop
+    waiting. The page has the same buttons.
 shutup-and-run internet off [--forget]
     stop, and remove the task or unit. --forget also deletes the id and the
     password, so the next `on` makes new ones.
 shutup-and-run internet status [--json]
     on or off, connected or why not, bytes carried. Exit 1 when it is on and
     not working.
-shutup-and-run internet credentials [--json]
-    the proxy address with its password, for the operator.
+shutup-and-run internet credentials [--json | --env]
+    the proxy address with its password, for the operator. --env prints it
+    as HTTPS_PROXY and HTTP_PROXY, for a task's env.
 shutup-and-run internet serve [--background]
     the process itself, which the task or the unit runs. Its page is
     http://127.0.0.1:8788/.
@@ -940,6 +1095,8 @@ pub async fn cli(args: &[String]) -> ExitCode {
     let result = match sub {
         "on" => on_cli(&dir, rest),
         "off" => off_cli(&dir, rest),
+        "pause" => pause_cli(&dir, true, rest),
+        "resume" => pause_cli(&dir, false, rest),
         "status" => status_cli(&dir, rest),
         "credentials" => credentials_cli(&dir, rest),
         "serve" => match crate::wsl::parse_flags(rest, &[], &["--background"]) {
@@ -973,10 +1130,29 @@ fn print(json_out: bool, value: Value, text: String) {
     }
 }
 
+/// `--login ID:PASSWORD`: what the operator's backend chose for this PC.
+/// The message never repeats the value: it carries the password.
+fn parse_login(text: &str) -> Result<(String, String), String> {
+    match text.split_once(':') {
+        Some((id, secret)) if valid_word(id, 1..=64) && valid_word(secret, 16..=128) => {
+            Ok((id.to_string(), secret.to_string()))
+        }
+        _ => Err("--login ID:PASSWORD: the id 1 to 64 and the password 16 to 128 letters, digits, '-', '_' or '.'".to_string()),
+    }
+}
+
 fn on_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
     let flags = crate::wsl::parse_flags(
         args,
-        &["--relay", "--id", "--hours"],
+        &[
+            "--relay",
+            "--id",
+            "--login",
+            "--hours",
+            "--max-day",
+            "--token",
+            "--wait",
+        ],
         &["--metered", "--json"],
     )
     .map_err(|e| e.0)?;
@@ -988,14 +1164,19 @@ fn on_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
         return Err(format!("--relay {relay}: give HOST:PORT"));
     }
     let old = read_settings(dir);
-    let id = match flags.get("--id") {
-        Some(id) if valid_word(id, 1..=64) => id.to_string(),
-        Some(id) => {
+    let login = flags.get("--login").map(parse_login).transpose()?;
+    let id = match (&login, flags.get("--id")) {
+        (Some(_), Some(_)) => {
+            return Err("--login already names the id: leave out --id".to_string())
+        }
+        (Some((id, _)), None) => id.clone(),
+        (None, Some(id)) if valid_word(id, 1..=64) => id.to_string(),
+        (None, Some(id)) => {
             return Err(format!(
                 "--id {id}: 1 to 64 letters, digits, '-', '_' or '.'"
             ))
         }
-        None => old.as_ref().map_or_else(default_id, |o| o.id.clone()),
+        (None, None) => old.as_ref().map_or_else(default_id, |o| o.id.clone()),
     };
     let hours = match flags.get("--hours") {
         Some(text) => {
@@ -1004,52 +1185,241 @@ fn on_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
         }
         None => None,
     };
+    let max_day_bytes = match flags.get("--max-day") {
+        Some(text) => match crate::bytesize::parse_qty(text) {
+            Ok(n) if n > 0 => Some(n as u64),
+            _ => return Err(format!("--max-day {text}: a size like 2g or 500m")),
+        },
+        None => None,
+    };
+    let wait = match flags.get("--wait") {
+        Some(text) => match text.parse::<u64>() {
+            Ok(secs) if (1..=600).contains(&secs) => Some(secs),
+            _ => return Err(format!("--wait {text}: seconds, 1 to 600")),
+        },
+        None => None,
+    };
+    // Kept from the last `on` unless given: changing the hours must not
+    // drop the relay's token.
+    let relay_token = match flags.get("--token") {
+        Some(token) if valid_word(token, 8..=256) => Some(token.to_string()),
+        Some(_) => return Err("--token: 8 to 256 letters, digits, '-', '_' or '.'".to_string()),
+        None => old.as_ref().and_then(|o| o.relay_token.clone()),
+    };
+    let since = crate::status::now_unix();
     let settings = Settings {
         enabled: true,
         relay: relay.to_string(),
         id,
-        secret: old
-            .as_ref()
-            .map_or_else(crate::launcher::random_id, |o| o.secret.clone()),
+        secret: match login {
+            Some((_, secret)) => secret,
+            None => old
+                .as_ref()
+                .map_or_else(crate::launcher::random_id, |o| o.secret.clone()),
+        },
         lend_hours: hours,
         metered: flags.has("--metered"),
-        consent_at: crate::status::unix_to_iso(crate::status::now_unix()),
+        max_day_bytes,
+        relay_token,
+        consent_at: crate::status::unix_to_iso(since),
+        paused_until: None,
     };
+    let same_link = old
+        .as_ref()
+        .is_some_and(|o| o.enabled && o.same_link(&settings));
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     write_settings(dir, &settings).map_err(|e| format!("{}: {e}", dir.join(FILE).display()))?;
     let started = start_process()?;
-    let proxy = proxy_url(&settings, None, false);
-    let text = format!(
-        "internet sharing is on: relay {}, id {}\n{started}\n\
-         give the operator the proxy address with its password: `shutup-and-run internet credentials`\n\
-         status: `shutup-and-run internet status`, or http://127.0.0.1:8788/",
+    let mut value = json!({"ok": true, "enabled": true, "relay": settings.relay,
+                           "id": settings.id, "started": started});
+    let mut text = format!(
+        "internet sharing is on: relay {}, id {}\n{started}",
         settings.relay, settings.id
     );
+    let mut code = ExitCode::SUCCESS;
+    if let Some(secs) = wait {
+        let status = wait_settled(dir, &settings, since, same_link, secs);
+        let connected = status.as_ref().is_some_and(|s| s.state == "connected");
+        let mut lines = checks(
+            &settings,
+            status.as_ref().or(read_status(dir).as_ref()),
+            crate::status::now_unix(),
+        );
+        if !connected && lines.iter().all(|c| c.ok) {
+            lines = vec![check(
+                "internet",
+                false,
+                format!("not connected to {} within {secs}s", settings.relay),
+            )
+            .coded(RELAY_UNREACHABLE)
+            .with(settings.relay.clone())];
+        }
+        let port = status.as_ref().and_then(|s| s.proxy_port);
+        value["connected"] = json!(connected);
+        value["state"] = json!(status.as_ref().map(|s| s.state.clone()));
+        value["proxy"] = json!(proxy_url(&settings, port, false));
+        value["checks"] = crate::cli::checks_json(&lines);
+        let (report, _) = crate::cli::report(&lines);
+        text.push('\n');
+        text.push_str(report.trim_end());
+        if !connected {
+            value["ok"] = json!(false);
+            if let Some(bad) = lines.iter().find(|c| !c.ok) {
+                value["code"] = json!(bad.code());
+                value["error"] = json!(bad.detail);
+            }
+            crate::hints::attach(&mut value, 1);
+            code = ExitCode::from(1);
+        }
+    } else {
+        value["proxy"] = json!(proxy_url(&settings, None, false));
+    }
+    text.push_str(
+        "\ngive the operator the proxy address with its password: `shutup-and-run internet credentials`\n\
+         status: `shutup-and-run internet status`, or http://127.0.0.1:8788/",
+    );
+    print(flags.has("--json"), value, text);
+    Ok(code)
+}
+
+/// `on --wait`: the first status the process wrote after `since` that is an
+/// answer: connected (for a new login or relay, through a connection made
+/// after `since`), refused or waiting. None when `secs` pass first.
+fn wait_settled(
+    dir: &Path,
+    settings: &Settings,
+    since: i64,
+    same_link: bool,
+    secs: u64,
+) -> Option<Status> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(status) = read_status(dir).filter(|s| settled(s, settings, since, same_link)) {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn settled(status: &Status, settings: &Settings, since: i64, same_link: bool) -> bool {
+    let after = |iso: Option<&str>| {
+        iso.and_then(crate::status::iso_to_unix)
+            .is_some_and(|at| at >= since)
+    };
+    let fresh = after(Some(&status.updated_at))
+        && status.id == settings.id
+        && status.relay == settings.relay;
+    fresh
+        && match status.state.as_str() {
+            "connected" => same_link || after(status.connected_since.as_deref()),
+            "refused" | "waiting" => true,
+            _ => false,
+        }
+}
+
+/// `internet pause [--for 1h]` and `internet resume`: new streams wait, or
+/// stop waiting. One already open goes on either way.
+fn pause_cli(dir: &Path, pause: bool, args: &[String]) -> Result<ExitCode, String> {
+    let flags = crate::wsl::parse_flags(args, &["--for"], &["--json"]).map_err(|e| e.0)?;
+    if !pause && flags.get("--for").is_some() {
+        return Err("--for is for pause, not resume".to_string());
+    }
+    let now = crate::status::now_unix();
+    let until = if pause {
+        let span = flags.get("--for").unwrap_or("1h");
+        let offset = crate::lending::offset_secs(feed(), now);
+        let secs = crate::cli::pause_secs("--for", span, offset, now).ok_or(
+            "--for takes a time from 1m to 7d, or day for the rest of the day: 30m, 2h, 1d, day",
+        )?;
+        Some(now + secs as i64)
+    } else {
+        None
+    };
+    let text = set_pause(dir, until)?;
     print(
         flags.has("--json"),
-        json!({"ok": true, "enabled": true, "relay": settings.relay, "id": settings.id,
-               "proxy": proxy, "started": started}),
+        json!({"ok": true, "paused_until": until.map(crate::status::unix_to_iso)}),
         text,
     );
     Ok(ExitCode::SUCCESS)
 }
 
-fn off_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
-    let flags = crate::wsl::parse_flags(args, &[], &["--forget", "--json"]).map_err(|e| e.0)?;
-    let mut text = Vec::new();
+/// Writes the pause (None ends it) and says what happens, in one line.
+fn set_pause(dir: &Path, until: Option<i64>) -> Result<String, String> {
+    let Some(mut settings) = read_settings(dir).filter(|s| s.enabled) else {
+        return Err("internet sharing is off here: nothing to pause".to_string());
+    };
+    settings.paused_until = until;
+    write_settings(dir, &settings).map_err(|e| format!("{}: {e}", dir.join(FILE).display()))?;
+    Ok(match until {
+        Some(until) => format!(
+            "internet sharing paused until {} (UTC); connections already open go on",
+            crate::status::unix_to_iso(until)
+        ),
+        None => "internet sharing resumed".to_string(),
+    })
+}
+
+/// For `shutup-and-run status`: this mode's JSON, its line, and whether it
+/// works. None when it was never turned on here.
+pub fn summary() -> Option<(Value, String, bool)> {
+    let dir = dir();
+    let settings = read_settings(&dir)?;
+    let (value, _, code) = status_out(
+        Some(&settings),
+        read_status(&dir).as_ref(),
+        crate::status::now_unix(),
+    );
+    let line = checks(
+        &settings,
+        read_status(&dir).as_ref(),
+        crate::status::now_unix(),
+    )
+    .first()
+    .map_or_else(String::new, |c| {
+        if c.ok {
+            c.detail.clone()
+        } else {
+            format!("{} ({})", c.detail, c.code())
+        }
+    });
+    Some((value, line, code == 0))
+}
+
+/// Turns it off and removes the task or unit; with `forget`, also every
+/// file of this mode. What it did, a line each.
+pub fn off(dir: &Path, forget: bool) -> Result<Vec<String>, String> {
+    let mut text = vec!["internet sharing is off".to_string()];
     if let Some(mut settings) = read_settings(dir) {
         settings.enabled = false;
         write_settings(dir, &settings).map_err(|e| e.to_string())?;
     }
     text.push(stop_process());
-    if flags.has("--forget") {
+    if forget {
         for file in [FILE, STATUS_FILE, LOG_FILE, LOCK_FILE] {
             let _ = std::fs::remove_file(dir.join(file));
         }
         let _ = std::fs::remove_file(dir.join(LOG_FILE).with_extension("log.1"));
         text.push("deleted the id, the password, the status and the log".to_string());
     }
-    text.insert(0, "internet sharing is off".to_string());
+    Ok(text)
+}
+
+/// `wsl uninstall`: nothing of this mode stays behind either.
+pub fn remove_if_installed() -> Vec<String> {
+    let dir = dir();
+    if !dir.join(FILE).exists() {
+        return Vec::new();
+    }
+    off(&dir, true).unwrap_or_else(|e| vec![format!("internet sharing: {e}")])
+}
+
+fn off_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
+    let flags = crate::wsl::parse_flags(args, &[], &["--forget", "--json"]).map_err(|e| e.0)?;
+    let text = off(dir, flags.has("--forget"))?;
     print(
         flags.has("--json"),
         json!({"ok": true, "enabled": false, "forgot": flags.has("--forget")}),
@@ -1093,6 +1463,14 @@ pub fn status_out(
         if let Some(hours) = &settings.lend_hours {
             text.push_str(&format!("\nhours: {hours}"));
         }
+        if let Some(max) = settings.max_day_bytes {
+            let used = status.map_or(0, |s| s.day_bytes);
+            text.push_str(&format!(
+                "\ntoday: {} of {} a day",
+                bytes_text(used),
+                bytes_text(max)
+            ));
+        }
     }
     let value = json!({
         "ok": healthy,
@@ -1102,6 +1480,8 @@ pub fn status_out(
         "proxy": proxy_url(settings, port, false),
         "lend_hours": settings.lend_hours,
         "metered": settings.metered,
+        "max_day_bytes": settings.max_day_bytes,
+        "relay_token": settings.relay_token.is_some(),
         "consent_at": settings.consent_at,
         "status": status,
         "checks": crate::cli::checks_json(&checks),
@@ -1110,12 +1490,17 @@ pub fn status_out(
 }
 
 fn credentials_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
-    let flags = crate::wsl::parse_flags(args, &[], &["--json"]).map_err(|e| e.0)?;
+    let flags = crate::wsl::parse_flags(args, &[], &["--json", "--env"]).map_err(|e| e.0)?;
     let Some(settings) = read_settings(dir) else {
         return Err("internet sharing was never turned on here: `shutup-and-run internet on --relay HOST:PORT`".to_string());
     };
     let port = read_status(dir).and_then(|s| s.proxy_port);
     let url = proxy_url(&settings, port, true);
+    if flags.has("--env") {
+        // For a task's `env`: most HTTP libraries read these by themselves.
+        println!("HTTPS_PROXY={url}\nHTTP_PROXY={url}");
+        return Ok(ExitCode::SUCCESS);
+    }
     print(
         flags.has("--json"),
         json!({"ok": true, "id": settings.id, "password": settings.secret, "proxy": url}),
@@ -1189,7 +1574,7 @@ pub(crate) fn unit_text(exe: &Path) -> String {
          Wants=network-online.target\n\n\
          [Service]\n\
          ExecStart={} internet serve\n\
-         Restart=always\n\
+         Restart=on-failure\n\
          RestartSec=5\n\n\
          [Install]\n\
          WantedBy=multi-user.target\n",
@@ -1207,12 +1592,84 @@ struct Page {
 
 impl Page {
     fn router(self) -> axum::Router {
-        use axum::routing::get;
+        use axum::routing::{get, post};
+        // `local_only` answers only this machine, and a POST only from this
+        // page's own origin.
         axum::Router::new()
             .route("/", get(page))
+            .route("/pause", post(page_pause))
+            .route("/resume", post(page_resume))
+            .route("/off", post(page_off))
             .layer(axum::middleware::from_fn(crate::status::local_only))
             .with_state(self)
     }
+}
+
+/// The page's buttons: one hour, as `internet pause` does by default.
+async fn page_pause(
+    axum::extract::State(page): axum::extract::State<Page>,
+) -> axum::response::Response {
+    let until = crate::status::now_unix() + 3600;
+    back_to_page(set_pause(&page.dir, Some(until)))
+}
+
+async fn page_resume(
+    axum::extract::State(page): axum::extract::State<Page>,
+) -> axum::response::Response {
+    back_to_page(set_pause(&page.dir, None))
+}
+
+fn back_to_page(result: Result<String, String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match result {
+        Ok(_) => axum::response::Redirect::to("/").into_response(),
+        Err(e) => (axum::http::StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+async fn page_off(
+    axum::extract::State(page): axum::extract::State<Page>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let pt = crate::hints::lang() == crate::hints::Lang::Pt;
+    let dir = page.dir.clone();
+    match tokio::task::spawn_blocking(move || off_from_inside(&dir)).await {
+        Ok(Ok(())) => axum::response::Html(format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>shutup-and-run</title>\
+             <p>{}</p>",
+            if pt {
+                "Compartilhamento desligado. Esta página fecha em alguns segundos. Para ligar de novo: <code>shutup-and-run internet on --relay HOST:PORTA</code>"
+            } else {
+                "Internet sharing is off. This page goes away in a few seconds. To turn it on again: <code>shutup-and-run internet on --relay HOST:PORT</code>"
+            }
+        ))
+        .into_response(),
+        Ok(Err(e)) => (axum::http::StatusCode::CONFLICT, e).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `internet off` from inside the process it stops: the task or the unit
+/// goes without ending this process, which sees the file and exits at its
+/// next tick, with nothing to restart it.
+fn off_from_inside(dir: &Path) -> Result<(), String> {
+    let Some(mut settings) = read_settings(dir).filter(|s| s.enabled) else {
+        return Err("internet sharing is already off".to_string());
+    };
+    settings.enabled = false;
+    write_settings(dir, &settings).map_err(|e| format!("{}: {e}", dir.join(FILE).display()))?;
+    if cfg!(windows) {
+        crate::wsl::delete_named_task(TASK_NAME);
+    } else if Path::new(UNIT_PATH).exists() {
+        let _ = std::process::Command::new("systemctl")
+            .args(["disable", "shutup-and-run-internet"])
+            .output();
+        let _ = std::fs::remove_file(UNIT_PATH);
+        let _ = std::process::Command::new("systemctl")
+            .arg("daemon-reload")
+            .output();
+    }
+    Ok(())
 }
 
 async fn page(
@@ -1302,13 +1759,24 @@ pub(crate) fn render(
                 }
                 body.push_str("</table>");
             }
-            body.push_str(&format!(
-                "<p class=\"hint\">{}</p>",
-                t(
-                    "To turn it off: <code>shutup-and-run internet off</code>",
-                    "Para desligar: <code>shutup-and-run internet off</code>"
-                )
-            ));
+            if settings.enabled {
+                let paused = settings.paused_until.is_some_and(|until| until > now);
+                let (action, label) = if paused {
+                    ("/resume", t("Resume now", "Retomar agora"))
+                } else {
+                    ("/pause", t("Pause 1 hour", "Pausar 1 hora"))
+                };
+                body.push_str(&format!(
+                    "<div><form method=\"post\" action=\"{action}\"><button>{label}</button></form> \
+                     <form method=\"post\" action=\"/off\"><button>{}</button></form></div>\
+                     <p class=\"hint\">{}</p>",
+                    t("Stop sharing", "Parar de compartilhar"),
+                    t(
+                        "A connection already open finishes; new ones wait. The same at a terminal: <code>shutup-and-run internet pause --for 1h</code>, <code>internet resume</code>, <code>internet off</code>.",
+                        "Uma conexão já aberta termina; as novas esperam. O mesmo num terminal: <code>shutup-and-run internet pause --for 1h</code>, <code>internet resume</code>, <code>internet off</code>."
+                    )
+                ));
+            }
         }
     }
     format!(
@@ -1318,7 +1786,7 @@ pub(crate) fn render(
          <title>shutup-and-run: {}</title>\
          <style>body{{font:15px system-ui,sans-serif;max-width:46em;margin:2em auto;padding:0 1em}}\
          .bad b{{color:#b00}}.ok b{{color:#070}}.hint{{color:#555}}th{{text-align:left;padding-right:1em}}\
-         code{{word-break:break-all}}</style></head><body><h1>{}</h1>{body}</body></html>",
+         code{{word-break:break-all}}form{{display:inline}}button{{font:inherit;padding:.3em .8em}}</style></head><body><h1>{}</h1>{body}</body></html>",
         if pt { "pt-BR" } else { "en" },
         t("internet sharing", "compartilhar internet"),
         t("Internet sharing", "Compartilhar internet"),
@@ -1337,7 +1805,10 @@ mod tests {
             secret: "0123456789abcdef0123456789abcdef".to_string(),
             lend_hours: None,
             metered: false,
+            max_day_bytes: None,
+            relay_token: None,
             consent_at: "2026-01-01T00:00:00Z".to_string(),
+            paused_until: None,
         }
     }
 
@@ -1474,14 +1945,153 @@ mod tests {
         std::fs::write(&path, doc.to_string()).unwrap();
         let s = settings("relay.example.com:7000");
         assert_eq!(
-            hold_now(&s, Some(&path), now).unwrap().code,
+            hold_now(&s, Some(&path), None, now, 0).unwrap().code,
             "WORKER_PAUSED"
         );
         let doc = json!({"state": "idle", "updated_at": crate::status::unix_to_iso(now)});
         std::fs::write(&path, doc.to_string()).unwrap();
         if !cfg!(windows) {
-            assert_eq!(hold_now(&s, Some(&path), now), None);
+            assert_eq!(hold_now(&s, Some(&path), None, now, 0), None);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_login_from_the_operator_is_checked_and_never_repeated() {
+        let (id, secret) = parse_login("pc-ana-01:abcdefghijklmnop0123").unwrap();
+        assert_eq!(
+            (id.as_str(), secret.as_str()),
+            ("pc-ana-01", "abcdefghijklmnop0123")
+        );
+        for bad in [
+            "pc-ana-01",
+            "pc-ana-01:short-pass",
+            ":abcdefghijklmnop0123",
+            "pc ana:abcdefghijklmnop0123",
+        ] {
+            let e = parse_login(bad).unwrap_err();
+            assert!(
+                !e.contains("short-pass") && !e.contains("abcdefghijklmnop"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_takes_only_an_answer_written_after_it_began() {
+        let s = settings("relay.example.com:7000");
+        let since = 1_800_000_000;
+        let status = |state: &str, at: i64, connected: Option<i64>| Status {
+            state: state.to_string(),
+            relay: s.relay.clone(),
+            id: s.id.clone(),
+            connected_since: connected.map(crate::status::unix_to_iso),
+            updated_at: crate::status::unix_to_iso(at),
+            ..Status::default()
+        };
+        // Before `on`: what the last run said is not the answer.
+        assert!(!settled(
+            &status("refused", since - 1, None),
+            &s,
+            since,
+            false
+        ));
+        assert!(!settled(
+            &status("connecting", since + 5, None),
+            &s,
+            since,
+            false
+        ));
+        assert!(settled(
+            &status("refused", since + 5, None),
+            &s,
+            since,
+            false
+        ));
+        assert!(settled(
+            &status("waiting", since + 5, None),
+            &s,
+            since,
+            false
+        ));
+        // A new login needs a connection made after it; the same one does not.
+        let old_link = status("connected", since + 5, Some(since - 600));
+        assert!(!settled(&old_link, &s, since, false));
+        assert!(settled(&old_link, &s, since, true));
+        assert!(settled(
+            &status("connected", since + 5, Some(since + 2)),
+            &s,
+            since,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_pause_holds_new_streams_until_it_ends() {
+        let now = 1_800_000_000;
+        let s = Settings {
+            paused_until: Some(now + 3600),
+            ..settings("relay.example.com:7000")
+        };
+        let hold = hold_now(&s, None, None, now, 0).unwrap();
+        assert_eq!(hold.code, PAUSED);
+        assert_eq!(hold.resumes_at, Some(now + 3600));
+        if !cfg!(windows) {
+            assert_eq!(hold_now(&s, None, None, now + 3600, 0), None);
+        }
+        // An older file, without the field, still reads.
+        let mut doc = serde_json::to_value(settings("relay.example.com:7000")).unwrap();
+        doc.as_object_mut().unwrap().remove("paused_until");
+        assert!(serde_json::from_value::<Settings>(doc).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_page_pauses_and_resumes_only_from_itself() {
+        use tower::ServiceExt;
+        let dir = std::env::temp_dir().join(format!("sar-internet-b-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        write_settings(&dir, &settings("relay.example.com:7000")).unwrap();
+        let post = |path: &str, origin: &str| {
+            let mut request = axum::http::Request::post(path)
+                .header("host", "127.0.0.1:8788")
+                .header("origin", origin)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                    [127, 0, 0, 1],
+                    9,
+                ))));
+            request
+        };
+        let app = Page { dir: dir.clone() }.router();
+        let other = app
+            .clone()
+            .oneshot(post("/pause", "http://evil.example"))
+            .await
+            .unwrap();
+        assert_eq!(other.status(), 403);
+        assert_eq!(read_settings(&dir).unwrap().paused_until, None);
+        let ok = app
+            .clone()
+            .oneshot(post("/pause", "http://127.0.0.1:8788"))
+            .await
+            .unwrap();
+        assert!(ok.status().is_redirection());
+        let until = read_settings(&dir).unwrap().paused_until.unwrap();
+        assert!(until > crate::status::now_unix() + 3500);
+        let html = render(
+            read_settings(&dir).as_ref(),
+            None,
+            crate::status::now_unix(),
+            false,
+        );
+        assert!(html.contains("action=\"/resume\"") && html.contains("action=\"/off\""));
+        app.oneshot(post("/resume", "http://127.0.0.1:8788"))
+            .await
+            .unwrap();
+        assert_eq!(read_settings(&dir).unwrap().paused_until, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1491,8 +2101,35 @@ mod tests {
         let html = render(Some(&s), None, 1_800_000_000, true);
         assert!(html.contains("Compartilhar internet"));
         assert!(html.contains("<details><summary>mostrar</summary>"));
+        assert!(html.contains("Pausar 1 hora") && html.contains("Parar de compartilhar"));
         let off = render(None, None, 1_800_000_000, false);
         assert!(off.contains("internet on --relay"));
+    }
+
+    #[test]
+    fn the_days_bytes_past_the_limit_hold_new_streams_until_midnight() {
+        let s = Settings {
+            max_day_bytes: Some(1000),
+            ..settings("relay.example.com:7000")
+        };
+        let now = 1_800_000_000;
+        assert_eq!(hold_now(&s, None, None, now, 999), None);
+        let hold = hold_now(&s, None, None, now, 1000).unwrap();
+        assert_eq!(hold.code, DAILY_LIMIT);
+        let midnight = hold.resumes_at.unwrap();
+        assert!(midnight > now && midnight - now <= 86_400);
+    }
+
+    /// After a sleep, a stream whose other end is gone carries nothing
+    /// and is closed, so it does not hold a place for good.
+    #[tokio::test]
+    async fn a_stream_with_nothing_crossing_is_closed() {
+        let (mut a, _a_far) = tokio::io::duplex(64);
+        let (mut b, _b_far) = tokio::io::duplex(64);
+        let began = std::time::Instant::now();
+        let moved = splice(&mut a, &mut b, Duration::from_millis(100)).await;
+        assert_eq!(moved, (0, 0));
+        assert!(began.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
@@ -1504,9 +2141,9 @@ mod tests {
     }
 
     #[test]
-    fn the_unit_runs_the_process_again_when_it_stops() {
+    fn the_unit_runs_the_process_again_when_it_fails() {
         let unit = unit_text(Path::new("/usr/local/bin/shutup-and-run"));
         assert!(unit.contains("ExecStart=/usr/local/bin/shutup-and-run internet serve"));
-        assert!(unit.contains("Restart=always"));
+        assert!(unit.contains("Restart=on-failure"));
     }
 }
