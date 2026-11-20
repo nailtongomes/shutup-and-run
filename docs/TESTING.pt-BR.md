@@ -321,8 +321,9 @@ docker run --rm --network relay_egress curlimages/curl -s -x http://ID:SENHA@rel
 - [ ] Chrome: pare o relay, descomente `--open=8101=${PC_ID}:${PC_SECRET}` no `compose.yml`, crie `.env` com `PC_ID=ID` e `PC_SECRET=SENHA`, `docker compose up -d`, e rode o `zenika/alpine-chrome ... --dump-dom https://api.ipify.org` de docs/INTERNET.md: o `<body>` tem o IP do PC.
 - [ ] Uma tarefa de um worker em outro servidor, com `HTTPS_PROXY` no `env` (`internet credentials --env`, com o endereço que o worker alcança), imprime o IP do PC: `{"image": "curlimages/curl", "command": ["curl", "-s", "https://api.ipify.org"], "env": {"HTTPS_PROXY": "http://ID:SENHA@ENDERECO:8080"}}`.
 - [ ] Com o login escolhido pelo operador: `internet on --relay IP_DO_SERVIDOR:7000 --token TOKEN --login pc-teste-01:uma-senha-de-teste-123 --wait 60`; no servidor, o mesmo `docker run` com `pc-teste-01:uma-senha-de-teste-123` imprime o IP do PC.
+- [ ] Os exemplos de cliente (requests, Selenium, Playwright, Puppeteer, Node, n8n) estão em [INTERNET.md](INTERNET.md#examples-curl-requests-selenium-playwright-puppeteer-node-n8n): rode o da sua automação com o `ID:SENHA` acima e confira o IP do PC.
 - [ ] Em http://127.0.0.1:8788/, "Pausar 1 hora": o `docker run` acima falha (503); "Retomar agora": volta a funcionar. "Parar de compartilhar": a página diz que desligou e `internet status` diz `off`.
-- [ ] O resto da lista está em [WINDOWS-PENDING.md](WINDOWS-PENDING.md#0226-compartilhar-só-a-internet-alpha) e na seção seguinte dele (resiliência, token, limite diário): Defender, sono, relay reiniciado, esperas, rede do PC recusada, bytes, com o worker, desligar, logon.
+- [ ] O resto da lista está em [WINDOWS-PENDING.md](WINDOWS-PENDING.md#0226-compartilhar-só-a-internet-alpha) e nas duas seções 0.2.27 seguintes (resiliência, token, limite diário; internet ao lado do worker, botões): Defender, sono, relay reiniciado, esperas, rede do PC recusada, bytes, com o worker, desligar, logon.
 
 Num Linux só (prova o caminho e a reconexão, não o IP): `sudo bash tests/internet/local.sh target/release/shutup-and-run`.
 

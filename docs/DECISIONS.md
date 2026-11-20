@@ -628,7 +628,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** Plain TCP between the PC and the relay: the password and the names of the sites can be read on the way; HTTPS content cannot. Any PC can connect to the relay, and after a relay restart the first to connect sets an id's password. One TCP connection per stream means one round trip to the relay before each stream, and four idle connections per PC on the relay. UDP, QUIC and WebRTC do not go through. A second page and a second file to keep in step with the worker's, and `doctor` on a Windows PC without WSL still fails on its first line (`internet status` is the check there).
 
-## Internet sharing: a dead link skipped, IPv4 first, a token, a limit a day, one-line install
+## Internet sharing: a dead link skipped, IPv4 first, a token, a limit a day, one-line install (0.2.27)
 
 **Context.** In the first days of the alpha: right after a PC woke or changed its Wi-Fi, the relay handed a request to a connection that was already dead and answered `502` after 15 seconds. A home with broken IPv6 spent up to 10 seconds per stream on it, and a site could see an IPv6 address other than the one a test showed. Four idle connections were too few for one Chrome page. An id lost its password the moment its PC slept past a minute. A crash of the process waited for the next logon. After a sleep, streams whose far end was gone stayed open for good. And a client had to download the `.exe` by hand.
 
@@ -649,7 +649,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** One more round trip before each stream. A 0.2.26 PC stops connecting until it is updated. A site reached only over IPv6 waits for the IPv4 attempts first, 3 s each. A WebSocket or a long poll silent for 10 minutes is closed. An id whose PC changed its password waits 10 minutes. A task that keeps failing at once restarts every minute instead of stopping.
 
-## Internet sharing beside the worker: one command for an agent, a login from the operator, a pause and a stop on the page
+## Internet sharing beside the worker: one command for an agent, a login from the operator, a pause and a stop on the page (0.2.27)
 
 **Context.** The PCs are clients the operator trusts, who trust the operator; their own AI agent sets things up. The agent had to combine three documents, run `on`, poll `status` until connected, and send the generated password back to the operator's backend. The install line lent either the internet or containers, never both. A PC that only lent its internet had no pause, and the person at it could stop it only from a terminal.
 

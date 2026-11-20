@@ -216,7 +216,7 @@ The person can always stop it: the page's buttons (pause 1 hour, stop sharing), 
 
 ## Internet sharing: more
 
-`--hours "mon-fri 19-07"` limits when; `--max-day 5g` limits the data a day; `--metered` lets it use a metered network, only if the PC's owner agreed. For a task that must go out through this PC, `shutup-and-run internet credentials --env` prints the `HTTPS_PROXY` and `HTTP_PROXY` lines for its `env` (docs/INTERNET.md, "A task that goes out through a client's connection"). `internet status --json` is this mode alone. `internet off --forget` undoes all of it, the id and password included. Turning it on is the owner's consent: do it only when the owner asked. docs/INTERNET.md has the risks to tell them.
+`--hours "mon-fri 19-07"` limits when; `--max-day 5g` limits the data a day; `--metered` lets it use a metered network, only if the PC's owner agreed. For a task that must go out through this PC, `shutup-and-run internet credentials --env` prints the `HTTPS_PROXY` and `HTTP_PROXY` lines for its `env` (docs/INTERNET.md, "A task that goes out through a client's connection"); the code for curl, requests, Selenium, Playwright, Puppeteer, Node and n8n is in its [examples](INTERNET.md#examples-curl-requests-selenium-playwright-puppeteer-node-n8n). `internet status --json` is this mode alone. `internet off --forget` undoes all of it, the id and password included. Turning it on is the owner's consent: do it only when the owner asked. docs/INTERNET.md has the risks to tell them.
 
 ## Managed containers (work with no poll URL)
 

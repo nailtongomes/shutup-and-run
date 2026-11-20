@@ -38,7 +38,7 @@ docker compose logs -f relay        # "PC <id> connected from <ip>", a line per 
 - `8080` is the proxy. It is **not** published: containers on the compose network `egress` use `http://ID:SECRET@relay:8080`. A container in another datacenter reaches it only over a private address or a VPN; never publish it on the internet.
 - For Chrome, uncomment `--open=8101=${PC_ID}:${PC_SECRET}` and put `PC_ID` and `PC_SECRET` in a `.env` beside `compose.yml`; then Chrome uses `--proxy-server=http://relay:8101`.
 
-The Dockerfile takes the latest release's binary, which has the relay from 0.2.26 on. To run a build of your own, build the musl binary (AGENTS.md), copy it beside `compose.yml` and replace the Dockerfile's first stage with `COPY shutup-and-run /shutup-and-run`.
+The Dockerfile takes the latest release's binary, which has the relay from 0.2.26 on. A 0.2.27 relay refuses 0.2.26 PCs (`update it`): update the PCs with the relay. To run a build of your own, build the musl binary (AGENTS.md), copy it beside `compose.yml` and replace the Dockerfile's first stage with `COPY shutup-and-run /shutup-and-run`.
 
 The relay keeps nothing on disk. A restart drops every stream; the PCs come back by themselves within seconds. Once a minute the log has a line per PC whose numbers changed: `relay: PC <id>: 16 idle, 2 open`.
 
@@ -133,12 +133,140 @@ The case this is for: an agent or a person makes a task where the client works, 
     "timeout_secs": 1800}
    ```
 
-   `requests`, `httpx`, `curl` and most HTTP libraries read `HTTPS_PROXY` by themselves. Chrome does not: the image starts it with `--proxy-server` (the relay's `--open` port for that PC), or SeleniumBase with `proxy="ID:SECRET@10.8.0.1:8080"`.
+   `requests`, `httpx`, `curl` and most HTTP libraries read `HTTPS_PROXY` by themselves. Chrome does not: the image starts it with `--proxy-server` (the relay's `--open` port for that PC), or logs in from Playwright, Puppeteer or SeleniumBase. [Examples](#examples-curl-requests-selenium-playwright-puppeteer-node-n8n) has each.
 3. When the worker starts it, the task can first ask whether the PC is there: `curl -s $PROXY_STATUS_URL` answers `{"id":"ID","connected":true,"idle":16,"open":0,"seen_secs_ago":4}`, or `401` for a wrong login. Not connected: the proxy answers `503` for 10 seconds per request; the task waits and tries again, or ends and is sent again later. The worker does not retry a job.
 
 The worker's containers must reach the proxy port. On the relay's own host, bind it on Docker's bridge (`--proxy 172.17.0.1:8080`) and the worker's containers there use `172.17.0.1:8080`. On another server, put the relay and the worker on a VPN (WireGuard, Tailscale) and bind the proxy on the VPN address. Published on the internet, the password is all that guards the client's connection, and it crosses in the clear.
 
 The proxy password then sits in the job's env on the worker. A Linux worker is the operator's and trusted; never send it to a task on another client's PC.
+
+## Examples: curl, requests, Selenium, Playwright, Puppeteer, Node, n8n
+
+The values are made up. `ID:PASSWORD` is the PC's login (`internet credentials`, or the `--login` the operator chose). `PROXY_HOST:8080` is where your containers reach the relay's proxy: `relay:8080` on the compose network, `172.17.0.1:8080` on the relay's host, a VPN address elsewhere. Each example was run against a relay and a PC from this repository (0.2.27, Python 3.13, Node 22, Chrome 153), except the ones marked *not tested here*.
+
+**Is the PC there?** Before a long task: `curl -s http://ID:PASSWORD@PROXY_HOST:8080/status` answers `{"connected":true,...}`. While the PC is away (asleep, paused, outside its hours), the proxy answers `503` after 10 seconds: wait and try again, as for any flaky site.
+
+### Without code: the task's env
+
+```json
+"env": {"HTTPS_PROXY": "http://ID:PASSWORD@PROXY_HOST:8080",
+        "HTTP_PROXY": "http://ID:PASSWORD@PROXY_HOST:8080"}
+```
+
+`curl`, `wget`, Python's `requests` and `httpx`, and Go's `net/http` read these by themselves. Node's built-in `fetch` reads them only with `NODE_USE_ENV_PROXY=1` in the env too (it worked on Node 22.23, with a warning that it is experimental). Chrome, Selenium, Playwright and Puppeteer do not read them: below. If the image or the machine also sets the lowercase `https_proxy`, that one wins in `curl` and `requests`: set both, or neither.
+
+### curl
+
+```bash
+curl -x http://ID:PASSWORD@PROXY_HOST:8080 https://api.ipify.org
+```
+
+### Python: requests and httpx
+
+```python
+import requests, httpx
+
+proxy = "http://ID:PASSWORD@PROXY_HOST:8080"
+print(requests.get("https://api.ipify.org", proxies={"https": proxy, "http": proxy}, timeout=60).text)
+
+with httpx.Client(proxy=proxy, timeout=60) as client:
+    print(client.get("https://api.ipify.org").text)
+```
+
+With `HTTPS_PROXY` in the env, plain `requests.get(url)` and `httpx.get(url)` go the same way.
+
+### Selenium (Chrome)
+
+Chrome's `--proxy-server` takes no login. Use the relay's port with no login for that PC (`relay --open 8101=ID:PASSWORD`, kept on a private network):
+
+```python
+from selenium import webdriver
+
+options = webdriver.ChromeOptions()
+options.add_argument("--headless=new")
+options.add_argument("--proxy-server=http://PROXY_HOST:8101")
+options.add_argument("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+driver = webdriver.Chrome(options=options)
+driver.get("https://api.ipify.org")
+print(driver.find_element("tag name", "body").text)  # the PC's IP
+driver.quit()
+```
+
+Or SeleniumBase, which logs in by itself (*not tested here*):
+
+```python
+from seleniumbase import SB
+
+with SB(proxy="ID:PASSWORD@PROXY_HOST:8080", headless2=True) as sb:
+    sb.open("https://api.ipify.org")
+    print(sb.get_text("body"))
+```
+
+Selenium's own BiDi login (`driver.network.add_auth_handler`) hung on the first page in our test; do not rely on it. For a new robot, Playwright or Puppeteer log in with no extra port.
+
+### Playwright
+
+Node:
+
+```js
+import { chromium } from "playwright";
+
+const browser = await chromium.launch({
+  proxy: { server: "http://PROXY_HOST:8080", username: "ID", password: "PASSWORD" },
+  args: ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp"],
+});
+const page = await browser.newPage();
+await page.goto("https://api.ipify.org");
+console.log(await page.textContent("body"));
+await browser.close();
+```
+
+Python is the same call, `p.chromium.launch(proxy={"server": "http://PROXY_HOST:8080", "username": "ID", "password": "PASSWORD"})` (*not tested here*; the Node one was).
+
+### Puppeteer
+
+```js
+import puppeteer from "puppeteer";
+
+const browser = await puppeteer.launch({
+  args: ["--proxy-server=http://PROXY_HOST:8080",
+         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"],
+});
+const page = await browser.newPage();
+await page.authenticate({ username: "ID", password: "PASSWORD" });
+await page.goto("https://api.ipify.org");
+console.log(await page.$eval("body", (b) => b.innerText));
+await browser.close();
+```
+
+### Node: fetch, axios, node:https
+
+```js
+import { ProxyAgent, fetch } from "undici";          // npm i undici
+import { HttpsProxyAgent } from "https-proxy-agent"; // npm i https-proxy-agent
+import axios from "axios";
+
+const proxy = "http://ID:PASSWORD@PROXY_HOST:8080";
+
+const res = await fetch("https://api.ipify.org", { dispatcher: new ProxyAgent(proxy) });
+console.log(await res.text());
+
+const agent = new HttpsProxyAgent(proxy);            // also for https.get(url, { agent }, ...)
+const { data } = await axios.get("https://api.ipify.org", { httpsAgent: agent, proxy: false });
+console.log(data);
+```
+
+axios's own `proxy: {host, port, auth}` option also went through in our test; the agent is the form that works the same with every Node HTTP library.
+
+### n8n (*not tested here*)
+
+- **HTTP Request node**: Options, Add option, **Proxy**: `http://ID:PASSWORD@PROXY_HOST:8080`. Only that node goes out through the client's PC.
+- `HTTPS_PROXY` and `HTTP_PROXY` on the n8n container send every request of every workflow through the PC, the calls to your own APIs and credentials included. Prefer the node option.
+- An n8n that runs in a client's container (a task on a worker) is the same: the node option, with the address that container reaches.
+
+### Browsers: what does not go through
+
+UDP does not cross the relay. Chrome falls back from QUIC to TCP by itself; WebRTC would show the datacenter's IP unless `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, as in the examples above. Name resolution happens on the PC, so a site's DNS answer is the one the client's home gets.
 
 ## A test from another network
 

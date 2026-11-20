@@ -118,7 +118,7 @@ O roteiro completo está em [TESTING.pt-BR.md, "Compartilhar só a internet"](TE
 - [ ] **Desligar.** `internet off`: a tarefa some do Agendador, o processo some do Gerenciador de Tarefas em 5 s, a página 8788 não abre. `internet off --forget` apaga `internet.json`, `internet-status.json` e `internet.log` de `C:\ProgramData\shutup-and-run\`.
 - [ ] **Logon.** Com a internet ligada, reinicie o PC e entre: sem fazer nada, `internet status` volta a `ok`.
 
-## Compartilhar só a internet: resiliência, token, limite diário, instalação em uma linha (ainda sem versão)
+## 0.2.27: compartilhar a internet, resiliência, token, limite diário, instalação em uma linha
 
 Com o relay do `examples/relay` atual (que agora pede `relay_token`):
 
@@ -133,7 +133,7 @@ Com o relay do `examples/relay` atual (que agora pede `relay_token`):
 - [ ] **Uninstall.** `shutup-and-run wsl uninstall --purge` num PC com a internet ligada: a tarefa `shutup-and-run-internet` some e os arquivos `internet.*` também.
 - [ ] **Status pelo relay.** No servidor, `curl -s http://ID:SENHA@relay:8080/status` diz `"connected":true` com o PC ligado e `false` com ele desligado.
 
-## Internet ao lado do worker: um comando para a IA, login do operador, pausar e parar pela página (ainda sem versão)
+## 0.2.27: internet ao lado do worker, um comando para a IA, login do operador, pausar e parar pela página
 
 - [ ] **`fit`.** Num PC sem WSL, `shutup-and-run fit` diz `lend: internet` e `WSL_UNAVAILABLE` com "administrator and a restart"; num PC com WSL2 e 16 GB, `lend: both`; num de 8 GB ou menos, `lend: internet` com `SAFETY_SMALL_MACHINE`.
 - [ ] **Um comando.** `shutup-and-run internet on --relay SERVIDOR:7000 --token TOKEN --login pc-teste-01:SENHA-DE-16-OU-MAIS --wait 60 --json` volta em segundos com `"connected":true`. Com o token errado, volta em menos de 10 s com `INTERNET_REFUSED`; com o relay parado, depois de 60 s com `INTERNET_RELAY_UNREACHABLE`. No servidor, `curl -s http://pc-teste-01:SENHA@relay:8080/status` diz `"connected":true` sem ninguém ter copiado nada do PC.
