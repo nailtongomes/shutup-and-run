@@ -1394,6 +1394,8 @@ async fn doctor_cli(args: &[String]) -> WslResult<ExitCode> {
     let flags = parse_flags(args, &["--smoke-image"], &["--json", "--report"])?;
     let image = flags.get("--smoke-image").unwrap_or(DEFAULT_SMOKE_IMAGE);
     let (mut checks, inner) = doctor(image, SERVICE_WAIT_SECS)?;
+    // Internet sharing runs on Windows itself, with or without WSL.
+    checks.extend(crate::internet::checks_if_configured());
     // Only on a PC the doctor got through: one without WSL keeps its one line.
     if inner.is_some() {
         checks.extend(update_check(
@@ -2815,7 +2817,7 @@ fn host_of(url: &str) -> String {
 
 /// The task must not point at a file in Downloads. The .exe is copied next
 /// to the data, unless it already runs from there.
-fn install_exe_copy(data: &Path) -> WslResult<PathBuf> {
+pub(crate) fn install_exe_copy(data: &Path) -> WslResult<PathBuf> {
     let current = std::env::current_exe().map_err(|e| err(format!("current exe: {e}")))?;
     let target = data.join("shutup-and-run.exe");
     if current == target {
@@ -2825,8 +2827,9 @@ fn install_exe_copy(data: &Path) -> WslResult<PathBuf> {
         Ok(_) => Ok(target),
         // Windows refuses to overwrite a running .exe. The copy already there
         // is then the one the task runs, which is fine for a re-install.
+        // On stderr: `internet on --json` prints only its JSON on stdout.
         Err(e) if target.exists() => {
-            println!("    kept {} ({e})", target.display());
+            eprintln!("    kept {} ({e})", target.display());
             Ok(target)
         }
         Err(e) => Err(err(format!("copy to {}: {e}", target.display()))),
@@ -2851,24 +2854,35 @@ fn install_exe_copy(data: &Path) -> WslResult<PathBuf> {
 ///
 /// No double quote in the script: it travels as one command-line argument.
 /// The quotes around the path are `[char]34`.
+#[cfg(test)]
 pub(crate) fn task_register_script(exe: &Path) -> String {
+    task_script(exe, TASK_NAME, "wsl serve --background")
+}
+
+/// The same task under another name, running the .exe with other arguments.
+pub(crate) fn task_script(exe: &Path, name: &str, args: &str) -> String {
     let exe = exe.display().to_string().replace('\'', "''");
     format!(
         "$ErrorActionPreference = 'Stop'; \
          $u = $env:USERDOMAIN + '\\' + $env:USERNAME; \
          $q = [char]34; \
          $a = New-ScheduledTaskAction -Execute ($env:WINDIR + '\\System32\\conhost.exe') \
-         -Argument ('--headless ' + $q + '{exe}' + $q + ' wsl serve --background'); \
+         -Argument ('--headless ' + $q + '{exe}' + $q + ' {args}'); \
          $t = New-ScheduledTaskTrigger -AtLogOn -User $u; \
          $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
          -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew; \
-         Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $a -Trigger $t -Settings $s \
+         Register-ScheduledTask -TaskName '{name}' -Action $a -Trigger $t -Settings $s \
          -RunLevel Limited -Force | Out-Null"
     )
 }
 
 fn register_task(exe: &Path) -> WslResult<()> {
-    let script = task_register_script(exe);
+    register_named_task(exe, TASK_NAME, "wsl serve --background")
+}
+
+/// Registers the logon task `name` and starts it now.
+pub(crate) fn register_named_task(exe: &Path, name: &str, args: &str) -> WslResult<()> {
+    let script = task_script(exe, name, args);
     let out = run(
         "powershell.exe",
         &["-NoProfile", "-NonInteractive", "-Command", &script],
@@ -2882,11 +2896,11 @@ fn register_task(exe: &Path) -> WslResult<()> {
             &out,
         ));
     }
-    let out = run("schtasks.exe", &["/Run", "/TN", TASK_NAME], None, SHORT)?;
+    let out = run("schtasks.exe", &["/Run", "/TN", name], None, SHORT)?;
     if !out.ok() {
         return Err(step_failed(
             "schtasks /Run",
-            &format!("schtasks /Run /TN {TASK_NAME}"),
+            &format!("schtasks /Run /TN {name}"),
             &out,
         ));
     }
@@ -2895,16 +2909,16 @@ fn register_task(exe: &Path) -> WslResult<()> {
 
 /// End and delete the logon task. A task that is not there is not an error.
 fn remove_task() {
-    let _ = run("schtasks.exe", &["/End", "/TN", TASK_NAME], None, SHORT);
-    match run(
-        "schtasks.exe",
-        &["/Delete", "/F", "/TN", TASK_NAME],
-        None,
-        SHORT,
-    ) {
-        Ok(out) if out.ok() => println!("deleted task {TASK_NAME}"),
-        Ok(out) => println!("task {TASK_NAME}: {}", out.one_line()),
-        Err(e) => println!("task {TASK_NAME}: {e}"),
+    println!("{}", remove_named_task(TASK_NAME));
+}
+
+/// What happened, in one line.
+pub(crate) fn remove_named_task(name: &str) -> String {
+    let _ = run("schtasks.exe", &["/End", "/TN", name], None, SHORT);
+    match run("schtasks.exe", &["/Delete", "/F", "/TN", name], None, SHORT) {
+        Ok(out) if out.ok() => format!("deleted task {name}"),
+        Ok(out) => format!("task {name}: {}", out.one_line()),
+        Err(e) => format!("task {name}: {e}"),
     }
 }
 
@@ -3047,13 +3061,13 @@ fn pump<R: Read>(reader: Option<R>, log: &Logger) {
 }
 
 #[derive(Clone)]
-struct Logger {
+pub(crate) struct Logger {
     file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
     echo: bool,
 }
 
 impl Logger {
-    fn open(path: &Path, echo: bool) -> WslResult<Self> {
+    pub(crate) fn open(path: &Path, echo: bool) -> WslResult<Self> {
         rotate(path);
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -3070,7 +3084,7 @@ impl Logger {
         self.raw(&format!("supervisor: {text}"));
     }
 
-    fn raw(&self, text: &str) {
+    pub(crate) fn raw(&self, text: &str) {
         if self.echo {
             println!("{text}");
         }
@@ -3154,7 +3168,7 @@ fn session_is_ending() {
 }
 
 /// The PC's side of the feed. A reading Windows does not give is left out.
-fn host_feed(cpu_busy_percent: Option<u64>) -> crate::host::Feed {
+pub(crate) fn host_feed(cpu_busy_percent: Option<u64>) -> crate::host::Feed {
     let memory = host_memory();
     let power = host_power();
     crate::host::Feed {

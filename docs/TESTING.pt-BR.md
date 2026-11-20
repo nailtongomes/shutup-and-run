@@ -288,6 +288,40 @@ shutup-and-run demo sign --configured
 - [ ] `wsl -d shutup-and-run -u root ls /run/shutup-and-run/jobs` fica vazio sem tarefa rodando, também depois de uma tarefa que estourou o tempo e depois de `wsl stop` / `wsl start`.
 - [ ] `shutup-and-run wsl reset`: a instalação diz que o repasse foi desligado; `certificate status` diz off.
 
+### Compartilhar só a internet (sem WSL)
+
+Num servidor Linux com Docker e a porta 7000 aberta para a internet, e num PC Windows 11 **sem WSL** (`wsl --list` não mostra nada, ou o WSL nem está instalado). docs/INTERNET.md explica o porquê de cada passo.
+
+No servidor:
+
+```bash
+git clone https://github.com/nailtongomes/shutup-and-run && cd shutup-and-run/examples/relay
+docker compose up -d --build
+docker compose logs -f relay          # deixe aberto
+curl -s https://api.ipify.org; echo   # o IP do servidor, para comparar
+```
+
+No PC, num PowerShell comum (não de administrador), na pasta onde baixou o `.exe` da última release, salvo como `shutup-and-run.exe`:
+
+```powershell
+.\shutup-and-run.exe internet on --relay IP_DO_SERVIDOR:7000
+.\shutup-and-run.exe internet status        # ok ... connected
+.\shutup-and-run.exe internet credentials   # anote ID e SENHA
+curl.exe -s https://api.ipify.org           # o IP do PC
+```
+
+De volta ao servidor:
+
+```bash
+docker run --rm --network relay_egress curlimages/curl -s -x http://ID:SENHA@relay:8080 https://api.ipify.org; echo
+```
+
+- [ ] O comando imprime o IP do PC, não o do servidor. O log do relay tem `PC ID connected` e uma linha `api.ipify.org:443 sent ... received ...`.
+- [ ] Chrome: pare o relay, descomente `--open=8101=${PC_ID}:${PC_SECRET}` no `compose.yml`, crie `.env` com `PC_ID=ID` e `PC_SECRET=SENHA`, `docker compose up -d`, e rode o `zenika/alpine-chrome ... --dump-dom https://api.ipify.org` de docs/INTERNET.md: o `<body>` tem o IP do PC.
+- [ ] O resto da lista está em [WINDOWS-PENDING.md](WINDOWS-PENDING.md#compartilhar-só-a-internet-alpha-ainda-sem-versão): Defender, sono, relay reiniciado, esperas, rede do PC recusada, bytes, com o worker, desligar, logon.
+
+Num Linux só (prova o caminho e a reconexão, não o IP): `sudo bash tests/internet/local.sh target/release/shutup-and-run`.
+
 ## 5. Windows 11: o atalho, parar, desligar
 
 Ponha o atalho na área de trabalho:

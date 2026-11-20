@@ -71,6 +71,8 @@ async fn main() -> ExitCode {
         Some("pause") => shutup_and_run::cli::pause_cli(true, rest),
         Some("resume") => shutup_and_run::cli::pause_cli(false, rest),
         Some("wsl") => shutup_and_run::wsl::cli(rest).await,
+        Some("internet") => shutup_and_run::internet::cli(rest).await,
+        Some("relay") => shutup_and_run::relay::cli(rest).await,
         None | Some("serve") => {
             let code = serve().await;
             if shutup_and_run::status::restart_wanted() {
@@ -122,6 +124,14 @@ shutup-and-run bans
 
 shutup-and-run bans lift <ip>
     remove a ban and its failure count
+
+shutup-and-run internet on --relay HOST:PORT | off | status | credentials
+    lend only this PC's internet connection to the operator's containers,
+    with no WSL and no Docker. `shutup-and-run internet --help`.
+
+shutup-and-run relay [--agents ADDR] [--proxy ADDR] [--open PORT=ID:SECRET]
+    the operator's side of `internet on`: an HTTP proxy that goes out
+    through the PCs. `shutup-and-run relay --help`.
 
 shutup-and-run wsl <doctor|install|reset|serve|start|stop|logs|uninstall>
     Windows 11: run the service inside a WSL2 distribution of its own.

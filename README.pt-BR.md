@@ -273,6 +273,19 @@ Como fica guardado. `certificate set` confere o arquivo primeiro (precisa abrir 
 
 O que isto não é. Não é isolamento nem cofre. A senha importada é um arquivo comum que o root da máquina lê; no Windows essa máquina é a distribuição WSL2, e o usuário dela é root ali. Apagar um arquivo não o elimina do disco. `certificate validate` diz que o arquivo é utilizável, não que o sistema de um tribunal ou de um banco o aceita. `demo sign` faz uma assinatura básica de PDF (`adbe.pkcs7.detached`) e a verifica com openssl; não é PAdES e não diz nada sobre ICP-Brasil.
 
+## Emprestar só a internet (alpha)
+
+Um PC fraco demais para containers, ou sem WSL, pode emprestar a **conexão de internet**: os containers do operador num datacenter saem pela conexão de casa do cliente, e o site vê o IP residencial do cliente. O PC abre a conexão até um relay do operador (nenhuma porta aberta no PC ou no roteador, funciona atrás de CGNAT); o relay é um proxy HTTP para `requests`, `curl` e Chrome. Sem Docker, sem WSL: só o `.exe`.
+
+```
+shutup-and-run internet on --relay relay.example.com:7000   # no PC: começa agora e a cada logon
+shutup-and-run internet credentials                          # endereço do proxy e senha, para o operador
+shutup-and-run internet status                               # conectado ou por que não, bytes; http://127.0.0.1:8788/
+shutup-and-run relay                                         # no servidor do operador (examples/relay)
+```
+
+Novas conexões esperam enquanto o worker está pausado, fora de `--hours`, na bateria abaixo de 60%, enquanto a pessoa apresenta e em rede limitada; uma conexão já aberta nunca é cortada. Destinos na própria rede do PC são recusados. Nesta versão a ligação até o relay é TCP sem criptografia. A escolha, os riscos, um teste a partir de outra rede e os próximos passos: [docs/INTERNET.md](docs/INTERNET.md).
+
 ## Configuração
 
 Uma máquina tem uma única fonte de configuração.
