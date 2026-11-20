@@ -796,6 +796,7 @@ mod tests {
             max_day_bytes: None,
             relay_token: None,
             consent_at: "2026-01-01T00:00:00Z".to_string(),
+            paused_until: None,
         }
     }
 

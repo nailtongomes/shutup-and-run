@@ -273,12 +273,13 @@ Como fica guardado. `certificate set` confere o arquivo primeiro (precisa abrir 
 
 O que isto não é. Não é isolamento nem cofre. A senha importada é um arquivo comum que o root da máquina lê; no Windows essa máquina é a distribuição WSL2, e o usuário dela é root ali. Apagar um arquivo não o elimina do disco. `certificate validate` diz que o arquivo é utilizável, não que o sistema de um tribunal ou de um banco o aceita. `demo sign` faz uma assinatura básica de PDF (`adbe.pkcs7.detached`) e a verifica com openssl; não é PAdES e não diz nada sobre ICP-Brasil.
 
-## Emprestar só a internet (alpha)
+## Emprestar a internet (alpha)
 
-Um PC fraco demais para containers, ou sem WSL, pode emprestar a **conexão de internet**: os containers do operador num datacenter saem pela conexão de casa do cliente, e o site vê o IP residencial do cliente. O PC abre a conexão até um relay do operador (nenhuma porta aberta no PC ou no roteador, funciona atrás de CGNAT); o relay é um proxy HTTP para `requests`, `curl` e Chrome. Sem Docker, sem WSL: só o `.exe`.
+Um PC pode emprestar a **conexão de internet**, ao lado do worker ou sozinho quando é fraco demais para containers ou não tem WSL: os containers do operador num datacenter saem pela conexão de casa do cliente, e o site vê o IP residencial do cliente. O PC abre a conexão até um relay do operador (nenhuma porta aberta no PC ou no roteador, funciona atrás de CGNAT); o relay é um proxy HTTP para `requests`, `curl` e Chrome. Sem Docker, sem WSL: só o `.exe`.
 
 ```
-shutup-and-run internet on --relay relay.example.com:7000   # no PC: começa agora e a cada logon
+shutup-and-run fit                                           # o que este PC pode emprestar: os dois, ou só a internet
+shutup-and-run internet on --relay relay.example.com:7000 --login ID:SENHA --wait 60   # no PC: começa agora e a cada logon
 shutup-and-run internet credentials                          # endereço do proxy e senha, para o operador
 shutup-and-run internet status                               # conectado ou por que não, bytes; http://127.0.0.1:8788/
 shutup-and-run relay                                         # no servidor do operador (examples/relay)
@@ -286,7 +287,7 @@ shutup-and-run relay                                         # no servidor do op
 
 Novas conexões esperam enquanto o worker está pausado, fora de `--hours`, na bateria abaixo de 60%, enquanto a pessoa apresenta e em rede limitada; uma conexão já aberta nunca é cortada. Destinos na própria rede do PC são recusados. Nesta versão a ligação até o relay é TCP sem criptografia. A escolha, os riscos, um teste a partir de outra rede e os próximos passos: [docs/INTERNET.md](docs/INTERNET.md).
 
-Uma tarefa enviada a um worker seu em outro lugar sai pelo PC de um cliente pelo `env`: `HTTPS_PROXY=http://ID:SENHA@...` (`shutup-and-run internet credentials --env`). No Windows a linha de instalação faz tudo: `$env:SHUTUP_AND_RUN_RELAY = "relay.exemplo.com:7000"` antes de `irm .../install.ps1 | iex`.
+Uma tarefa enviada a um worker seu em outro lugar sai pelo PC de um cliente pelo `env`: `HTTPS_PROXY=http://ID:SENHA@...` (`shutup-and-run internet credentials --env`). No Windows a linha de instalação faz tudo: `$env:SHUTUP_AND_RUN_RELAY = "relay.exemplo.com:7000"` (e `$env:SHUTUP_AND_RUN_POLL_URL` para o worker também) antes de `irm .../install.ps1 | iex`; o `install.sh` aceita o mesmo. A pessoa no PC pausa ou desliga pelos botões em http://127.0.0.1:8788/, ou com `shutup-and-run internet pause --for 1h` e `internet off`. Os passos de um agente: [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#a-task-from-the-operator-run-it-here-lend-the-internet-or-both).
 
 ## Configuração
 

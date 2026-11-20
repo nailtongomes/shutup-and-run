@@ -643,8 +643,23 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - A stream with no byte either way for 10 minutes is closed, on the PC and on the relay.
 - `--max-day`: past it, new streams wait until midnight on the PC's clock.
 - The logon tasks (the worker's and this one) restart a process that ended with an error a minute later, up to 999 times.
-- `install.ps1` with `SHUTUP_AND_RUN_RELAY` runs `internet on` instead of the WSL install, and restarts internet sharing after an update. `wsl uninstall` removes it too.
+- `install.ps1` with `SHUTUP_AND_RUN_RELAY` runs `internet on`, and restarts internet sharing after an update. `wsl uninstall` removes it too.
 - `GET /status` on the proxy port, with a PC's login, says whether it is connected; once a minute the relay logs each PC whose numbers changed.
 - A task goes out through a PC by its `env` (`HTTPS_PROXY`); the request has no proxy field.
 
 **Cost.** One more round trip before each stream. A 0.2.26 PC stops connecting until it is updated. A site reached only over IPv6 waits for the IPv4 attempts first, 3 s each. A WebSocket or a long poll silent for 10 minutes is closed. An id whose PC changed its password waits 10 minutes. A task that keeps failing at once restarts every minute instead of stopping.
+
+## Internet sharing beside the worker: one command for an agent, a login from the operator, a pause and a stop on the page
+
+**Context.** The PCs are clients the operator trusts, who trust the operator; their own AI agent sets things up. The agent had to combine three documents, run `on`, poll `status` until connected, and send the generated password back to the operator's backend. The install line lent either the internet or containers, never both. A PC that only lent its internet had no pause, and the person at it could stop it only from a terminal.
+
+**Decision.**
+
+- `fit --json`: `both` or `internet`, from what the doctor and the safety levels already read: WSL2 on Windows (`WSL_UNAVAILABLE`), and a PC above the small-machine line (`SAFETY_SMALL_MACHINE`, which would need the owner's authorization for jobs). No new code.
+- `internet on --login ID:PASSWORD`: the operator's backend chooses the login, so nothing comes back from the PC; the backend checks the PC with the relay's `GET /status`. `--wait SECONDS` returns once connected, or exits 1 with the code and the hint (`INTERNET_REFUSED`, `INTERNET_WAITING`, `INTERNET_RELAY_UNREACHABLE`). It takes only a status written after it began, and for a new login a connection made after it began.
+- The install lines (`install.ps1`, `install.sh`) do both: `SHUTUP_AND_RUN_RELAY` turns on the internet, and `SHUTUP_AND_RUN_POLL_URL` the worker too, on Windows only where `fit` says containers. Not connected within 60 s is not a failed install. `install.sh` gets `SHUTUP_AND_RUN_INTERNET_ONLY=1` (no Docker).
+- `status` shows the internet line and an `internet` section; with no worker it says `"worker": "not installed"` and takes the internet's exit code.
+- Its own pause (`internet pause --for`, `internet resume`, `paused_until` in `internet.json`), and on the page two buttons: pause 1 hour (or resume) and stop sharing, behind the same loopback and same-origin check as the worker's page. The stop deletes the task or unit without ending the process, which sees the file and exits cleanly; the systemd unit is now `Restart=on-failure`, so a clean exit stays stopped.
+- Nothing was cut: `--open` ports, the page, plain TCP and a relay without a token stay as options, with their risks in docs/INTERNET.md.
+
+**Cost.** The page is no longer read-only: anyone at the PC can stop the sharing, which is the point. The backend holds every PC's password (`--login`). An older binary refuses an `internet.json` with `paused_until` (unknown fields stay refused), so going back a version after a pause needs `internet on` again. `fit` on Linux does not look for Docker: the install puts it there.

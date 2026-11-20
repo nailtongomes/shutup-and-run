@@ -6,7 +6,7 @@ When the person asks what to expect (a slow PC, a battery, a shutdown, a job tha
 
 ## Rules of the CLI
 
-- Add `--json` to `config`, `status`, `doctor`, `jobs`, `pause` and `resume`: one JSON object on stdout, `"ok": true|false`, and `"error"`, `"code"` and `"hint"` when false.
+- Add `--json` to `config`, `status`, `doctor`, `jobs`, `pause`, `resume`, `fit` and `internet`: one JSON object on stdout, `"ok": true|false`, and `"error"`, `"code"` and `"hint"` when false.
 - `hint` is the next step: short, one concrete action, with the command when there is one. Run it if you have a shell; read it to the person if you are guiding one. Without `--json` it is the `hint:` line. Its language is the config key `language`: `shutup-and-run config set language pt` for Portuguese, `en` (the default) for English; `shutup-and-run wsl install --language pt` sets it at install. The local page opens in that language too, until the person presses its language button. The [catalogue](#codes-and-hints) lists every code.
 - Exit codes: `0` done. `1` it failed, or the doctor found a problem. `2` wrong command line. `3` invalid config or value; nothing was written.
 - `shutup-and-run config --help` documents every command. `shutup-and-run config keys` lists every key.
@@ -191,23 +191,32 @@ The JSON also carries `fix`. It is the same sentence under the name 0.2.8 used; 
 | `WSL_LIMITS_NOT_IN_EFFECT` | The limits apply when WSL restarts: `shutup-and-run wsl stop`, `wsl --shutdown` (it stops every WSL distribution of this user), `shutup-and-run wsl start`. | Os limites valem quando o WSL reinicia: `shutup-and-run wsl stop`, `wsl --shutdown` (para todas as distribuições WSL deste usuário), `shutup-and-run wsl start`. |
 | `INTERNET_NOT_RUNNING` | Run `shutup-and-run internet on --relay HOST:PORT` again with the same relay: it starts the process and its logon task (Linux: its systemd unit). | Rode `shutup-and-run internet on --relay HOST:PORTA` de novo com o mesmo relay: ele inicia o processo e a tarefa de logon (Linux: a unidade do systemd). |
 | `INTERNET_RELAY_UNREACHABLE` | Check that this PC reaches {} (`Test-NetConnection HOST -Port PORT` on Windows, `nc -vz HOST PORT` on Linux) and that the relay runs; it reconnects by itself. | Confira se este PC alcança {} (`Test-NetConnection HOST -Port PORTA` no Windows, `nc -vz HOST PORTA` no Linux) e se o relay está no ar; ele reconecta sozinho. |
-| `INTERNET_REFUSED` | The relay says why on this line. A token: `shutup-and-run internet on --relay HOST:PORT --token TOKEN` with the operator's. An id in use: the same with `--id NEW-NAME`. | O relay diz o motivo nesta linha. Token: `shutup-and-run internet on --relay HOST:PORTA --token TOKEN` com o do operador. Id em uso: o mesmo com `--id NOVO-NOME`. |
-| `INTERNET_WAITING` | New connections resume by themselves when the reason on this line ends. `shutup-and-run resume` ends a pause; `internet on ... --metered` accepts a metered network, `--max-day` sets the daily limit. | Novas conexões voltam sozinhas quando o motivo desta linha acabar. `shutup-and-run resume` encerra uma pausa; `internet on ... --metered` aceita rede limitada, `--max-day` define o limite diário. |
+| `INTERNET_REFUSED` | The relay says why on this line. A token: `shutup-and-run internet on --relay HOST:PORT --token TOKEN` with the operator's. An id in use: the same with `--id NEW-NAME` or a new `--login`. | O relay diz o motivo nesta linha. Token: `shutup-and-run internet on --relay HOST:PORTA --token TOKEN` com o do operador. Id em uso: o mesmo com `--id NOVO-NOME` ou um novo `--login`. |
+| `INTERNET_WAITING` | New connections resume by themselves when the reason on this line ends. `shutup-and-run internet resume` (or `resume`, for the worker's) ends a pause; `internet on ... --metered` accepts a metered network, `--max-day` sets the daily limit. | Novas conexões voltam sozinhas quando o motivo desta linha acabar. `shutup-and-run internet resume` (ou `resume`, a do worker) encerra uma pausa; `internet on ... --metered` aceita rede limitada, `--max-day` define o limite diário. |
 | any other | Run `shutup-and-run doctor --report` and open the issue link it prints. | Rode `shutup-and-run doctor --report` e abra o link de issue que ele imprime. |
 
-## Internet sharing (a PC with no WSL, or too weak for jobs)
+## A task from the operator: run it here, lend the internet, or both
 
-When the operator asks to lend only this PC's connection, run as the PC's user, no administrator, no WSL needed:
+A person asks you, their agent, to take part in the operator's work: run containers on this PC, lend its internet connection, or both. The two live side by side; neither needs the other.
 
-On Windows, the install line does all of it (`$env:SHUTUP_AND_RUN_RELAY = "HOST:PORT"`, `$env:SHUTUP_AND_RUN_RELAY_TOKEN` when the operator gave one, then `irm .../install.ps1 | iex`). By hand:
+1. **Ask before turning anything on.** Read this to the person, in their language, and go on only on a clear yes:
+   > "This lets the operator use this PC: its internet connection, so their programs reach sites as if from your home, and, if it can, part of its processor and memory for their containers. Connections to your own network are refused. It waits while you are on battery, presenting, on a metered network, or outside the hours you set, and you can pause or stop it at any time on http://127.0.0.1:8788/ or with `shutup-and-run internet off`."
+2. **What can it lend?** `shutup-and-run fit --json` (no install needed: run it once the `.exe` or the binary is there). `"lend": "both"` or `"internet"`; the `containers` line says why not, with its hint. No WSL2 means an administrator and a restart: lend the internet now and offer the containers for when they can restart.
+3. **Internet, one command.** The operator gives the relay, its token and, best, the login it chose for this PC:
+   ```bash
+   shutup-and-run internet on --relay HOST:PORT --token TOKEN --login ID:PASSWORD --wait 60 --json
+   ```
+   It returns once connected (`"connected": true`, exit 0), or exits 1 with `code` and `hint`: `INTERNET_REFUSED` (the relay said why), `INTERNET_WAITING` (a battery, a metered network, the hours: it starts by itself later), `INTERNET_RELAY_UNREACHABLE`. With `--login`, nothing needs to go back to the operator: the backend already knows `http://ID:PASSWORD@RELAY:8080` and checks the PC with `GET /status` on the relay. Without it, `internet credentials --json` gives the address to send to the operator, and nowhere else.
+4. **Containers too**, when `fit` said `both`: Windows, `shutup-and-run wsl install --poll-url URL --max-slots 1`; Linux, the install line. Or [managed containers](#managed-containers-work-with-no-poll-url) when there is no poll URL.
+5. **Check, one read.** `shutup-and-run status --json`: the worker, and an `internet` section when it is on. On a PC that only lends the internet, `"worker": "not installed"` and the exit code is the internet's.
 
-```bash
-shutup-and-run internet on --relay HOST:PORT --token TOKEN --json   # both from the operator; it starts now and at every logon
-shutup-and-run internet status --json                 # wait for "state":"connected"; exit 1 and a hint otherwise
-shutup-and-run internet credentials --json            # "proxy": send this to the operator, and nowhere else
-```
+On Windows the install line does steps 3 and 4: `$env:SHUTUP_AND_RUN_RELAY = "HOST:PORT"`, `$env:SHUTUP_AND_RUN_RELAY_TOKEN`, `$env:SHUTUP_AND_RUN_INTERNET_LOGIN = "ID:PASSWORD"`, and `$env:SHUTUP_AND_RUN_POLL_URL` for the worker too, then `irm .../install.ps1 | iex`. It installs the worker only where `fit` says containers; elsewhere it lends the internet and prints what the worker needs. On Linux the same variables go to `install.sh`; `SHUTUP_AND_RUN_INTERNET_ONLY=1` skips Docker and the worker.
 
-`--hours "mon-fri 19-07"` limits when; `--max-day 5g` limits the data a day; `--metered` lets it use a metered network, only if the PC's owner agreed. For a task that must go out through this PC, `shutup-and-run internet credentials --env` prints the `HTTPS_PROXY` and `HTTP_PROXY` lines for its `env` (docs/INTERNET.md, "A task that goes out through a client's connection"). `internet off --forget` undoes all of it. Turning it on is the owner's consent: do it only when the owner asked. docs/INTERNET.md has the risks to tell them.
+The person can always stop it: the page's buttons (pause 1 hour, stop sharing), `shutup-and-run internet pause --for 2h`, `internet resume`, `internet off`. The worker's `pause` holds the internet too.
+
+## Internet sharing: more
+
+`--hours "mon-fri 19-07"` limits when; `--max-day 5g` limits the data a day; `--metered` lets it use a metered network, only if the PC's owner agreed. For a task that must go out through this PC, `shutup-and-run internet credentials --env` prints the `HTTPS_PROXY` and `HTTP_PROXY` lines for its `env` (docs/INTERNET.md, "A task that goes out through a client's connection"). `internet status --json` is this mode alone. `internet off --forget` undoes all of it, the id and password included. Turning it on is the owner's consent: do it only when the owner asked. docs/INTERNET.md has the risks to tell them.
 
 ## Managed containers (work with no poll URL)
 

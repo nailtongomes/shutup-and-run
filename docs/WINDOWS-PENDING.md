@@ -132,3 +132,13 @@ Com o relay do `examples/relay` atual (que agora pede `relay_token`):
 - [ ] **Id guardado.** Com o PC dormindo 3 minutos, um segundo PC com o mesmo `--id` e outra senha é recusado (`id in use`); o primeiro, ao acordar, volta.
 - [ ] **Uninstall.** `shutup-and-run wsl uninstall --purge` num PC com a internet ligada: a tarefa `shutup-and-run-internet` some e os arquivos `internet.*` também.
 - [ ] **Status pelo relay.** No servidor, `curl -s http://ID:SENHA@relay:8080/status` diz `"connected":true` com o PC ligado e `false` com ele desligado.
+
+## Internet ao lado do worker: um comando para a IA, login do operador, pausar e parar pela página (ainda sem versão)
+
+- [ ] **`fit`.** Num PC sem WSL, `shutup-and-run fit` diz `lend: internet` e `WSL_UNAVAILABLE` com "administrator and a restart"; num PC com WSL2 e 16 GB, `lend: both`; num de 8 GB ou menos, `lend: internet` com `SAFETY_SMALL_MACHINE`.
+- [ ] **Um comando.** `shutup-and-run internet on --relay SERVIDOR:7000 --token TOKEN --login pc-teste-01:SENHA-DE-16-OU-MAIS --wait 60 --json` volta em segundos com `"connected":true`. Com o token errado, volta em menos de 10 s com `INTERNET_REFUSED`; com o relay parado, depois de 60 s com `INTERNET_RELAY_UNREACHABLE`. No servidor, `curl -s http://pc-teste-01:SENHA@relay:8080/status` diz `"connected":true` sem ninguém ter copiado nada do PC.
+- [ ] **Instalação com os dois.** Num PC com WSL2: `$env:SHUTUP_AND_RUN_RELAY`, `$env:SHUTUP_AND_RUN_RELAY_TOKEN`, `$env:SHUTUP_AND_RUN_INTERNET_LOGIN` e `$env:SHUTUP_AND_RUN_POLL_URL`, depois `irm .../install.ps1 | iex`: a internet conecta e o `wsl install` roda. `shutup-and-run status` mostra o worker e a linha `internet:`. Num PC sem WSL, a mesma linha empresta a internet e diz `the worker waits: no WSL2 here yet` com a dica; rodar de novo depois de instalar o WSL e reiniciar instala o worker sem derrubar a internet.
+- [ ] **Atualização com os dois.** Rode a linha de novo sem variáveis: o worker volta (`wsl update`) e a internet também.
+- [ ] **Botões da página.** Em http://127.0.0.1:8788/, "Pausar 1 hora": `internet status` diz `waits: INTERNET_PAUSED`, um download em curso termina e o próximo pedido recebe 503; "Retomar agora" volta. "Parar de compartilhar": a página diz que desligou, some em alguns segundos, a tarefa `shutup-and-run-internet` não existe mais (`schtasks /Query /TN shutup-and-run-internet` falha) e ela não volta no próximo logon.
+- [ ] **Pausa pela linha de comando.** `shutup-and-run internet pause --for 30m` e `internet resume`: o mesmo, num PC só com internet.
+- [ ] **Status num PC só com internet.** `shutup-and-run status --json` diz `"worker":"not installed"`, traz `internet`, e sai 0 com ela conectada, 1 com ela parada.

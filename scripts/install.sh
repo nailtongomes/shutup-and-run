@@ -12,6 +12,10 @@
 #
 # Show the token once:  sudo SHUTUP_AND_RUN_SHOW_TOKEN=1 bash scripts/install.sh
 # Skip ufw:             sudo SHUTUP_AND_RUN_NO_UFW=1 bash scripts/install.sh
+# Lend the internet connection too, through the operator's relay (made-up values):
+#   curl -fsSL .../install.sh | sudo SHUTUP_AND_RUN_RELAY=relay.example.com:7000 \
+#     SHUTUP_AND_RUN_RELAY_TOKEN=<token> SHUTUP_AND_RUN_INTERNET_LOGIN=<id>:<password> bash
+# Only the internet connection, no Docker and no worker: add SHUTUP_AND_RUN_INTERNET_ONLY=1.
 # Remove it:            sudo bash scripts/install.sh --uninstall
 # Remove config too:    sudo bash scripts/install.sh --uninstall --purge
 set -euo pipefail
@@ -29,6 +33,9 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 if [[ "${1:-}" == "--uninstall" ]]; then
+  if [[ -x "$PREFIX/$NAME" ]]; then
+    "$PREFIX/$NAME" internet off >/dev/null 2>&1 || true
+  fi
   systemctl disable --now "$NAME" >/dev/null 2>&1 || true
   rm -f "$UNIT" "$PREFIX/$NAME"
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -41,14 +48,26 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
-export DEBIAN_FRONTEND=noninteractive
-if ! command -v docker >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
-  apt-get update
-  apt-get install -y docker.io openssl curl ca-certificates
+internet_only=
+if [[ -n "${SHUTUP_AND_RUN_RELAY:-}" && "${SHUTUP_AND_RUN_INTERNET_ONLY:-}" == 1 ]]; then
+  internet_only=1
 fi
-if ! docker info >/dev/null 2>&1; then
-  systemctl enable --now docker
-  docker info >/dev/null
+
+export DEBIAN_FRONTEND=noninteractive
+if [[ -n "$internet_only" ]]; then
+  if ! command -v curl >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y curl ca-certificates
+  fi
+else
+  if ! command -v docker >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y docker.io openssl curl ca-certificates
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    systemctl enable --now docker
+    docker info >/dev/null
+  fi
 fi
 
 install_bin() {
@@ -83,6 +102,28 @@ install_bin() {
   rm -rf "$dir"
 }
 install_bin
+
+# Internet sharing: `internet on` waits up to 60 s for the relay. Not
+# connected yet is not a failed install: it says why and keeps trying.
+if [[ -n "${SHUTUP_AND_RUN_RELAY:-}" ]]; then
+  on=(internet on --relay "$SHUTUP_AND_RUN_RELAY" --wait 60)
+  if [[ -n "${SHUTUP_AND_RUN_RELAY_TOKEN:-}" ]]; then
+    on+=(--token "$SHUTUP_AND_RUN_RELAY_TOKEN")
+  fi
+  if [[ -n "${SHUTUP_AND_RUN_INTERNET_LOGIN:-}" ]]; then
+    on+=(--login "$SHUTUP_AND_RUN_INTERNET_LOGIN")
+  fi
+  set +e
+  "$PREFIX/$NAME" "${on[@]}"
+  code=$?
+  set -e
+  if [[ "$code" == 2 ]]; then
+    exit 2
+  fi
+  if [[ -n "$internet_only" ]]; then
+    exit 0
+  fi
+fi
 
 cpus=$(nproc)
 mem_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)

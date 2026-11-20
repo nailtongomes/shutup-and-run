@@ -72,6 +72,7 @@ async fn main() -> ExitCode {
         Some("resume") => shutup_and_run::cli::pause_cli(false, rest),
         Some("wsl") => shutup_and_run::wsl::cli(rest).await,
         Some("internet") => shutup_and_run::internet::cli(rest).await,
+        Some("fit") => shutup_and_run::fit::cli(rest),
         Some("relay") => shutup_and_run::relay::cli(rest).await,
         None | Some("serve") => {
             let code = serve().await;
@@ -125,9 +126,14 @@ shutup-and-run bans
 shutup-and-run bans lift <ip>
     remove a ban and its failure count
 
-shutup-and-run internet on --relay HOST:PORT | off | status | credentials
-    lend only this PC's internet connection to the operator's containers,
-    with no WSL and no Docker. `shutup-and-run internet --help`.
+shutup-and-run fit [--json]
+    what this PC can lend before anything is installed: containers and its
+    internet connection, or only its internet connection, and why.
+
+shutup-and-run internet on --relay HOST:PORT | pause | resume | off | status | credentials
+    lend this PC's internet connection to the operator's containers, with
+    no WSL and no Docker, alone or beside the worker.
+    `shutup-and-run internet --help`.
 
 shutup-and-run relay [--agents ADDR] [--proxy ADDR] [--open PORT=ID:SECRET]
     the operator's side of `internet on`: an HTTP proxy that goes out

@@ -51,22 +51,27 @@ The operator tells the client, or the client's AI agent, one line. Windows (Powe
 ```powershell
 $env:SHUTUP_AND_RUN_RELAY = "relay.example.com:7000"
 $env:SHUTUP_AND_RUN_RELAY_TOKEN = "TOKEN"     # only when the relay asks for one
+$env:SHUTUP_AND_RUN_INTERNET_LOGIN = "ID:PASSWORD"   # optional: the login the operator chose for this PC
 irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
 ```
 
-The install line downloads the `.exe`, checks it against `SHA256SUMS`, puts it on the PATH and runs `shutup-and-run internet on --relay ... --token ...` instead of the WSL install. Run again, it is the update, and it starts internet sharing again on the new `.exe`. `internet on` itself copies the `.exe` to `C:\ProgramData\shutup-and-run\`, registers the logon task `shutup-and-run-internet` (under `conhost --headless`, no window) and starts it. On a PC that already runs the worker, the same `.exe` does it; the worker and this mode are independent.
+The install line downloads the `.exe`, checks it against `SHA256SUMS`, puts it on the PATH and runs `shutup-and-run internet on --relay ... --token ... --login ... --wait 60`: it returns once the PC is connected, or says why not (and keeps trying). With `$env:SHUTUP_AND_RUN_POLL_URL` too, it also installs the worker, where `shutup-and-run fit` says this PC can run containers (WSL2 already there, 8 GiB and more than 2 processors); elsewhere it lends the internet now and prints what the worker needs. Run again, it is the update, and it starts internet sharing again on the new `.exe`. `internet on` itself copies the `.exe` to `C:\ProgramData\shutup-and-run\`, registers the logon task `shutup-and-run-internet` (under `conhost --headless`, no window) and starts it. On a PC that already runs the worker, the same `.exe` does it; the worker and this mode are independent.
 
-Linux (root): `shutup-and-run internet on --relay relay.example.com:7000` writes and starts the systemd unit `shutup-and-run-internet`. Without systemd, keep `shutup-and-run internet serve` running.
+Linux (root): `shutup-and-run internet on --relay relay.example.com:7000` writes and starts the systemd unit `shutup-and-run-internet`. Without systemd, keep `shutup-and-run internet serve` running. `install.sh` takes the same `SHUTUP_AND_RUN_RELAY`, `SHUTUP_AND_RUN_RELAY_TOKEN` and `SHUTUP_AND_RUN_INTERNET_LOGIN`, beside the worker it installs, or alone with `SHUTUP_AND_RUN_INTERNET_ONLY=1` (no Docker).
+
+**The login from the operator's backend.** `--login ID:PASSWORD` (the password 16 to 128 letters, digits, `-`, `_` or `.`) sets the id and the password the operator chose, so nothing has to come back from the PC: the task is created with `HTTPS_PROXY=http://ID:PASSWORD@relay:8080`, and the backend asks the relay's `GET /status` with the same login whether that PC is connected. Without it, the PC makes its own and `internet credentials` shows them. An agent sets it up in one command: `internet on --relay HOST:7000 --token TOKEN --login ID:PASSWORD --wait 60 --json`.
 
 | Command | What it does |
 | --- | --- |
-| `internet on --relay HOST:PORT [--id NAME] [--token TOKEN] [--hours "mon-fri 19-07"] [--max-day 5g] [--metered]` | turn on, or change; keeps the id, the password and the token of a previous `on` |
+| `fit [--json]` | before anything: `both` (containers and the internet) or `internet`, and why |
+| `internet on --relay HOST:PORT [--login ID:PASSWORD \| --id NAME] [--token TOKEN] [--hours "mon-fri 19-07"] [--max-day 5g] [--metered] [--wait SECONDS]` | turn on, or change; keeps the id, the password and the token of a previous `on`. `--wait` returns once connected, or exits 1 with the code and the hint |
+| `internet pause [--for 1h]`, `internet resume` | new streams wait (30m, 2h, 1d, `day`), or stop waiting; open ones go on |
 | `internet status [--json]` | `ok`, or why not, with a `hint`; bytes carried, and today's against `--max-day`. Exit 1 when on and not working |
 | `internet credentials [--json \| --env]` | the proxy address with the password, for the operator; `--env` as `HTTPS_PROXY=` and `HTTP_PROXY=` lines, for a task's env |
 | `internet off [--forget]` | stop and remove the task or unit; `--forget` also deletes the id and password. `wsl uninstall` does both |
-| `http://127.0.0.1:8788/` | the same, on a page, refreshed every 10 seconds. Read-only |
+| `http://127.0.0.1:8788/` | the same, on a page, refreshed every 10 seconds, with two buttons for the person at the PC: pause 1 hour (or resume) and stop sharing |
 
-`doctor` shows the same `internet` line on a machine where it was turned on. Codes: `INTERNET_NOT_RUNNING`, `INTERNET_RELAY_UNREACHABLE`, `INTERNET_REFUSED`, `INTERNET_WAITING` (hints in [FOR-AGENTS.md](FOR-AGENTS.md#codes-and-hints)).
+`doctor` and `status` show the same `internet` line on a machine where it was turned on; `status --json` has it as `internet`, and on a PC with no worker says `"worker": "not installed"`. Codes: `INTERNET_NOT_RUNNING`, `INTERNET_RELAY_UNREACHABLE`, `INTERNET_REFUSED`, `INTERNET_WAITING` (hints in [FOR-AGENTS.md](FOR-AGENTS.md#codes-and-hints)).
 
 The files are in `C:\ProgramData\shutup-and-run\` on Windows and `/var/lib/shutup-and-run/` on Linux: `internet.json` (the relay, the id, the password, the hours; mode 600 on Linux), `internet-status.json` (written every 5 to 30 seconds), `internet.log` (rotated at 10 MB, two files). `internet off --forget` deletes them.
 
@@ -76,6 +81,7 @@ The files are in `C:\ProgramData\shutup-and-run\` on Windows and `/var/lib/shutu
 | --- | --- |
 | Owner's consent | Turning it on at the PC is the consent; `consent_at` in `internet.json` records when. Nothing remote turns it on. |
 | `pause` of the worker | Yes: while the worker is paused (`status.json` says `draining`), new streams wait. |
+| Its own pause | `internet pause --for 1h`, or the page's button: new streams wait until then (`INTERNET_PAUSED`). `internet resume`, or `on` again, ends it. |
 | Hours | Yes, its own: `--hours`, in the syntax of `lend_hours`, on the Windows clock. |
 | Battery under 60% | Yes (Windows). |
 | Presenting or full screen | Yes (Windows). |
@@ -101,7 +107,7 @@ The PC counts what crosses the site's side of each stream: `bytes_received` (fro
 - In between, the relay may still hold connections that are dead. It tries first the one heard from in the last 15 s, and a claimed connection must answer `A` within 3 s; one that does not is skipped for the next, up to 3, so a request right after a wake costs a few seconds, not a `502`.
 - A stream with no byte either way for 10 minutes is closed on both sides: after a sleep its other end is gone, and it would hold one of the PC's 256 places for good.
 - An id keeps its password on the relay for 10 minutes after its last connection is gone: a PC that slept gets its id back, not whoever connected first. A relay restart forgets it; the token is what keeps others out then.
-- The process itself: the logon task (Windows), which also starts it again a minute after it ends with an error, up to 999 times; `Restart=always` (systemd).
+- The process itself: the logon task (Windows), which also starts it again a minute after it ends with an error, up to 999 times; `Restart=on-failure` (systemd). The process exits cleanly only when it is turned off, so the page's stop is not undone.
 
 `cargo test relay::` runs these against a real relay in the process: one that restarts on the same port, one that greets and then goes silent, a dead connection skipped for a live one, an id kept while its PC is away, and a wait that closes and reopens.
 
@@ -188,6 +194,7 @@ The client accepted these in the contract; this is the list to point at.
 - **The proxy port is the client's connection.** With the password, anyone who reaches `8080` uses it; an `--open` port needs no password at all. Keep both on a private network.
 - **Chrome may leak the datacenter's IP through WebRTC** (UDP is not carried). `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` stops that. UDP and QUIC do not go through the PC.
 - **The password is readable on the PC** (`internet.json`, the page, `internet credentials`). Anyone at the PC can read it, as they can the poll token.
+- **With `--login` the operator's backend holds every PC's password**, and the install line carries it in an environment variable of that PowerShell session. Keep it with the poll tokens, out of logs and tickets.
 
 Left out on purpose: an allowlist of destinations, strong authentication, several operators or tenants, billing, and choosing the PC automatically.
 

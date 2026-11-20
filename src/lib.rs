@@ -13,6 +13,7 @@ pub mod cli;
 pub mod clock;
 pub mod config;
 pub mod devx;
+pub mod fit;
 pub mod hints;
 pub mod host;
 pub mod internet;

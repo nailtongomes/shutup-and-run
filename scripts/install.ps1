@@ -23,13 +23,17 @@
 # config, the poll token and the job history are kept. On any failure the
 # previous .exe is put back and started, and no download is left behind.
 #
-# Internet sharing only (a PC with no WSL, or too weak for jobs; no
-# administrator, no WSL needed):
+# Internet sharing (no administrator, no WSL needed), alone or beside the
+# worker:
 #   $env:SHUTUP_AND_RUN_RELAY = "relay.example.com:7000"
-#   $env:SHUTUP_AND_RUN_RELAY_TOKEN = "<token>"   # only when the relay asks for one
+#   $env:SHUTUP_AND_RUN_RELAY_TOKEN = "<token>"        # only when the relay asks for one
+#   $env:SHUTUP_AND_RUN_INTERNET_LOGIN = "<id>:<password>"   # optional: what the operator chose
 #   irm .../install.ps1 | iex
-# runs `shutup-and-run internet on --relay ...` instead of the WSL install.
-# An update over it starts the task shutup-and-run-internet again.
+# runs `shutup-and-run internet on --relay ... --wait 60`. With
+# SHUTUP_AND_RUN_POLL_URL as well it also installs the worker, when this PC
+# has WSL2 (`shutup-and-run fit`); without WSL2 it lends the internet now
+# and says what the worker needs. An update over it starts the task
+# shutup-and-run-internet again.
 #
 # For the worker it needs WSL2 already enabled: `wsl --install --no-distribution` as
 # administrator, then a reboot. This script does not need administrator.
@@ -142,22 +146,41 @@ try {
     }
     if (-not ($env:Path -split ";" | Where-Object { $_ -eq $Dir })) { $env:Path = "$env:Path;$Dir" }
 
-    if ($env:SHUTUP_AND_RUN_RELAY) {
-        $On = @("internet", "on", "--relay", $env:SHUTUP_AND_RUN_RELAY)
+    $Relay = $env:SHUTUP_AND_RUN_RELAY
+    if ($Relay) {
+        $On = @("internet", "on", "--relay", $Relay, "--wait", "60")
         if ($env:SHUTUP_AND_RUN_RELAY_TOKEN) { $On += @("--token", $env:SHUTUP_AND_RUN_RELAY_TOKEN) }
+        if ($env:SHUTUP_AND_RUN_INTERNET_LOGIN) { $On += @("--login", $env:SHUTUP_AND_RUN_INTERNET_LOGIN) }
         & $Exe @On
-        if ($LASTEXITCODE -ne 0) { throw "shutup-and-run internet on failed: exit code $(Describe-Exit $LASTEXITCODE)" }
-        Write-Host "give the operator what this prints: shutup-and-run internet credentials"
-    } elseif ($env:SHUTUP_AND_RUN_POLL_URL) {
-        & $Exe wsl install --poll-url $env:SHUTUP_AND_RUN_POLL_URL
+        # Exit 1 is on but not connected yet: the line above says why, and it
+        # keeps trying by itself. Not a reason to undo the install.
+        if ($LASTEXITCODE -eq 2) { throw "shutup-and-run internet on: exit code 2 (usage)" }
+        if (-not $env:SHUTUP_AND_RUN_INTERNET_LOGIN) {
+            Write-Host "give the operator what this prints: shutup-and-run internet credentials"
+        }
+    }
+    # Containers too only where WSL2 is already there and the PC has room:
+    # enabling WSL2 needs an administrator and a restart, which an install
+    # that lends the internet does not wait for.
+    $Worker = $env:SHUTUP_AND_RUN_POLL_URL
+    if ($Relay -and $Worker) {
+        $Fit = (& $Exe fit --json) | ConvertFrom-Json
+        if (-not $Fit.containers) {
+            $Worker = $null
+            Write-Host "the worker waits: $($Fit.checks[0].detail)"
+            Write-Host "hint: $($Fit.checks[0].hint) Then run this install again."
+        }
+    }
+    if ($Worker) {
+        & $Exe wsl install --poll-url $Worker
         if ($LASTEXITCODE -ne 0) { throw "shutup-and-run wsl install failed: exit code $(Describe-Exit $LASTEXITCODE)" }
-    } elseif ($Had -and ($Task -or -not $Internet)) {
+    } elseif ($Had -and ($Task -or (-not $Internet -and -not $Relay))) {
         & $Exe wsl update
         # Exit 2 is the usage: a release older than `wsl update`. Its install
         # keeps the config and puts in the Linux binary of its own version.
         if ($LASTEXITCODE -eq 2) { & $Exe wsl install }
         if ($LASTEXITCODE -ne 0) { throw "shutup-and-run wsl update failed: exit code $(Describe-Exit $LASTEXITCODE)" }
-    } else {
+    } elseif (-not $Relay) {
         Write-Host ""
         Write-Host "next (set SHUTUP_AND_RUN_POLL_TOKEN first if your orchestrator issued one):"
         Write-Host "  shutup-and-run wsl install --poll-url https://orchestrator.example/poll"

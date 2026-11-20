@@ -609,6 +609,16 @@ fn wsl_status() -> WslResult<Output> {
     run("wsl.exe", &["--status"], None, SHORT)
 }
 
+/// WSL2 answers `wsl --status`, or what it said instead: the doctor's
+/// first line, for `fit`.
+pub(crate) fn wsl_ready() -> Result<(), String> {
+    match wsl_status() {
+        Ok(out) if out.ok() => Ok(()),
+        Ok(out) => Err(out.one_line()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn list_distros() -> WslResult<Vec<Distro>> {
     // With no distribution at all wsl.exe prints a localized message and
     // exits non-zero. That parses as no distributions, which is the answer.
@@ -779,7 +789,7 @@ pub(crate) fn wsl_budget(ram_bytes: u64, cpus: u64) -> (u64, u64) {
 }
 
 /// Physical RAM of this PC. None when it cannot be read.
-fn host_memory_bytes() -> Option<u64> {
+pub(crate) fn host_memory_bytes() -> Option<u64> {
     host_memory().map(|(total, _)| total)
 }
 
@@ -818,7 +828,7 @@ fn host_memory() -> Option<(u64, u64)> {
     ))
 }
 
-fn host_cpus() -> u64 {
+pub(crate) fn host_cpus() -> u64 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u64)
         .unwrap_or(1)
@@ -2918,6 +2928,12 @@ fn remove_task() {
 /// What happened, in one line.
 pub(crate) fn remove_named_task(name: &str) -> String {
     let _ = run("schtasks.exe", &["/End", "/TN", name], None, SHORT);
+    delete_named_task(name)
+}
+
+/// Delete the logon task and leave its running process be: for that process
+/// itself, which `/End` would end before the `/Delete`.
+pub(crate) fn delete_named_task(name: &str) -> String {
     match run("schtasks.exe", &["/Delete", "/F", "/TN", name], None, SHORT) {
         Ok(out) if out.ok() => format!("deleted task {name}"),
         Ok(out) => format!("task {name}: {}", out.one_line()),
