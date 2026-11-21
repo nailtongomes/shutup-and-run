@@ -12,7 +12,8 @@
 //!   user = the PC's id, password = its secret. Chrome takes no login on the
 //!   command line, so `--open PORT=ID:SECRET` adds a port with no login that
 //!   always goes out through that PC. Keep both on a network only the
-//!   operator's containers reach.
+//!   operator's containers reach. `GET /status` with a PC's login is that
+//!   PC; `GET /pcs` with the relay's token as a bearer is every PC.
 //!
 //! It keeps nothing on disk. Alpha: plain TCP, see docs/INTERNET.md.
 
@@ -61,12 +62,15 @@ struct Idle {
     heard: Arc<AtomicU64>,
 }
 
-/// What a PC carries now, and when any of its connections was last alive,
-/// in milliseconds since the relay started.
+/// What a PC carries now, when any of its connections was last alive, in
+/// milliseconds since the relay started, and the bytes of the streams it
+/// carried since then: sent by the containers, received by them.
 #[derive(Default)]
 pub(crate) struct Stats {
     open: AtomicUsize,
     seen: AtomicU64,
+    sent: AtomicU64,
+    received: AtomicU64,
 }
 
 /// One PC: its password and its idle connections, each held by a task that
@@ -220,16 +224,25 @@ impl Relay {
         let pool = pools
             .get_mut(id)
             .filter(|pool| same(&pool.secret, secret))?;
-        pool.idle.retain(|idle| !idle.claim.is_closed());
-        let open = pool.stats.open.load(Ordering::Relaxed);
-        let seen = pool.stats.seen.load(Ordering::Relaxed);
-        Some(serde_json::json!({
-            "id": id,
-            "connected": !pool.idle.is_empty(),
-            "idle": pool.idle.len(),
-            "open": open,
-            "seen_secs_ago": now.saturating_sub(seen) / 1000,
-        }))
+        Some(pool_state(id, pool, now))
+    }
+
+    /// Every PC the relay knows, connected first, for `GET /pcs`. Never a
+    /// password or an address.
+    fn pcs(&self) -> serde_json::Value {
+        let now = self.now_ms();
+        let mut pools = self.pools.lock().unwrap();
+        let mut list: Vec<serde_json::Value> = pools
+            .iter_mut()
+            .map(|(id, pool)| pool_state(id, pool, now))
+            .collect();
+        list.sort_by_key(|pc| {
+            (
+                pc["connected"] != true,
+                pc["id"].as_str().map(str::to_owned),
+            )
+        });
+        serde_json::json!({ "pcs": list })
     }
 
     /// One line per PC whose numbers changed: `id: idle N, open M`.
@@ -247,6 +260,20 @@ impl Relay {
         lines.sort();
         lines
     }
+}
+
+fn pool_state(id: &str, pool: &mut Pool, now: u64) -> serde_json::Value {
+    pool.idle.retain(|idle| !idle.claim.is_closed());
+    let stats = &pool.stats;
+    serde_json::json!({
+        "id": id,
+        "connected": !pool.idle.is_empty(),
+        "idle": pool.idle.len(),
+        "open": stats.open.load(Ordering::Relaxed),
+        "seen_secs_ago": now.saturating_sub(stats.seen.load(Ordering::Relaxed)) / 1000,
+        "sent_bytes": stats.sent.load(Ordering::Relaxed),
+        "received_bytes": stats.received.load(Ordering::Relaxed),
+    })
 }
 
 fn same(a: &str, b: &str) -> bool {
@@ -393,6 +420,10 @@ struct Request {
     connect: bool,
     /// `GET /status`, sent to the relay itself: the PC's state.
     status: bool,
+    /// `GET /pcs`, sent to the relay itself: every PC, for the operator.
+    pcs: bool,
+    /// `Authorization: Bearer`, read only for `GET /pcs`.
+    bearer: Option<String>,
     target: String,
     /// The head to send on, for a plain `http://` request.
     head: Vec<u8>,
@@ -409,6 +440,7 @@ fn parse_head(lines: &[String]) -> Result<Request, &'static str> {
     };
     let mut login = None;
     let mut site_login = None;
+    let mut bearer = None;
     let mut kept = Vec::new();
     let basic = |value: &str| {
         value
@@ -435,19 +467,25 @@ fn parse_head(lines: &[String]) -> Result<Request, &'static str> {
             // The site's own login, sent on; read only for `GET /status`.
             "authorization" => {
                 site_login = basic(value);
+                bearer = value
+                    .trim()
+                    .strip_prefix("Bearer ")
+                    .map(|t| t.trim().to_string());
                 kept.push(line.clone());
             }
             "proxy-connection" | "connection" | "keep-alive" => {}
             _ => kept.push(line.clone()),
         }
     }
-    if *method == "GET" && *uri == "/status" {
+    if *method == "GET" && (*uri == "/status" || *uri == "/pcs") {
         return Ok(Request {
             connect: false,
-            status: true,
+            status: *uri == "/status",
+            pcs: *uri == "/pcs",
             target: String::new(),
             head: Vec::new(),
             login: login.or(site_login),
+            bearer,
         });
     }
     if *method == "CONNECT" {
@@ -457,9 +495,11 @@ fn parse_head(lines: &[String]) -> Result<Request, &'static str> {
         return Ok(Request {
             connect: true,
             status: false,
+            pcs: false,
             target: uri.to_string(),
             head: Vec::new(),
             login,
+            bearer: None,
         });
     }
     let rest = uri
@@ -490,9 +530,11 @@ fn parse_head(lines: &[String]) -> Result<Request, &'static str> {
     Ok(Request {
         connect: false,
         status: false,
+        pcs: false,
         target,
         head: head.into_bytes(),
         login,
+        bearer: None,
     })
 }
 
@@ -531,6 +573,19 @@ async fn answer(client: &mut Link, status: &str, extra: &str, text: &str) {
         .await;
 }
 
+async fn answer_json(client: &mut Link, value: &serde_json::Value) {
+    let body = format!("{value}\n");
+    let _ = client
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+}
+
 async fn proxy(relay: Arc<Relay>, stream: TcpStream, preset: Option<(String, String)>) {
     let _ = stream.set_nodelay(true);
     let mut client = BufReader::new(stream);
@@ -542,6 +597,31 @@ async fn proxy(relay: Arc<Relay>, stream: TcpStream, preset: Option<(String, Str
         Ok(request) => request,
         Err(why) => return answer(&mut client, "400 Bad Request", "", why).await,
     };
+    if request.pcs {
+        return match (&relay.token, &request.bearer) {
+            (Some(token), Some(given)) if same(token, given) => {
+                answer_json(&mut client, &relay.pcs()).await
+            }
+            (None, _) => {
+                answer(
+                    &mut client,
+                    "404 Not Found",
+                    "",
+                    "/pcs needs a relay with a token (--token-file or SHUTUP_AND_RUN_RELAY_TOKEN)",
+                )
+                .await
+            }
+            _ => {
+                answer(
+                    &mut client,
+                    "401 Unauthorized",
+                    "WWW-Authenticate: Bearer realm=\"shutup-and-run\"\r\n",
+                    "Authorization: Bearer <the relay's token>",
+                )
+                .await
+            }
+        };
+    }
     let Some((id, secret)) = preset.or(request.login.clone()) else {
         return answer(
             &mut client,
@@ -553,18 +633,7 @@ async fn proxy(relay: Arc<Relay>, stream: TcpStream, preset: Option<(String, Str
     };
     if request.status {
         return match relay.status(&id, &secret) {
-            Some(state) => {
-                let body = format!("{state}\n");
-                let _ = client
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await;
-            }
+            Some(state) => answer_json(&mut client, &state).await,
             None => {
                 answer(
                     &mut client,
@@ -652,6 +721,8 @@ async fn proxy(relay: Arc<Relay>, stream: TcpStream, preset: Option<(String, Str
     // A reset at the end is how many sites close; the bytes still count.
     let (up, down) = splice(&mut client, &mut link, STREAM_IDLE).await;
     stats.open.fetch_sub(1, Ordering::Relaxed);
+    stats.sent.fetch_add(up, Ordering::Relaxed);
+    stats.received.fetch_add(down, Ordering::Relaxed);
     println!("relay: {id} {} sent {up} received {down}", request.target);
 }
 
@@ -684,7 +755,8 @@ shutup-and-run relay [--agents 0.0.0.0:7000] [--proxy 127.0.0.1:8080] [--open PO
     a network only your containers reach. --token-file: a PC connects only
     with the token in that file (`internet on --token`); without it, the
     same from the environment variable SHUTUP_AND_RUN_RELAY_TOKEN. `GET /status` on
-    the proxy port, with a PC's login, says whether it is connected.
+    the proxy port, with a PC's login, says whether it is connected; `GET /pcs`
+    with `Authorization: Bearer <the token>` lists every PC.
     docs/INTERNET.md."
 }
 
@@ -796,6 +868,7 @@ mod tests {
     use tokio::sync::watch;
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const OTHER_SECRET: &str = "abcdef0123456789abcdef0123456789";
 
     fn settings(relay: SocketAddr) -> Settings {
         Settings {
@@ -1191,6 +1264,61 @@ mod tests {
         )
         .await;
         assert!(out.starts_with("HTTP/1.1 401"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn the_operator_lists_the_pcs_with_the_relays_token() {
+        let token = "relay-test-token-0123";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let relay = Relay::new(proxy.port(), Some(token.to_string()));
+        let (_kept, ..) = relay.register("pc-b", SECRET).unwrap();
+        let (_away, ..) = relay.register("pc-a", OTHER_SECRET).unwrap();
+        drop(_away);
+        tokio::spawn(accept_proxy(relay, listener, None));
+
+        let out = ask(
+            proxy,
+            format!("GET /pcs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        let body: serde_json::Value =
+            serde_json::from_str(out.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let pcs = body["pcs"].as_array().unwrap();
+        assert_eq!(pcs[0]["id"], "pc-b", "connected first");
+        assert_eq!(pcs[0]["connected"], true);
+        assert_eq!(pcs[1]["id"], "pc-a");
+        assert_eq!(pcs[1]["connected"], false);
+        assert_eq!(pcs[0]["sent_bytes"], 0);
+        assert!(
+            !out.contains(SECRET) && !out.contains(OTHER_SECRET),
+            "{out}"
+        );
+
+        let out = ask(
+            proxy,
+            "GET /pcs HTTP/1.1\r\nAuthorization: Bearer wrong-token-0123\r\n\r\n".to_string(),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 401"), "{out}");
+        let auth = login("pc-b", SECRET);
+        let out = ask(
+            proxy,
+            format!("GET /pcs HTTP/1.1\r\nAuthorization: Basic {auth}\r\n\r\n"),
+        )
+        .await;
+        assert!(
+            out.starts_with("HTTP/1.1 401"),
+            "a PC's login is not the operator's: {out}"
+        );
+
+        // A relay without a token has no list to give.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let open = listener.local_addr().unwrap();
+        tokio::spawn(accept_proxy(Relay::new(open.port(), None), listener, None));
+        let out = ask(open, "GET /pcs HTTP/1.1\r\n\r\n".to_string()).await;
+        assert!(out.starts_with("HTTP/1.1 404"), "{out}");
     }
 
     #[test]

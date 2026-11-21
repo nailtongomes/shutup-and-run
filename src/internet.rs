@@ -53,10 +53,11 @@ pub(crate) const HELLO: &str = "SAR2";
 /// The page of this mode. 8787 is the worker's.
 pub const PAGE_LISTEN: &str = "127.0.0.1:8788";
 /// Idle connections kept open to the relay, each ready for one stream.
-/// Chrome opens 10 to 30 for one page; an idle one costs a socket.
-const IDLE_CONNECTIONS: usize = 16;
+/// Chrome opens 10 to 30 for one page; an idle one costs a socket. Sized
+/// for 10 consumers at once (docs/INTERNET.md, "How many at once").
+const IDLE_CONNECTIONS: usize = 32;
 /// Streams open at once. Above it no idle connection is replaced.
-const MAX_STREAMS: usize = 256;
+const MAX_STREAMS: usize = 512;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per address of a site: a home with broken IPv6 must not cost 10 s a stream.
 const ADDRESS_TIMEOUT: Duration = Duration::from_secs(3);
