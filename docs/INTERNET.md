@@ -57,7 +57,14 @@ docker compose logs -f relay        # "PC <id> connected from <ip>", a line per 
 
 The image is the release's own musl binary on `scratch` (`examples/relay/Dockerfile`), so what the relay speaks is what that release's PCs speak. A 0.2.27 relay refuses 0.2.26 PCs (`update it`): update the PCs with the relay. To run a build of your own, copy a musl binary (AGENTS.md) beside the Dockerfile as `shutup-and-run` and `docker build`.
 
-The relay keeps nothing on disk. A restart drops every stream; the PCs come back by themselves within seconds. Once a minute the log has a line per PC whose numbers changed: `relay: PC <id>: 16 idle, 2 open`.
+The relay keeps nothing on disk. A restart drops every stream; the PCs come back by themselves within seconds. Once a minute the log has a line per PC whose numbers changed: `relay: PC <id>: 32 idle, 2 open`.
+
+**Which PCs are there.** `GET /pcs` on the proxy port, with the relay's token as a bearer, lists every PC the relay knows, connected first: `id`, `connected`, `idle`, `open` (streams now), `seen_secs_ago`, and `sent_bytes` and `received_bytes` (the containers', since the relay started). Never a password or an address. A relay without a token answers `404`.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://172.17.0.1:8080/pcs
+# {"pcs":[{"connected":true,"id":"pc-cliente-01","idle":32,"open":3,"received_bytes":5120334,"seen_secs_ago":2,"sent_bytes":80211}]}
+```
 
 By hand: `shutup-and-run relay --agents 0.0.0.0:7000 --proxy 172.17.0.1:8080 --token-file FILE` (the proxy on a private address).
 
@@ -122,11 +129,24 @@ The PC counts what crosses the site's side of each stream: `bytes_received` (fro
 - The relay closes or restarts: each idle connection sees the end at once and dials again after 1 s, doubling up to 30 s, with up to 1 s at random so they do not knock together.
 - The PC sleeps, its Wi-Fi changes, the internet drops: an idle connection pings every 10 s and the relay echoes; 30 s without a word and the PC drops it and dials again (the relay drops its end after 35 s).
 - In between, the relay may still hold connections that are dead. It tries first the one heard from in the last 15 s, and a claimed connection must answer `A` within 3 s; one that does not is skipped for the next, up to 3, so a request right after a wake costs a few seconds, not a `502`.
-- A stream with no byte either way for 10 minutes is closed on both sides: after a sleep its other end is gone, and it would hold one of the PC's 256 places for good.
+- A stream with no byte either way for 10 minutes is closed on both sides: after a sleep its other end is gone, and it would hold one of the PC's 512 places for good.
 - An id keeps its password on the relay for 10 minutes after its last connection is gone: a PC that slept gets its id back, not whoever connected first. A relay restart forgets it; the token is what keeps others out then.
 - The process itself: the logon task (Windows), which also starts it again a minute after it ends with an error, up to 999 times; `Restart=on-failure` (systemd). The process exits cleanly only when it is turned off, so the page's stop is not undone.
 
 `cargo test relay::` runs these against a real relay in the process: one that restarts on the same port, one that greets and then goes silent, a dead connection skipped for a live one, an id kept while its PC is away, and a wait that closes and reopens.
+
+## How many at once
+
+A PC keeps 32 idle connections to the relay and carries up to 512 streams at once. The use case it is sized for: up to 10 consumers at the same time (containers, Selenium or Playwright browsers) through one PC. A browser opens 10 to 30 streams for one page and keeps some open a while, and each stream that starts takes an idle connection, which the PC replaces at once.
+
+Measured with `SHUTUP_AND_RUN_LOAD=1 tests/internet/local.sh` (relay and PC on one Linux server in a datacenter, 10 headless Chromium at once, each opening five sites three times):
+
+| PC | runs | pages | failed | median page | 95% under | most streams open at once |
+| --- | --- | --- | --- | --- | --- | --- |
+| 32 idle, 512 streams (now) | 2 | 150 each | 0 | 1.5 and 1.7 s | 5.2 and 5.9 s | 192 and 191 |
+| 16 idle, 256 streams (up to 0.2.28) | 1 | 150 | 0 | 1.8 s | 5.9 s | 192 |
+
+Both carried 10 browsers with no failure and in about the same time: more idle connections did not make pages faster here. What changed is the margin: 10 browsers held up to 192 streams at once, three quarters of the old 256, past which a PC starts no new idle connection; 512 leaves room for heavier pages or a few more consumers. On a client's PC the limit that counts is the home connection's upload: every page a consumer loads leaves the relay as the PC's download and comes back as its upload. A 10 Mbit/s upload is about 1 MB/s for all of them together; ten browsers on heavy pages share that. The relay's own cost is small: an idle connection is a socket and a ping every 10 s.
 
 ## A task that goes out through a client's connection
 

@@ -112,6 +112,8 @@ O PC do cliente está atrás do roteador de casa e, muitas vezes, do CGNAT da op
 
    Antes de uma tarefa longa, veja se o PC está lá: `curl http://pc-cliente-01:A_SENHA@172.17.0.1:8080/status` responde `"connected":true`. Código para requests, Selenium, Playwright, Puppeteer, Node e n8n: [INTERNET.md, Examples](INTERNET.md#examples-curl-requests-selenium-playwright-puppeteer-node-n8n).
 
+   Todos os PCs de uma vez, com o token do relay: `curl -s -H "Authorization: Bearer $TOKEN" http://172.17.0.1:8080/pcs` lista id, se está conectado, conexões abertas agora e bytes desde que o relay subiu (nunca senha nem endereço).
+
 ## A URL de poll diz onde está o relay
 
 Para não passar endereço, token e login a cada cliente, o seu backend pode responder isso. Quando a pessoa liga a internet com `SHUTUP_AND_RUN_LEND_INTERNET=1` (ou `shutup-and-run internet on --discover URL`), o PC faz **um** `POST` na sua URL de poll:
@@ -130,6 +132,8 @@ com `Authorization: Bearer <token do poll>` quando o cliente tem um. O `"lend": 
 - Qualquer outra resposta, e o PC não liga nada e diz o motivo.
 - É perguntado uma vez, quando a pessoa liga. Para mudar o relay, a linha de instalação roda de novo.
 - O contrato completo: [INTEGRATION-CONTRACT.md, Internet discovery](INTEGRATION-CONTRACT.md#internet-discovery).
+
+**Sem escrever backend: n8n neste servidor.** O fluxo [examples/n8n/worker-orchestrator.json](../examples/n8n/worker-orchestrator.json) já é uma URL de poll (aprovação de PCs, fila, callbacks) e responde também a descoberta: gera e guarda um login por PC e devolve relay, token e login. Para mandar uma tarefa pela internet de um PC, enfileire com `"via_internet": "ID_DO_PC"`: o fluxo põe o `HTTPS_PROXY` daquele PC na tarefa e a entrega ao worker deste servidor. Passo a passo em [examples/n8n/README.md, "Internet sharing"](../examples/n8n/README.md#9-internet-sharing).
 
 ## O teste de dois minutos
 

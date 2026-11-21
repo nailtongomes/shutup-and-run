@@ -38,7 +38,23 @@
     },
     {
       "parameters": {
-        "jsCode": "// Placeholders. Replace them, and keep the real values out of version control.\nconst CFG = {\n  // The address a worker reaches this n8n at, up to and including /webhook.\n  publicBase: 'https://n8n.example.com/webhook',\n  // Goes in every callback_url. The runner adds no header to a callback.\n  callbackSecret: 'REPLACE_WITH_CALLBACK_SECRET',\n  // Sent by you, not by workers, to the n3-admin webhook.\n  adminToken: 'REPLACE_WITH_ADMIN_TOKEN',\n  // Offer the same job_key to the same worker again after this long with no callback.\n  reofferAfterSecs: 120,\n  // Unknown tokens kept as pending machines. More than this are refused and not recorded.\n  maxPending: 200,\n};\n// Demo storage: this workflow's static data. It is saved only when the\n// workflow is active, and two executions that both write at the same moment\n// overwrite each other (two callbacks in the same second: one is lost).\n// Fine for one machine and a smoke test. For real use keep `workers` and\n// `jobs` in a database table.\nconst store = $getWorkflowStaticData('global');\nstore.workers = store.workers || {};\nstore.jobs = store.jobs || [];\nstore.results = store.results || {};\nconst now = Math.floor(Date.now() / 1000);\nconst req = $input.first().json;\n\n// Worker identification: the bearer token, by its SHA-256 (the Crypto node).\n// The body is what the machine says about itself, a claim, not an identity.\nconst hasToken = /^Bearer\\s+\\S{16,}$/i.test(req.headers.authorization || '');\nif (!hasToken) return [{ json: { decision: 'forbidden' } }];\nconst hash = req.token_hash;\nconst body = req.body || {};\nconst text = (v) => String(v ?? '').slice(0, 64);\n\nlet worker = store.workers[hash];\nif (!worker) {\n  const pending = Object.values(store.workers).filter((w) => w.status === 'pending').length;\n  if (pending >= CFG.maxPending) return [{ json: { decision: 'forbidden' } }];\n  worker = store.workers[hash] = { status: 'pending', first_seen: now, last_seen: 0 };\n}\n// What the machine says about itself, refreshed at most once every five\n// minutes: an idle poll that writes nothing cannot overwrite a callback that\n// is being recorded at the same moment.\nif (now - worker.last_seen >= 300) {\n  Object.assign(worker, {\n    worker: text(body.worker),\n    os: text(body.os),\n    arch: text(body.arch),\n    version: text(body.version),\n    max_slots: Number(body.max_slots) || 0,\n    // The address is read from the connection, never from the body: Cloudflare's header first, then your reverse proxy's.\n    ip: text(req.headers['cf-connecting-ip'] || req.headers['x-real-ip'] || (req.headers['x-forwarded-for'] || '').split(',')[0]),\n    last_seen: now,\n  });\n}\n\n// Authorization decision. A machine that is not approved gets 403 and nothing\n// else: no task, no image name, no secret.\nif (worker.status !== 'approved') return [{ json: { decision: 'forbidden' } }];\n\n// One job per poll. A job offered to a machine stays with that machine:\n// job_key only deduplicates there. It is offered again, to the same machine,\n// when no callback came within reofferAfterSecs.\nconst job = store.jobs.find((j) =>\n  j.state !== 'done' &&\n  (!j.worker_hash || j.worker_hash === hash) &&\n  (!j.os || j.os === worker.os) &&\n  (!j.offered_to || (j.offered_to === hash && now - j.offered_at >= CFG.reofferAfterSecs))\n);\nif (!job) return [{ json: { decision: 'none' } }];\n\njob.state = 'offered';\njob.offered_to = hash;\njob.offered_at = now;\njob.offers = (job.offers || 0) + 1;\n\nif (job.via_manifest) {\n  // Same origin as the poll URL, so the worker sends its token with the GET.\n  const manifest_url = `${CFG.publicBase}/n3-manifest?job_key=${encodeURIComponent(job.job_key)}`;\n  return [{ json: { decision: 'manifest', response: { manifest_url } } }];\n}\nconst task = {\n  ...job.task,\n  job_key: job.job_key,\n  callback_url: `${CFG.publicBase}/n3-callback?secret=${encodeURIComponent(CFG.callbackSecret)}`,\n};\nreturn [{ json: { decision: 'task', response: { task } } }];\n"
+        "action": "generate",
+        "dataPropertyName": "random",
+        "encodingType": "hex",
+        "stringLength": 32
+      },
+      "id": "3f0c8a52-6d1e-5b7a-9c44-2e8f1d0b7a61",
+      "name": "Random login",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [
+        330,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Placeholders. Replace them, and keep the real values out of version control.\nconst CFG = {\n  // The address a worker reaches this n8n at, up to and including /webhook.\n  publicBase: 'https://n8n.example.com/webhook',\n  // Goes in every callback_url. The runner adds no header to a callback.\n  callbackSecret: 'REPLACE_WITH_CALLBACK_SECRET',\n  // Sent by you, not by workers, to the n3-admin webhook.\n  adminToken: 'REPLACE_WITH_ADMIN_TOKEN',\n  // Offer the same job_key to the same worker again after this long with no callback.\n  reofferAfterSecs: 120,\n  // Unknown tokens kept as pending machines. More than this are refused and not recorded.\n  maxPending: 200,\n  // Internet sharing (docs/SERVIDOR.pt-BR.md): where PCs dial in, the relay's\n  // token ('' when the relay has none), and the proxy as the worker on the\n  // relay's server reaches it.\n  relay: 'relay.example.com:7000',\n  relayToken: 'REPLACE_WITH_RELAY_TOKEN',\n  relayProxy: '172.17.0.1:8080',\n};\n// Demo storage: this workflow's static data. It is saved only when the\n// workflow is active, and two executions that both write at the same moment\n// overwrite each other (two callbacks in the same second: one is lost).\n// Fine for one machine and a smoke test. For real use keep `workers` and\n// `jobs` in a database table.\nconst store = $getWorkflowStaticData('global');\nstore.workers = store.workers || {};\nstore.jobs = store.jobs || [];\nstore.results = store.results || {};\nstore.internet = store.internet || {};\nconst now = Math.floor(Date.now() / 1000);\nconst req = $input.first().json;\n\n// Worker identification: the bearer token, by its SHA-256 (the Crypto node).\n// The body is what the machine says about itself, a claim, not an identity.\nconst hasToken = /^Bearer\\s+\\S{16,}$/i.test(req.headers.authorization || '');\nconst body = req.body || {};\nconst text = (v) => String(v ?? '').slice(0, 64);\nconst address = () => text(req.headers['cf-connecting-ip'] || req.headers['x-real-ip'] || (req.headers['x-forwarded-for'] || '').split(',')[0]);\n\n// Internet discovery (docs/INTEGRATION-CONTRACT.md, \"Internet discovery\"):\n// the person at a PC turned sharing on with this URL, and the PC asks where\n// the relay is. It gets the relay, its token, and a login of its own, made\n// here from the Random login node and kept; the same poll token gets the\n// same login again. No approval: a PC that asks only lends you a\n// connection, and a task goes through it only when you name it\n// (enqueue with via_internet).\nif (body.lend === 'internet') {\n  const key = hasToken ? req.token_hash : null;\n  let pc = key && Object.values(store.internet).find((p) => p.token_hash === key);\n  if (!pc) {\n    if (Object.keys(store.internet).length >= CFG.maxPending) return [{ json: { decision: 'forbidden' } }];\n    const name = text(body.worker).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'pc';\n    const id = `${name}-${req.random.slice(0, 6)}`;\n    pc = store.internet[id] = { id, password: req.random.slice(6), token_hash: key, first_seen: now };\n  }\n  Object.assign(pc, { worker: text(body.worker), os: text(body.os), version: text(body.version), ip: address(), last_seen: now });\n  const response = { relay: CFG.relay, login: `${pc.id}:${pc.password}` };\n  if (CFG.relayToken) response.token = CFG.relayToken;\n  return [{ json: { decision: 'relay', response } }];\n}\n\nif (!hasToken) return [{ json: { decision: 'forbidden' } }];\nconst hash = req.token_hash;\n\nlet worker = store.workers[hash];\nif (!worker) {\n  const pending = Object.values(store.workers).filter((w) => w.status === 'pending').length;\n  if (pending >= CFG.maxPending) return [{ json: { decision: 'forbidden' } }];\n  worker = store.workers[hash] = { status: 'pending', first_seen: now, last_seen: 0 };\n}\n// What the machine says about itself, refreshed at most once every five\n// minutes: an idle poll that writes nothing cannot overwrite a callback that\n// is being recorded at the same moment.\nif (now - worker.last_seen >= 300) {\n  Object.assign(worker, {\n    worker: text(body.worker),\n    os: text(body.os),\n    arch: text(body.arch),\n    version: text(body.version),\n    max_slots: Number(body.max_slots) || 0,\n    // The address is read from the connection, never from the body: Cloudflare's header first, then your reverse proxy's.\n    ip: address(),\n    last_seen: now,\n  });\n}\n\n// Authorization decision. A machine that is not approved gets 403 and nothing\n// else: no task, no image name, no secret.\nif (worker.status !== 'approved') return [{ json: { decision: 'forbidden' } }];\n\n// One job per poll. A job offered to a machine stays with that machine:\n// job_key only deduplicates there. It is offered again, to the same machine,\n// when no callback came within reofferAfterSecs.\nconst job = store.jobs.find((j) =>\n  j.state !== 'done' &&\n  (!j.worker_hash || j.worker_hash === hash) &&\n  (!j.os || j.os === worker.os) &&\n  (!j.offered_to || (j.offered_to === hash && now - j.offered_at >= CFG.reofferAfterSecs))\n);\nif (!job) return [{ json: { decision: 'none' } }];\n\njob.state = 'offered';\njob.offered_to = hash;\njob.offered_at = now;\njob.offers = (job.offers || 0) + 1;\n\nif (job.via_manifest) {\n  // Same origin as the poll URL, so the worker sends its token with the GET.\n  const manifest_url = `${CFG.publicBase}/n3-manifest?job_key=${encodeURIComponent(job.job_key)}`;\n  return [{ json: { decision: 'manifest', response: { manifest_url } } }];\n}\nconst task = {\n  ...job.task,\n  job_key: job.job_key,\n  callback_url: `${CFG.publicBase}/n3-callback?secret=${encodeURIComponent(CFG.callbackSecret)}`,\n};\nreturn [{ json: { decision: 'task', response: { task } } }];\n"
       },
       "id": "0ee39b6c-0c6f-547f-8f6f-a78e00eb72c7",
       "name": "Identify, authorize, pick a job",
@@ -148,6 +164,30 @@
               },
               "renameOutput": true,
               "outputKey": "manifest"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "6a1d2c3e-8f4b-5e6a-b7c8-0d9e1f2a3b4c",
+                    "leftValue": "={{ $json.decision }}",
+                    "rightValue": "relay",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "relay"
             }
           ]
         },
@@ -230,6 +270,23 @@
     },
     {
       "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "c8e1f4a2-5b3d-5c6e-9f7a-1b2c3d4e5f60",
+      "name": "200 relay",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        900,
+        320
+      ]
+    },
+    {
+      "parameters": {
         "httpMethod": "GET",
         "path": "n3-manifest",
         "responseMode": "responseNode",
@@ -264,7 +321,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Placeholders. Replace them, and keep the real values out of version control.\nconst CFG = {\n  // The address a worker reaches this n8n at, up to and including /webhook.\n  publicBase: 'https://n8n.example.com/webhook',\n  // Goes in every callback_url. The runner adds no header to a callback.\n  callbackSecret: 'REPLACE_WITH_CALLBACK_SECRET',\n  // Sent by you, not by workers, to the n3-admin webhook.\n  adminToken: 'REPLACE_WITH_ADMIN_TOKEN',\n  // Offer the same job_key to the same worker again after this long with no callback.\n  reofferAfterSecs: 120,\n  // Unknown tokens kept as pending machines. More than this are refused and not recorded.\n  maxPending: 200,\n};\n// Demo storage: this workflow's static data. It is saved only when the\n// workflow is active, and two executions that both write at the same moment\n// overwrite each other (two callbacks in the same second: one is lost).\n// Fine for one machine and a smoke test. For real use keep `workers` and\n// `jobs` in a database table.\nconst store = $getWorkflowStaticData('global');\nstore.workers = store.workers || {};\nstore.jobs = store.jobs || [];\nstore.results = store.results || {};\nconst now = Math.floor(Date.now() / 1000);\nconst req = $input.first().json;\n\n// Only the machine the job was offered to may read its manifest.\nconst hash = req.token_hash;\nconst key = String((req.query || {}).job_key || '');\nconst worker = store.workers[hash];\nconst job = store.jobs.find((j) => j.job_key === key && j.state !== 'done');\nif (!worker || worker.status !== 'approved' || !job || job.offered_to !== hash) {\n  return [{ json: { decision: 'not_found' } }];\n}\n// A manifest is one JobRequest. It cannot name another manifest.\nconst task = {\n  ...job.task,\n  job_key: job.job_key,\n  callback_url: `${CFG.publicBase}/n3-callback?secret=${encodeURIComponent(CFG.callbackSecret)}`,\n};\nreturn [{ json: { decision: 'found', response: task } }];\n"
+        "jsCode": "// Placeholders. Replace them, and keep the real values out of version control.\nconst CFG = {\n  // The address a worker reaches this n8n at, up to and including /webhook.\n  publicBase: 'https://n8n.example.com/webhook',\n  // Goes in every callback_url. The runner adds no header to a callback.\n  callbackSecret: 'REPLACE_WITH_CALLBACK_SECRET',\n  // Sent by you, not by workers, to the n3-admin webhook.\n  adminToken: 'REPLACE_WITH_ADMIN_TOKEN',\n  // Offer the same job_key to the same worker again after this long with no callback.\n  reofferAfterSecs: 120,\n  // Unknown tokens kept as pending machines. More than this are refused and not recorded.\n  maxPending: 200,\n  // Internet sharing (docs/SERVIDOR.pt-BR.md): where PCs dial in, the relay's\n  // token ('' when the relay has none), and the proxy as the worker on the\n  // relay's server reaches it.\n  relay: 'relay.example.com:7000',\n  relayToken: 'REPLACE_WITH_RELAY_TOKEN',\n  relayProxy: '172.17.0.1:8080',\n};\n// Demo storage: this workflow's static data. It is saved only when the\n// workflow is active, and two executions that both write at the same moment\n// overwrite each other (two callbacks in the same second: one is lost).\n// Fine for one machine and a smoke test. For real use keep `workers` and\n// `jobs` in a database table.\nconst store = $getWorkflowStaticData('global');\nstore.workers = store.workers || {};\nstore.jobs = store.jobs || [];\nstore.results = store.results || {};\nstore.internet = store.internet || {};\nconst now = Math.floor(Date.now() / 1000);\nconst req = $input.first().json;\n\n// Only the machine the job was offered to may read its manifest.\nconst hash = req.token_hash;\nconst key = String((req.query || {}).job_key || '');\nconst worker = store.workers[hash];\nconst job = store.jobs.find((j) => j.job_key === key && j.state !== 'done');\nif (!worker || worker.status !== 'approved' || !job || job.offered_to !== hash) {\n  return [{ json: { decision: 'not_found' } }];\n}\n// A manifest is one JobRequest. It cannot name another manifest.\nconst task = {\n  ...job.task,\n  job_key: job.job_key,\n  callback_url: `${CFG.publicBase}/n3-callback?secret=${encodeURIComponent(CFG.callbackSecret)}`,\n};\nreturn [{ json: { decision: 'found', response: task } }];\n"
       },
       "id": "6d8fb0a6-75c7-5a7a-a9e0-522594f886dd",
       "name": "Find the offered job",
@@ -392,7 +449,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Placeholders. Replace them, and keep the real values out of version control.\nconst CFG = {\n  // The address a worker reaches this n8n at, up to and including /webhook.\n  publicBase: 'https://n8n.example.com/webhook',\n  // Goes in every callback_url. The runner adds no header to a callback.\n  callbackSecret: 'REPLACE_WITH_CALLBACK_SECRET',\n  // Sent by you, not by workers, to the n3-admin webhook.\n  adminToken: 'REPLACE_WITH_ADMIN_TOKEN',\n  // Offer the same job_key to the same worker again after this long with no callback.\n  reofferAfterSecs: 120,\n  // Unknown tokens kept as pending machines. More than this are refused and not recorded.\n  maxPending: 200,\n};\n// Demo storage: this workflow's static data. It is saved only when the\n// workflow is active, and two executions that both write at the same moment\n// overwrite each other (two callbacks in the same second: one is lost).\n// Fine for one machine and a smoke test. For real use keep `workers` and\n// `jobs` in a database table.\nconst store = $getWorkflowStaticData('global');\nstore.workers = store.workers || {};\nstore.jobs = store.jobs || [];\nstore.results = store.results || {};\nconst now = Math.floor(Date.now() / 1000);\nconst req = $input.first().json;\n\nif (String((req.query || {}).secret || '') !== CFG.callbackSecret) {\n  return [{ json: { decision: 'forbidden' } }];\n}\nconst result = req.body || {};\nconst id = String(result.id || '');\n// Idempotent on the job id: the runner tries three times, and a slow answer\n// here can make the same callback arrive twice.\nif (id && !store.results[id]) {\n  store.results[id] = { ...result, received_at: now };\n  const job = store.jobs.find((j) => j.job_key === result.job_key);\n  if (job) {\n    job.state = 'done';\n    job.result = { id, reason: result.reason, exit_code: result.exit_code, duration_secs: result.duration_secs };\n    // This says the container ended. Whether the work is done is for the\n    // job's own report, or a check of the external system, to say.\n    job.container_ok = result.reason === 'exited' && result.exit_code === 0;\n  }\n}\n// Answer at once. The runner waits five seconds per try.\nreturn [{ json: { decision: 'ok' } }];\n"
+        "jsCode": "// Placeholders. Replace them, and keep the real values out of version control.\nconst CFG = {\n  // The address a worker reaches this n8n at, up to and including /webhook.\n  publicBase: 'https://n8n.example.com/webhook',\n  // Goes in every callback_url. The runner adds no header to a callback.\n  callbackSecret: 'REPLACE_WITH_CALLBACK_SECRET',\n  // Sent by you, not by workers, to the n3-admin webhook.\n  adminToken: 'REPLACE_WITH_ADMIN_TOKEN',\n  // Offer the same job_key to the same worker again after this long with no callback.\n  reofferAfterSecs: 120,\n  // Unknown tokens kept as pending machines. More than this are refused and not recorded.\n  maxPending: 200,\n  // Internet sharing (docs/SERVIDOR.pt-BR.md): where PCs dial in, the relay's\n  // token ('' when the relay has none), and the proxy as the worker on the\n  // relay's server reaches it.\n  relay: 'relay.example.com:7000',\n  relayToken: 'REPLACE_WITH_RELAY_TOKEN',\n  relayProxy: '172.17.0.1:8080',\n};\n// Demo storage: this workflow's static data. It is saved only when the\n// workflow is active, and two executions that both write at the same moment\n// overwrite each other (two callbacks in the same second: one is lost).\n// Fine for one machine and a smoke test. For real use keep `workers` and\n// `jobs` in a database table.\nconst store = $getWorkflowStaticData('global');\nstore.workers = store.workers || {};\nstore.jobs = store.jobs || [];\nstore.results = store.results || {};\nstore.internet = store.internet || {};\nconst now = Math.floor(Date.now() / 1000);\nconst req = $input.first().json;\n\nif (String((req.query || {}).secret || '') !== CFG.callbackSecret) {\n  return [{ json: { decision: 'forbidden' } }];\n}\nconst result = req.body || {};\nconst id = String(result.id || '');\n// Idempotent on the job id: the runner tries three times, and a slow answer\n// here can make the same callback arrive twice.\nif (id && !store.results[id]) {\n  store.results[id] = { ...result, received_at: now };\n  const job = store.jobs.find((j) => j.job_key === result.job_key);\n  if (job) {\n    job.state = 'done';\n    job.result = { id, reason: result.reason, exit_code: result.exit_code, duration_secs: result.duration_secs };\n    // This says the container ended. Whether the work is done is for the\n    // job's own report, or a check of the external system, to say.\n    job.container_ok = result.reason === 'exited' && result.exit_code === 0;\n  }\n}\n// Answer at once. The runner waits five seconds per try.\nreturn [{ json: { decision: 'ok' } }];\n"
       },
       "id": "d4fb918e-73bd-588d-9d85-e5cd1ce0f5a5",
       "name": "Record the result once",
@@ -519,7 +576,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Placeholders. Replace them, and keep the real values out of version control.\nconst CFG = {\n  // The address a worker reaches this n8n at, up to and including /webhook.\n  publicBase: 'https://n8n.example.com/webhook',\n  // Goes in every callback_url. The runner adds no header to a callback.\n  callbackSecret: 'REPLACE_WITH_CALLBACK_SECRET',\n  // Sent by you, not by workers, to the n3-admin webhook.\n  adminToken: 'REPLACE_WITH_ADMIN_TOKEN',\n  // Offer the same job_key to the same worker again after this long with no callback.\n  reofferAfterSecs: 120,\n  // Unknown tokens kept as pending machines. More than this are refused and not recorded.\n  maxPending: 200,\n};\n// Demo storage: this workflow's static data. It is saved only when the\n// workflow is active, and two executions that both write at the same moment\n// overwrite each other (two callbacks in the same second: one is lost).\n// Fine for one machine and a smoke test. For real use keep `workers` and\n// `jobs` in a database table.\nconst store = $getWorkflowStaticData('global');\nstore.workers = store.workers || {};\nstore.jobs = store.jobs || [];\nstore.results = store.results || {};\nconst now = Math.floor(Date.now() / 1000);\nconst req = $input.first().json;\n\nif ((req.headers.authorization || '') !== `Bearer ${CFG.adminToken}`) {\n  return [{ json: { decision: 'forbidden' } }];\n}\nconst body = req.body || {};\nconst view = () => ({\n  workers: Object.entries(store.workers).map(([token_hash, w]) => ({ token_hash, ...w })),\n  jobs: store.jobs,\n});\nconst fail = (error) => [{ json: { decision: 'ok', response: { error } } }];\n\nif (body.action === 'approve' || body.action === 'revoke') {\n  const worker = store.workers[String(body.token_hash || '')];\n  if (!worker) return fail('unknown token_hash');\n  worker.status = body.action === 'approve' ? 'approved' : 'revoked';\n} else if (body.action === 'enqueue') {\n  const job = body.job || {};\n  if (!/^[A-Za-z0-9._:-]{1,200}$/.test(String(job.job_key || ''))) return fail('job.job_key is missing or invalid');\n  if (!job.task || typeof job.task.image !== 'string') return fail('job.task.image is missing');\n  if (store.jobs.some((j) => j.job_key === job.job_key)) return fail('job_key already queued; a new attempt needs a new key');\n  store.jobs.push({\n    job_key: job.job_key,\n    task: job.task,\n    via_manifest: !!job.via_manifest,\n    os: job.os || null,\n    worker_hash: job.worker_hash || null,\n    state: 'queued',\n    queued_at: now,\n  });\n} else if (body.action === 'reset') {\n  store.workers = {};\n  store.jobs = [];\n  store.results = {};\n} else if (body.action !== 'list') {\n  return fail('action is one of list, approve, revoke, enqueue, reset');\n}\nreturn [{ json: { decision: 'ok', response: view() } }];\n"
+        "jsCode": "// Placeholders. Replace them, and keep the real values out of version control.\nconst CFG = {\n  // The address a worker reaches this n8n at, up to and including /webhook.\n  publicBase: 'https://n8n.example.com/webhook',\n  // Goes in every callback_url. The runner adds no header to a callback.\n  callbackSecret: 'REPLACE_WITH_CALLBACK_SECRET',\n  // Sent by you, not by workers, to the n3-admin webhook.\n  adminToken: 'REPLACE_WITH_ADMIN_TOKEN',\n  // Offer the same job_key to the same worker again after this long with no callback.\n  reofferAfterSecs: 120,\n  // Unknown tokens kept as pending machines. More than this are refused and not recorded.\n  maxPending: 200,\n  // Internet sharing (docs/SERVIDOR.pt-BR.md): where PCs dial in, the relay's\n  // token ('' when the relay has none), and the proxy as the worker on the\n  // relay's server reaches it.\n  relay: 'relay.example.com:7000',\n  relayToken: 'REPLACE_WITH_RELAY_TOKEN',\n  relayProxy: '172.17.0.1:8080',\n};\n// Demo storage: this workflow's static data. It is saved only when the\n// workflow is active, and two executions that both write at the same moment\n// overwrite each other (two callbacks in the same second: one is lost).\n// Fine for one machine and a smoke test. For real use keep `workers` and\n// `jobs` in a database table.\nconst store = $getWorkflowStaticData('global');\nstore.workers = store.workers || {};\nstore.jobs = store.jobs || [];\nstore.results = store.results || {};\nstore.internet = store.internet || {};\nconst now = Math.floor(Date.now() / 1000);\nconst req = $input.first().json;\n\nif ((req.headers.authorization || '') !== `Bearer ${CFG.adminToken}`) {\n  return [{ json: { decision: 'forbidden' } }];\n}\nconst body = req.body || {};\nconst view = () => ({\n  workers: Object.entries(store.workers).map(([token_hash, w]) => ({ token_hash, ...w })),\n  jobs: store.jobs,\n  // The PCs that lend their internet. Never their password.\n  internet: Object.values(store.internet).map(({ password, token_hash, ...pc }) => pc),\n});\nconst fail = (error) => [{ json: { decision: 'ok', response: { error } } }];\n\nif (body.action === 'approve' || body.action === 'revoke') {\n  const worker = store.workers[String(body.token_hash || '')];\n  if (!worker) return fail('unknown token_hash');\n  worker.status = body.action === 'approve' ? 'approved' : 'revoked';\n} else if (body.action === 'enqueue') {\n  const job = body.job || {};\n  if (!/^[A-Za-z0-9._:-]{1,200}$/.test(String(job.job_key || ''))) return fail('job.job_key is missing or invalid');\n  if (!job.task || typeof job.task.image !== 'string') return fail('job.task.image is missing');\n  if (store.jobs.some((j) => j.job_key === job.job_key)) return fail('job_key already queued; a new attempt needs a new key');\n  // Through a PC's internet: its proxy goes in the task's env, upper and\n  // lower case (curl and Python read the lower one first). Only a worker on\n  // the relay's server reaches the proxy, so the job goes to linux unless\n  // you say which machine (worker_hash).\n  let task = job.task;\n  if (job.via_internet) {\n    const pc = store.internet[String(job.via_internet)];\n    if (!pc) return fail('via_internet: no PC with that id in the list');\n    const proxy = `http://${pc.id}:${pc.password}@${CFG.relayProxy}`;\n    task = { ...task, env: { ...(task.env || {}), HTTPS_PROXY: proxy, HTTP_PROXY: proxy, https_proxy: proxy, http_proxy: proxy } };\n  }\n  store.jobs.push({\n    job_key: job.job_key,\n    task,\n    via_manifest: !!job.via_manifest,\n    via_internet: job.via_internet || null,\n    os: job.os || (job.via_internet && !job.worker_hash ? 'linux' : null),\n    worker_hash: job.worker_hash || null,\n    state: 'queued',\n    queued_at: now,\n  });\n} else if (body.action === 'reset') {\n  store.workers = {};\n  store.jobs = [];\n  store.results = {};\n  store.internet = {};\n} else if (body.action !== 'list') {\n  return fail('action is one of list, approve, revoke, enqueue, reset');\n}\nreturn [{ json: { decision: 'ok', response: view() } }];\n"
       },
       "id": "40bdea85-842a-5ef5-a46e-1f0675c912de",
       "name": "Approve, enqueue, list",
@@ -645,7 +702,7 @@
       "main": [
         [
           {
-            "node": "Identify, authorize, pick a job",
+            "node": "Random login",
             "type": "main",
             "index": 0
           }
@@ -689,6 +746,13 @@
         [
           {
             "node": "200 manifest_url",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "200 relay",
             "type": "main",
             "index": 0
           }
@@ -820,6 +884,17 @@
         [
           {
             "node": "403 not the admin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Random login": {
+      "main": [
+        [
+          {
+            "node": "Identify, authorize, pick a job",
             "type": "main",
             "index": 0
           }

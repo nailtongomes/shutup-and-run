@@ -37,6 +37,9 @@ Each of the four Code nodes in `worker-orchestrator.json` starts with the same `
 | `https://n8n.example.com/webhook` | The address a worker can reach your n8n at, ending in `/webhook`. It must be the same scheme, host and port as the poll URL you give the workers, or they will fetch manifests without their token. |
 | `REPLACE_WITH_CALLBACK_SECRET` | A long random string: `openssl rand -hex 32`. It goes in every `callback_url`, because the runner adds no header to a callback. |
 | `REPLACE_WITH_ADMIN_TOKEN` | Another one. It is yours. No worker ever sees it. |
+| `relay.example.com:7000` | Only for internet sharing (section 9): where PCs dial in to your relay. |
+| `REPLACE_WITH_RELAY_TOKEN` | The relay's token (`/etc/shutup-and-run/relay_token`, or `RELAY_TOKEN` of its compose file); `''` when the relay has none. |
+| `172.17.0.1:8080` | The relay's proxy as a job on that server reaches it. |
 
 In `push-to-linux.json`, the **Job** node holds `runner_url`, `runner_token` (the Linux machine's `SHUTUP_AND_RUN_TOKEN`) and the `callback_url`.
 
@@ -63,10 +66,11 @@ The poll URL must have a certificate from a public authority. The runner does no
 ## 4. What the poll workflow does
 
 ```text
-Worker poll ─ Hash poll token ─ Identify, authorize, pick a job ─ Poll answer ─┬─ 403 not approved
- (Webhook)     (Crypto)          (Code)                            (Switch)    ├─ 204 no job
-                                                                               ├─ 200 task
-                                                                               └─ 200 manifest_url
+Worker poll ─ Hash poll token ─ Random login ─ Identify, authorize, pick a job ─ Poll answer ─┬─ 403 not approved
+ (Webhook)     (Crypto)          (Crypto)       (Code)                            (Switch)    ├─ 204 no job
+                                                                                              ├─ 200 task
+                                                                                              ├─ 200 manifest_url
+                                                                                              └─ 200 relay
 ```
 
 1. **Webhook for worker polling.** `POST n3-worker-poll`. The body is the [worker poll request](../../docs/schemas/worker-poll-request.schema.json).
@@ -238,3 +242,27 @@ curl -s -X POST "$N8N/n3-admin" -H "Authorization: Bearer $ADMIN" -H 'Content-Ty
 - **Rate limit the poll URL** in the reverse proxy. Anyone who knows it can create pending records.
 
 Measures worth keeping once this runs for real: the share of offered jobs that got a callback before their deadline, the time from queued to accepted, the share of `start_failed` and `timeout_kill` per machine, and how many machines polled in the last hour against how many are approved.
+
+## 9. Internet sharing
+
+The same poll URL answers a PC that lends only its internet connection, or its internet beside the worker ([docs/INTERNET.md](../../docs/INTERNET.md), [docs/SERVIDOR.pt-BR.md](../../docs/SERVIDOR.pt-BR.md)). Run the relay and this n8n on one server, set the three relay placeholders of section 2, and give the client one line:
+
+```powershell
+$env:SHUTUP_AND_RUN_POLL_URL = "https://n8n.example.com/webhook/n3-worker-poll"
+$env:SHUTUP_AND_RUN_LEND_INTERNET = "1"
+irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
+```
+
+**Discovery.** The PC sends one `POST` with `"lend": "internet"` ([contract](../../docs/INTEGRATION-CONTRACT.md#internet-discovery)). The workflow answers `200` with `relay`, `token` and a `login` it makes for that PC: an id from the PC's name and six random hex digits, and a password of 26, both from the **Random login** node. It keeps them in `internet`; a PC that sends a poll token gets the same login on every discovery, one without gets a new one each time. There is no approval: a PC that asks only offers you its connection, and a job goes through it only when you name it. At most 200 are kept.
+
+**The list.** `{"action":"list"}` has `internet`: each PC's `id`, `worker`, `os`, `version`, `ip`, `first_seen`, `last_seen`. Never its password. Whether it is connected now is the relay's answer: `GET /pcs` with the relay's token ([docs/INTERNET.md](../../docs/INTERNET.md#the-operator-the-relay)).
+
+**A job through a PC's internet.** `enqueue` with `via_internet`, the PC's `id` from the list:
+
+```bash
+curl -s -X POST "$N8N/n3-admin" -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{"action":"enqueue","job":{"job_key":"via-pc-001","via_internet":"desk-07-a1b2c3","worker_hash":"THE_HASH_OF_THE_WORKER_ON_THE_RELAY_SERVER","task":{"image":"curlimages/curl","command":["curl","-s","https://api.ipify.org"],"timeout_secs":60}}}'
+```
+
+The workflow puts `HTTPS_PROXY`, `HTTP_PROXY` and their lower-case names, `http://ID:PASSWORD@172.17.0.1:8080`, in the task's `env`, beside the env you gave. Only a worker on the relay's server reaches that address: name it with `worker_hash`, or the job goes to the first Linux worker that polls. A Windows PC never gets it. The job's output is the PC's address. A PC that is away makes the task's requests fail with `503` after 10 seconds; the job is not held back for it.
+
+Checked on n8n 2.48.7 (Node 24), with a relay and the runner's own `internet on --discover --wait`: the PC connected with the login the workflow made, got the same login on a second discovery, showed in `list` and in the relay's `/pcs`; an unknown `via_internet` was refused; and a worker's poll got the job with that PC's proxy in its `env`, through which a request reached a site. The job was not run in a container there.

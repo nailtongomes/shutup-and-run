@@ -11,8 +11,11 @@
 # fetches the musl asset of its own version for the WSL distribution. A later
 # job runs the README one-liner on a fresh runner and smokes the service it
 # installed. The one-liners fetch install.sh and install.ps1 from main.
-# The relay's image, ghcr.io/nailtongomes/shutup-and-run-relay, is built from
-# the release's own musl binary and pushed as <version> and latest.
+# Two images are built from the release's own musl binary: the relay's,
+# ghcr.io/nailtongomes/shutup-and-run-relay as <version> and latest, and the
+# worker's, ghcr.io/nailtongomes/shutup-and-run as v<version> and latest.
+# image.yml cannot do the second: a tag this workflow creates with
+# GITHUB_TOKEN starts no other workflow.
 name: release
 
 on:
@@ -151,10 +154,10 @@ jobs:
           done < old-tags
           gh release list --repo "${GITHUB_REPOSITORY}" --limit 10
 
-  # The relay's image, from the release's own musl binary: what a server
-  # pulls is what the PCs' release speaks. Runs after a release, and on
-  # "Run workflow" for the newest release when there is nothing new.
-  relay-image:
+  # The images, from the release's own musl binary: what a server pulls is
+  # what the PCs' release speaks. Runs after a release, and on "Run
+  # workflow" for the newest release when there is nothing new.
+  images:
     needs: [version, publish]
     if: >-
       always() && needs.version.result == 'success' &&
@@ -179,6 +182,8 @@ jobs:
           mv shutup-and-run-x86_64-unknown-linux-musl shutup-and-run
           chmod 755 shutup-and-run
           rm SHA256SUMS
+          # The worker's Dockerfile, at the root, takes the same file.
+          cp shutup-and-run ../../shutup-and-run
       - name: build and try
         env:
           TAG: ${{ needs.version.outputs.tag }}
@@ -186,6 +191,9 @@ jobs:
           image=ghcr.io/nailtongomes/shutup-and-run-relay
           docker build -t "${image}:${TAG#v}" -t "${image}:latest" examples/relay
           docker run --rm "${image}:${TAG#v}" --help | head -n 3
+          worker=ghcr.io/nailtongomes/shutup-and-run
+          docker build -t "${worker}:${TAG}" -t "${worker}:latest" .
+          docker run --rm "${worker}:${TAG}" version --json
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -198,6 +206,9 @@ jobs:
           image=ghcr.io/nailtongomes/shutup-and-run-relay
           docker push "${image}:${TAG#v}"
           docker push "${image}:latest"
+          worker=ghcr.io/nailtongomes/shutup-and-run
+          docker push "${worker}:${TAG}"
+          docker push "${worker}:latest"
 
   install:
     needs: [version, publish]

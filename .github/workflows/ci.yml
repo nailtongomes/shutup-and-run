@@ -138,6 +138,85 @@ jobs:
           & $installed wsl task remove
           if (Get-ScheduledTask -TaskName shutup-and-run -ErrorAction SilentlyContinue) { throw "the task survived wsl task remove" }
           exit 0
+      # Internet sharing on Windows, all on this runner: a relay on loopback,
+      # the install line with the relay's variables, curl.exe through the PC,
+      # the operator's list, then the page's buttons: pause (a new request
+      # waits), resume, and stop, which must remove the task and end the
+      # process. The token and the login are made up for this run.
+      - name: internet sharing through install.ps1, a local relay and the page
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = "Stop"
+          $asset = "shutup-and-run-x86_64-pc-windows-msvc.exe"
+          $rel = Join-Path $env:RUNNER_TEMP "release-internet"
+          New-Item -ItemType Directory -Force -Path $rel | Out-Null
+          Copy-Item target\release\shutup-and-run.exe (Join-Path $rel $asset)
+          $want = (Get-FileHash -Algorithm SHA256 (Join-Path $rel $asset)).Hash.ToLower()
+          Set-Content -Encoding ascii -Path (Join-Path $rel "SHA256SUMS") -Value "$want  $asset"
+          $server = Start-Process python -ArgumentList "-m", "http.server", "8097", "--bind", "127.0.0.1", "--directory", $rel -PassThru -WindowStyle Hidden
+          $token = "ci-relay-token-0123"
+          $tokenFile = Join-Path $env:RUNNER_TEMP "relay_token"
+          Set-Content -Encoding ascii -Path $tokenFile -Value $token
+          $relayLog = Join-Path $env:RUNNER_TEMP "relay.log"
+          $relay = Start-Process target\release\shutup-and-run.exe -ArgumentList "relay", "--agents", "127.0.0.1:17000", "--proxy", "127.0.0.1:18080", "--token-file", $tokenFile -PassThru -WindowStyle Hidden -RedirectStandardOutput $relayLog
+          Start-Sleep -Seconds 3
+          $installed = Join-Path $env:ProgramData "shutup-and-run\shutup-and-run.exe"
+          $proxy = "http://ci-pc:ci-pc-password-0123456@127.0.0.1:18080"
+          function Through { & curl.exe -s -o NUL -w "%{http_code}" --max-time 30 -x $proxy https://example.com/ }
+          function Page($path) { & curl.exe -s -o NUL -w "%{http_code}" -X POST -d "from=ci" -H "Origin: http://127.0.0.1:8788" "http://127.0.0.1:8788$path" }
+          function State { ((& $installed internet status --json) -join "" | ConvertFrom-Json).status.state }
+          function WaitFor($want) {
+            for ($i = 0; $i -lt 60; $i++) { if ((State) -eq $want) { return }; Start-Sleep -Seconds 1 }
+            & $installed internet status
+            throw "internet sharing is not $want within 60 s"
+          }
+          try {
+            $env:SHUTUP_AND_RUN_EXE_URL = "http://127.0.0.1:8097/$asset"
+            $env:SHUTUP_AND_RUN_POLL_URL = ""
+            $env:SHUTUP_AND_RUN_RELAY = "127.0.0.1:17000"
+            $env:SHUTUP_AND_RUN_RELAY_TOKEN = $token
+            $env:SHUTUP_AND_RUN_INTERNET_LOGIN = "ci-pc:ci-pc-password-0123456"
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1
+            if ($LASTEXITCODE -ne 0) { throw "install.ps1 with a relay exited $LASTEXITCODE" }
+            if (-not (Get-ScheduledTask -TaskName shutup-and-run-internet -ErrorAction SilentlyContinue)) { throw "no task shutup-and-run-internet" }
+            WaitFor "connected"
+            $code = Through
+            if ($code -ne "200") { throw "curl.exe through the PC: $code" }
+            $status = & curl.exe -s "$proxy/status"
+            Write-Host "relay /status: $status"
+            if ("$status" -notmatch '"connected":true') { throw "/status does not say connected" }
+            $pcs = & curl.exe -s -H "Authorization: Bearer $token" http://127.0.0.1:18080/pcs
+            Write-Host "relay /pcs: $pcs"
+            if ("$pcs" -notmatch '"id":"ci-pc"') { throw "/pcs does not list the PC" }
+
+            $code = Page "/pause"
+            if ($code -ne "303") { throw "the page's pause answered $code" }
+            WaitFor "waiting"
+            $code = Through
+            if ($code -eq "200") { throw "a request went through a paused PC" }
+            $code = Page "/resume"
+            if ($code -ne "303") { throw "the page's resume answered $code" }
+            WaitFor "connected"
+            $code = Through
+            if ($code -ne "200") { throw "curl.exe after resume: $code" }
+
+            $code = Page "/off"
+            if ($code -ne "200") { throw "the page's stop answered $code" }
+            if (Get-ScheduledTask -TaskName shutup-and-run-internet -ErrorAction SilentlyContinue) { throw "the task survived the page's stop" }
+            for ($i = 0; $i -lt 30; $i++) {
+              $left = @(Get-CimInstance Win32_Process -Filter "Name = 'shutup-and-run.exe'" | Where-Object { $_.CommandLine -match "internet serve" })
+              if ($left.Count -eq 0) { break }
+              Start-Sleep -Seconds 1
+            }
+            if ($left.Count -gt 0) { throw "internet serve still runs 30 s after the page's stop" }
+          } finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $relay.Id -Force -ErrorAction SilentlyContinue
+            Get-Content $relayLog -ErrorAction SilentlyContinue | Select-Object -Last 20
+            & $installed internet off --forget
+          }
+          exit 0
       # For tests/windows-sandbox/run.ps1 -Exe, before a release has this build.
       - uses: actions/upload-artifact@v4
         with:
