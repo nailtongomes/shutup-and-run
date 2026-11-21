@@ -11,6 +11,8 @@ Machine-readable, JSON Schema Draft 2020-12:
 | [schemas/worker-poll-response.schema.json](schemas/worker-poll-response.schema.json) | The JSON a poll URL may answer with. |
 | [schemas/manifest.schema.json](schemas/manifest.schema.json) | The body a `manifest_url` must return. |
 | [schemas/job-result.schema.json](schemas/job-result.schema.json) | A job as the runner reports it. `$defs/callback` is the callback body. |
+| [schemas/internet-discovery-request.schema.json](schemas/internet-discovery-request.schema.json) | What `internet on --discover` sends, once, to ask where the relay is. |
+| [schemas/internet-discovery-response.schema.json](schemas/internet-discovery-response.schema.json) | What the URL answers it: the relay, its token, the PC's login. |
 
 [schemas/examples](schemas/examples) holds one file per example in this document. `src/contract.rs` sends every one of them through the real HTTP router, the real poll parser and the real callback, and checks what the runner emits against these schemas, on every `cargo test`. If this document and the runner disagree, that is a bug in one of them: say so in an issue before working around it.
 
@@ -305,6 +307,22 @@ There is no register call. Enrollment is this: the first poll with a new token.
 
 `shutup-and-run config check` asks the poll URL once, to tell a wrong path from a poll endpoint. That request is the poll body with `free_slots: 0` and **no `Authorization` header**. Answer it like any request without a token: `401`, `403` or `204`. Never with a task; the worker would not run it. A `404`, `405` or `5xx` is reported to the person as `POLL_HTTP_ERROR`, and `429` as `POLL_RATE_LIMITED`. The probe does not create a pending machine: it has no token.
 
+#### Internet discovery
+
+A PC that lends its internet connection (docs/INTERNET.md) asks a URL of yours once where your relay is, when the person at the PC turns it on with `shutup-and-run internet on --discover URL` (the install lines: `SHUTUP_AND_RUN_LEND_INTERNET=1` with `SHUTUP_AND_RUN_POLL_URL`). The poll URL serves; the body tells it from a poll:
+
+```json
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.28", "lend": "internet"}
+```
+
+with `Authorization: Bearer <SHUTUP_AND_RUN_POLL_TOKEN>` when that is set at the PC, and none otherwise. Answer `200` with where the PC dials in, and best the login you chose for it, so its tasks can use it without anything coming back from the PC:
+
+```json
+{"relay": "relay.example.com:7000", "token": "example-relay-token-123", "login": "pc-desk-07:example-password-0123"}
+```
+
+`relay` is required; `token` when your relay asks for one; `login` is `ID:PASSWORD` (the password 16 to 128 letters, digits, `-`, `_` or `.`), and without it the PC makes its own. Any other status, or an empty body, and `internet on` fails with nothing changed. A flag the person gave (`--token`, `--login`) wins over the answer. It is asked once per `internet on`, never on a schedule, and the answer never turns sharing on by itself: the person's command did. Schemas: `internet-discovery-request.schema.json`, `internet-discovery-response.schema.json`.
+
 ### The answers
 
 | Status | Body | The worker |
@@ -497,7 +515,7 @@ On a Windows worker these exist only on `127.0.0.1` inside the WSL2 distribution
 
 ## 8. Validating against the schemas
 
-The schemas reference each other by relative `$ref`, so load all five and register them by `$id`:
+The schemas reference each other by relative `$ref`, so load them all and register them by `$id`:
 
 ```python
 import json, pathlib

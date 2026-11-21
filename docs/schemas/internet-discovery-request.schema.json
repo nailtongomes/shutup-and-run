@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/docs/schemas/internet-discovery-request.schema.json",
+  "title": "InternetDiscoveryRequest",
+  "description": "The body of the one POST `shutup-and-run internet on --discover URL` sends, usually to the poll URL, when the person at the PC turns internet sharing on. `lend` is what tells it from a poll. The bearer is SHUTUP_AND_RUN_POLL_TOKEN when it is set at the PC, else there is no Authorization header. It is sent once per `internet on`, never on a schedule. A production endpoint should read the keys it knows and ignore the rest.",
+  "type": "object",
+  "required": ["worker", "os", "arch", "version", "lend"],
+  "additionalProperties": false,
+  "properties": {
+    "worker": {
+      "description": "The PC's name (COMPUTERNAME on Windows, the hostname on Linux). A claim, not proof: the bearer token is what identifies the PC.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "os": {"description": "windows or linux.", "type": "string", "enum": ["windows", "linux"]},
+    "arch": {"description": "CPU architecture of the binary, as Rust names it: x86_64, aarch64.", "type": "string", "minLength": 1},
+    "version": {"description": "Version of the program, such as 0.2.28.", "type": "string", "minLength": 1},
+    "lend": {"description": "Always internet: this PC asks where to lend its internet connection.", "const": "internet"}
+  }
+}

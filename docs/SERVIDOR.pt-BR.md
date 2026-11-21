@@ -29,7 +29,7 @@ O PC do cliente está atrás do roteador de casa e, muitas vezes, do CGNAT da op
 
 ## Montar, passo a passo
 
-1. **Uma VPS Ubuntu com IP público.** No painel do provedor, libere a porta **7000/TCP** de entrada. Se a VPS usa `ufw`, a instalação abre a 7000 nele.
+1. **Um servidor Linux com IP público** (uma VPS serve; para o jeito *a* ou *b* abaixo, com Docker). No painel do provedor, libere a porta **7000/TCP** de entrada. Se ele usa `ufw`, a linha sem Docker abre a 7000 nele; com Docker, o Docker já publica a porta.
 
 2. **O worker, se as tarefas vão rodar neste servidor** (antes do relay, para o Docker já existir):
 
@@ -37,15 +37,43 @@ O PC do cliente está atrás do roteador de casa e, muitas vezes, do CGNAT da op
    curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.sh | sudo SHUTUP_AND_RUN_ALLOWLIST=ghcr.io/voce/seu-robo bash
    ```
 
-3. **O relay, em uma linha:**
+3. **O relay**, de um destes três jeitos (escolha um):
+
+   **a) Docker, um comando** (o mais simples, a imagem [`ghcr.io/nailtongomes/shutup-and-run-relay`](https://github.com/nailtongomes/shutup-and-run/pkgs/container/shutup-and-run-relay), uns 20 MB, publicada a cada release):
+
+   ```bash
+   TOKEN=$(head -c 24 /dev/urandom | base64 | tr -d '/+='); echo "guarde o token: $TOKEN"
+   docker run -d --name relay --restart unless-stopped \
+     -p 7000:7000 -p 172.17.0.1:8080:8080 \
+     -e SHUTUP_AND_RUN_RELAY_TOKEN="$TOKEN" \
+     ghcr.io/nailtongomes/shutup-and-run-relay
+   docker logs -f relay     # "relay ...: PCs on 0.0.0.0:7000 with a token"
+   ```
+
+   **b) Num `docker compose` que você já tem**: cole este serviço nele e ponha `RELAY_TOKEN=...` no `.env` ao lado (o arquivo completo é [examples/relay/compose.yml](../examples/relay/compose.yml)):
+
+   ```yaml
+     relay:
+       image: ghcr.io/nailtongomes/shutup-and-run-relay:latest
+       environment:
+         SHUTUP_AND_RUN_RELAY_TOKEN: ${RELAY_TOKEN:?put RELAY_TOKEN in .env}
+       ports:
+         - "7000:7000"
+         - "172.17.0.1:8080:8080"
+       restart: unless-stopped
+       read_only: true
+       mem_limit: 128m
+   ```
+
+   Os outros serviços desse compose usam o proxy em `relay:8080`; as tarefas do worker, em `172.17.0.1:8080`.
+
+   **c) Sem Docker, em uma linha** (serviço systemd `shutup-and-run-relay`):
 
    ```bash
    curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.sh | sudo SHUTUP_AND_RUN_RELAY_SERVER=1 bash
    ```
 
-   Ela cria o token (`/etc/shutup-and-run/relay_token`), a unidade systemd `shutup-and-run-relay` (volta sozinha depois de um reinício ou de uma queda) e imprime o que passar aos clientes: o endereço `IP:7000`, a linha de instalação do Windows e o `HTTPS_PROXY` das tarefas. O token aparece só com `SHUTUP_AND_RUN_SHOW_TOKEN=1`; senão, `sudo cat /etc/shutup-and-run/relay_token`.
-
-   Prefere Docker? `examples/relay` com `docker compose up -d --build` faz o mesmo, com a 8080 também em `172.17.0.1`.
+   Ela cria o token (`/etc/shutup-and-run/relay_token`), o serviço (volta sozinho depois de um reinício ou de uma queda) e imprime o que passar aos clientes. O token aparece só com `SHUTUP_AND_RUN_SHOW_TOKEN=1`; senão, `sudo cat /etc/shutup-and-run/relay_token`.
 
 4. **O login de cada cliente.** O seu backend escolhe um id e uma senha por PC (a senha com 16 a 128 letras, números, `-`, `_` ou `.`), por exemplo:
 
@@ -64,7 +92,16 @@ O PC do cliente está atrás do roteador de casa e, muitas vezes, do CGNAT da op
    irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
    ```
 
-   Termina com `connected` em alguns segundos. A partir daí o PC conecta sozinho a cada logon; a pessoa pausa ou desliga em http://127.0.0.1:8788/.
+   Ou, se o seu backend responde a [descoberta](#a-url-de-poll-diz-onde-está-o-relay), só o sim do cliente e a URL:
+
+   ```powershell
+   $env:SHUTUP_AND_RUN_POLL_URL = "https://seu-backend.exemplo/poll"
+   $env:SHUTUP_AND_RUN_POLL_TOKEN = "O_TOKEN_DESTE_CLIENTE"   # opcional: diz ao backend quem é
+   $env:SHUTUP_AND_RUN_LEND_INTERNET = "1"
+   irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.ps1 | iex
+   ```
+
+   Termina com `connected` em alguns segundos. A partir daí o PC conecta sozinho a cada logon; a pessoa pausa ou desliga em http://127.0.0.1:8788/. Num PC com WSL2 e folga, a mesma linha também instala o worker (containers no PC); num PC sem, só a internet.
 
 6. **Nas suas tarefas**, o proxy vai no `env`:
 
@@ -74,6 +111,25 @@ O PC do cliente está atrás do roteador de casa e, muitas vezes, do CGNAT da op
    ```
 
    Antes de uma tarefa longa, veja se o PC está lá: `curl http://pc-cliente-01:A_SENHA@172.17.0.1:8080/status` responde `"connected":true`. Código para requests, Selenium, Playwright, Puppeteer, Node e n8n: [INTERNET.md, Examples](INTERNET.md#examples-curl-requests-selenium-playwright-puppeteer-node-n8n).
+
+## A URL de poll diz onde está o relay
+
+Para não passar endereço, token e login a cada cliente, o seu backend pode responder isso. Quando a pessoa liga a internet com `SHUTUP_AND_RUN_LEND_INTERNET=1` (ou `shutup-and-run internet on --discover URL`), o PC faz **um** `POST` na sua URL de poll:
+
+```json
+{"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.28", "lend": "internet"}
+```
+
+com `Authorization: Bearer <token do poll>` quando o cliente tem um. O `"lend": "internet"` diferencia do poll de tarefas. Responda `200`:
+
+```json
+{"relay": "IP_DO_SERVIDOR:7000", "token": "O_TOKEN_DO_RELAY", "login": "pc-cliente-01:A_SENHA"}
+```
+
+- `relay` é obrigatório; `token`, se o seu relay pede; `login`, o que o backend escolheu para esse PC (guarde-o: é o que as tarefas usam).
+- Qualquer outra resposta, e o PC não liga nada e diz o motivo.
+- É perguntado uma vez, quando a pessoa liga. Para mudar o relay, a linha de instalação roda de novo.
+- O contrato completo: [INTEGRATION-CONTRACT.md, Internet discovery](INTEGRATION-CONTRACT.md#internet-discovery).
 
 ## O teste de dois minutos
 
@@ -90,12 +146,12 @@ O segundo `curl` roda num container na rede padrão do Docker, como uma tarefa d
 
 ## Atualizar e remover
 
-- **Atualizar:** rode de novo a linha do relay (ou a do worker: ela reinicia o relay no binário novo). Atualize o relay e os PCs juntos: um relay 0.2.27 recusa um PC 0.2.26 com `update it`, e o PC se atualiza rodando a linha de instalação dele de novo.
-- **Remover:** `curl -fsSL .../install.sh | sudo bash -s -- --uninstall` tira o worker e o relay; com `--purge`, também a configuração e o token.
+- **Atualizar:** com Docker, `docker pull ghcr.io/nailtongomes/shutup-and-run-relay` e recrie o container (`docker compose pull && docker compose up -d`, no compose). Sem Docker, rode de novo a linha do relay (ou a do worker: ela reinicia o relay no binário novo). Atualize o relay e os PCs juntos: um relay 0.2.27 recusa um PC 0.2.26 com `update it`, e o PC se atualiza rodando a linha de instalação dele de novo.
+- **Remover:** `docker rm -f relay`; sem Docker, `curl -fsSL .../install.sh | sudo bash -s -- --uninstall` tira o worker e o relay (com `--purge`, também a configuração e o token).
 
 ## Tarefas em outro servidor
 
-O proxy nunca vai para a internet. Ponha o relay e os outros servidores numa VPN (Tailscale, WireGuard) e o proxy no endereço da VPN:
+O proxy nunca vai para a internet. Ponha o relay e os outros servidores numa VPN (Tailscale, WireGuard) e o proxy no endereço da VPN: no Docker, `-p 100.64.0.5:8080:8080` no lugar de `-p 172.17.0.1:8080:8080`; sem Docker,
 
 ```bash
 curl -fsSL .../install.sh | sudo SHUTUP_AND_RUN_RELAY_SERVER=1 SHUTUP_AND_RUN_RELAY_PROXY=100.64.0.5:8080 bash
@@ -108,7 +164,8 @@ As tarefas de lá usam `http://ID:SENHA@100.64.0.5:8080`.
 | O que acontece | Por quê, e o que fazer |
 | --- | --- |
 | O PC diz `INTERNET_RELAY_UNREACHABLE` | A 7000 não está liberada no firewall do provedor, ou o relay está parado: `systemctl status shutup-and-run-relay`. |
-| O PC diz `INTERNET_REFUSED` com `wrong or missing relay token` | O token do PC não é o de `/etc/shutup-and-run/relay_token`. |
+| O PC diz `INTERNET_REFUSED` com `wrong or missing relay token` | O token do PC não é o do relay (`SHUTUP_AND_RUN_RELAY_TOKEN` do container, ou `/etc/shutup-and-run/relay_token`). |
+| `internet on --discover` diz `answered 204 with no relay for this PC` | O seu backend não respondeu `200` com `relay` ao corpo com `"lend": "internet"`. |
 | O PC diz `INTERNET_REFUSED` com `update it` | O PC está numa versão antiga: rode a linha de instalação dele de novo. |
 | `/status` responde `401` | O id ou a senha da tarefa não são os do PC. |
 | A tarefa recebe `503` | O PC não está conectado agora (desligado, dormindo, pausado, fora do horário, bateria baixa, rede limitada). Tente de novo mais tarde. |

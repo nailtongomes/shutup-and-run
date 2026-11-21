@@ -14,11 +14,24 @@ Um runner de jobs Docker pequeno e auto-hospedado, em Rust. Um orquestrador que 
 - **Feito para um PC compartilhado.** Alguém pode estar trabalhando na máquina enquanto um job roda, e o trabalho dessa pessoa vem primeiro: limite de CPU e de memória em todo container, um job por vez por padrão, nenhum job novo enquanto faltar memória ou disco e, num PC pequeno, nada roda até o dono dizer sim.
 - **Nada para abrir no PC do cliente.** Um worker Windows pede trabalho a uma URL sua. Nenhuma porta de entrada, sem Docker Desktop, sem administrador depois de habilitar o WSL2, e sem janela.
 - **Feito para ser operado por um agente de IA.** Todo comando é não interativo, imprime JSON e tem código de saída fixo. A configuração é um arquivo só, que nunca se edita à mão. Um doctor aponta cada problema com o comando que resolve.
+- **Ou só a internet.** Um PC fraco demais para containers empresta a conexão de casa: seus containers, em qualquer lugar, acessam os sites com o IP do cliente, por um relay no seu servidor (um `docker run`). Os dois podem rodar no mesmo PC.
 - **Pequeno.** Um binário estático, um histórico em SQLite, uma página local em `127.0.0.1` para a pessoa no PC, e o que cada job imprimiu guardado na máquina por 7 dias.
 
 **Dúvidas?** O [FAQ](docs/FAQ.pt-BR.md) responde o que esperar: PC lento, bateria, desligamento, uma tarefa que não começou.
 
-**Conteúdo:** [Como funciona](#como-funciona) · [Início rápido](#início-rápido) · [A página local](#a-página-local) · [Protegendo o PC](#protegendo-o-pc) · [Containers gerenciados](#containers-gerenciados) · [Para um agente de IA](#para-um-agente-de-ia) · [A API](#push-pull-e-a-api) · [Segurança](#segurança) · [Limites](#limites)
+**Conteúdo:** [Formas de emprestar um PC](#formas-de-emprestar-um-pc) · [Como funciona](#como-funciona) · [Início rápido](#início-rápido) · [A página local](#a-página-local) · [Protegendo o PC](#protegendo-o-pc) · [Containers gerenciados](#containers-gerenciados) · [Para um agente de IA](#para-um-agente-de-ia) · [A API](#push-pull-e-a-api) · [Segurança](#segurança) · [Limites](#limites)
+
+## Formas de emprestar um PC
+
+| Modo | Para | O cliente (ou a IA dele) | Você |
+| --- | --- | --- | --- |
+| **Containers, por pull** | Um PC com WSL2 e folga (`shutup-and-run fit` diz `both`) | A linha de instalação com a sua URL de poll. Nada para abrir no PC | Responde o poll com uma tarefa ([contrato](docs/INTEGRATION-CONTRACT.md#3-poll)) |
+| **Containers, por push** | Um servidor Linux seu, que você alcança | `install.sh` | `POST /v1/jobs` com o token. Não serve para PC de cliente atrás de roteador |
+| **Containers gerenciados** | Uma máquina que roda os próprios containers, sem URL | `managed apply` uma vez | Nada ([containers gerenciados](#containers-gerenciados)) |
+| **Só a internet** | Um PC fraco, ou sem WSL2 (`fit` diz `internet`) | A linha de instalação com o seu relay, ou `SHUTUP_AND_RUN_LEND_INTERNET=1` e a sua URL de poll diz onde ele está | Um relay: um `docker run` ou uma linha ([seu servidor](docs/SERVIDOR.pt-BR.md)). Suas tarefas, em qualquer lugar, usam `HTTPS_PROXY` ([exemplos](docs/INTERNET.md#examples-curl-requests-selenium-playwright-puppeteer-node-n8n)) |
+| **Os dois** | Um PC que roda containers e empresta a conexão para as suas outras máquinas | A linha de instalação com a URL de poll e `SHUTUP_AND_RUN_LEND_INTERNET=1` | Os dois acima; uma tarefa que não cabe no PC vai para o seu servidor e sai pela conexão do PC |
+
+Os passos de um agente de IA para todos eles: [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#a-task-from-the-operator-run-it-here-lend-the-internet-or-both).
 
 ## O que é, e o que não é
 
@@ -287,7 +300,7 @@ shutup-and-run relay                                         # no servidor do op
 
 Novas conexões esperam enquanto o worker está pausado, fora de `--hours`, na bateria abaixo de 60%, enquanto a pessoa apresenta e em rede limitada; uma conexão já aberta nunca é cortada. Destinos na própria rede do PC são recusados. Nesta versão a ligação até o relay é TCP sem criptografia. A escolha, os riscos, um teste a partir de outra rede e os próximos passos: [docs/INTERNET.md](docs/INTERNET.md).
 
-Uma tarefa enviada a um worker seu em outro lugar sai pelo PC de um cliente pelo `env`: `HTTPS_PROXY=http://ID:SENHA@...` (`shutup-and-run internet credentials --env`). No Windows a linha de instalação faz tudo: `$env:SHUTUP_AND_RUN_RELAY = "relay.exemplo.com:7000"` (e `$env:SHUTUP_AND_RUN_POLL_URL` para o worker também) antes de `irm .../install.ps1 | iex`; o `install.sh` aceita o mesmo. A pessoa no PC pausa ou desliga pelos botões em http://127.0.0.1:8788/, ou com `shutup-and-run internet pause --for 1h` e `internet off`. Os passos de um agente: [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#a-task-from-the-operator-run-it-here-lend-the-internet-or-both). Seu servidor (o relay), passo a passo: [docs/SERVIDOR.pt-BR.md](docs/SERVIDOR.pt-BR.md), ou em uma linha `curl -fsSL .../install.sh | sudo SHUTUP_AND_RUN_RELAY_SERVER=1 bash`. Como usar o proxy com curl, requests, Selenium, Playwright, Puppeteer, Node ou n8n: [exemplos](docs/INTERNET.md#examples-curl-requests-selenium-playwright-puppeteer-node-n8n).
+Uma tarefa enviada a um worker seu em outro lugar sai pelo PC de um cliente pelo `env`: `HTTPS_PROXY=http://ID:SENHA@...` (`shutup-and-run internet credentials --env`). No Windows a linha de instalação faz tudo: `$env:SHUTUP_AND_RUN_RELAY = "relay.exemplo.com:7000"` (e `$env:SHUTUP_AND_RUN_POLL_URL` para o worker também) antes de `irm .../install.ps1 | iex`; o `install.sh` aceita o mesmo. A pessoa no PC pausa ou desliga pelos botões em http://127.0.0.1:8788/, ou com `shutup-and-run internet pause --for 1h` e `internet off`. Os passos de um agente: [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#a-task-from-the-operator-run-it-here-lend-the-internet-or-both). Seu servidor (o relay), passo a passo: [docs/SERVIDOR.pt-BR.md](docs/SERVIDOR.pt-BR.md); em uma linha, `docker run -d --restart unless-stopped -p 7000:7000 -p 172.17.0.1:8080:8080 -e SHUTUP_AND_RUN_RELAY_TOKEN=TOKEN ghcr.io/nailtongomes/shutup-and-run-relay`, ou sem Docker `curl -fsSL .../install.sh | sudo SHUTUP_AND_RUN_RELAY_SERVER=1 bash`. A sua URL de poll pode dizer a cada PC onde está o relay (`SHUTUP_AND_RUN_LEND_INTERNET=1` na instalação; [contrato](docs/INTEGRATION-CONTRACT.md#internet-discovery)). Como usar o proxy com curl, requests, Selenium, Playwright, Puppeteer, Node ou n8n: [exemplos](docs/INTERNET.md#examples-curl-requests-selenium-playwright-puppeteer-node-n8n).
 
 ## Configuração
 
