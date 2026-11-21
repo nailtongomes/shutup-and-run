@@ -2,13 +2,17 @@
 #
 #   docker compose up -d --build
 #
-# PCs dial in on 7000, the one port published, with the token in
-# ./relay_token. Your containers join the
-# network `egress` and use the proxy http://ID:SECRET@relay:8080, where ID
-# and SECRET are what `shutup-and-run internet credentials` prints on the PC.
-# 8080 is not published: only containers on `egress` reach it. To reach it
-# from another datacenter, publish it on a private address or a VPN only,
-# never on the internet: it goes out through someone's home connection.
+# PCs dial in on 7000, the one port published to the internet, with the
+# token in ./relay_token. The proxy, 8080, is for your containers only:
+# - containers on this compose network `egress`: http://ID:SECRET@relay:8080;
+# - the jobs of a shutup-and-run worker on this server (Docker's default
+#   network): http://ID:SECRET@172.17.0.1:8080, published on Docker's bridge
+#   address only, which the internet does not reach.
+# ID and SECRET are the PC's login (`internet credentials` on the PC, or the
+# `--login` you gave it). From another datacenter, publish it on a VPN
+# address only, never on the internet: it goes out through someone's home.
+# Without Docker: `install.sh` with SHUTUP_AND_RUN_RELAY_SERVER=1
+# (docs/SERVIDOR.pt-BR.md).
 services:
   relay:
     build: .
@@ -21,8 +25,10 @@ services:
       # Chrome takes no proxy login. A port with none, through one PC, from
       # a .env file beside this one (PC_ID=..., PC_SECRET=...):
       # - --open=8101=${PC_ID}:${PC_SECRET}
+      # and, for a worker's jobs, under ports: - "172.17.0.1:8101:8101"
     ports:
       - "7000:7000"
+      - "172.17.0.1:8080:8080"
     secrets: [relay_token]
     networks: [egress]
     restart: unless-stopped

@@ -663,3 +663,12 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - Nothing was cut: `--open` ports, the page, plain TCP and a relay without a token stay as options, with their risks in docs/INTERNET.md.
 
 **Cost.** The page is no longer read-only: anyone at the PC can stop the sharing, which is the point. The backend holds every PC's password (`--login`). An older binary refuses an `internet.json` with `paused_until` (unknown fields stay refused), so going back a version after a pause needs `internet on` again. `fit` on Linux does not look for Docker: the install puts it there.
+
+## The relay in one line, its proxy on Docker's bridge
+
+**Context.** An operator had to read `examples/relay`, install Docker and write a token by hand to have a relay. And the compose file published the proxy only on its own network `egress`, which the jobs of a shutup-and-run worker on the same server never join: a request cannot choose a network, so those jobs could not reach the proxy at all.
+
+**Decision.** `install.sh` with `SHUTUP_AND_RUN_RELAY_SERVER=1` installs the binary, makes `/etc/shutup-and-run/relay_token`, and writes the systemd unit `shutup-and-run-relay`: PCs on `0.0.0.0:7000`, the proxy on Docker's bridge address (read from `docker0` or `docker network inspect`; loopback until Docker exists; `SHUTUP_AND_RUN_RELAY_PROXY` for a VPN address). It prints what to give the clients, the token only with `SHUTUP_AND_RUN_SHOW_TOKEN=1`. The plain install line restarts the relay on the new binary, and `--uninstall` removes it. The compose file also publishes the proxy on `172.17.0.1:8080`. docs/SERVIDOR.pt-BR.md walks an operator through it.
+
+**Cost.** Every container on that server's default Docker network reaches the proxy, not only the worker's jobs; the PC's login still guards it. A relay installed before Docker sits on loopback until its line runs again. The unit runs as root, with `ProtectSystem=strict`; the relay writes nothing.
+

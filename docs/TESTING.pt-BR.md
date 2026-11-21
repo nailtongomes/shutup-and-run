@@ -292,7 +292,7 @@ shutup-and-run demo sign --configured
 
 Num servidor Linux com Docker e a porta 7000 aberta para a internet, e num PC Windows 11 **sem WSL** (`wsl --list` não mostra nada, ou o WSL nem está instalado). docs/INTERNET.md explica o porquê de cada passo.
 
-No servidor:
+No servidor (ou, sem Docker, a linha do relay de [SERVIDOR.pt-BR.md](SERVIDOR.pt-BR.md), passo 3, e depois o teste de dois minutos dele):
 
 ```bash
 git clone https://github.com/nailtongomes/shutup-and-run && cd shutup-and-run/examples/relay

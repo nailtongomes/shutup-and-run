@@ -23,7 +23,17 @@ The relay speaks plain HTTP proxy (`CONNECT` for HTTPS, `http://` URLs for plain
 
 ## The operator: the relay
 
-On a Linux server with Docker that the PCs can reach on one TCP port:
+A step-by-step guide in Portuguese, with the topology, the server's size and a two-minute test: [SERVIDOR.pt-BR.md](SERVIDOR.pt-BR.md).
+
+On an Ubuntu server the PCs can reach on one TCP port, in one line, no Docker needed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install.sh | sudo SHUTUP_AND_RUN_RELAY_SERVER=1 bash
+```
+
+It makes the token (`/etc/shutup-and-run/relay_token`), the systemd unit `shutup-and-run-relay` with PCs on `0.0.0.0:7000` and the proxy on Docker's bridge address (`172.17.0.1:8080`, loopback until Docker is there; `SHUTUP_AND_RUN_RELAY_PROXY` for a VPN address), and prints what to give the clients. Install the worker first if its jobs run on the same server. The plain install line restarts the relay on the new binary; `--uninstall` removes it.
+
+Or with Docker:
 
 ```bash
 cd examples/relay
@@ -35,14 +45,14 @@ docker compose logs -f relay        # "PC <id> connected from <ip>", a line per 
 - The token keeps unknown PCs out: without it anyone who finds port 7000 can connect one. Give it to the client with the relay's address (`internet on --relay HOST:7000 --token TOKEN`). To run without one, take `--token-file` and the `secrets` out of `compose.yml`.
 
 - `7000` is published: the PCs dial in there, with the token. Open it in the server's firewall.
-- `8080` is the proxy. It is **not** published: containers on the compose network `egress` use `http://ID:SECRET@relay:8080`. A container in another datacenter reaches it only over a private address or a VPN; never publish it on the internet.
-- For Chrome, uncomment `--open=8101=${PC_ID}:${PC_SECRET}` and put `PC_ID` and `PC_SECRET` in a `.env` beside `compose.yml`; then Chrome uses `--proxy-server=http://relay:8101`.
+- `8080` is the proxy, published only on Docker's bridge address: containers on the compose network `egress` use `http://ID:SECRET@relay:8080`, and the jobs of a shutup-and-run worker on the same server (Docker's default network; a request cannot choose another) use `http://ID:SECRET@172.17.0.1:8080`. A container in another datacenter reaches it only over a VPN; never publish it on the internet.
+- For Chrome, uncomment `--open=8101=${PC_ID}:${PC_SECRET}` and put `PC_ID` and `PC_SECRET` in a `.env` beside `compose.yml`; then Chrome uses `--proxy-server=http://relay:8101`. For a worker's jobs, also add `- "172.17.0.1:8101:8101"` under `ports` and use `http://172.17.0.1:8101`.
 
 The Dockerfile takes the latest release's binary, which has the relay from 0.2.26 on. A 0.2.27 relay refuses 0.2.26 PCs (`update it`): update the PCs with the relay. To run a build of your own, build the musl binary (AGENTS.md), copy it beside `compose.yml` and replace the Dockerfile's first stage with `COPY shutup-and-run /shutup-and-run`.
 
 The relay keeps nothing on disk. A restart drops every stream; the PCs come back by themselves within seconds. Once a minute the log has a line per PC whose numbers changed: `relay: PC <id>: 16 idle, 2 open`.
 
-Without Docker: `shutup-and-run relay --agents 0.0.0.0:7000 --proxy 10.0.0.5:8080` (the proxy on a private address).
+By hand: `shutup-and-run relay --agents 0.0.0.0:7000 --proxy 172.17.0.1:8080 --token-file FILE` (the proxy on a private address).
 
 ## The client's PC
 
@@ -136,7 +146,7 @@ The case this is for: an agent or a person makes a task where the client works, 
    `requests`, `httpx`, `curl` and most HTTP libraries read `HTTPS_PROXY` by themselves. Chrome does not: the image starts it with `--proxy-server` (the relay's `--open` port for that PC), or logs in from Playwright, Puppeteer or SeleniumBase. [Examples](#examples-curl-requests-selenium-playwright-puppeteer-node-n8n) has each.
 3. When the worker starts it, the task can first ask whether the PC is there: `curl -s $PROXY_STATUS_URL` answers `{"id":"ID","connected":true,"idle":16,"open":0,"seen_secs_ago":4}`, or `401` for a wrong login. Not connected: the proxy answers `503` for 10 seconds per request; the task waits and tries again, or ends and is sent again later. The worker does not retry a job.
 
-The worker's containers must reach the proxy port. On the relay's own host, bind it on Docker's bridge (`--proxy 172.17.0.1:8080`) and the worker's containers there use `172.17.0.1:8080`. On another server, put the relay and the worker on a VPN (WireGuard, Tailscale) and bind the proxy on the VPN address. Published on the internet, the password is all that guards the client's connection, and it crosses in the clear.
+The worker's containers must reach the proxy port. On the relay's own host, the relay's install line and the compose file put it on Docker's bridge, and the worker's containers there use `172.17.0.1:8080`. On another server, put the relay and the worker on a VPN (WireGuard, Tailscale) and bind the proxy on the VPN address. Published on the internet, the password is all that guards the client's connection, and it crosses in the clear.
 
 The proxy password then sits in the job's env on the worker. A Linux worker is the operator's and trusted; never send it to a task on another client's PC.
 
