@@ -96,7 +96,7 @@ GitHub-hosted Ubuntu installs packages from `azure.archive.ubuntu.com`, sometime
 
 ## GHCR image
 
-`ghcr.io/nailtongomes/shutup-and-run` is the static musl binary on `scratch`. `:edge` tracks `main`. A `v*` tag is pushed under that tag name. linux/amd64 only. The systemd installer stays the way to put it on a machine. The image exists for people who already run everything under Docker. Publishing uses `GITHUB_TOKEN` with `packages: write`. The first push may create a private package; the owner has to switch it to public once if anonymous pulls should work.
+`ghcr.io/nailtongomes/shutup-and-run` is the static musl binary on `scratch`. `:edge` tracks `main`. Each release is pushed as `v<version>` and `latest` by the release workflow, from the release's own binary (the tags that workflow creates with `GITHUB_TOKEN` start no other workflow, so `image.yml` on `v*` stopped at v0.2.9). linux/amd64 only. The systemd installer stays the way to put it on a machine. The image exists for people who already run everything under Docker. Publishing uses `GITHUB_TOKEN` with `packages: write`. The first push may create a private package; the owner has to switch it to public once if anonymous pulls should work.
 
 ## GitHub release
 
@@ -683,4 +683,18 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 - The READMEs open with the ways to lend a PC, one row each.
 
 **Cost.** A PC told by the URL keeps that relay until the next `internet on --discover`: moving the relay means running the install line again on each PC. The poll URL learns which PCs lend their internet. The image is built only after a release (or "Run workflow" on main for the newest one), not on every push. A relay with no token in its env accepts any PC, as before.
+
+## The operator's list of PCs, room for 10 consumers, the worker image per release, n8n as the hub
+
+**Context.** The operator's backend could ask the relay about one PC at a time, with that PC's login. Ten browsers at once through one PC went near its 256 streams. The worker image had no version tag since v0.2.9. And a server with a relay still needed a backend to answer the discovery and to send a job through a chosen PC.
+
+**Decision.**
+
+- `GET /pcs` on the relay's proxy port, with the relay's token as a bearer, lists every PC the relay knows: id, connected, idle, open, seen, and bytes since the relay started. No password, no address. A relay without a token has no list (`404`): the token is the operator's, the PCs' logins are not. It is on the proxy port, which only the operator's containers reach.
+- A PC keeps 32 idle connections and up to 512 streams. 10 Chromium at once held up to 192 streams, three quarters of the old 256; the old numbers were as fast, so this is margin, not speed (`tests/internet/local.sh` with `SHUTUP_AND_RUN_LOAD=1`, numbers in docs/INTERNET.md). Constants, like the rest.
+- The release workflow's `images` job pushes the worker image as `v<version>` and `latest` beside the relay's, from the same checked binary.
+- `examples/n8n/worker-orchestrator.json` answers the discovery (a login per PC, made by a Crypto node and kept) and queues a job `via_internet`, which puts that PC's proxy in the task's `env`. The queue stays in the orchestrator, as before; the relay and the worker get no queue.
+- CI runs internet sharing on the Windows runner: `install.ps1` with a relay, `curl.exe` through the PC, `/status` and `/pcs`, the page's pause, resume and stop.
+
+**Cost.** Anyone with the relay's token reads which PCs are there and how much they carried; the PCs hold that token too, but reach only port 7000, not the proxy. 32 idle connections are 32 sockets on the PC and the relay per PC, and a ping each every 10 s. The n8n flow answers any discovery that reaches it, without approval, up to 200 PCs: a stranger with the URL can lend you a connection you never use. The Windows CI step proves the path on a runner, not on a home PC behind NAT.
 

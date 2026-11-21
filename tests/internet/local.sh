@@ -6,11 +6,16 @@
 #
 #   cargo build --release --locked
 #   sudo bash tests/internet/local.sh target/release/shutup-and-run
+#   sudo SHUTUP_AND_RUN_LOAD=1 bash tests/internet/local.sh target/release/shutup-and-run
+#
+# The second also loads pages in 10 browsers at once through the PC
+# (load.mjs: node with Playwright).
 #
 # Leaves nothing behind: `internet off --forget` at the end.
 set -euo pipefail
 
 bin=$(realpath "${1:?usage: local.sh PATH_TO_BINARY}")
+here=$(cd "$(dirname "$0")" && pwd)
 agents=127.0.0.1:17000
 proxy_port=18080
 work=$(mktemp -d)
@@ -81,6 +86,11 @@ fi
 sleep 6
 wait_connected
 "$bin" status || true
+
+# 10 browsers at once through this one PC (node with Playwright).
+if [ "${SHUTUP_AND_RUN_LOAD:-}" = 1 ]; then
+  node "$here/load.mjs" "$url" "${SHUTUP_AND_RUN_LOAD_BROWSERS:-10}"
+fi
 
 echo "restarting the relay"
 kill "$relay_pid"
