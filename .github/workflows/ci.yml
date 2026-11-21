@@ -164,7 +164,7 @@ jobs:
           $installed = Join-Path $env:ProgramData "shutup-and-run\shutup-and-run.exe"
           $proxy = "http://ci-pc:ci-pc-password-0123456@127.0.0.1:18080"
           function Through { & curl.exe -s -o NUL -w "%{http_code}" --max-time 30 -x $proxy https://example.com/ }
-          function Page($path) { & curl.exe -s -o NUL -w "%{http_code}" -X POST -d "" -H "Origin: http://127.0.0.1:8788" "http://127.0.0.1:8788$path" }
+          function Page($path) { & curl.exe -s -o NUL -w "%{http_code}" -X POST -d "from=ci" -H "Origin: http://127.0.0.1:8788" "http://127.0.0.1:8788$path" }
           function State { ((& $installed internet status --json) -join "" | ConvertFrom-Json).status.state }
           function WaitFor($want) {
             for ($i = 0; $i -lt 60; $i++) { if ((State) -eq $want) { return }; Start-Sleep -Seconds 1 }
