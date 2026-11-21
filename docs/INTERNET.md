@@ -33,22 +33,29 @@ curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/sc
 
 It makes the token (`/etc/shutup-and-run/relay_token`), the systemd unit `shutup-and-run-relay` with PCs on `0.0.0.0:7000` and the proxy on Docker's bridge address (`172.17.0.1:8080`, loopback until Docker is there; `SHUTUP_AND_RUN_RELAY_PROXY` for a VPN address), and prints what to give the clients. Install the worker first if its jobs run on the same server. The plain install line restarts the relay on the new binary; `--uninstall` removes it.
 
-Or with Docker:
+Or with Docker, the release's image (about 20 MB, `ghcr.io/nailtongomes/shutup-and-run-relay`, pushed as each version and `latest`):
+
+```bash
+docker run -d --name relay --restart unless-stopped -p 7000:7000 -p 172.17.0.1:8080:8080 \
+  -e SHUTUP_AND_RUN_RELAY_TOKEN=TOKEN ghcr.io/nailtongomes/shutup-and-run-relay
+```
+
+The token comes from `SHUTUP_AND_RUN_RELAY_TOKEN` (or `--token-file`); without one the relay accepts any PC. To add it to a compose file you already run, paste the `relay` service of `examples/relay/compose.yml` and put `RELAY_TOKEN` in its `.env`; on its own:
 
 ```bash
 cd examples/relay
-head -c 24 /dev/urandom | base64 | tr -d '/+=' > relay_token   # what every PC must send
-docker compose up -d --build        # the release's musl binary, checked against SHA256SUMS
+echo "RELAY_TOKEN=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')" > .env   # what every PC must send
+docker compose up -d
 docker compose logs -f relay        # "PC <id> connected from <ip>", a line per stream, a summary per minute
 ```
 
-- The token keeps unknown PCs out: without it anyone who finds port 7000 can connect one. Give it to the client with the relay's address (`internet on --relay HOST:7000 --token TOKEN`). To run without one, take `--token-file` and the `secrets` out of `compose.yml`.
+- The token keeps unknown PCs out: without it anyone who finds port 7000 can connect one. Give it to the client with the relay's address (`internet on --relay HOST:7000 --token TOKEN`), or let your poll URL hand both out (`internet on --discover`, [contract](INTEGRATION-CONTRACT.md#internet-discovery)).
 
 - `7000` is published: the PCs dial in there, with the token. Open it in the server's firewall.
-- `8080` is the proxy, published only on Docker's bridge address: containers on the compose network `egress` use `http://ID:SECRET@relay:8080`, and the jobs of a shutup-and-run worker on the same server (Docker's default network; a request cannot choose another) use `http://ID:SECRET@172.17.0.1:8080`. A container in another datacenter reaches it only over a VPN; never publish it on the internet.
-- For Chrome, uncomment `--open=8101=${PC_ID}:${PC_SECRET}` and put `PC_ID` and `PC_SECRET` in a `.env` beside `compose.yml`; then Chrome uses `--proxy-server=http://relay:8101`. For a worker's jobs, also add `- "172.17.0.1:8101:8101"` under `ports` and use `http://172.17.0.1:8101`.
+- `8080` is the proxy, published only on Docker's bridge address: services of the same compose file use `http://ID:SECRET@relay:8080`, and the jobs of a shutup-and-run worker on the same server (Docker's default network; a request cannot choose another) use `http://ID:SECRET@172.17.0.1:8080`. A container in another datacenter reaches it only over a VPN; never publish it on the internet.
+- For Chrome with no login: uncomment the `command` line with `--open=8101=${PC_ID}:${PC_SECRET}` in `compose.yml`, put `PC_ID` and `PC_SECRET` in its `.env`, and add `- "172.17.0.1:8101:8101"` under `ports`; Chrome uses `--proxy-server=http://relay:8101` from the same compose file, `http://172.17.0.1:8101` from a worker's job. With `docker run`: `... ghcr.io/nailtongomes/shutup-and-run-relay --agents=0.0.0.0:7000 --proxy=0.0.0.0:8080 --open=8101=ID:SECRET` and `-p 172.17.0.1:8101:8101`.
 
-The Dockerfile takes the latest release's binary, which has the relay from 0.2.26 on. A 0.2.27 relay refuses 0.2.26 PCs (`update it`): update the PCs with the relay. To run a build of your own, build the musl binary (AGENTS.md), copy it beside `compose.yml` and replace the Dockerfile's first stage with `COPY shutup-and-run /shutup-and-run`.
+The image is the release's own musl binary on `scratch` (`examples/relay/Dockerfile`), so what the relay speaks is what that release's PCs speak. A 0.2.27 relay refuses 0.2.26 PCs (`update it`): update the PCs with the relay. To run a build of your own, copy a musl binary (AGENTS.md) beside the Dockerfile as `shutup-and-run` and `docker build`.
 
 The relay keeps nothing on disk. A restart drops every stream; the PCs come back by themselves within seconds. Once a minute the log has a line per PC whose numbers changed: `relay: PC <id>: 16 idle, 2 open`.
 
@@ -74,7 +81,7 @@ Linux (root): `shutup-and-run internet on --relay relay.example.com:7000` writes
 | Command | What it does |
 | --- | --- |
 | `fit [--json]` | before anything: `both` (containers and the internet) or `internet`, and why |
-| `internet on --relay HOST:PORT [--login ID:PASSWORD \| --id NAME] [--token TOKEN] [--hours "mon-fri 19-07"] [--max-day 5g] [--metered] [--wait SECONDS]` | turn on, or change; keeps the id, the password and the token of a previous `on`. `--wait` returns once connected, or exits 1 with the code and the hint |
+| `internet on (--relay HOST:PORT \| --discover URL) [--login ID:PASSWORD \| --id NAME] [--token TOKEN] [--hours "mon-fri 19-07"] [--max-day 5g] [--metered] [--wait SECONDS]` | turn on, or change; keeps the id, the password and the token of a previous `on`. `--discover` asks your URL (the poll URL serves) for the relay, the token and the login, once ([contract](INTEGRATION-CONTRACT.md#internet-discovery)). `--wait` returns once connected, or exits 1 with the code and the hint |
 | `internet pause [--for 1h]`, `internet resume` | new streams wait (30m, 2h, 1d, `day`), or stop waiting; open ones go on |
 | `internet status [--json]` | `ok`, or why not, with a `hint`; bytes carried, and today's against `--max-day`. Exit 1 when on and not working |
 | `internet credentials [--json \| --env]` | the proxy address with the password, for the operator; `--env` as `HTTPS_PROXY=` and `HTTP_PROXY=` lines, for a task's env |
@@ -282,23 +289,23 @@ UDP does not cross the relay. Chrome falls back from QUIC to TCP by itself; WebR
 
 The proof that matters: from a container in the datacenter, the site sees the PC's IP.
 
-1. Server: `docker compose up -d --build` in `examples/relay`, with `7000` open.
-2. PC: `internet on --relay SERVER:7000 --token TOKEN` (the content of `relay_token`), then `internet status` says `ok ... connected`. `internet credentials` gives `ID` and `SECRET`.
+1. Server: the relay (the `docker run` above, or `docker compose up -d` in `examples/relay`), with `7000` open.
+2. PC: `internet on --relay SERVER:7000 --token TOKEN` (the relay's token), then `internet status` says `ok ... connected`. `internet credentials` gives `ID` and `SECRET`.
 3. PC: `curl https://api.ipify.org` (Windows: `curl.exe`) prints the PC's public IP, say `177.x.y.z`.
 4. Server, the datacenter's IP for comparison: `curl https://api.ipify.org`.
 5. Server, through the PC:
 
    ```bash
-   docker run --rm --network relay_egress curlimages/curl -s \
-     -x http://ID:SECRET@relay:8080 https://api.ipify.org
+   docker run --rm curlimages/curl -s \
+     -x http://ID:SECRET@172.17.0.1:8080 https://api.ipify.org
    ```
 
    prints `177.x.y.z`, the PC's IP, not step 4's.
-6. Chrome headless, through the port with no login (`--open=8101=ID:SECRET`, then `docker compose up -d`):
+6. Chrome headless, through the port with no login (`--open=8101=ID:SECRET` and `-p 172.17.0.1:8101:8101`, above):
 
    ```bash
-   docker run --rm --network relay_egress zenika/alpine-chrome \
-     --no-sandbox --proxy-server=http://relay:8101 \
+   docker run --rm zenika/alpine-chrome \
+     --no-sandbox --proxy-server=http://172.17.0.1:8101 \
      --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
      --dump-dom https://api.ipify.org
    ```
@@ -309,7 +316,7 @@ The proof that matters: from a container in the datacenter, the site sees the PC
    from selenium import webdriver
    options = webdriver.ChromeOptions()
    options.add_argument("--headless=new")
-   options.add_argument("--proxy-server=http://relay:8101")
+   options.add_argument("--proxy-server=http://172.17.0.1:8101")
    options.add_argument("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
    driver = webdriver.Chrome(options=options)
    driver.get("https://api.ipify.org")

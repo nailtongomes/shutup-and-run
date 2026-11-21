@@ -668,6 +668,10 @@ async fn next_line(link: &mut Link) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 // CLI
 
+/// The relay's token from the environment, when there is no --token-file:
+/// the one line of a `docker run` or a compose file.
+pub const TOKEN_ENV: &str = "SHUTUP_AND_RUN_RELAY_TOKEN";
+
 pub fn usage() -> &'static str {
     "\
 shutup-and-run relay [--agents 0.0.0.0:7000] [--proxy 127.0.0.1:8080] [--open PORT=ID:SECRET,...]
@@ -678,7 +682,8 @@ shutup-and-run relay [--agents 0.0.0.0:7000] [--proxy 127.0.0.1:8080] [--open PO
     one PC (for Chrome, which takes no proxy login), on the address of
     --proxy. The proxy listens on loopback unless told otherwise: put it on
     a network only your containers reach. --token-file: a PC connects only
-    with the token in that file (`internet on --token`). `GET /status` on
+    with the token in that file (`internet on --token`); without it, the
+    same from the environment variable SHUTUP_AND_RUN_RELAY_TOKEN. `GET /status` on
     the proxy port, with a PC's login, says whether it is connected.
     docs/INTERNET.md."
 }
@@ -716,21 +721,28 @@ async fn run(args: &[String]) -> Result<(), String> {
         &[],
     )
     .map_err(|e| e.0)?;
-    // From a file, so it is not on the command line for `ps` to show.
-    let token = match flags.get("--token-file") {
+    // From a file or the environment, so it is not on the command line for
+    // `ps` to show. The message never repeats it.
+    let (token, from) = match flags.get("--token-file") {
         Some(path) => {
             let text =
                 std::fs::read_to_string(path).map_err(|e| format!("--token-file {path}: {e}"))?;
-            let token = text.trim().to_string();
-            if !valid_word(&token, 8..=256) {
-                return Err(format!(
-                    "--token-file {path}: 8 to 256 letters, digits, '-', '_' or '.'"
-                ));
-            }
-            Some(token)
+            (
+                Some(text.trim().to_string()),
+                format!("--token-file {path}"),
+            )
         }
-        None => None,
+        None => (
+            std::env::var(TOKEN_ENV)
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty()),
+            TOKEN_ENV.to_string(),
+        ),
     };
+    if token.as_deref().is_some_and(|t| !valid_word(t, 8..=256)) {
+        return Err(format!("{from}: 8 to 256 letters, digits, '-', '_' or '.'"));
+    }
     let agents_addr = flags.get("--agents").unwrap_or("0.0.0.0:7000");
     let proxy_addr: SocketAddr = flags
         .get("--proxy")

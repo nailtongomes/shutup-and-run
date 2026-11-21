@@ -672,3 +672,15 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** Every container on that server's default Docker network reaches the proxy, not only the worker's jobs; the PC's login still guards it. A relay installed before Docker sits on loopback until its line runs again. The unit runs as root, with `ProtectSystem=strict`; the relay writes nothing.
 
+## The poll URL says where the relay is; the relay as an image (0.2.28)
+
+**Context.** Every client had to be told the relay's address, token and login, and an operator with a server already running Docker had to clone the repository and build an image to run a relay.
+
+**Decision.**
+
+- `internet on --discover URL` (the install lines: `SHUTUP_AND_RUN_LEND_INTERNET=1` with `SHUTUP_AND_RUN_POLL_URL`) sends one `POST` to the operator's URL, the poll URL serving, with `"lend": "internet"` and the poll token when set, and takes `relay`, `token` and `login` from a `200` answer. It is the person's own command, so it is the same consent as `--relay`; the URL only says where. It is asked once per `on`, not on a schedule, and nothing else from the poll touches internet sharing. Two schemas, `internet-discovery-request` and `-response`, held by `src/contract.rs`.
+- The release workflow builds `ghcr.io/nailtongomes/shutup-and-run-relay` from the release's own musl binary (checked against `SHA256SUMS`) and pushes it as the version and `latest`: a relay pulled is the same release as the PCs. The relay takes its token from `SHUTUP_AND_RUN_RELAY_TOKEN` when there is no `--token-file`, so a `docker run` or a compose service is one line of env. `examples/relay/compose.yml` uses the image, fails without a token, and is a service to paste into a compose file that exists.
+- The READMEs open with the ways to lend a PC, one row each.
+
+**Cost.** A PC told by the URL keeps that relay until the next `internet on --discover`: moving the relay means running the install line again on each PC. The poll URL learns which PCs lend their internet. The image is built only after a release (or "Run workflow" on main for the newest one), not on every push. A relay with no token in its env accepts any PC, as before.
+

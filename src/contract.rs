@@ -39,6 +39,14 @@ const SCHEMAS: &[(&str, &str)] = &[
         include_str!("../docs/schemas/worker-poll-response.schema.json"),
     ),
     (
+        "internet-discovery-request.schema.json",
+        include_str!("../docs/schemas/internet-discovery-request.schema.json"),
+    ),
+    (
+        "internet-discovery-response.schema.json",
+        include_str!("../docs/schemas/internet-discovery-response.schema.json"),
+    ),
+    (
         "manifest.schema.json",
         include_str!("../docs/schemas/manifest.schema.json"),
     ),
@@ -733,6 +741,47 @@ fn poll_answers_parse_as_documented() {
         task.env["SCRIPT_URL"],
         "https://scripts.example.com/protocolar.py"
     );
+}
+
+// `internet on --discover`: what the PC sends and what it takes are what
+// the schemas say.
+#[test]
+fn the_internet_discovery_matches_its_schemas() {
+    let request = schema("internet-discovery-request.schema.json");
+    let example = example!("internet-discovery-request.json");
+    assert_valid(&request, &parse(example.1, example.0), example.0);
+    let body = crate::internet::discovery_body();
+    assert_valid(&request, &body, "discovery body");
+    assert_eq!(body["lend"], "internet");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+
+    let response = schema("internet-discovery-response.schema.json");
+    let example = example!("internet-discovery-response.json");
+    assert_valid(&response, &parse(example.1, example.0), example.0);
+    let found = crate::internet::parse_discovery(example.1.as_bytes()).expect(example.0);
+    assert_eq!(found.relay, "relay.example.com:7000");
+    assert_eq!(found.token.as_deref(), Some("example-relay-token-123"));
+    assert_eq!(
+        found.login,
+        Some((
+            "pc-desk-07".to_string(),
+            "example-password-0123".to_string()
+        ))
+    );
+    // The relay alone is enough; what the schema refuses, the PC refuses.
+    let bare = json!({"relay": "relay.example.com:7000"});
+    assert_valid(&response, &bare, "relay only");
+    assert!(crate::internet::parse_discovery(bare.to_string().as_bytes()).is_ok());
+    for bad in [
+        json!({}),
+        json!({"relay": "no-port"}),
+        json!({"relay": "r.example.com:7000", "token": "short"}),
+        json!({"relay": "r.example.com:7000", "login": "pc:short-password"}),
+    ] {
+        assert!(!response.is_valid(&bad), "{bad}");
+        let e = crate::internet::parse_discovery(bad.to_string().as_bytes()).unwrap_err();
+        assert!(!e.contains("short-password"), "{e}");
+    }
 }
 
 // The poll request: what the worker sends is what the schema says.

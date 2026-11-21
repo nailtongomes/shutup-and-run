@@ -106,7 +106,7 @@ O `check.ps1` com `-JobName` mostra também o disco gravado pela tarefa. O que e
 O roteiro completo está em [TESTING.pt-BR.md, "Compartilhar só a internet"](TESTING.pt-BR.md#compartilhar-só-a-internet-sem-wsl). Precisa de um relay no ar (`examples/relay`, `docker compose up -d --build` num servidor com a porta 7000 aberta) e de **dois** PCs Windows 11: um **sem WSL** (ou com WSL desligado, `wsl --list` vazio) e um com o worker instalado.
 
 - [ ] **Sem WSL.** `internet on --relay SERVIDOR:7000` como usuário comum: sem janela, sem pedido de administrador; a tarefa `shutup-and-run-internet` aparece no Agendador de Tarefas; `internet status` diz `ok ... connected` em até 10 s; `http://127.0.0.1:8788/` mostra o mesmo.
-- [ ] **O IP.** Do servidor, `docker run --rm --network relay_egress curlimages/curl -s -x http://ID:SENHA@relay:8080 https://api.ipify.org` imprime o mesmo IP que `curl.exe https://api.ipify.org` no PC, e não o IP do servidor.
+- [ ] **O IP.** Do servidor, `docker run --rm curlimages/curl -s -x http://ID:SENHA@172.17.0.1:8080 https://api.ipify.org` imprime o mesmo IP que `curl.exe https://api.ipify.org` no PC, e não o IP do servidor.
 - [ ] **Chrome.** Com `--open=8101=ID:SENHA` no relay, o `zenika/alpine-chrome --dump-dom` de docs/INTERNET.md imprime o IP do PC. Um Selenium de verdade (o probe do operador) abre a página de um tribunal pelo mesmo caminho.
 - [ ] **Defender.** Nenhum alerta do Windows Defender ao baixar, ligar e usar (a ferramenta não é chisel/frp). Se aparecer, anote o nome exato da ameaça.
 - [ ] **Sono.** Com `internet status` em `ok`, durma o PC 2 minutos e acorde: em até um minuto `internet status` volta a `ok` sozinho e o curl do servidor funciona. Troque de Wi-Fi: o mesmo.
@@ -142,3 +142,11 @@ Com o relay do `examples/relay` atual (que agora pede `relay_token`):
 - [ ] **Botões da página.** Em http://127.0.0.1:8788/, "Pausar 1 hora": `internet status` diz `waits: INTERNET_PAUSED`, um download em curso termina e o próximo pedido recebe 503; "Retomar agora" volta. "Parar de compartilhar": a página diz que desligou, some em alguns segundos, a tarefa `shutup-and-run-internet` não existe mais (`schtasks /Query /TN shutup-and-run-internet` falha) e ela não volta no próximo logon.
 - [ ] **Pausa pela linha de comando.** `shutup-and-run internet pause --for 30m` e `internet resume`: o mesmo, num PC só com internet.
 - [ ] **Status num PC só com internet.** `shutup-and-run status --json` diz `"worker":"not installed"`, traz `internet`, e sai 0 com ela conectada, 1 com ela parada.
+
+## 0.2.28: descoberta do relay pela URL de poll, imagem do relay
+
+- [ ] **Só a URL.** Num PC sem WSL, com o seu backend respondendo a descoberta ([INTEGRATION-CONTRACT.md](INTEGRATION-CONTRACT.md#internet-discovery)): `$env:SHUTUP_AND_RUN_POLL_URL = "https://SEU-BACKEND/poll"`, `$env:SHUTUP_AND_RUN_LEND_INTERNET = "1"`, `irm .../install.ps1 | iex`. Termina com `connected`, com o id do `login` que o backend mandou, sem ninguém digitar o relay. O backend recebeu um `POST` com `"lend": "internet"`.
+- [ ] **Backend sem relay.** O backend responde `204` ao mesmo pedido: a instalação diz `answered 204 with no relay for this PC` e não deixa a internet ligada.
+- [ ] **Os dois.** Num PC com WSL2, as mesmas variáveis: a internet conecta e o `wsl install` também roda.
+- [ ] **Imagem.** No servidor, o `docker run ... ghcr.io/nailtongomes/shutup-and-run-relay` do SERVIDOR.pt-BR.md, passo 3a: `docker logs relay` diz `with a token`, e o teste de dois minutos mostra o IP do PC.
+

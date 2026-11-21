@@ -11,6 +11,8 @@
 # fetches the musl asset of its own version for the WSL distribution. A later
 # job runs the README one-liner on a fresh runner and smokes the service it
 # installed. The one-liners fetch install.sh and install.ps1 from main.
+# The relay's image, ghcr.io/nailtongomes/shutup-and-run-relay, is built from
+# the release's own musl binary and pushed as <version> and latest.
 name: release
 
 on:
@@ -148,6 +150,54 @@ jobs:
               || gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}"
           done < old-tags
           gh release list --repo "${GITHUB_REPOSITORY}" --limit 10
+
+  # The relay's image, from the release's own musl binary: what a server
+  # pulls is what the PCs' release speaks. Runs after a release, and on
+  # "Run workflow" for the newest release when there is nothing new.
+  relay-image:
+    needs: [version, publish]
+    if: >-
+      always() && needs.version.result == 'success' &&
+      (needs.publish.result == 'success' || needs.version.outputs.release == 'false')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: the release's binary, checked
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          cd examples/relay
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern shutup-and-run-x86_64-unknown-linux-musl --pattern SHA256SUMS
+          grep ' shutup-and-run-x86_64-unknown-linux-musl$' SHA256SUMS | sha256sum -c -
+          mv shutup-and-run-x86_64-unknown-linux-musl shutup-and-run
+          chmod 755 shutup-and-run
+          rm SHA256SUMS
+      - name: build and try
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          image=ghcr.io/nailtongomes/shutup-and-run-relay
+          docker build -t "${image}:${TAG#v}" -t "${image}:latest" examples/relay
+          docker run --rm "${image}:${TAG#v}" --help | head -n 3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: push
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          image=ghcr.io/nailtongomes/shutup-and-run-relay
+          docker push "${image}:${TAG#v}"
+          docker push "${image}:latest"
 
   install:
     needs: [version, publish]

@@ -35,6 +35,13 @@
 # and says what the worker needs. An update over it starts the task
 # shutup-and-run-internet again.
 #
+# Or let the poll URL say where the relay is (docs/INTEGRATION-CONTRACT.md,
+# "Internet discovery"): the person's yes, and the URL, nothing else:
+#   $env:SHUTUP_AND_RUN_POLL_URL = "https://orchestrator.example/poll"
+#   $env:SHUTUP_AND_RUN_LEND_INTERNET = "1"
+#   irm .../install.ps1 | iex
+# runs `shutup-and-run internet on --discover <poll URL> --wait 60`.
+#
 # For the worker it needs WSL2 already enabled: `wsl --install --no-distribution` as
 # administrator, then a reboot. This script does not need administrator.
 
@@ -147,15 +154,25 @@ try {
     if (-not ($env:Path -split ";" | Where-Object { $_ -eq $Dir })) { $env:Path = "$env:Path;$Dir" }
 
     $Relay = $env:SHUTUP_AND_RUN_RELAY
-    if ($Relay) {
-        $On = @("internet", "on", "--relay", $Relay, "--wait", "60")
+    # The person's yes to lending the internet; the poll URL says where.
+    $Discover = (-not $Relay) -and ($env:SHUTUP_AND_RUN_LEND_INTERNET -eq "1") -and [bool]$env:SHUTUP_AND_RUN_POLL_URL
+    $Lend = [bool]$Relay -or $Discover
+    if (($env:SHUTUP_AND_RUN_LEND_INTERNET -eq "1") -and -not $Lend) {
+        Write-Host "SHUTUP_AND_RUN_LEND_INTERNET needs SHUTUP_AND_RUN_POLL_URL (or SHUTUP_AND_RUN_RELAY): the internet is not lent"
+    }
+    if ($Lend) {
+        if ($Discover) {
+            $On = @("internet", "on", "--discover", $env:SHUTUP_AND_RUN_POLL_URL, "--wait", "60")
+        } else {
+            $On = @("internet", "on", "--relay", $Relay, "--wait", "60")
+        }
         if ($env:SHUTUP_AND_RUN_RELAY_TOKEN) { $On += @("--token", $env:SHUTUP_AND_RUN_RELAY_TOKEN) }
         if ($env:SHUTUP_AND_RUN_INTERNET_LOGIN) { $On += @("--login", $env:SHUTUP_AND_RUN_INTERNET_LOGIN) }
         & $Exe @On
         # Exit 1 is on but not connected yet: the line above says why, and it
         # keeps trying by itself. Not a reason to undo the install.
         if ($LASTEXITCODE -eq 2) { throw "shutup-and-run internet on: exit code 2 (usage)" }
-        if (-not $env:SHUTUP_AND_RUN_INTERNET_LOGIN) {
+        if (-not $env:SHUTUP_AND_RUN_INTERNET_LOGIN -and -not $Discover) {
             Write-Host "give the operator what this prints: shutup-and-run internet credentials"
         }
     }
@@ -163,7 +180,7 @@ try {
     # enabling WSL2 needs an administrator and a restart, which an install
     # that lends the internet does not wait for.
     $Worker = $env:SHUTUP_AND_RUN_POLL_URL
-    if ($Relay -and $Worker) {
+    if ($Lend -and $Worker) {
         $Fit = (& $Exe fit --json) | ConvertFrom-Json
         if (-not $Fit.containers) {
             $Worker = $null
@@ -174,13 +191,13 @@ try {
     if ($Worker) {
         & $Exe wsl install --poll-url $Worker
         if ($LASTEXITCODE -ne 0) { throw "shutup-and-run wsl install failed: exit code $(Describe-Exit $LASTEXITCODE)" }
-    } elseif ($Had -and ($Task -or (-not $Internet -and -not $Relay))) {
+    } elseif ($Had -and ($Task -or (-not $Internet -and -not $Lend))) {
         & $Exe wsl update
         # Exit 2 is the usage: a release older than `wsl update`. Its install
         # keeps the config and puts in the Linux binary of its own version.
         if ($LASTEXITCODE -eq 2) { & $Exe wsl install }
         if ($LASTEXITCODE -ne 0) { throw "shutup-and-run wsl update failed: exit code $(Describe-Exit $LASTEXITCODE)" }
-    } elseif (-not $Relay) {
+    } elseif (-not $Lend) {
         Write-Host ""
         Write-Host "next (set SHUTUP_AND_RUN_POLL_TOKEN first if your orchestrator issued one):"
         Write-Host "  shutup-and-run wsl install --poll-url https://orchestrator.example/poll"

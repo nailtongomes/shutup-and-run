@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/docs/schemas/internet-discovery-response.schema.json",
+  "title": "InternetDiscoveryResponse",
+  "description": "What the operator's URL answers `internet on --discover`, with status 200. Any other status, or an empty body, means it has no relay for this PC, and `internet on` fails with nothing changed. A flag given at the PC (--token, --login) wins over the answer. The PC keeps what it got in internet.json and does not ask again until the next `internet on --discover`.",
+  "type": "object",
+  "required": ["relay"],
+  "properties": {
+    "relay": {
+      "description": "Where PCs dial in: HOST:PORT of the relay, such as relay.example.com:7000.",
+      "type": "string",
+      "pattern": "^[!-~]+:[0-9]{1,5}$",
+      "maxLength": 300
+    },
+    "token": {
+      "description": "The relay's token (`relay --token-file`), when it asks for one.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{8,256}$"
+    },
+    "login": {
+      "description": "ID:PASSWORD the operator chose for this PC: the proxy login its tasks will use. Without it the PC makes its own, and the operator gets it from the person (`internet credentials`).",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,64}:[A-Za-z0-9._-]{16,128}$"
+    }
+  }
+}

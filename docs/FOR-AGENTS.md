@@ -206,11 +206,15 @@ A person asks you, their agent, to take part in the operator's work: run contain
    ```bash
    shutup-and-run internet on --relay HOST:PORT --token TOKEN --login ID:PASSWORD --wait 60 --json
    ```
+   Or, when the operator's poll URL answers the discovery ([contract](INTEGRATION-CONTRACT.md#internet-discovery)), only the URL:
+   ```bash
+   SHUTUP_AND_RUN_POLL_TOKEN=TOKEN shutup-and-run internet on --discover POLL_URL --wait 60 --json
+   ```
    It returns once connected (`"connected": true`, exit 0), or exits 1 with `code` and `hint`: `INTERNET_REFUSED` (the relay said why), `INTERNET_WAITING` (a battery, a metered network, the hours: it starts by itself later), `INTERNET_RELAY_UNREACHABLE`. With `--login`, nothing needs to go back to the operator: the backend already knows `http://ID:PASSWORD@RELAY:8080` and checks the PC with `GET /status` on the relay. Without it, `internet credentials --json` gives the address to send to the operator, and nowhere else.
 4. **Containers too**, when `fit` said `both`: Windows, `shutup-and-run wsl install --poll-url URL --max-slots 1`; Linux, the install line. Or [managed containers](#managed-containers-work-with-no-poll-url) when there is no poll URL.
 5. **Check, one read.** `shutup-and-run status --json`: the worker, and an `internet` section when it is on. On a PC that only lends the internet, `"worker": "not installed"` and the exit code is the internet's.
 
-On Windows the install line does steps 3 and 4: `$env:SHUTUP_AND_RUN_RELAY = "HOST:PORT"`, `$env:SHUTUP_AND_RUN_RELAY_TOKEN`, `$env:SHUTUP_AND_RUN_INTERNET_LOGIN = "ID:PASSWORD"`, and `$env:SHUTUP_AND_RUN_POLL_URL` for the worker too, then `irm .../install.ps1 | iex`. It installs the worker only where `fit` says containers; elsewhere it lends the internet and prints what the worker needs. On Linux the same variables go to `install.sh`; `SHUTUP_AND_RUN_INTERNET_ONLY=1` skips Docker and the worker.
+On Windows the install line does steps 3 and 4: `$env:SHUTUP_AND_RUN_RELAY = "HOST:PORT"`, `$env:SHUTUP_AND_RUN_RELAY_TOKEN`, `$env:SHUTUP_AND_RUN_INTERNET_LOGIN = "ID:PASSWORD"`, and `$env:SHUTUP_AND_RUN_POLL_URL` for the worker too, then `irm .../install.ps1 | iex`. With discovery, `$env:SHUTUP_AND_RUN_POLL_URL` and `$env:SHUTUP_AND_RUN_LEND_INTERNET = "1"` are enough (and `$env:SHUTUP_AND_RUN_POLL_TOKEN` when the operator gave one). It installs the worker only where `fit` says containers; elsewhere it lends the internet and prints what the worker needs. On Linux the same variables go to `install.sh`; `SHUTUP_AND_RUN_INTERNET_ONLY=1` skips Docker and the worker.
 
 The person can always stop it: the page's buttons (pause 1 hour, stop sharing), `shutup-and-run internet pause --for 2h`, `internet resume`, `internet off`. The worker's `pause` holds the internet too.
 

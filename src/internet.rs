@@ -1051,7 +1051,7 @@ pub fn proxy_url(settings: &Settings, proxy_port: Option<u16>, reveal: bool) -> 
 
 pub fn usage() -> &'static str {
     "\
-shutup-and-run internet on --relay HOST:PORT [--login ID:PASSWORD | --id NAME]
+shutup-and-run internet on (--relay HOST:PORT | --discover URL) [--login ID:PASSWORD | --id NAME]
         [--token TOKEN] [--hours \"mon-fri 19-07\"] [--max-day 5g] [--metered]
         [--wait SECONDS] [--json]
     lend this PC's internet connection to the operator's containers, through
@@ -1063,8 +1063,11 @@ shutup-and-run internet on --relay HOST:PORT [--login ID:PASSWORD | --id NAME]
     presents, on a metered network unless --metered, and once the day's bytes
     reach --max-day. One already open is never cut. --login takes the id and
     the password the operator chose (else they are made here). --token is
-    what the operator's relay asks of every PC, when it asks. --wait returns
-    once connected, or exits 1 with the reason.
+    what the operator's relay asks of every PC, when it asks. --discover
+    asks the operator's URL (the poll URL serves) for the relay, the token
+    and the login, once, with SHUTUP_AND_RUN_POLL_TOKEN as its bearer when
+    set; a flag given wins. --wait returns once connected, or exits 1 with
+    the reason.
 shutup-and-run internet pause [--for 1h] | resume
     new connections wait (30m, 2h, 1d, day; 1h when not given), or stop
     waiting. The page has the same buttons.
@@ -1093,7 +1096,7 @@ pub async fn cli(args: &[String]) -> ExitCode {
     };
     let dir = dir();
     let result = match sub {
-        "on" => on_cli(&dir, rest),
+        "on" => on_cli(&dir, rest).await,
         "off" => off_cli(&dir, rest),
         "pause" => pause_cli(&dir, true, rest),
         "resume" => pause_cli(&dir, false, rest),
@@ -1130,6 +1133,101 @@ fn print(json_out: bool, value: Value, text: String) {
     }
 }
 
+/// What the operator's URL answers `internet on --discover`: where its
+/// relay is, and what this PC sends it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Discovered {
+    pub relay: String,
+    pub token: Option<String>,
+    pub login: Option<(String, String)>,
+}
+
+/// The body of `internet on --discover`: who asks and that it lends its
+/// internet connection. `"lend": "internet"` is what tells it from a poll.
+pub(crate) fn discovery_body() -> Value {
+    json!({
+        "worker": pc_name(),
+        "os": if cfg!(windows) { "windows" } else { "linux" },
+        "arch": std::env::consts::ARCH,
+        "version": env!("CARGO_PKG_VERSION"),
+        "lend": "internet",
+    })
+}
+
+/// The answer, checked as `on` checks its flags. A message never repeats
+/// the token or the password.
+pub(crate) fn parse_discovery(bytes: &[u8]) -> Result<Discovered, String> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| "the answer is not JSON".to_string())?;
+    let field = |name: &str| value.get(name).and_then(Value::as_str);
+    let relay = field("relay").ok_or("the answer has no \"relay\"")?;
+    if !valid_target(relay) {
+        return Err("\"relay\" is not HOST:PORT".to_string());
+    }
+    let token = match field("token") {
+        Some(token) if valid_word(token, 8..=256) => Some(token.to_string()),
+        Some(_) => return Err("\"token\": 8 to 256 letters, digits, '-', '_' or '.'".to_string()),
+        None => None,
+    };
+    let login = match field("login") {
+        Some(login) => Some(parse_login(login).map_err(|_| {
+            "\"login\": ID:PASSWORD, the id 1 to 64 and the password 16 to 128 letters, digits, '-', '_' or '.'".to_string()
+        })?),
+        None => None,
+    };
+    Ok(Discovered {
+        relay: relay.to_string(),
+        token,
+        login,
+    })
+}
+
+/// `internet on --discover URL`: one POST to the operator's URL (the poll
+/// URL serves), with SHUTUP_AND_RUN_POLL_TOKEN as the bearer when it is set.
+/// The person turned it on here; the answer only says where to.
+async fn discover(url: &str) -> Result<Discovered, String> {
+    let shown = crate::config::mask_query(url);
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(format!("--discover {shown}: an http:// or https:// URL"));
+    }
+    let client = crate::poll::client()?;
+    let mut request = client.post(url).json(&discovery_body());
+    if let Some(token) = std::env::var("SHUTUP_AND_RUN_POLL_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(|e| {
+        format!(
+            "--discover {shown}: {}",
+            crate::config::mask_query(&e.to_string())
+        )
+    })?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("--discover {shown}: {e}"))?;
+    if status != reqwest::StatusCode::OK || bytes.iter().all(u8::is_ascii_whitespace) {
+        return Err(format!(
+            "--discover {shown}: answered {status} with no relay for this PC"
+        ));
+    }
+    parse_discovery(&bytes).map_err(|e| format!("--discover {shown}: {e}"))
+}
+
+/// This PC's name, as the poll body's `worker` says it.
+fn pc_name() -> String {
+    ["COMPUTERNAME", "HOSTNAME"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|name| name.trim().chars().take(64).collect::<String>())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "pc".to_string())
+}
+
 /// `--login ID:PASSWORD`: what the operator's backend chose for this PC.
 /// The message never repeats the value: it carries the password.
 fn parse_login(text: &str) -> Result<(String, String), String> {
@@ -1141,11 +1239,12 @@ fn parse_login(text: &str) -> Result<(String, String), String> {
     }
 }
 
-fn on_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
+async fn on_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
     let flags = crate::wsl::parse_flags(
         args,
         &[
             "--relay",
+            "--discover",
             "--id",
             "--login",
             "--hours",
@@ -1156,15 +1255,27 @@ fn on_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
         &["--metered", "--json"],
     )
     .map_err(|e| e.0)?;
-    let Some(relay) = flags.get("--relay") else {
-        eprintln!("{}", usage());
-        return Ok(ExitCode::from(2));
+    let discovered = match (flags.get("--relay"), flags.get("--discover")) {
+        (Some(_), Some(_)) => return Err("--relay or --discover, not both".to_string()),
+        (None, None) => {
+            eprintln!("{}", usage());
+            return Ok(ExitCode::from(2));
+        }
+        (_, Some(url)) => Some(discover(url).await?),
+        (Some(_), None) => None,
     };
-    if !valid_target(relay) {
-        return Err(format!("--relay {relay}: give HOST:PORT"));
-    }
+    let relay = match (&discovered, flags.get("--relay")) {
+        (Some(found), _) => found.relay.clone(),
+        (None, Some(relay)) if valid_target(relay) => relay.to_string(),
+        (None, relay) => return Err(format!("--relay {}: give HOST:PORT", relay.unwrap_or(""))),
+    };
+    let relay = relay.as_str();
     let old = read_settings(dir);
-    let login = flags.get("--login").map(parse_login).transpose()?;
+    // A flag wins over what the URL said.
+    let login = match flags.get("--login") {
+        Some(text) => Some(parse_login(text)?),
+        None => discovered.as_ref().and_then(|d| d.login.clone()),
+    };
     let id = match (&login, flags.get("--id")) {
         (Some(_), Some(_)) => {
             return Err("--login already names the id: leave out --id".to_string())
@@ -1204,7 +1315,10 @@ fn on_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
     let relay_token = match flags.get("--token") {
         Some(token) if valid_word(token, 8..=256) => Some(token.to_string()),
         Some(_) => return Err("--token: 8 to 256 letters, digits, '-', '_' or '.'".to_string()),
-        None => old.as_ref().and_then(|o| o.relay_token.clone()),
+        None => discovered
+            .as_ref()
+            .and_then(|d| d.token.clone())
+            .or_else(|| old.as_ref().and_then(|o| o.relay_token.clone())),
     };
     let since = crate::status::now_unix();
     let settings = Settings {

@@ -14,11 +14,24 @@ A small, self-hosted Docker job runner, in Rust. An orchestrator you already use
 - **Made for a shared PC.** Someone may be working on the machine while a job runs, and their work comes first: a CPU and a memory limit on every container, one job at a time by default, no new job while memory or disk is short, and on a small PC nothing runs until its owner says yes.
 - **Nothing to open on the customer's PC.** A Windows worker asks a URL of yours for work. No inbound port, no Docker Desktop, no administrator after WSL2 is enabled, and no window.
 - **Made to be run by an AI agent.** Every command is non-interactive, prints JSON and has a fixed exit code. The config is one file that is never edited by hand. A doctor names each problem with the command that fixes it.
+- **Or only its internet.** A PC too weak for containers lends its home connection instead: your containers anywhere reach sites from the client's IP, through a relay on your server (one `docker run`). Both can run on one PC.
 - **Small.** One static binary, a SQLite history, a local page on `127.0.0.1` for the person at the PC, and what each job printed kept on the machine for 7 days.
 
 **Questions?** The [FAQ](docs/FAQ.md) answers what to expect: a slow PC, a battery, a shutdown, a job that did not start.
 
-**Contents:** [How it works](#how-it-works) · [Quick start](#quick-start) · [The local page](#the-local-page) · [Protecting the PC](#protecting-the-pc) · [Managed containers](#managed-containers) · [For an AI agent](#for-an-ai-agent) · [The API](#push-pull-and-the-api) · [Security](#security) · [Limits](#limits)
+**Contents:** [Ways to lend a PC](#ways-to-lend-a-pc) · [How it works](#how-it-works) · [Quick start](#quick-start) · [The local page](#the-local-page) · [Protecting the PC](#protecting-the-pc) · [Managed containers](#managed-containers) · [For an AI agent](#for-an-ai-agent) · [The API](#push-pull-and-the-api) · [Security](#security) · [Limits](#limits)
+
+## Ways to lend a PC
+
+| Mode | For | The client (or their AI agent) | You |
+| --- | --- | --- | --- |
+| **Containers, pulled** | A PC with WSL2 and room (`shutup-and-run fit` says `both`) | The install line with your poll URL. Nothing to open on the PC | Answer the poll with a task ([contract](docs/INTEGRATION-CONTRACT.md#3-poll)) |
+| **Containers, pushed** | A Linux server of yours that you can reach | `install.sh` | `POST /v1/jobs` with the token. Not for a client's PC behind a router |
+| **Managed containers** | A machine that runs its own containers, with no URL | `managed apply` once | Nothing ([managed containers](#managed-containers)) |
+| **Only the internet** | A weak PC, or one with no WSL2 (`fit` says `internet`) | The install line with your relay, or `SHUTUP_AND_RUN_LEND_INTERNET=1` and your poll URL says where it is | A relay: one `docker run` or one line ([your server](docs/SERVIDOR.pt-BR.md)). Your tasks anywhere use `HTTPS_PROXY` ([examples](docs/INTERNET.md#examples-curl-requests-selenium-playwright-puppeteer-node-n8n)) |
+| **Both** | A PC that runs containers and lends its connection to your other machines | The install line with the poll URL and `SHUTUP_AND_RUN_LEND_INTERNET=1` | Both of the above; a task that does not fit the PC goes to your server, out through the PC's connection |
+
+An AI agent's steps for all of them: [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#a-task-from-the-operator-run-it-here-lend-the-internet-or-both).
 
 ## What it is, and is not
 
@@ -287,7 +300,7 @@ shutup-and-run relay                                         # on the operator's
 
 New connections wait while the worker is paused, outside `--hours`, on a battery under 60%, while the person presents, and on a metered network; one already open is never cut. Destinations on the PC's own network are refused. The link to the relay is plain TCP in this version. The choice, the risks, a test from another network and what comes next: [docs/INTERNET.md](docs/INTERNET.md).
 
-A task sent to one of your workers elsewhere goes out through a client's PC by its `env`: `HTTPS_PROXY=http://ID:SECRET@...` (`shutup-and-run internet credentials --env`). On Windows the install line does it all: `$env:SHUTUP_AND_RUN_RELAY = "relay.example.com:7000"` (and `$env:SHUTUP_AND_RUN_POLL_URL` for the worker too) before `irm .../install.ps1 | iex`; `install.sh` takes the same. The person at the PC pauses or stops it with the buttons on http://127.0.0.1:8788/, or `shutup-and-run internet pause --for 1h` and `internet off`. An agent's steps: [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#a-task-from-the-operator-run-it-here-lend-the-internet-or-both). Your server (the relay), step by step: [docs/SERVIDOR.pt-BR.md](docs/SERVIDOR.pt-BR.md), or in one line `curl -fsSL .../install.sh | sudo SHUTUP_AND_RUN_RELAY_SERVER=1 bash`. Using the proxy from curl, requests, Selenium, Playwright, Puppeteer, Node or n8n: [examples](docs/INTERNET.md#examples-curl-requests-selenium-playwright-puppeteer-node-n8n).
+A task sent to one of your workers elsewhere goes out through a client's PC by its `env`: `HTTPS_PROXY=http://ID:SECRET@...` (`shutup-and-run internet credentials --env`). On Windows the install line does it all: `$env:SHUTUP_AND_RUN_RELAY = "relay.example.com:7000"` (and `$env:SHUTUP_AND_RUN_POLL_URL` for the worker too) before `irm .../install.ps1 | iex`; `install.sh` takes the same. The person at the PC pauses or stops it with the buttons on http://127.0.0.1:8788/, or `shutup-and-run internet pause --for 1h` and `internet off`. An agent's steps: [docs/FOR-AGENTS.md](docs/FOR-AGENTS.md#a-task-from-the-operator-run-it-here-lend-the-internet-or-both). Your server (the relay), step by step: [docs/SERVIDOR.pt-BR.md](docs/SERVIDOR.pt-BR.md); in one line, `docker run -d --restart unless-stopped -p 7000:7000 -p 172.17.0.1:8080:8080 -e SHUTUP_AND_RUN_RELAY_TOKEN=TOKEN ghcr.io/nailtongomes/shutup-and-run-relay`, or without Docker `curl -fsSL .../install.sh | sudo SHUTUP_AND_RUN_RELAY_SERVER=1 bash`. Your poll URL can tell each PC where the relay is (`SHUTUP_AND_RUN_LEND_INTERNET=1` at install; [contract](docs/INTEGRATION-CONTRACT.md#internet-discovery)). Using the proxy from curl, requests, Selenium, Playwright, Puppeteer, Node or n8n: [examples](docs/INTERNET.md#examples-curl-requests-selenium-playwright-puppeteer-node-n8n).
 
 ## Configuration
 

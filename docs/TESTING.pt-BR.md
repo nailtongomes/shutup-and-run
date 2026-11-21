@@ -295,10 +295,10 @@ Num servidor Linux com Docker e a porta 7000 aberta para a internet, e num PC Wi
 No servidor (ou, sem Docker, a linha do relay de [SERVIDOR.pt-BR.md](SERVIDOR.pt-BR.md), passo 3, e depois o teste de dois minutos dele):
 
 ```bash
-git clone https://github.com/nailtongomes/shutup-and-run && cd shutup-and-run/examples/relay
-head -c 24 /dev/urandom | base64 | tr -d '/+=' > relay_token   # o TOKEN
-docker compose up -d --build
-docker compose logs -f relay          # deixe aberto
+TOKEN=$(head -c 24 /dev/urandom | base64 | tr -d '/+='); echo "$TOKEN"   # o TOKEN
+docker run -d --name relay --restart unless-stopped -p 7000:7000 -p 172.17.0.1:8080:8080 \
+  -e SHUTUP_AND_RUN_RELAY_TOKEN="$TOKEN" ghcr.io/nailtongomes/shutup-and-run-relay
+docker logs -f relay                  # deixe aberto
 curl -s https://api.ipify.org; echo   # o IP do servidor, para comparar
 ```
 
@@ -314,7 +314,7 @@ curl.exe -s https://api.ipify.org           # o IP do PC
 De volta ao servidor:
 
 ```bash
-docker run --rm --network relay_egress curlimages/curl -s -x http://ID:SENHA@relay:8080 https://api.ipify.org; echo
+docker run --rm curlimages/curl -s -x http://ID:SENHA@172.17.0.1:8080 https://api.ipify.org; echo
 ```
 
 - [ ] O comando imprime o IP do PC, não o do servidor. O log do relay tem `PC ID connected` e uma linha `api.ipify.org:443 sent ... received ...`.

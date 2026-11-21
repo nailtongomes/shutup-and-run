@@ -15,6 +15,9 @@
 # Lend the internet connection too, through the operator's relay (made-up values):
 #   curl -fsSL .../install.sh | sudo SHUTUP_AND_RUN_RELAY=relay.example.com:7000 \
 #     SHUTUP_AND_RUN_RELAY_TOKEN=<token> SHUTUP_AND_RUN_INTERNET_LOGIN=<id>:<password> bash
+# Or let your poll URL say where the relay is (docs/INTEGRATION-CONTRACT.md):
+#   curl -fsSL .../install.sh | sudo SHUTUP_AND_RUN_LEND_INTERNET=1 \
+#     SHUTUP_AND_RUN_POLL_URL=https://orchestrator.example/poll bash
 # Only the internet connection, no Docker and no worker: add SHUTUP_AND_RUN_INTERNET_ONLY=1.
 # The operator's relay for internet sharing, as the systemd unit shutup-and-run-relay
 # (no Docker needed; PCs dial in on 7000, containers use the proxy on Docker's
@@ -54,8 +57,16 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
+# The person's yes to lending the internet: a relay given, or the poll URL
+# to ask for one.
+lend=
+if [[ -n "${SHUTUP_AND_RUN_RELAY:-}" ]]; then
+  lend=relay
+elif [[ "${SHUTUP_AND_RUN_LEND_INTERNET:-}" == 1 && -n "${SHUTUP_AND_RUN_POLL_URL:-}" ]]; then
+  lend=discover
+fi
 internet_only=
-if [[ -n "${SHUTUP_AND_RUN_RELAY:-}" && "${SHUTUP_AND_RUN_INTERNET_ONLY:-}" == 1 ]]; then
+if [[ -n "$lend" && "${SHUTUP_AND_RUN_INTERNET_ONLY:-}" == 1 ]]; then
   internet_only=1
 fi
 relay_server=
@@ -200,8 +211,12 @@ fi
 
 # Internet sharing: `internet on` waits up to 60 s for the relay. Not
 # connected yet is not a failed install: it says why and keeps trying.
-if [[ -n "${SHUTUP_AND_RUN_RELAY:-}" ]]; then
-  on=(internet on --relay "$SHUTUP_AND_RUN_RELAY" --wait 60)
+if [[ -n "$lend" ]]; then
+  if [[ "$lend" == relay ]]; then
+    on=(internet on --relay "$SHUTUP_AND_RUN_RELAY" --wait 60)
+  else
+    on=(internet on --discover "$SHUTUP_AND_RUN_POLL_URL" --wait 60)
+  fi
   if [[ -n "${SHUTUP_AND_RUN_RELAY_TOKEN:-}" ]]; then
     on+=(--token "$SHUTUP_AND_RUN_RELAY_TOKEN")
   fi

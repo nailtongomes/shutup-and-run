@@ -1,0 +1,5 @@
+{
+  "relay": "relay.example.com:7000",
+  "token": "example-relay-token-123",
+  "login": "pc-desk-07:example-password-0123"
+}
