@@ -2,9 +2,12 @@
 # Internet sharing on Android, in Termux, without a phone: the Android build
 # of the binary in termux/termux-docker (Android's own C library and
 # Termux's files, on x86_64), with a relay on the container's loopback.
-# `fit` and the worker's commands, `internet on --wait`, `status`,
-# `credentials`, curl through the proxy, the bytes, a change of network
-# (the container's network disconnected and connected again), and `off`.
+# scripts/install-termux.sh (a wrong checksum refused, then the install and
+# `internet on` from its variables), `fit` and the worker's commands,
+# `status`, `credentials`, curl through the proxy, the bytes, a change of
+# network (the container's network disconnected and connected again), a
+# new version stopping the old process, the process killed and started
+# again by its boot script, and `off`.
 # It proves the Android code paths, not a phone's radio, battery or IP:
 # docs/INTERNET.md, "Android", has the test on a phone.
 #
@@ -25,9 +28,16 @@ if [[ "${1:-}" != inside ]]; then
   if [[ -n "${CA_BUNDLE:-}" ]]; then
     ca=(-v "$(realpath "$CA_BUNDLE"):/ca.crt:ro" -e CURL_CA_BUNDLE=/ca.crt)
   fi
-  trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
-  docker run -d --name "$name" -v "$bin:/sar:ro" -v "$here:/t:ro" "${ca[@]}" \
-    "$image" sleep 900 >/dev/null
+  # A release as install-termux.sh downloads it, and one whose sum is wrong.
+  dist=$(mktemp -d)
+  trap 'docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$dist"' EXIT
+  mkdir -p "$dist/good" "$dist/bad"
+  for d in good bad; do cp "$bin" "$dist/$d/shutup-and-run-x86_64-linux-android"; done
+  (cd "$dist/good" && sha256sum shutup-and-run-x86_64-linux-android >SHA256SUMS)
+  echo "$(printf '0%.0s' {1..64})  shutup-and-run-x86_64-linux-android" >"$dist/bad/SHA256SUMS"
+  chmod -R a+rX "$dist"
+  docker run -d --name "$name" -v "$dist:/dist:ro" -v "$here:/t:ro" \
+    -v "$here/../../scripts:/s:ro" "${ca[@]}" "$image" sleep 900 >/dev/null
   phase() { docker exec "$name" bash /t/termux.sh inside "$@"; }
   phase on
   # A new address, as when a phone moves from Wi-Fi to mobile data: the
@@ -36,6 +46,7 @@ if [[ "${1:-}" != inside ]]; then
   phase offline
   docker network connect bridge "$name"
   phase back
+  phase restart
   phase off
   echo "termux.sh: all passed"
   exit 0
@@ -57,9 +68,20 @@ wait_for() {
   return 1
 }
 
+pid() { sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$HOME/.shutup-and-run/internet-status.json"; }
+asset=shutup-and-run-x86_64-linux-android
+
 case $step in
 on)
-  cp /sar "$sar" && chmod 755 "$sar"
+  if SHUTUP_AND_RUN_URL=file:///dist/bad/$asset bash /s/install-termux.sh 2>err.txt; then
+    fail "install-termux.sh took a wrong checksum"
+  fi
+  grep -q "checksum mismatch" err.txt || fail "the refusal says why: $(cat err.txt)"
+  [[ ! -e "$sar" ]] || fail "something was installed"
+  SHUTUP_AND_RUN_URL=file:///dist/good/$asset bash /s/install-termux.sh | grep -q "^next: " ||
+    fail "install without a relay"
+  "$sar" version | grep -q "^shutup-and-run " || fail "the installed binary does not run"
+  pass "install-termux.sh: a wrong checksum refused, then installed"
   "$sar" fit --json | grep -q '"lend":"internet"' || fail "fit lends only the internet"
   "$sar" fit --json | grep -q ANDROID_NO_CONTAINERS || fail "fit names the reason"
   pass "fit: only the internet connection, ANDROID_NO_CONTAINERS"
@@ -71,9 +93,11 @@ on)
 
   "$sar" relay --agents 127.0.0.1:7000 --proxy 127.0.0.1:8080 >"$HOME/relay.log" 2>&1 &
   sleep 1
-  out=$("$sar" internet on --relay 127.0.0.1:7000 --wait 30 --json) || fail "on: $out"
-  grep -q '"connected":true' <<<"$out" || fail "on --wait: $out"
-  pass "internet on --relay --wait: connected"
+  out=$(SHUTUP_AND_RUN_URL=file:///dist/good/$asset SHUTUP_AND_RUN_RELAY=127.0.0.1:7000 \
+    SHUTUP_AND_RUN_MAX_DAY=1g bash /s/install-termux.sh) || fail "install and on: $out"
+  grep -q "connected to 127.0.0.1:7000" <<<"$out" || fail "on --wait: $out"
+  "$sar" internet status --json | grep -q '"max_day_bytes":1073741824' || fail "the variables reach on"
+  pass "install-termux.sh with SHUTUP_AND_RUN_RELAY: internet on --wait, connected"
   [[ -x "$HOME/.termux/boot/shutup-and-run-internet" ]] || fail "no Termux:Boot script"
   grep -q "internet serve --background" "$HOME/.termux/boot/shutup-and-run-internet" ||
     fail "the boot script runs the process"
@@ -108,6 +132,29 @@ back)
     fail "curl after the change"
   [[ "$code" == 200 ]] || fail "after the change: $code"
   pass "network back: dialed again, connected, curl works"
+  ;;
+restart)
+  # What an update looks like to `on`: the process is of another version.
+  old=$(pid)
+  status=$HOME/.shutup-and-run/internet-status.json
+  sed 's/"version": "[^"]*"/"version": "0.0.1"/' "$status" >"$status.new" && mv "$status.new" "$status"
+  out=$("$sar" internet on --relay 127.0.0.1:7000 --wait 30) || fail "on after an update: $out"
+  grep -q "stopped 0.0.1 (pid $old)" <<<"$out" || fail "the old version was not stopped: $out"
+  wait_for 15 '"state":"connected"' || fail "not connected after the update"
+  [[ "$(pid)" != "$old" ]] || fail "the same process after the update"
+  pass "on after an update: the old process stopped, a new one connected"
+  # Killed (a crash, or Android's phantom process killer on the process
+  # alone): the boot script starts it again a minute later.
+  old=$(pid)
+  kill -9 "$old"
+  for _ in $(seq 1 80); do
+    now=$(pid)
+    [[ -n "$now" && "$now" != "$old" ]] && "$sar" internet status --json | grep -q '"state":"connected"' && break
+    sleep 1
+  done
+  [[ "$(pid)" != "$old" ]] || fail "not started again after kill -9"
+  "$sar" internet status | grep -q "connected to" || fail "not connected after the restart"
+  pass "killed: started again by its boot script, connected"
   ;;
 off)
   "$sar" internet off | grep -q "stops within 5 seconds" || fail "off"

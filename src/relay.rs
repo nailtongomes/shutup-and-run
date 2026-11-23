@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 
 /// How long a container's request waits for a PC's idle connection.
 const CLAIM_WAIT: Duration = Duration::from_secs(10);
@@ -50,6 +50,12 @@ const DIAL_REPLY: Duration = Duration::from_secs(30);
 const RESERVE: Duration = Duration::from_secs(10 * 60);
 /// Idle connections one PC may leave here.
 const IDLE_MAX: usize = 64;
+/// Streams one PC carries at once: 7 consumers (the owner's number) of
+/// about 20 each, which is what one Chromium held at most while loading
+/// pages (`tests/internet/load.mjs`). A client's home or phone upload is
+/// shared by all of them, and one consumer out of control must not take
+/// it all. One more waits for one to end, up to `CLAIM_WAIT`, then `503`.
+pub(crate) const PC_STREAMS: usize = 7 * 20;
 const HEAD_MAX: usize = 16 * 1024;
 const SUMMARY_EVERY: Duration = Duration::from_secs(60);
 
@@ -80,6 +86,9 @@ struct Pool {
     idle: Vec<Idle>,
     arrived: Arc<Notify>,
     stats: Arc<Stats>,
+    /// `PC_STREAMS` permits: one held by each stream, from its claim to
+    /// its end.
+    streams: Arc<Semaphore>,
 }
 
 pub(crate) struct Relay {
@@ -88,6 +97,8 @@ pub(crate) struct Relay {
     /// What every PC must send, when the operator set one.
     token: Option<String>,
     reserve: Duration,
+    /// How long a stream over `PC_STREAMS` waits for one to end.
+    stream_wait: Duration,
     started: tokio::time::Instant,
 }
 
@@ -95,6 +106,8 @@ pub(crate) struct Relay {
 enum ClaimError {
     Login,
     NotConnected,
+    /// The PC carries `PC_STREAMS` already, and none ended in time.
+    Busy,
 }
 
 impl Relay {
@@ -112,6 +125,40 @@ impl Relay {
             proxy_port,
             token,
             reserve,
+            stream_wait: CLAIM_WAIT,
+            started: tokio::time::Instant::now(),
+        })
+    }
+
+    /// A place among the PC's `PC_STREAMS`, held until the stream ends.
+    async fn stream_permit(
+        &self,
+        id: &str,
+        secret: &str,
+    ) -> Result<OwnedSemaphorePermit, ClaimError> {
+        let streams = {
+            let pools = self.pools.lock().unwrap();
+            pools
+                .get(id)
+                .filter(|pool| same(&pool.secret, secret))
+                .ok_or(ClaimError::Login)?
+                .streams
+                .clone()
+        };
+        match tokio::time::timeout(self.stream_wait, streams.acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err(ClaimError::Busy),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_stream_wait(proxy_port: u16, stream_wait: Duration) -> Arc<Self> {
+        Arc::new(Relay {
+            pools: Mutex::new(HashMap::new()),
+            proxy_port,
+            token: None,
+            reserve: RESERVE,
+            stream_wait,
             started: tokio::time::Instant::now(),
         })
     }
@@ -145,6 +192,7 @@ impl Relay {
             idle: Vec::new(),
             arrived: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
+            streams: Arc::new(Semaphore::new(PC_STREAMS)),
         });
         pool.idle.retain(|idle| !idle.claim.is_closed());
         let first = pool.idle.is_empty();
@@ -645,6 +693,30 @@ async fn proxy(relay: Arc<Relay>, stream: TcpStream, preset: Option<(String, Str
             }
         };
     }
+    let _permit = match relay.stream_permit(&id, &secret).await {
+        Ok(permit) => permit,
+        Err(ClaimError::Busy) => {
+            return answer(
+                &mut client,
+                "503 Service Unavailable",
+                "",
+                &format!(
+                    "PC {id} carries {PC_STREAMS} streams at once, and none ended within {}s",
+                    relay.stream_wait.as_secs()
+                ),
+            )
+            .await
+        }
+        Err(_) => {
+            return answer(
+                &mut client,
+                "407 Proxy Authentication Required",
+                "Proxy-Authenticate: Basic realm=\"shutup-and-run\"\r\n",
+                "no PC with that id and password",
+            )
+            .await
+        }
+    };
     // A connection that does not say `A` at once is dead: the next one is
     // tried, so a PC that just woke or changed its Wi-Fi costs a few
     // seconds, not a 502.
@@ -662,7 +734,7 @@ async fn proxy(relay: Arc<Relay>, stream: TcpStream, preset: Option<(String, Str
                 )
                 .await
             }
-            Err(ClaimError::NotConnected) => {
+            Err(ClaimError::NotConnected | ClaimError::Busy) => {
                 return answer(
                     &mut client,
                     "503 Service Unavailable",
@@ -1238,6 +1310,69 @@ mod tests {
             line.starts_with("C "),
             "the dead one was tried first: {line:?}"
         );
+    }
+
+    /// A PC carries `PC_STREAMS` at once: one more waits for one to end,
+    /// and gets a 503 when none does in time.
+    #[tokio::test]
+    async fn a_pc_carries_its_streams_at_once_and_the_next_waits() {
+        // A site that keeps every connection open until its client leaves.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let site = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while s.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+                });
+            }
+        });
+        let agents = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agents_addr = agents.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let relay = Relay::with_stream_wait(proxy.port(), Duration::from_millis(800));
+        tokio::spawn(accept_agents(relay.clone(), agents));
+        tokio::spawn(accept_proxy(relay, listener, None));
+        let (_s_tx, s_rx) = watch::channel(settings(agents_addr));
+        let (_h_tx, h_rx) = watch::channel(None);
+        let shared = Arc::new(Shared::default());
+        spawn_links(s_rx, h_rx, shared.clone(), test_opts());
+        wait_idle(&shared).await;
+
+        let auth = login("pc-test", SECRET);
+        let connect =
+            format!("CONNECT {site} HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\n");
+        async fn tunnel(proxy: SocketAddr, connect: String) -> (TcpStream, String) {
+            let mut s = TcpStream::connect(proxy).await.unwrap();
+            s.write_all(connect.as_bytes()).await.unwrap();
+            let mut head = [0u8; 12];
+            s.read_exact(&mut head).await.unwrap();
+            (s, String::from_utf8_lossy(&head).to_string())
+        }
+        let open = || tunnel(proxy, connect.clone());
+        let mut tunnels = Vec::new();
+        for _ in 0..PC_STREAMS {
+            let (s, head) = open().await;
+            assert_eq!(head, "HTTP/1.1 200");
+            tunnels.push(s);
+        }
+        let began = std::time::Instant::now();
+        let out = ask(proxy, connect.clone()).await;
+        assert!(out.starts_with("HTTP/1.1 503"), "{out}");
+        assert!(out.contains("140 streams at once"), "{out}");
+        assert!(
+            began.elapsed() >= Duration::from_millis(700),
+            "it waited first"
+        );
+
+        // One ends while the next waits: the next gets through.
+        let next = tokio::spawn(open());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(tunnels.pop());
+        let (_s, head) = next.await.unwrap();
+        assert_eq!(head, "HTTP/1.1 200");
     }
 
     #[tokio::test]

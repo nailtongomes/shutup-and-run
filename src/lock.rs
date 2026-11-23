@@ -7,6 +7,9 @@ use std::fs::File;
 use std::fs::TryLockError;
 use std::path::Path;
 
+/// How the error of a lock held by another process begins.
+pub const HELD: &str = "another shutup-and-run is already running";
+
 /// Keep the returned file alive. Dropping it releases the lock.
 pub fn acquire(path: &Path) -> Result<File, String> {
     if let Some(parent) = path.parent() {
@@ -22,10 +25,7 @@ pub fn acquire(path: &Path) -> Result<File, String> {
         .map_err(|e| format!("{}: {e}", path.display()))?;
     match try_lock(&file) {
         Ok(true) => Ok(file),
-        Ok(false) => Err(format!(
-            "another shutup-and-run is already running ({} is locked)",
-            path.display()
-        )),
+        Ok(false) => Err(format!("{HELD} ({} is locked)", path.display())),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }

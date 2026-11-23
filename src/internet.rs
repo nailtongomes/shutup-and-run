@@ -853,7 +853,15 @@ fn worker_status_path() -> Option<PathBuf> {
 
 pub async fn serve(dir: &Path, background: bool) -> Result<ExitCode, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let _lock = crate::lock::acquire(&dir.join(LOCK_FILE))?;
+    let _lock = match crate::lock::acquire(&dir.join(LOCK_FILE)) {
+        Ok(lock) => lock,
+        // On a phone the boot script runs this until it ends well: another
+        // one already running is the end it wants.
+        Err(e) if crate::android::PHONE && e.starts_with(crate::lock::HELD) => {
+            return Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => return Err(e),
+    };
     let log = crate::wsl::Logger::open(&dir.join(LOG_FILE), !background).map_err(|e| e.0)?;
     let Some(first) = read_settings(dir).filter(|s| s.enabled) else {
         log.raw("internet: off; nothing to do");
@@ -1747,9 +1755,7 @@ fn credentials_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
 /// one line (a few on a phone).
 fn start_process(dir: &Path) -> Result<String, String> {
     if crate::android::PHONE {
-        // The lock is free only when no `internet serve` runs.
-        let running = crate::lock::acquire(&dir.join(LOCK_FILE)).is_err();
-        return crate::android::start(running);
+        return android_start(dir);
     }
     if cfg!(windows) {
         let data = crate::wsl::data_dir();
@@ -1783,6 +1789,37 @@ fn start_process(dir: &Path) -> Result<String, String> {
         }
     }
     Ok("started; systemd unit shutup-and-run-internet starts it at boot".to_string())
+}
+
+/// A phone: the process of another version (the binary was just updated)
+/// is stopped, then the boot script is written and run unless the process
+/// still runs. The lock is free only when no `internet serve` runs.
+fn android_start(dir: &Path) -> Result<String, String> {
+    let free = || crate::lock::acquire(&dir.join(LOCK_FILE)).is_ok();
+    let mut lines = Vec::new();
+    let now = crate::status::now_unix();
+    let old = read_status(dir).filter(|s| {
+        s.version != env!("CARGO_PKG_VERSION")
+            && s.pid > 1
+            && crate::status::iso_to_unix(&s.updated_at).is_some_and(|at| now - at <= STALE_SECS)
+    });
+    if let Some(old) = old.filter(|_| !free()) {
+        crate::android::terminate(old.pid);
+        for _ in 0..50 {
+            if free() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        lines.push(format!(
+            "stopped {} (pid {}) to start {}",
+            old.version,
+            old.pid,
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    lines.push(crate::android::start(!free())?);
+    Ok(lines.join("\n"))
 }
 
 fn stop_process() -> String {

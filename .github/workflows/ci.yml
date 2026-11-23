@@ -15,7 +15,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-      - run: shellcheck scripts/*.sh tests/poll-mock/*.sh tests/internet/termux.sh
+      - run: shellcheck scripts/*.sh tests/poll-mock/*.sh tests/internet/*.sh tests/screen/*.sh
       - name: windows fallback launcher shape
         run: python3 scripts/windows/check-sar-launcher.py
 
@@ -356,6 +356,19 @@ jobs:
         run: |
           sudo CYCLE_KEEP="${RUNNER_TEMP}/probe-screenshot.png" bash tests/poll-mock/cycle.sh \
             "${GITHUB_WORKSPACE}/target/release/shutup-and-run" probe ghcr.io/nailtongomes/shutup-and-run-selenium-probe:ci
+      # A job's screen on the local page against this Docker: a stand-in
+      # for noVNC (tests/screen/fake-novnc.py) in the probe image just
+      # built, the link, the proxy, the WebSocket and its Origin check.
+      - name: a job's screen on the local page
+        timeout-minutes: 10
+        run: |
+          sudo bash tests/screen/linux.sh "${GITHUB_WORKSPACE}/target/release/shutup-and-run" \
+            fake=ghcr.io/nailtongomes/shutup-and-run-selenium-probe:ci
+      # Internet sharing on Linux: a relay on loopback, `internet on` as a
+      # systemd unit, curl through it, a pause, the relay restarted.
+      - name: internet sharing, relay and PC on this runner
+        timeout-minutes: 10
+        run: sudo bash tests/internet/local.sh "${GITHUB_WORKSPACE}/target/release/shutup-and-run"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
