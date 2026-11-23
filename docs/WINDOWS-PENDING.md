@@ -150,7 +150,7 @@ Com o relay do `examples/relay` atual (que agora pede `relay_token`):
 - [ ] **Os dois.** Num PC com WSL2, as mesmas variáveis: a internet conecta e o `wsl install` também roda.
 - [ ] **Imagem.** No servidor, o `docker run ... ghcr.io/nailtongomes/shutup-and-run-relay` do SERVIDOR.pt-BR.md, passo 3a: `docker logs relay` diz `with a token`, e o teste de dois minutos mostra o IP do PC.
 
-## Depois da 0.2.28: lista de PCs no relay, 10 consumidores, n8n como hub
+## 0.2.29: lista de PCs no relay, 10 consumidores, n8n como hub
 
 O CI agora roda no runner Windows a linha de instalação com o relay, um `curl.exe` pelo PC, `/status`, `/pcs` e os três botões da página. Falta o que o runner não tem: casa atrás de NAT, sono, Wi-Fi.
 
@@ -158,7 +158,7 @@ O CI agora roda no runner Windows a linha de instalação com o relay, um `curl.
 - [ ] **10 de uma vez.** Do servidor, 10 navegadores pelo mesmo PC de casa (`node tests/internet/load.mjs http://ID:SENHA@172.17.0.1:8080`): anote páginas, falhas, mediana e o pico de conexões, e o upload da casa (speedtest). O PC continua usável enquanto isso.
 - [ ] **n8n.** Com o fluxo `worker-orchestrator` no servidor: a linha de instalação com `SHUTUP_AND_RUN_POLL_URL` do n8n e `SHUTUP_AND_RUN_LEND_INTERNET=1` conecta sem ninguém digitar o relay; `list` mostra o PC em `internet`; uma tarefa `via_internet` imprime o IP da casa.
 
-## Ver a tela de uma tarefa pela página local
+## 0.2.29: ver a tela de uma tarefa pela página local
 
 Confirmado à mão no Linux com Docker (`tests/screen/linux.sh`): o link **Ver tela** nas listas, o noVNC pela página, o WebSocket e o fim da rota quando o container termina. No Windows falta ver o mesmo pelo encaminhamento do WSL2.
 
