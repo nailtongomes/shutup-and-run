@@ -248,7 +248,10 @@ pub fn boot_script(exe: &Path) -> String {
          # Written by `shutup-and-run internet on`; `internet off` removes it.\n\
          # Termux:Boot runs it once the phone has started.\n\
          termux-wake-lock\n\
-         exec '{}' internet serve --background\n",
+         # Again a minute after it ends with an error, as the logon task and\n\
+         # the systemd unit do. It ends well when turned off, or when one\n\
+         # runs already.\n\
+         until '{}' internet serve --background; do sleep 60; done\n",
         exe.display()
     )
 }
@@ -271,8 +274,8 @@ pub fn start(running: bool) -> Result<String, String> {
     let mut lines = vec![if running {
         "already running: it reads the new settings within 5 seconds".to_string()
     } else {
-        spawn_serve(&exe)?;
-        "started in the background".to_string()
+        spawn(&script)?;
+        "started in the background, again a minute after an error".to_string()
     }];
     lines.push(match run("termux-wake-lock") {
         true => "wake lock held (termux-wake-lock): it goes on with the screen off".to_string(),
@@ -308,12 +311,12 @@ fn run(program: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// `internet serve --background`, in a process group of its own: closing
-/// the Termux session that ran `on` does not end it.
-fn spawn_serve(exe: &Path) -> Result<(), String> {
-    let mut command = std::process::Command::new(exe);
+/// The boot script, which runs `internet serve` until it ends well, in a
+/// process group of its own: closing the Termux session that ran `on`
+/// does not end it.
+fn spawn(script: &Path) -> Result<(), String> {
+    let mut command = std::process::Command::new(script);
     command
-        .args(["internet", "serve", "--background"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -325,7 +328,19 @@ fn spawn_serve(exe: &Path) -> Result<(), String> {
     command
         .spawn()
         .map(drop)
-        .map_err(|e| format!("{}: {e}", exe.display()))
+        .map_err(|e| format!("{}: {e}", script.display()))
+}
+
+/// Asks the process `pid` (an `internet serve` of another version) to end.
+pub fn terminate(pid: u32) {
+    #[cfg(unix)]
+    // SAFETY: kill only sends a signal; a pid that is gone is an error it
+    // returns, and nothing is read back.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 #[cfg(test)]
@@ -394,7 +409,7 @@ mod tests {
         assert!(script.starts_with("#!/"));
         assert!(script.contains("\ntermux-wake-lock\n"));
         assert!(script.ends_with(
-            "exec '/data/data/com.termux/files/usr/bin/shutup-and-run' internet serve --background\n"
+            "until '/data/data/com.termux/files/usr/bin/shutup-and-run' internet serve --background; do sleep 60; done\n"
         ));
     }
 }

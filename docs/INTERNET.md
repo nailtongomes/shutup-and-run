@@ -117,19 +117,16 @@ The binary is for 64-bit ARM, which nearly every phone sold since 2017 is (`unam
 ### Install, once
 
 1. Install **Termux** from [F-Droid](https://f-droid.org/packages/com.termux/) or its [GitHub releases](https://github.com/termux/termux-app/releases), not from Google Play: the Play build is another one, and these steps were written for the F-Droid and GitHub builds. Install **Termux:Boot** from the same place, and open it once, so Android lets it start at boot.
-2. In Termux:
+2. In Termux, one line installs it and turns it on:
 
    ```sh
-   pkg install -y curl
-   cd "$TMPDIR"
-   curl -fLO https://github.com/nailtongomes/shutup-and-run/releases/latest/download/shutup-and-run-aarch64-linux-android
-   curl -fLO https://github.com/nailtongomes/shutup-and-run/releases/latest/download/SHA256SUMS
-   grep ' shutup-and-run-aarch64-linux-android$' SHA256SUMS | sha256sum -c -
-   install -m 755 shutup-and-run-aarch64-linux-android "$PREFIX/bin/shutup-and-run"
-   shutup-and-run fit
+   curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install-termux.sh \
+     | SHUTUP_AND_RUN_RELAY=relay.example.com:7000 SHUTUP_AND_RUN_RELAY_TOKEN=TOKEN bash
    ```
 
-   `sha256sum -c` must say `OK`. `fit` says `lend: internet`. The same lines are the update; then `internet on` again.
+   It downloads the Android binary and `SHA256SUMS` of the latest release, refuses a binary whose sum does not match, installs it as `$PREFIX/bin/shutup-and-run` and runs `internet on ... --wait 60`, which returns once the phone is connected or says why not. `SHUTUP_AND_RUN_INTERNET_LOGIN=ID:PASSWORD` passes the operator's login, `SHUTUP_AND_RUN_MOBILE_DATA=1` allows mobile data and `SHUTUP_AND_RUN_MAX_DAY=2g` caps a day. Without `SHUTUP_AND_RUN_RELAY` it only installs. The same line is the update: `internet on` stops the process of the old version and starts the new one.
+
+   By hand, the same steps: `curl -fLO` the asset `shutup-and-run-aarch64-linux-android` and `SHA256SUMS` from the [latest release](https://github.com/nailtongomes/shutup-and-run/releases/latest), `grep ' shutup-and-run-aarch64-linux-android$' SHA256SUMS | sha256sum -c -` (it must say `OK`), `install -m 755 shutup-and-run-aarch64-linux-android "$PREFIX/bin/shutup-and-run"`.
 
 ### Turn it on, look, turn it off
 
@@ -158,7 +155,7 @@ Termux keeps running with the screen off while it holds the wake lock (a CPU loc
 - **OnePlus, OPPO, realme:** the app's Battery: **Allow background activity**, and **Auto launch** on.
 - **Android 12 and later** may kill programs started from Termux ("phantom processes"). On Android 14 and later: Developer options, **Disable child process restrictions**. On 12L and 13, once, from a computer with adb: `adb shell settings put global settings_enable_monitor_phantom_procs false`. On 12: `adb shell device_config set_sync_disabled_for_tests persistent` and `adb shell device_config put activity_manager max_phantom_processes 2147483647`.
 
-After a reboot, Termux:Boot starts it once the phone is unlocked for the first time; `internet status` says `connected` within a minute. If a battery saver killed it anyway, `internet status` says `INTERNET_NOT_RUNNING`, and `internet on` with the same relay starts it again.
+After a reboot, Termux:Boot starts it once the phone is unlocked for the first time; `internet status` says `connected` within a minute. A process that ends with an error, or is killed alone, starts again a minute later: the boot script runs it in a loop until it ends well (`off`). If a battery saver killed Termux itself, `internet status` says `INTERNET_NOT_RUNNING`, and `internet on` with the same relay starts it again.
 
 ### Risks on a phone
 
@@ -238,7 +235,7 @@ The PC counts what crosses the site's side of each stream: `bytes_received` (fro
 
 ## How many at once
 
-A PC keeps 32 idle connections to the relay and carries up to 512 streams at once. The use case it is sized for: up to 10 consumers at the same time (containers, Selenium or Playwright browsers) through one PC. A browser opens 10 to 30 streams for one page and keeps some open a while, and each stream that starts takes an idle connection, which the PC replaces at once.
+A PC keeps 32 idle connections to the relay and carries up to 512 streams at once. The relay lets one PC carry **140 streams at once**: 7 consumers at the same time (containers, Selenium or Playwright browsers), at about 20 streams each, which is what one headless Chromium held at most while loading pages. One more stream waits up to 10 seconds for one to end, then gets `503` (`PC <id> carries 140 streams at once`). A client's home or phone upload is shared by all of them, and one consumer out of control must not take it all. A browser opens 10 to 30 streams for one page and keeps some open a while, so the limit counts streams, not consumers: `curl` and `requests` take one per request.
 
 Measured with `SHUTUP_AND_RUN_LOAD=1 tests/internet/local.sh` (relay and PC on one Linux server in a datacenter, 10 headless Chromium at once, each opening five sites three times):
 
@@ -247,7 +244,19 @@ Measured with `SHUTUP_AND_RUN_LOAD=1 tests/internet/local.sh` (relay and PC on o
 | 32 idle, 512 streams (0.2.29) | 2 | 150 each | 0 | 1.5 and 1.7 s | 5.2 and 5.9 s | 192 and 191 |
 | 16 idle, 256 streams (up to 0.2.28) | 1 | 150 | 0 | 1.8 s | 5.9 s | 192 |
 
-Both carried 10 browsers with no failure and in about the same time: more idle connections did not make pages faster here. What changed is the margin: 10 browsers held up to 192 streams at once, three quarters of the old 256, past which a PC starts no new idle connection; 512 leaves room for heavier pages or a few more consumers. On a client's PC the limit that counts is the home connection's upload: every page a consumer loads leaves the relay as the PC's download and comes back as its upload. A 10 Mbit/s upload is about 1 MB/s for all of them together; ten browsers on heavy pages share that. The relay's own cost is small: an idle connection is a socket and a ping every 10 s.
+With the relay's limit, same server:
+
+| Relay limit | browsers | pages | failed | median page | 95% under | most streams open at once |
+| --- | --- | --- | --- | --- | --- | --- |
+| none | 1 | 15 | 0 | 0.3 s | 1.0 s | 20 |
+| none | 3 | 45 | 0 | 0.5 s | 1.6 s | 58 |
+| 7 streams | 1 | 15 | 13 | | | 7 |
+| 140 streams | 7 | 105 | 0 | 1.1 s | 4.0 s | 135 |
+| 140 streams | 10 | 150 | 1 (`503`) | 1.3 s | 8.6 s | 140 |
+
+Seven streams were not enough for one browser: Chrome keeps several tunnels open between pages, and the next ones waited and failed. 140 carried seven browsers with no failure; ten went past it and one page of 150 got the `503`.
+
+Before the limit, both carried 10 browsers with no failure and in about the same time: more idle connections did not make pages faster here. What changed is the margin: 10 browsers held up to 192 streams at once, three quarters of the old 256, past which a PC starts no new idle connection; 512 leaves room for heavier pages or a few more consumers. On a client's PC the limit that counts is the home connection's upload: every page a consumer loads leaves the relay as the PC's download and comes back as its upload. A 10 Mbit/s upload is about 1 MB/s for all of them together; ten browsers on heavy pages share that. The relay's own cost is small: an idle connection is a socket and a ping every 10 s.
 
 ## A task that goes out through a client's connection
 
@@ -471,4 +480,4 @@ In this order, each a small patch:
 1. TLS on the link, with the relay's certificate pinned in `internet.json` (`rustls` is already a dependency through `reqwest` and `axum-server`).
 2. ~~A relay token~~: done, `relay --token-file` and `internet on --token`.
 3. A password per container instead of per PC, issued by the relay, and the `--open` ports bound to one container's network.
-4. Per-PC limits on the relay: streams at once; and a list of destinations if the contract asks for one. (Bytes a day are limited on the PC: `--max-day`.)
+4. ~~Per-PC streams at once on the relay~~: done, 140. A list of destinations if the contract asks for one. (Bytes a day are limited on the PC: `--max-day`.)

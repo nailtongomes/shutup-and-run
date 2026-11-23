@@ -5,17 +5,27 @@
 # WebSocket from the page's origin (and not from another), and the route
 # gone once the container ends. Run as root (the Docker socket).
 #
-#   sudo bash tests/screen/linux.sh target/release/shutup-and-run [IMAGE]
+#   sudo bash tests/screen/linux.sh target/release/shutup-and-run [IMAGE | fake[=IMAGE]]
 #
 # IMAGE defaults to ghcr.io/nailtongomes/rpa-worker-selenium:latest (about
-# 1.5 GB to download). With SHUTUP_AND_RUN_SCREEN_SHOT=FILE.png and node with
-# Playwright, it also saves what the viewer shows. It starts its own worker on
-# a temporary config and history, with a random token, and removes everything
-# on exit. Not part of CI.
+# 1.5 GB to download). `fake` runs tests/screen/fake-novnc.py instead, a
+# stand-in that answers like noVNC for 90 s, in any image with python3
+# (python:3.13-alpine unless `fake=IMAGE`; CI gives it the Selenium probe
+# image it already built, which keeps Docker Hub out of the test). With SHUTUP_AND_RUN_SCREEN_SHOT=FILE.png and node with
+# Playwright, it also saves what the viewer shows (the real image only). It
+# starts its own worker on a temporary config and history, with a random
+# token, and removes everything on exit.
 set -euo pipefail
 
 BIN="$(readlink -f "${1:?usage: linux.sh <binary> [image]}")"
 IMAGE="${2:-ghcr.io/nailtongomes/rpa-worker-selenium:latest}"
+FAKE=""
+if [[ "$IMAGE" == fake || "$IMAGE" == fake=* ]]; then
+  IMAGE="${IMAGE#fake}"
+  IMAGE="${IMAGE#=}"
+  IMAGE="${IMAGE:-python:3.13-alpine}"
+  FAKE="$(base64 -w0 "$(dirname "$0")/fake-novnc.py")"
+fi
 REPO="${IMAGE%:*}"
 WORK="$(mktemp -d)"
 PORT=18795
@@ -71,11 +81,17 @@ for _ in $(seq 1 100); do
 done
 
 "$BIN" managed mode on --json >/dev/null
-echo '{"name":"tela","image":"'"$IMAGE"'",
-  "command":["python","/app/preflight.py"],
-  "env":{"USE_XVFB":"1","USE_OPENBOX":"1","USE_VNC":"1","USE_NOVNC":"1"},
-  "cpu":1,"memory":"2g","shm":"1g","timeout_secs":900,"policy":"once","enabled":true}' |
-  "$BIN" managed apply - --json >/dev/null
+if [[ -n "$FAKE" ]]; then
+  echo '{"name":"tela","image":"'"$IMAGE"'",
+    "command":["python3","-c","import base64,os; exec(base64.b64decode(os.environ[\"FAKE_NOVNC\"]))"],
+    "env":{"FAKE_NOVNC":"'"$FAKE"'","FAKE_SECS":"90"},
+    "cpu":1,"memory":"256m","timeout_secs":900,"policy":"once","enabled":true}'
+else
+  echo '{"name":"tela","image":"'"$IMAGE"'",
+    "command":["python","/app/preflight.py"],
+    "env":{"USE_XVFB":"1","USE_OPENBOX":"1","USE_VNC":"1","USE_NOVNC":"1"},
+    "cpu":1,"memory":"2g","shm":"1g","timeout_secs":900,"policy":"once","enabled":true}'
+fi | "$BIN" managed apply - --json >/dev/null
 "$BIN" managed start tela --json >/dev/null
 
 ID=""
@@ -111,7 +127,7 @@ check is "$(code "$URL/local/screen/0123456789abcdef/vnc.html") \
 $(code -H "Authorization: Bearer $TOKEN" -H "Host: 203.0.113.9:$PORT" "$URL/local/screen/$ID/vnc.html")" \
   "404 404"
 
-if [[ -n "${SHUTUP_AND_RUN_SCREEN_SHOT:-}" ]]; then
+if [[ -n "${SHUTUP_AND_RUN_SCREEN_SHOT:-}" && -z "$FAKE" ]]; then
   SHOT="$(readlink -f "$SHUTUP_AND_RUN_SCREEN_SHOT")"
   node -e '
     const { chromium } = require("playwright");
