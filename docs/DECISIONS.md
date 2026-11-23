@@ -728,7 +728,7 @@ Alternatives:
 
 Cost: Termux from F-Droid or GitHub, installed by the person, and two apps (Termux, Termux:Boot) to keep alive against each maker's battery saver, documented per maker in docs/INTERNET.md. The network kind is a guess from the interface's name; a VPN or an unusual name holds sharing until `--mobile-data`. A phone reads no battery, presenting or metered flag. Android 12 and later may kill the process ("phantom processes") unless a setting is changed once with adb or in Developer options. Now the boot script runs the process in a loop, a minute after each error, and `internet on` stops a process of another version before it starts its own; a process killed with Termux itself waits for the next boot or `internet on`. The Android build adds a CI job (two builds and the container test) and a release job.
 
-## The relay carries 140 streams per PC; a phone installs in one line and starts again by itself; two hand tests in CI
+## The relay carries 140 streams per PC; a phone installs in one line and starts again by itself; two hand tests in CI (0.2.31)
 
 Context: the owner asked for a limit of 7 simultaneous connections per PC on the relay, so one consumer out of control cannot take a client's home or phone connection. Measured on one server (`tests/internet/load.mjs`, headless Chromium): one browser loading pages held up to 20 streams at once, three held 58; with a limit of 7 streams one browser failed 13 pages of 15 (`ERR_TUNNEL_CONNECTION_FAILED`), because Chrome keeps several tunnels open between pages. The owner then chose 7 consumers.
 

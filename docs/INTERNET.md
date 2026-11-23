@@ -117,7 +117,7 @@ The binary is for 64-bit ARM, which nearly every phone sold since 2017 is (`unam
 ### Install, once
 
 1. Install **Termux** from [F-Droid](https://f-droid.org/packages/com.termux/) or its [GitHub releases](https://github.com/termux/termux-app/releases), not from Google Play: the Play build is another one, and these steps were written for the F-Droid and GitHub builds. Install **Termux:Boot** from the same place, and open it once, so Android lets it start at boot.
-2. In Termux, one line installs it and turns it on:
+2. In Termux, one line installs it and turns it on (0.2.31):
 
    ```sh
    curl -fsSL https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/install-termux.sh \
@@ -235,7 +235,7 @@ The PC counts what crosses the site's side of each stream: `bytes_received` (fro
 
 ## How many at once
 
-A PC keeps 32 idle connections to the relay and carries up to 512 streams at once. The relay lets one PC carry **140 streams at once**: 7 consumers at the same time (containers, Selenium or Playwright browsers), at about 20 streams each, which is what one headless Chromium held at most while loading pages. One more stream waits up to 10 seconds for one to end, then gets `503` (`PC <id> carries 140 streams at once`). A client's home or phone upload is shared by all of them, and one consumer out of control must not take it all. A browser opens 10 to 30 streams for one page and keeps some open a while, so the limit counts streams, not consumers: `curl` and `requests` take one per request.
+A PC keeps 32 idle connections to the relay and carries up to 512 streams at once. The relay lets one PC carry **140 streams at once** (0.2.31): 7 consumers at the same time (containers, Selenium or Playwright browsers), at about 20 streams each, which is what one headless Chromium held at most while loading pages. One more stream waits up to 10 seconds for one to end, then gets `503` (`PC <id> carries 140 streams at once`). A client's home or phone upload is shared by all of them, and one consumer out of control must not take it all. A browser opens 10 to 30 streams for one page and keeps some open a while, so the limit counts streams, not consumers: `curl` and `requests` take one per request.
 
 Measured with `SHUTUP_AND_RUN_LOAD=1 tests/internet/local.sh` (relay and PC on one Linux server in a datacenter, 10 headless Chromium at once, each opening five sites three times):
 
@@ -244,7 +244,7 @@ Measured with `SHUTUP_AND_RUN_LOAD=1 tests/internet/local.sh` (relay and PC on o
 | 32 idle, 512 streams (0.2.29) | 2 | 150 each | 0 | 1.5 and 1.7 s | 5.2 and 5.9 s | 192 and 191 |
 | 16 idle, 256 streams (up to 0.2.28) | 1 | 150 | 0 | 1.8 s | 5.9 s | 192 |
 
-With the relay's limit, same server:
+With the relay's limit (0.2.31), same server:
 
 | Relay limit | browsers | pages | failed | median page | 95% under | most streams open at once |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -480,4 +480,4 @@ In this order, each a small patch:
 1. TLS on the link, with the relay's certificate pinned in `internet.json` (`rustls` is already a dependency through `reqwest` and `axum-server`).
 2. ~~A relay token~~: done, `relay --token-file` and `internet on --token`.
 3. A password per container instead of per PC, issued by the relay, and the `--open` ports bound to one container's network.
-4. ~~Per-PC streams at once on the relay~~: done, 140. A list of destinations if the contract asks for one. (Bytes a day are limited on the PC: `--max-day`.)
+4. ~~Per-PC streams at once on the relay~~: done, 140 (0.2.31). A list of destinations if the contract asks for one. (Bytes a day are limited on the PC: `--max-day`.)
