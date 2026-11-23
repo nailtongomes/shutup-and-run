@@ -8,7 +8,7 @@ Uma VPS Linux (sua, confiável) e um PC com Windows 11 (tratado como PC de clien
 
 As instalações de uma linha baixam da última release do GitHub.
 
-- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a versão do `Cargo.toml` (`v0.2.14` quando isto foi escrito) ou posterior e tem os arquivos `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS` e, nas versões que o têm, `shutup-and-run-aarch64-linux-android` (um celular no Termux).
+- [ ] `https://github.com/nailtongomes/shutup-and-run/releases/latest` é a versão do `Cargo.toml` (`v0.2.14` quando isto foi escrito) ou posterior e tem os arquivos `shutup-and-run-x86_64-unknown-linux-musl`, `shutup-and-run-x86_64-pc-windows-msvc.exe`, `SHA256SUMS` e, a partir da v0.2.30, `shutup-and-run-aarch64-linux-android` (um celular no Termux).
 
 Se não estiver lá: o workflow `release` roda sozinho quando o `main` recebe uma versão do `Cargo.toml` que ainda não tem release, cria a tag e publica. Veja a última execução em Actions; "Run workflow" no `main` repete uma que falhou. Ninguém cria tag à mão.
 

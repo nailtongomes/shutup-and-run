@@ -103,7 +103,7 @@ The files are in `C:\ProgramData\shutup-and-run\` on Windows and `/var/lib/shutu
 
 ## Android: a phone in Termux
 
-A phone can lend its connection too: the home's Wi-Fi, or its mobile data when the person allows it. It is the same program, built for Android (`shutup-and-run-aarch64-linux-android` in each release), run in [Termux](https://termux.dev), a terminal app. No root, no app of ours, no store. Only internet sharing runs there: the worker needs Docker, and the commands that need it, WSL or systemd answer `ANDROID_NO_CONTAINERS` and exit 1. The choice and what an app of our own would take: [DECISIONS.md](DECISIONS.md#a-phone-shares-its-connection-from-termux).
+A phone can lend its connection too (0.2.30): the home's Wi-Fi, or its mobile data when the person allows it. It is the same program, built for Android (`shutup-and-run-aarch64-linux-android` in each release), run in [Termux](https://termux.dev), a terminal app. No root, no app of ours, no store. Only internet sharing runs there: the worker needs Docker, and the commands that need it, WSL or systemd answer `ANDROID_NO_CONTAINERS` and exit 1. The choice and what an app of our own would take: [DECISIONS.md](DECISIONS.md#a-phone-shares-its-connection-from-termux-0230).
 
 What is different from a PC:
 

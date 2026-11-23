@@ -315,7 +315,7 @@ A PC that lends its internet connection (docs/INTERNET.md) asks a URL of yours o
 {"worker": "DESK-07", "os": "windows", "arch": "x86_64", "version": "0.2.28", "lend": "internet"}
 ```
 
-`os` is `windows`, `linux`, or `android` for a phone in Termux (whose `worker` is `phone` unless `HOSTNAME` is set there). It comes with `Authorization: Bearer <SHUTUP_AND_RUN_POLL_TOKEN>` when that is set at the PC, and none otherwise. Answer `200` with where the PC dials in, and best the login you chose for it, so its tasks can use it without anything coming back from the PC:
+`os` is `windows`, `linux`, or `android` for a phone in Termux (0.2.30; its `worker` is `phone` unless `HOSTNAME` is set there). It comes with `Authorization: Bearer <SHUTUP_AND_RUN_POLL_TOKEN>` when that is set at the PC, and none otherwise. Answer `200` with where the PC dials in, and best the login you chose for it, so its tasks can use it without anything coming back from the PC:
 
 ```json
 {"relay": "relay.example.com:7000", "token": "example-relay-token-123", "login": "pc-desk-07:example-password-0123"}
