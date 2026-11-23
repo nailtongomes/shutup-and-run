@@ -1287,7 +1287,14 @@ mod tests {
             definition_json(&all[0].definition, true).to_string(),
             list_text(mode, &all, T0 as i64),
             String::from_utf8(crate::status::document(&live, T0 as i64, false, None)).unwrap(),
-            crate::status::managed_view(mode, &all, T0 as i64, crate::status::Lang::Pt, None),
+            crate::status::managed_view(
+                mode,
+                &all,
+                &Default::default(),
+                T0 as i64,
+                crate::status::Lang::Pt,
+                None,
+            ),
             fields,
         ];
         for words in [vec!["list"], vec!["show", "rpa"]] {

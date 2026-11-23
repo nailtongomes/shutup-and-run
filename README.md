@@ -206,6 +206,7 @@ It follows the system's light or dark theme and works on a phone, with no networ
 | --- | --- | --- |
 | `/` | The state in one word and colour: running and idle, working, paused, waiting for your authorization, blocked, Docker down. Under it, anything that needs a person, each with its button: authorize, resume, give a managed container its secret. Then whether the PC can be turned off, jobs now, the last job, the queue, the last jobs with their logs, and the computer's resources. Reloads every 10 seconds | none |
 | Jobs and logs (`/local/logs`) | The last 100 jobs: status, image, start in local time, duration, exit code, and what each printed, to open or download | none |
+| A job's screen (`/local/screen/JOB_ID`) | With `screen_view` on: what a running job shows on its screen, live and view only, when its image serves noVNC on port 6080. The job lists and the managed containers link to it (**View screen**) while it answers | none |
 | Safety (`/local/safety`) | Whether this computer is healthy, warned or blocked, and why. Where the owner reads the risks and authorizes, or withdraws an authorization | none: the owner's own decision |
 | Settings (`/local/config`) | Poll URL, poll interval, jobs at once, machine name | none |
 | Advanced settings (`/local/advanced`) | Allowed images, any-image, time limits, the resource limits, both tokens, the admin login | `admin` / `admin` until changed |
@@ -217,6 +218,8 @@ It follows the system's light or dark theme and works on a phone, with no networ
 - The resource limits (`resource_profile`, `max_job_cpus`, `max_job_memory`, `min_free_memory`, `min_free_disk`) are under Advanced settings. A field left empty uses the profile's default, shown in grey. `shutup-and-run config show` prints the same values under "in force", and in `effective` with `--json`.
 - The remaining keys are CLI only. `shutup-and-run config keys` says where each key can be edited.
 - It is in English or Portuguese, one at a time; a link switches and the choice is remembered.
+
+**Watching a job's screen.** An image that runs a browser on a virtual display can serve it with noVNC (for example `ghcr.io/nailtongomes/rpa-worker-selenium` with `USE_XVFB=1`, `USE_VNC=1` and `USE_NOVNC=1`: noVNC on port 6080, no password). With `shutup-and-run config set screen_view true --apply` (or Advanced settings, behind the admin login), the page opens noVNC through itself, connected and view only, for as long as the job runs. The address is the job's container on Docker's bridge, from Docker; a request cannot name a port or another container, and nothing changes for the task: no port, no network field. The person at the PC sees whatever the job shows. noVNC itself has no password, so another container on the same bridge reaches that port too. On Windows the page's `127.0.0.1:8787` is WSL2's forwarding of a TCP port, which carries the WebSocket like any other connection. `doctor` says `SCREEN_VIEW_NO_PAGE` when the setting is on and the page is off. `tests/screen/linux.sh` is the hand test.
 
 Security of the page, plainly. It needs no token, so it answers only a loopback connection that names a loopback host, and accepts a form only from its own origin. It never shows a token or a job's env; it does show what jobs printed (their logs, below); the editor of a managed container, behind the admin login, shows that container's plain env and never a secret's value. The admin login keeps a curious person out and is **not** a security boundary: whoever uses the PC can read the config file. Nothing on it is reachable from the network, and it is not meant to be put behind a proxy. On a machine set up with `config.toml` the page shows status only.
 
@@ -362,6 +365,7 @@ The keys are the same in both. An unknown key is refused.
 | `reaper_interval_secs`, `purge_interval_secs` | `SHUTUP_AND_RUN_REAPER_INTERVAL_SECS`, `_PURGE_INTERVAL_SECS` | How often timeouts are enforced (2) and old history deleted (3600). |
 | `docker_config` | `SHUTUP_AND_RUN_DOCKER_CONFIG` | Path to Docker's `config.json`, for private images. |
 | `certificate_enabled`, `certificate_consent`, `certificate_name` (JSON only) | | Certificate passthrough. Written by `shutup-and-run certificate set`, not by hand. Default off. |
+| `screen_view` | | The page shows a running job's screen when its image serves noVNC on port 6080. Default off. No environment variable: it is set on the machine. |
 
 **Allowlist.** `ghcr.io/you/worker` allows any tag or digest of that repository and nothing else: not `ghcr.io/you/worker-evil`, not `ghcr.io/you/other`. An entry with a tag allows exactly that string. A Windows worker has `poll_any_image` instead: its one source of work is your poll URL.
 

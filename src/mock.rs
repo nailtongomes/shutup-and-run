@@ -23,6 +23,7 @@ struct Inner {
     oom: std::collections::HashSet<String>,
     stats: Option<crate::runtime::Stats>,
     disk: Option<u64>,
+    screens: HashMap<String, std::net::SocketAddr>,
 }
 
 pub struct MockRuntime {
@@ -59,6 +60,7 @@ impl MockRuntime {
                 oom: std::collections::HashSet::new(),
                 stats: None,
                 disk: None,
+                screens: HashMap::new(),
             }),
         }
     }
@@ -69,6 +71,15 @@ impl MockRuntime {
             .await
             .running
             .insert(id.to_string(), deadline);
+    }
+
+    /// Where the container of `id` serves its screen while it runs.
+    pub async fn set_screen(&self, id: &str, address: std::net::SocketAddr) {
+        self.inner
+            .lock()
+            .await
+            .screens
+            .insert(id.to_string(), address);
     }
 
     /// The container is gone and nobody was told, as after a power cut.
@@ -320,6 +331,15 @@ impl Runtime for MockRuntime {
 
     async fn cleanup_created(&self) -> Result<usize, RuntimeError> {
         Ok(0)
+    }
+
+    async fn screen_address(&self, id: &str) -> Result<Option<std::net::SocketAddr>, RuntimeError> {
+        let inner = self.inner.lock().await;
+        Ok(inner
+            .running
+            .contains_key(id)
+            .then(|| inner.screens.get(id).copied())
+            .flatten())
     }
 
     async fn oom_killed(&self, id: &str) -> Result<bool, RuntimeError> {

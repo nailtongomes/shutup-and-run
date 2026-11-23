@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
 pub struct StartSpec {
@@ -38,6 +39,10 @@ impl RuntimeError {
         Self(msg.into())
     }
 }
+
+/// The one port the local page's screen view reaches in a job's container:
+/// where noVNC (websockify) serves by convention. Not a setting.
+pub const SCREEN_PORT: u16 = 6080;
 
 /// Bytes so far, and the size known so far, of an image download.
 pub type Progress<'a> = dyn Fn(u64, u64) + Send + Sync + 'a;
@@ -84,6 +89,12 @@ pub trait Runtime: Send + Sync {
     /// the old one behind) and that no container uses. The bytes it freed.
     async fn prune_dangling(&self) -> Result<u64, RuntimeError> {
         Ok(0)
+    }
+    /// Where the page's screen view reaches a running container: its address
+    /// on Docker's bridge, port [`SCREEN_PORT`]. From the daemon, never from
+    /// a request. None when the container is not running or has no address.
+    async fn screen_address(&self, _id: &str) -> Result<Option<SocketAddr>, RuntimeError> {
+        Ok(None)
     }
     /// The end of a container's stdout and stderr, at most `max_bytes`, for
     /// the job's log file. A runtime that streams overrides this.
