@@ -684,7 +684,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** A PC told by the URL keeps that relay until the next `internet on --discover`: moving the relay means running the install line again on each PC. The poll URL learns which PCs lend their internet. The image is built only after a release (or "Run workflow" on main for the newest one), not on every push. A relay with no token in its env accepts any PC, as before.
 
-## The operator's list of PCs, room for 10 consumers, the worker image per release, n8n as the hub
+## The operator's list of PCs, room for 10 consumers, the worker image per release, n8n as the hub (0.2.29)
 
 **Context.** The operator's backend could ask the relay about one PC at a time, with that PC's login. Ten browsers at once through one PC went near its 256 streams. The worker image had no version tag since v0.2.9. And a server with a relay still needed a backend to answer the discovery and to send a job through a chosen PC.
 
@@ -698,7 +698,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** Anyone with the relay's token reads which PCs are there and how much they carried; the PCs hold that token too, but reach only port 7000, not the proxy. 32 idle connections are 32 sockets on the PC and the relay per PC, and a ping each every 10 s. The n8n flow answers any discovery that reaches it, without approval, up to 200 PCs: a stranger with the URL can lend you a connection you never use. The Windows CI step proves the path on a runner, not on a home PC behind NAT.
 
-## A running job's screen on the local page, through the page
+## A running job's screen on the local page, through the page (0.2.29)
 
 **Context.** Jobs that drive a browser run it on a virtual display, and an image like `rpa-worker-selenium` serves that display with noVNC on port 6080, without a password. The person at the PC, or support on a call with them, wants to see what the job is doing. A request has no port or network field, on purpose, and the page is the one thing on the worker's port without the token.
 

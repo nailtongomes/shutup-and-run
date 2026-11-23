@@ -143,7 +143,7 @@ Measured with `SHUTUP_AND_RUN_LOAD=1 tests/internet/local.sh` (relay and PC on o
 
 | PC | runs | pages | failed | median page | 95% under | most streams open at once |
 | --- | --- | --- | --- | --- | --- | --- |
-| 32 idle, 512 streams (now) | 2 | 150 each | 0 | 1.5 and 1.7 s | 5.2 and 5.9 s | 192 and 191 |
+| 32 idle, 512 streams (0.2.29) | 2 | 150 each | 0 | 1.5 and 1.7 s | 5.2 and 5.9 s | 192 and 191 |
 | 16 idle, 256 streams (up to 0.2.28) | 1 | 150 | 0 | 1.8 s | 5.9 s | 192 |
 
 Both carried 10 browsers with no failure and in about the same time: more idle connections did not make pages faster here. What changed is the margin: 10 browsers held up to 192 streams at once, three quarters of the old 256, past which a PC starts no new idle connection; 512 leaves room for heavier pages or a few more consumers. On a client's PC the limit that counts is the home connection's upload: every page a consumer loads leaves the relay as the PC's download and comes back as its upload. A 10 Mbit/s upload is about 1 MB/s for all of them together; ten browsers on heavy pages share that. The relay's own cost is small: an idle connection is a socket and a ping every 10 s.
