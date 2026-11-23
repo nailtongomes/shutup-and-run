@@ -712,7 +712,7 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** The person at the PC sees what the job shows on its screen: a site the job logged in to, a document it opened. They could already read every task's env on a Windows PC; the screen adds what the job saw. `view_only` is noVNC's own option, in the page's link: the person can change it in noVNC's settings and type into the job's browser. noVNC has no password, so any other container on the same Docker bridge reaches its port 6080, as it could before this change. An open viewer keeps its connection until the container stops; a new one is refused once the job's row is finished. The probe adds up to 300 ms to drawing a list with a running job. Confirmed by hand on Linux with Docker (`tests/screen/linux.sh`); on Windows by reasoning about WSL2's forwarding, not yet on a PC (docs/WINDOWS-PENDING.md).
 
-## A phone shares its connection from Termux
+## A phone shares its connection from Termux (0.2.30)
 
 Context: an operator wants a client's phone to lend its home Wi-Fi or its mobile data, like a PC. There was no way to run `internet on` on Android. Alpha: the client accepted the risks; a container that cannot use the tunnel stops, with no failover.
 
