@@ -375,9 +375,10 @@ mod tests {
     #[test]
     fn this_machines_network_has_an_interface_when_it_has_an_address() {
         let network = current();
-        if network.address.is_some() {
+        // Interfaces are read on Unix only: Windows never asks.
+        if cfg!(unix) && network.address.is_some() {
             assert!(network.seen.interface.is_some(), "{network:?}");
-        } else {
+        } else if network.address.is_none() {
             assert_eq!(network.seen.kind, Kind::Offline);
         }
         // The status never carries the address.
