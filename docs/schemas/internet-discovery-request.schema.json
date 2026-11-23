@@ -13,7 +13,7 @@
       "minLength": 1,
       "maxLength": 64
     },
-    "os": {"description": "windows or linux.", "type": "string", "enum": ["windows", "linux"]},
+    "os": {"description": "windows, linux, or android (a phone, in Termux).", "type": "string", "enum": ["windows", "linux", "android"]},
     "arch": {"description": "CPU architecture of the binary, as Rust names it: x86_64, aarch64.", "type": "string", "minLength": 1},
     "version": {"description": "Version of the program, such as 0.2.28.", "type": "string", "minLength": 1},
     "lend": {"description": "Always internet: this PC asks where to lend its internet connection.", "const": "internet"}

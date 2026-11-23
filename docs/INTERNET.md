@@ -81,6 +81,8 @@ irm https://raw.githubusercontent.com/nailtongomes/shutup-and-run/main/scripts/i
 
 The install line downloads the `.exe`, checks it against `SHA256SUMS`, puts it on the PATH and runs `shutup-and-run internet on --relay ... --token ... --login ... --wait 60`: it returns once the PC is connected, or says why not (and keeps trying). With `$env:SHUTUP_AND_RUN_POLL_URL` too, it also installs the worker, where `shutup-and-run fit` says this PC can run containers (WSL2 already there, 8 GiB and more than 2 processors); elsewhere it lends the internet now and prints what the worker needs. Run again, it is the update, and it starts internet sharing again on the new `.exe`. `internet on` itself copies the `.exe` to `C:\ProgramData\shutup-and-run\`, registers the logon task `shutup-and-run-internet` (under `conhost --headless`, no window) and starts it. On a PC that already runs the worker, the same `.exe` does it; the worker and this mode are independent.
 
+A phone (Android, in Termux, no root): [Android](#android-a-phone-in-termux).
+
 Linux (root): `shutup-and-run internet on --relay relay.example.com:7000` writes and starts the systemd unit `shutup-and-run-internet`. Without systemd, keep `shutup-and-run internet serve` running. `install.sh` takes the same `SHUTUP_AND_RUN_RELAY`, `SHUTUP_AND_RUN_RELAY_TOKEN` and `SHUTUP_AND_RUN_INTERNET_LOGIN`, beside the worker it installs, or alone with `SHUTUP_AND_RUN_INTERNET_ONLY=1` (no Docker).
 
 **The login from the operator's backend.** `--login ID:PASSWORD` (the password 16 to 128 letters, digits, `-`, `_` or `.`) sets the id and the password the operator chose, so nothing has to come back from the PC: the task is created with `HTTPS_PROXY=http://ID:PASSWORD@relay:8080`, and the backend asks the relay's `GET /status` with the same login whether that PC is connected. Without it, the PC makes its own and `internet credentials` shows them. An agent sets it up in one command: `internet on --relay HOST:7000 --token TOKEN --login ID:PASSWORD --wait 60 --json`.
@@ -99,6 +101,103 @@ Linux (root): `shutup-and-run internet on --relay relay.example.com:7000` writes
 
 The files are in `C:\ProgramData\shutup-and-run\` on Windows and `/var/lib/shutup-and-run/` on Linux: `internet.json` (the relay, the id, the password, the hours; mode 600 on Linux), `internet-status.json` (written every 5 to 30 seconds), `internet.log` (rotated at 10 MB, two files). `internet off --forget` deletes them.
 
+## Android: a phone in Termux
+
+A phone can lend its connection too: the home's Wi-Fi, or its mobile data when the person allows it. It is the same program, built for Android (`shutup-and-run-aarch64-linux-android` in each release), run in [Termux](https://termux.dev), a terminal app. No root, no app of ours, no store. Only internet sharing runs there: the worker needs Docker, and the commands that need it, WSL or systemd answer `ANDROID_NO_CONTAINERS` and exit 1. The choice and what an app of our own would take: [DECISIONS.md](DECISIONS.md#a-phone-shares-its-connection-from-termux).
+
+What is different from a PC:
+
+- **Wi-Fi only, unless the person allows mobile data.** Every 5 seconds the phone reads which network its traffic leaves through: the address the kernel picks for the default route, and the interface that has it. `wlan0` is Wi-Fi; `rmnet_data0`, `ccmni0`, `seth_lte0` and the like are mobile data. On mobile data new connections wait (`INTERNET_NOT_ON_WIFI`) unless `--mobile-data`. A network it cannot name (a VPN's `tun0`, a maker's own name) counts as mobile data: the cost would fall on the person. `internet status` and the page show it: `network: Wi-Fi (wlan0); shares only on Wi-Fi`.
+- **A new network dials the relay at once.** When the interface or the address changes (Wi-Fi to mobile data, another Wi-Fi, the carrier gives a new IP, the signal comes back), the idle connections are closed and dialed again at once, and those waiting to retry stop waiting. Android itself closes the connections of a network that goes away. A stream open at that moment ends with its network, and the consumer's request fails; there is no failover.
+- **What it does not read.** The battery under 60%, presenting and Windows' metered flag come from Windows; nothing reads them on a phone. Keep it on its charger. `--hours`, `--max-day`, `pause` and the page's buttons work as on a PC.
+- **Files.** `~/.shutup-and-run/` in Termux (`internet.json` mode 600, the status, the log). Uninstalling Termux deletes them.
+
+The binary is for 64-bit ARM, which nearly every phone sold since 2017 is (`uname -m` says `aarch64`). It links only Android's own C library, never a static one: a static binary resolves names from `/etc/resolv.conf`, which Android does not have.
+
+### Install, once
+
+1. Install **Termux** from [F-Droid](https://f-droid.org/packages/com.termux/) or its [GitHub releases](https://github.com/termux/termux-app/releases), not from Google Play: the Play build is another one, and these steps were written for the F-Droid and GitHub builds. Install **Termux:Boot** from the same place, and open it once, so Android lets it start at boot.
+2. In Termux:
+
+   ```sh
+   pkg install -y curl
+   cd "$TMPDIR"
+   curl -fLO https://github.com/nailtongomes/shutup-and-run/releases/latest/download/shutup-and-run-aarch64-linux-android
+   curl -fLO https://github.com/nailtongomes/shutup-and-run/releases/latest/download/SHA256SUMS
+   grep ' shutup-and-run-aarch64-linux-android$' SHA256SUMS | sha256sum -c -
+   install -m 755 shutup-and-run-aarch64-linux-android "$PREFIX/bin/shutup-and-run"
+   shutup-and-run fit
+   ```
+
+   `sha256sum -c` must say `OK`. `fit` says `lend: internet`. The same lines are the update; then `internet on` again.
+
+### Turn it on, look, turn it off
+
+```sh
+shutup-and-run internet on --relay relay.example.com:7000 --token TOKEN --wait 60
+```
+
+with `--login ID:PASSWORD` when the operator chose the login, and `--mobile-data` (best with `--max-day 2g`) only when the person agrees to spend mobile data. It writes `~/.shutup-and-run/internet.json`, starts `internet serve` in the background, takes Termux's wake lock (`termux-wake-lock`: Termux's notification says so, and Android may ask to let Termux ignore battery optimization; allow it) and writes `~/.termux/boot/shutup-and-run-internet`, which Termux:Boot runs at every boot. Run again, it changes the settings and keeps the id, the password and the token.
+
+| On the phone | |
+| --- | --- |
+| `shutup-and-run internet status` | connected or why not, the network, the bytes |
+| `shutup-and-run internet credentials` | the proxy login, for the operator |
+| `http://127.0.0.1:8788/` in the phone's browser | the same page as on a PC, with pause 1 hour and stop |
+| `shutup-and-run internet pause --for 2h`, `internet resume` | new connections wait, or stop waiting |
+| `shutup-and-run internet off` | stops within 5 seconds, removes the boot script, releases the wake lock; `--forget` also deletes the id and the password |
+
+### With the screen off, after a reboot, and the battery savers
+
+Termux keeps running with the screen off while it holds the wake lock (a CPU lock and a Wi-Fi lock) and its notification is there. What stops it is the phone's own battery saving, which differs by maker ([dontkillmyapp.com](https://dontkillmyapp.com) has every model):
+
+- **Every phone:** Settings, Apps, Termux, Battery: **Unrestricted** (or "Don't optimize"). The same for Termux:Boot. Do not swipe Termux away, and do not tap "Exit" on its notification.
+- **Samsung:** Settings, Battery, Background usage limits, **Never sleeping apps**: add Termux and Termux:Boot.
+- **Xiaomi, Redmi, POCO:** the app's settings: **Autostart** on, Battery saver **No restrictions**; in recent apps, hold Termux and lock it.
+- **Huawei, Honor:** Settings, Battery, App launch, Termux: manage manually, with the three switches on.
+- **OnePlus, OPPO, realme:** the app's Battery: **Allow background activity**, and **Auto launch** on.
+- **Android 12 and later** may kill programs started from Termux ("phantom processes"). On Android 14 and later: Developer options, **Disable child process restrictions**. On 12L and 13, once, from a computer with adb: `adb shell settings put global settings_enable_monitor_phantom_procs false`. On 12: `adb shell device_config set_sync_disabled_for_tests persistent` and `adb shell device_config put activity_manager max_phantom_processes 2147483647`.
+
+After a reboot, Termux:Boot starts it once the phone is unlocked for the first time; `internet status` says `connected` within a minute. If a battery saver killed it anyway, `internet status` says `INTERNET_NOT_RUNNING`, and `internet on` with the same relay starts it again.
+
+### Risks on a phone
+
+The [risks](#risks-and-what-is-left-out) of a PC, and:
+
+- **The carrier's IP changes and is shared.** On mobile data the address is usually the carrier's (CGNAT): it changes when the phone reconnects, and many of the carrier's customers share it, so a site may already limit or block it, and a session tied to one IP may end when it changes.
+- **Mobile data costs money.** Every byte a consumer loads crosses the phone twice: about twice the traffic on the plan. Roaming costs more. `--mobile-data` is the person's choice, at the phone; `--max-day` caps it.
+- **Battery and heat.** The wake lock keeps the phone awake. On its charger, in a ventilated place.
+- **Anyone with the phone unlocked** can read the password in Termux, as on a PC.
+- **The network is guessed from the interface's name.** A Wi-Fi that is itself another phone's hotspot is still Wi-Fi to it, and a maker's unusual name is `unknown` until `--mobile-data`.
+
+### Testing it on a phone
+
+`tests/internet/termux.sh` runs in CI: the Android build in termux/termux-docker (Android's C library and Termux's files, on x86_64), with `fit`, the worker's commands refused, `on --wait`, `status` with the network, curl over HTTP and HTTPS through the relay, the bytes, the container's network removed (offline) and back (dialed again, curl works) and `off`. It cannot test a phone's radio, battery savers or IP. On a phone, with a relay on the server (the `docker run` above, `--open=8101=ID:PASSWORD` and `-p 172.17.0.1:8101:8101` for Chrome):
+
+1. Phone on Wi-Fi. In Termux: `curl https://api.ipify.org` prints the home's IP, `IP_WIFI`. `internet on --relay SERVER:7000 --token TOKEN --wait 60` says connected; `internet status` says `network: Wi-Fi (wlan0)`.
+2. Server: `curl https://api.ipify.org` prints the datacenter's IP. Through the phone, `docker run --rm curlimages/curl -s -x http://ID:PASSWORD@172.17.0.1:8080 https://api.ipify.org` prints `IP_WIFI`.
+3. Selenium through the phone: `docker run -d --name chrome -p 127.0.0.1:4444:4444 --shm-size 2g selenium/standalone-chromium`, then
+
+   ```python
+   from selenium import webdriver
+   options = webdriver.ChromeOptions()
+   options.add_argument("--proxy-server=http://172.17.0.1:8101")
+   options.add_argument("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+   driver = webdriver.Remote("http://127.0.0.1:4444", options=options)
+   driver.get("https://api.ipify.org")
+   print(driver.find_element("tag name", "body").text)  # IP_WIFI
+   driver.quit()
+   ```
+
+4. Wi-Fi off on the phone: within 10 seconds `internet status` says `INTERNET_NOT_ON_WIFI` and `network: mobile data (...)`; step 2 answers `503` after 10 seconds.
+5. `internet on --relay SERVER:7000 --mobile-data --max-day 1g --wait 60`: connected. Termux's `curl https://api.ipify.org` prints the carrier's IP, `IP_MOBILE`; steps 2 and 3 print `IP_MOBILE`.
+6. On the server, `while sleep 5; do curl -s -m 20 -x http://ID:PASSWORD@172.17.0.1:8080 https://api.ipify.org; echo; done`, and turn Wi-Fi on: `IP_MOBILE`, a few failures for at most about 20 seconds, then `IP_WIFI`. `~/.shutup-and-run/internet.log` has `network mobile data (...) -> Wi-Fi (wlan0)`. Airplane mode for a minute and off again: `offline`, then back the same way.
+7. Screen off for 30 minutes, on the charger and then on the battery: the loop goes on. If it stops, the battery section above.
+8. Reboot the phone and unlock it without opening Termux: within a minute the loop prints the IP again.
+9. `internet status` counts the bytes; the operator's `GET /pcs` too. `internet off`: Termux's wake lock notification goes, and `/pcs` says `"connected":false`.
+
+Write down the phone's maker, model and Android version with the result; never the IPs.
+
 ## What it respects
 
 | Control | In this mode |
@@ -110,6 +209,7 @@ The files are in `C:\ProgramData\shutup-and-run\` on Windows and `/var/lib/shutu
 | Battery under 60% | Yes (Windows). |
 | Presenting or full screen | Yes (Windows). |
 | Metered network | Yes (Windows): it waits unless `--metered`. |
+| Wi-Fi only | Yes (Android): a phone waits on mobile data unless `--mobile-data`. |
 | Data a day | Yes, its own: `--max-day 5g`. Past it, new streams wait until midnight on the PC's clock (`INTERNET_DAILY_LIMIT`). Off unless set. |
 | Memory, disk, CPU limits, `safety` | No: this mode takes a few MB of memory and no disk, and is meant for the PC that cannot lend those. |
 | `min_idle_secs` | No. |
@@ -127,6 +227,7 @@ The PC counts what crosses the site's side of each stream: `bytes_received` (fro
 ## Reconnection and what keeps it working
 
 - The relay closes or restarts: each idle connection sees the end at once and dials again after 1 s, doubling up to 30 s, with up to 1 s at random so they do not knock together.
+- A phone moves to another network or gets a new address: the idle connections are dialed again at once ([Android](#android-a-phone-in-termux)).
 - The PC sleeps, its Wi-Fi changes, the internet drops: an idle connection pings every 10 s and the relay echoes; 30 s without a word and the PC drops it and dials again (the relay drops its end after 35 s).
 - In between, the relay may still hold connections that are dead. It tries first the one heard from in the last 15 s, and a claimed connection must answer `A` within 3 s; one that does not is skipped for the next, up to 3, so a request right after a wake costs a few seconds, not a `502`.
 - A stream with no byte either way for 10 minutes is closed on both sides: after a sleep its other end is gone, and it would hold one of the PC's 512 places for good.

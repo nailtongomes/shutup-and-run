@@ -878,6 +878,7 @@ mod tests {
             secret: SECRET.to_string(),
             lend_hours: None,
             metered: false,
+            mobile_data: false,
             max_day_bytes: None,
             relay_token: None,
             consent_at: "2026-01-01T00:00:00Z".to_string(),

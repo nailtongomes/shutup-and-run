@@ -1,7 +1,7 @@
 # A release is cut when `main` gets a version in Cargo.toml that has no tag
-# yet: this workflow builds the musl binary and the Windows .exe, creates the
-# tag v<version> on that commit and the GitHub release with both files and
-# one SHA256SUMS that lists them. Nobody pushes a tag by hand. A push to main
+# yet: this workflow builds the musl binary, the Windows .exe and the Android
+# (aarch64, Termux) binary, creates the tag v<version> on that commit and the
+# GitHub release with the three files and one SHA256SUMS that lists them. Nobody pushes a tag by hand. A push to main
 # that does not change the version does nothing. Pushing a tag v* still
 # works, and "Run workflow" on main retries a release that failed. The
 # three newest releases are kept; older ones are deleted with their tags.
@@ -85,6 +85,25 @@ jobs:
           name: shutup-and-run-x86_64-unknown-linux-musl
           path: target/x86_64-unknown-linux-musl/release/shutup-and-run
 
+  # A phone in Termux: internet sharing only (docs/INTERNET.md, Android).
+  android:
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - run: bash scripts/android-ndk.sh >> "$GITHUB_ENV"
+      - run: cargo build --release --locked --target aarch64-linux-android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shutup-and-run-aarch64-linux-android
+          path: target/aarch64-linux-android/release/shutup-and-run
+
   windows:
     needs: version
     if: needs.version.outputs.release == 'true'
@@ -102,7 +121,7 @@ jobs:
           path: target/release/shutup-and-run.exe
 
   publish:
-    needs: [version, musl, windows]
+    needs: [version, musl, windows, android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -113,13 +132,20 @@ jobs:
         with:
           name: shutup-and-run-x86_64-pc-windows-msvc.exe
           path: windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: shutup-and-run-aarch64-linux-android
+          path: android
       - name: pack
         run: |
           mkdir -p dist
           cp musl/shutup-and-run dist/shutup-and-run-x86_64-unknown-linux-musl
           cp windows/shutup-and-run.exe dist/shutup-and-run-x86_64-pc-windows-msvc.exe
+          cp android/shutup-and-run dist/shutup-and-run-aarch64-linux-android
           # Hash from inside dist so each line names the asset, not dist/<asset>.
-          (cd dist && sha256sum shutup-and-run-x86_64-unknown-linux-musl shutup-and-run-x86_64-pc-windows-msvc.exe > SHA256SUMS)
+          # The musl line first: the install job reads the first line.
+          (cd dist && sha256sum shutup-and-run-x86_64-unknown-linux-musl shutup-and-run-x86_64-pc-windows-msvc.exe \
+            shutup-and-run-aarch64-linux-android > SHA256SUMS)
           cat dist/SHA256SUMS
       # Creates the tag on this commit when it does not exist yet.
       - uses: softprops/action-gh-release@v2
@@ -129,6 +155,7 @@ jobs:
           files: |
             dist/shutup-and-run-x86_64-unknown-linux-musl
             dist/shutup-and-run-x86_64-pc-windows-msvc.exe
+            dist/shutup-and-run-aarch64-linux-android
             dist/SHA256SUMS
 
   # Only the three newest releases are kept; older ones go with their tags,
