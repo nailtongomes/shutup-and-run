@@ -95,10 +95,12 @@ pub const DAILY_LIMIT: &str = "INTERNET_DAILY_LIMIT";
 pub const PAUSED: &str = "INTERNET_PAUSED";
 
 /// Where this mode keeps its files: beside the supervisor's on Windows,
-/// beside the job history on Linux.
+/// beside the job history on Linux, in Termux's home on a phone.
 pub fn dir() -> PathBuf {
     if cfg!(windows) {
         crate::wsl::data_dir()
+    } else if crate::android::PHONE {
+        crate::android::data_dir()
     } else {
         PathBuf::from("/var/lib/shutup-and-run")
     }
@@ -125,6 +127,10 @@ pub struct Settings {
     /// The person accepted that streams spend a metered network's data.
     #[serde(default)]
     pub metered: bool,
+    /// A phone also shares on mobile data (and on a network it cannot
+    /// name); without it, only on Wi-Fi. Only on Android.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mobile_data: bool,
     /// At most this many bytes a day (received and sent), on the PC's clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_day_bytes: Option<u64>,
@@ -205,7 +211,7 @@ fn default_id() -> String {
     let name = name.trim_matches('-');
     let suffix = &crate::launcher::random_id()[..4];
     if name.is_empty() {
-        format!("pc-{suffix}")
+        format!("{}-{suffix}", unnamed())
     } else {
         format!("{name}-{suffix}")
     }
@@ -241,6 +247,9 @@ pub struct Status {
     pub connected_since: Option<String>,
     pub last_error: Option<String>,
     pub hold: Option<Hold>,
+    /// The network the phone's traffic leaves through. Only on Android.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<crate::android::Seen>,
     pub updated_at: String,
 }
 
@@ -260,9 +269,21 @@ pub(crate) struct Shared {
     proxy_port: Mutex<Option<u16>>,
     last_error: Mutex<Option<String>>,
     refused: Mutex<Option<String>>,
+    /// Counts the phone's changes of network: a link made before the last
+    /// one is dead, and a link waiting to dial again dials now.
+    epoch: AtomicU64,
+    kick: tokio::sync::Notify,
 }
 
 impl Shared {
+    /// The network changed (another Wi-Fi, mobile data, a new address, the
+    /// signal back): every idle link is dialed again now, not after 30 s of
+    /// silence or a backoff.
+    pub(crate) fn network_changed(&self) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+        self.kick.notify_waiters();
+    }
+
     fn error(&self, text: String) {
         *self.last_error.lock().unwrap() = Some(text);
     }
@@ -385,9 +406,18 @@ async fn slot(
                 }
                 // Apart in time, so four connections do not knock together.
                 let roll = crate::launcher::random_id();
-                let jitter = u64::from_str_radix(&roll[..3], 16).unwrap_or(0) % 1000;
-                tokio::time::sleep(backoff + Duration::from_millis(jitter)).await;
-                backoff = (backoff * 2).min(BACKOFF_MAX);
+                let jitter =
+                    Duration::from_millis(u64::from_str_radix(&roll[..3], 16).unwrap_or(0) % 1000);
+                tokio::select! {
+                    () = tokio::time::sleep(backoff + jitter) => {
+                        backoff = (backoff * 2).min(BACKOFF_MAX);
+                    }
+                    // A new network: the relay may be reachable now.
+                    () = shared.kick.notified() => {
+                        backoff = BACKOFF_MIN;
+                        tokio::time::sleep(jitter).await;
+                    }
+                }
             }
         }
     }
@@ -401,6 +431,7 @@ async fn link(
     shared: &Arc<Shared>,
     opts: Opts,
 ) -> Result<Ended, String> {
+    let epoch = shared.epoch.load(Ordering::Relaxed);
     let stream = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&current.relay))
         .await
         .map_err(|_| format!("the relay {} did not answer in 10s", current.relay))?
@@ -438,7 +469,19 @@ async fn link(
     let mut buf = Vec::new();
     let mut heard = tokio::time::Instant::now();
     loop {
-        match tokio::time::timeout(opts.ping, read_until_capped(&mut s, &mut buf)).await {
+        // Waits for a kick registered before the epoch is read: one that
+        // comes in between is not lost.
+        let kicked = shared.kick.notified();
+        tokio::pin!(kicked);
+        kicked.as_mut().enable();
+        if shared.epoch.load(Ordering::Relaxed) != epoch {
+            return Ok(Ended::Closed);
+        }
+        let read = tokio::select! {
+            read = tokio::time::timeout(opts.ping, read_until_capped(&mut s, &mut buf)) => read,
+            () = &mut kicked => return Ok(Ended::Closed),
+        };
+        match read {
             Err(_) => {
                 if heard.elapsed() >= opts.silent {
                     return Err("the relay stopped answering".to_string());
@@ -738,6 +781,7 @@ fn hold_now(
     settings: &Settings,
     worker_status: Option<&Path>,
     feed: Option<crate::host::Feed>,
+    network: Option<&crate::android::Network>,
     now: i64,
     day_bytes: u64,
 ) -> Option<Hold> {
@@ -753,6 +797,13 @@ fn hold_now(
             code: PAUSED.to_string(),
             detail: format!("paused until {} (UTC)", crate::status::unix_to_iso(until)),
             resumes_at: Some(until),
+        });
+    }
+    if let Some(network) = network.filter(|n| !n.allowed(settings.mobile_data)) {
+        return Some(Hold {
+            code: crate::android::NOT_ON_WIFI.to_string(),
+            detail: network.why_held(),
+            resumes_at: None,
         });
     }
     let hours = settings
@@ -833,10 +884,13 @@ pub async fn serve(dir: &Path, background: bool) -> Result<ExitCode, String> {
             .map_or(0, |s| s.day_bytes),
     );
     let (settings_tx, settings_rx) = watch::channel(first.clone());
+    // Only a phone reads its network: on a PC the network is the PC's.
+    let mut network = crate::android::PHONE.then(crate::android::current);
     let first_hold = hold_now(
         &first,
         worker_status.as_deref(),
         feed(),
+        network.as_ref(),
         now,
         base_received + base_sent - day_start,
     );
@@ -895,7 +949,26 @@ pub async fn serve(dir: &Path, background: bool) -> Result<ExitCode, String> {
             day_start = total;
         }
         let day_bytes = total - day_start;
-        let hold = hold_now(&current, worker_status.as_deref(), feed, now, day_bytes);
+        if let Some(old) = network.take() {
+            let new = crate::android::current();
+            if new != old {
+                log.raw(&format!(
+                    "internet: network {} -> {}; dialing the relay again",
+                    old.seen.text(),
+                    new.seen.text()
+                ));
+                shared.network_changed();
+            }
+            network = Some(new);
+        }
+        let hold = hold_now(
+            &current,
+            worker_status.as_deref(),
+            feed,
+            network.as_ref(),
+            now,
+            day_bytes,
+        );
         if *hold_tx.borrow() != hold {
             hold_tx.send_replace(hold.clone());
         }
@@ -923,6 +996,7 @@ pub async fn serve(dir: &Path, background: bool) -> Result<ExitCode, String> {
                 .map(crate::status::unix_to_iso),
             last_error: shared.last_error.lock().unwrap().clone(),
             hold,
+            network: network.as_ref().map(|n| n.seen.clone()),
             updated_at: String::new(),
         };
         if status.state != last_state {
@@ -1006,7 +1080,14 @@ pub fn checks(settings: &Settings, status: Option<&Status>, now: i64) -> Vec<Che
                 .hold
                 .as_ref()
                 .map_or(String::new(), |h| format!("{}: {}", h.code, h.detail));
-            soft(NAME, false, format!("waits: {detail}")).coded(WAITING)
+            // A phone off Wi-Fi has a next step of its own.
+            let code = match &status.hold {
+                Some(hold) if hold.code == crate::android::NOT_ON_WIFI => {
+                    crate::android::NOT_ON_WIFI
+                }
+                _ => WAITING,
+            };
+            soft(NAME, false, format!("waits: {detail}")).coded(code)
         }
         "refused" => check(
             NAME,
@@ -1054,15 +1135,17 @@ pub fn usage() -> &'static str {
     "\
 shutup-and-run internet on (--relay HOST:PORT | --discover URL) [--login ID:PASSWORD | --id NAME]
         [--token TOKEN] [--hours \"mon-fri 19-07\"] [--max-day 5g] [--metered]
-        [--wait SECONDS] [--json]
+        [--mobile-data] [--wait SECONDS] [--json]
     lend this PC's internet connection to the operator's containers, through
     the relay the operator runs. No WSL, no Docker; a worker on this PC may
     run beside it. It starts now and at every logon (Windows: task
-    shutup-and-run-internet; Linux: a systemd unit). Turning it on here is
+    shutup-and-run-internet; Linux: a systemd unit; Android, in Termux: a
+    Termux:Boot script and termux-wake-lock). Turning it on here is
     the PC owner's consent. New connections wait while the worker or this
     mode is paused, outside --hours, on a battery under 60%, while the person
     presents, on a metered network unless --metered, and once the day's bytes
-    reach --max-day. One already open is never cut. --login takes the id and
+    reach --max-day, and on a phone while it is off Wi-Fi unless
+    --mobile-data. One already open is never cut. --login takes the id and
     the password the operator chose (else they are made here). --token is
     what the operator's relay asks of every PC, when it asks. --discover
     asks the operator's URL (the poll URL serves) for the relay, the token
@@ -1148,7 +1231,13 @@ pub(crate) struct Discovered {
 pub(crate) fn discovery_body() -> Value {
     json!({
         "worker": pc_name(),
-        "os": if cfg!(windows) { "windows" } else { "linux" },
+        "os": if cfg!(windows) {
+            "windows"
+        } else if crate::android::PHONE {
+            "android"
+        } else {
+            "linux"
+        },
         "arch": std::env::consts::ARCH,
         "version": env!("CARGO_PKG_VERSION"),
         "lend": "internet",
@@ -1226,7 +1315,16 @@ fn pc_name() -> String {
         .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
         .map(|name| name.trim().chars().take(64).collect::<String>())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "pc".to_string())
+        .unwrap_or_else(|| unnamed().to_string())
+}
+
+/// The name of a machine that has none: Android has no `/etc/hostname`.
+fn unnamed() -> &'static str {
+    if crate::android::PHONE {
+        "phone"
+    } else {
+        "pc"
+    }
 }
 
 /// `--login ID:PASSWORD`: what the operator's backend chose for this PC.
@@ -1253,9 +1351,12 @@ async fn on_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
             "--token",
             "--wait",
         ],
-        &["--metered", "--json"],
+        &["--metered", "--mobile-data", "--json"],
     )
     .map_err(|e| e.0)?;
+    if flags.has("--mobile-data") && !crate::android::PHONE {
+        return Err("--mobile-data is for a phone; on a PC, --metered".to_string());
+    }
     let discovered = match (flags.get("--relay"), flags.get("--discover")) {
         (Some(_), Some(_)) => return Err("--relay or --discover, not both".to_string()),
         (None, None) => {
@@ -1334,6 +1435,7 @@ async fn on_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
         },
         lend_hours: hours,
         metered: flags.has("--metered"),
+        mobile_data: flags.has("--mobile-data"),
         max_day_bytes,
         relay_token,
         consent_at: crate::status::unix_to_iso(since),
@@ -1344,7 +1446,7 @@ async fn on_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
         .is_some_and(|o| o.enabled && o.same_link(&settings));
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     write_settings(dir, &settings).map_err(|e| format!("{}: {e}", dir.join(FILE).display()))?;
-    let started = start_process()?;
+    let started = start_process(dir)?;
     let mut value = json!({"ok": true, "enabled": true, "relay": settings.relay,
                            "id": settings.id, "started": started});
     let mut text = format!(
@@ -1575,6 +1677,17 @@ pub fn status_out(
             "\nproxy for the operator: {} (`shutup-and-run internet credentials` shows the password)",
             proxy_url(settings, port, false)
         ));
+        if let Some(seen) = status.and_then(|s| s.network.as_ref()) {
+            text.push_str(&format!(
+                "\nnetwork: {}; {}",
+                seen.text(),
+                if settings.mobile_data {
+                    "shares on mobile data too"
+                } else {
+                    "shares only on Wi-Fi"
+                }
+            ));
+        }
         if let Some(hours) = &settings.lend_hours {
             text.push_str(&format!("\nhours: {hours}"));
         }
@@ -1587,7 +1700,7 @@ pub fn status_out(
             ));
         }
     }
-    let value = json!({
+    let mut value = json!({
         "ok": healthy,
         "enabled": settings.enabled,
         "relay": settings.relay,
@@ -1601,6 +1714,9 @@ pub fn status_out(
         "status": status,
         "checks": crate::cli::checks_json(&checks),
     });
+    if crate::android::PHONE {
+        value["mobile_data"] = json!(settings.mobile_data);
+    }
     (value, text, if healthy { 0 } else { 1 })
 }
 
@@ -1628,8 +1744,13 @@ fn credentials_cli(dir: &Path, args: &[String]) -> Result<ExitCode, String> {
 }
 
 /// Starts `internet serve` now and at every logon or boot. What it did, in
-/// one line.
-fn start_process() -> Result<String, String> {
+/// one line (a few on a phone).
+fn start_process(dir: &Path) -> Result<String, String> {
+    if crate::android::PHONE {
+        // The lock is free only when no `internet serve` runs.
+        let running = crate::lock::acquire(&dir.join(LOCK_FILE)).is_err();
+        return crate::android::start(running);
+    }
     if cfg!(windows) {
         let data = crate::wsl::data_dir();
         std::fs::create_dir_all(&data).map_err(|e| format!("{}: {e}", data.display()))?;
@@ -1667,6 +1788,9 @@ fn start_process() -> Result<String, String> {
 fn stop_process() -> String {
     if cfg!(windows) {
         return crate::wsl::remove_named_task(TASK_NAME);
+    }
+    if crate::android::PHONE {
+        return crate::android::stop();
     }
     if !Path::new(UNIT_PATH).exists() {
         return "a running `internet serve` stops within 5 seconds".to_string();
@@ -1775,6 +1899,8 @@ fn off_from_inside(dir: &Path) -> Result<(), String> {
     write_settings(dir, &settings).map_err(|e| format!("{}: {e}", dir.join(FILE).display()))?;
     if cfg!(windows) {
         crate::wsl::delete_named_task(TASK_NAME);
+    } else if crate::android::PHONE {
+        crate::android::stop();
     } else if Path::new(UNIT_PATH).exists() {
         let _ = std::process::Command::new("systemctl")
             .args(["disable", "shutup-and-run-internet"])
@@ -1865,6 +1991,18 @@ pub(crate) fn render(
                         t("(UTC)", "(UTC)"),
                     ));
                 }
+                if let Some(seen) = status.and_then(|s| s.network.as_ref()) {
+                    body.push_str(&format!(
+                        "<tr><th>{}</th><td>{} ({})</td></tr>",
+                        t("Network", "Rede"),
+                        esc(&seen.text()),
+                        if settings.mobile_data {
+                            t("mobile data allowed", "dados móveis permitidos")
+                        } else {
+                            t("only Wi-Fi", "só Wi-Fi")
+                        }
+                    ));
+                }
                 if let Some(hours) = &settings.lend_hours {
                     body.push_str(&format!(
                         "<tr><th>{}</th><td><code>{}</code></td></tr>",
@@ -1920,6 +2058,7 @@ mod tests {
             secret: "0123456789abcdef0123456789abcdef".to_string(),
             lend_hours: None,
             metered: false,
+            mobile_data: false,
             max_day_bytes: None,
             relay_token: None,
             consent_at: "2026-01-01T00:00:00Z".to_string(),
@@ -2060,13 +2199,13 @@ mod tests {
         std::fs::write(&path, doc.to_string()).unwrap();
         let s = settings("relay.example.com:7000");
         assert_eq!(
-            hold_now(&s, Some(&path), None, now, 0).unwrap().code,
+            hold_now(&s, Some(&path), None, None, now, 0).unwrap().code,
             "WORKER_PAUSED"
         );
         let doc = json!({"state": "idle", "updated_at": crate::status::unix_to_iso(now)});
         std::fs::write(&path, doc.to_string()).unwrap();
         if !cfg!(windows) {
-            assert_eq!(hold_now(&s, Some(&path), None, now, 0), None);
+            assert_eq!(hold_now(&s, Some(&path), None, None, now, 0), None);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2148,11 +2287,11 @@ mod tests {
             paused_until: Some(now + 3600),
             ..settings("relay.example.com:7000")
         };
-        let hold = hold_now(&s, None, None, now, 0).unwrap();
+        let hold = hold_now(&s, None, None, None, now, 0).unwrap();
         assert_eq!(hold.code, PAUSED);
         assert_eq!(hold.resumes_at, Some(now + 3600));
         if !cfg!(windows) {
-            assert_eq!(hold_now(&s, None, None, now + 3600, 0), None);
+            assert_eq!(hold_now(&s, None, None, None, now + 3600, 0), None);
         }
         // An older file, without the field, still reads.
         let mut doc = serde_json::to_value(settings("relay.example.com:7000")).unwrap();
@@ -2228,8 +2367,8 @@ mod tests {
             ..settings("relay.example.com:7000")
         };
         let now = 1_800_000_000;
-        assert_eq!(hold_now(&s, None, None, now, 999), None);
-        let hold = hold_now(&s, None, None, now, 1000).unwrap();
+        assert_eq!(hold_now(&s, None, None, None, now, 999), None);
+        let hold = hold_now(&s, None, None, None, now, 1000).unwrap();
         assert_eq!(hold.code, DAILY_LIMIT);
         let midnight = hold.resumes_at.unwrap();
         assert!(midnight > now && midnight - now <= 86_400);
@@ -2245,6 +2384,126 @@ mod tests {
         let moved = splice(&mut a, &mut b, Duration::from_millis(100)).await;
         assert_eq!(moved, (0, 0));
         assert!(began.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A phone that moves from Wi-Fi to mobile data, or gets a new address,
+    /// dials the relay again at once: its old connections are dead, and
+    /// waiting for 30 s of silence would leave the operator with none.
+    #[tokio::test]
+    async fn a_new_network_dials_the_relay_again_at_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = listener.local_addr().unwrap().to_string();
+        let dialed = Arc::new(AtomicUsize::new(0));
+        let count = dialed.clone();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut s = tokio::io::BufReader::new(s);
+                    let mut line = String::new();
+                    while s.read_line(&mut line).await.is_ok_and(|n| n > 0) {
+                        let answer = if line.starts_with(HELLO) {
+                            "OK 8080\n"
+                        } else {
+                            "P\n"
+                        };
+                        if s.get_mut().write_all(answer.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        line.clear();
+                    }
+                });
+            }
+        });
+        let (_s_tx, s_rx) = watch::channel(settings(&relay));
+        let (_h_tx, h_rx) = watch::channel(None);
+        let shared = Arc::new(Shared::default());
+        // Pings far apart: only the change can make it dial again this soon.
+        let opts = Opts {
+            ping: Duration::from_secs(20),
+            silent: Duration::from_secs(60),
+            ..Opts::default()
+        };
+        spawn_links(s_rx, h_rx, shared.clone(), opts);
+        let reached = |n: usize| {
+            let dialed = dialed.clone();
+            async move {
+                for _ in 0..100 {
+                    if dialed.load(Ordering::Relaxed) >= n {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                false
+            }
+        };
+        assert!(reached(IDLE_CONNECTIONS).await, "the links never connected");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(dialed.load(Ordering::Relaxed), IDLE_CONNECTIONS);
+        shared.network_changed();
+        assert!(
+            reached(2 * IDLE_CONNECTIONS).await,
+            "dialed {} times after the change",
+            dialed.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn a_phone_off_wifi_holds_new_streams_unless_mobile_data_was_allowed() {
+        use crate::android::{Kind, Network, Seen, NOT_ON_WIFI};
+        let now = 1_800_000_000;
+        let on = |kind, name: &str| Network {
+            seen: Seen {
+                kind,
+                interface: Some(name.to_string()),
+            },
+            address: None,
+        };
+        let s = settings("relay.example.com:7000");
+        let mobile = on(Kind::Mobile, "rmnet_data0");
+        let hold = hold_now(&s, None, None, Some(&mobile), now, 0).unwrap();
+        assert_eq!(hold.code, NOT_ON_WIFI);
+        assert!(
+            hold.detail.contains("mobile data (rmnet_data0)"),
+            "{}",
+            hold.detail
+        );
+        let wifi = on(Kind::Wifi, "wlan0");
+        assert_eq!(hold_now(&s, None, None, Some(&wifi), now, 0), None);
+        let allowed = Settings {
+            mobile_data: true,
+            ..s.clone()
+        };
+        assert_eq!(hold_now(&allowed, None, None, Some(&mobile), now, 0), None);
+        // A PC reads no network: nothing changes there.
+        assert_eq!(hold_now(&s, None, None, None, now, 0), None);
+
+        // The status line has the phone's own code, and names the network.
+        let status = Status {
+            state: "waiting".to_string(),
+            id: s.id.clone(),
+            relay: s.relay.clone(),
+            hold: Some(hold),
+            network: Some(mobile.seen.clone()),
+            updated_at: crate::status::unix_to_iso(now),
+            ..Status::default()
+        };
+        let line = &checks(&s, Some(&status), now)[0];
+        assert_eq!(line.code(), NOT_ON_WIFI);
+        assert!(line.hint().contains("--mobile-data"), "{}", line.hint());
+        let (value, text, _) = status_out(Some(&s), Some(&status), now);
+        assert!(
+            text.contains("network: mobile data (rmnet_data0); shares only on Wi-Fi"),
+            "{text}"
+        );
+        assert_eq!(value["status"]["network"]["kind"], "mobile");
+        assert!(render(Some(&s), Some(&status), now, true).contains("só Wi-Fi"));
+        // On a PC the file and the status do not change.
+        let file = serde_json::to_value(&s).unwrap();
+        assert!(file.get("mobile_data").is_none(), "{file}");
+        let pc = serde_json::to_value(Status::default()).unwrap();
+        assert!(pc.get("network").is_none(), "{pc}");
     }
 
     #[test]

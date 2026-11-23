@@ -11,6 +11,8 @@ use std::process::ExitCode;
 #[derive(Clone, Debug)]
 pub struct Machine {
     pub windows: bool,
+    /// A phone, in Termux: no Docker, so never containers.
+    pub android: bool,
     /// `wsl --status` worked, or what it said. Only read on Windows.
     pub wsl: Result<(), String>,
     pub memory_bytes: Option<u64>,
@@ -22,6 +24,7 @@ impl Machine {
         let windows = cfg!(windows);
         Machine {
             windows,
+            android: crate::android::PHONE,
             wsl: if windows {
                 crate::wsl::wsl_ready()
             } else {
@@ -47,6 +50,12 @@ pub fn answer(machine: &Machine) -> (Vec<Check>, &'static str) {
         .is_some_and(|m| m < crate::safety::SMALL_MEMORY)
         || machine.cpus <= crate::safety::SMALL_CPUS;
     let containers = match &machine.wsl {
+        _ if machine.android => check(
+            "containers",
+            false,
+            "a phone: Android has no Docker, so only its internet connection",
+        )
+        .coded(crate::android::NO_CONTAINERS),
         Err(why) if machine.windows => check(
             "containers",
             false,
@@ -90,7 +99,13 @@ pub fn cli(args: &[String]) -> ExitCode {
         "lend": lend,
         "containers": checks[0].ok,
         "internet": true,
-        "os": if machine.windows { "windows" } else { "linux" },
+        "os": if machine.windows {
+            "windows"
+        } else if machine.android {
+            "android"
+        } else {
+            "linux"
+        },
         "memory_bytes": machine.memory_bytes,
         "cpus": machine.cpus,
         "checks": crate::cli::checks_json(&checks),
@@ -113,6 +128,7 @@ mod tests {
     fn machine(windows: bool, wsl: bool, gib: u64, cpus: u64) -> Machine {
         Machine {
             windows,
+            android: false,
             wsl: if wsl {
                 Ok(())
             } else {
@@ -146,6 +162,18 @@ mod tests {
         assert_eq!(checks[0].code(), "SAFETY_SMALL_MACHINE");
         let (_, lend) = answer(&machine(false, false, 32, 2));
         assert_eq!(lend, "internet", "two processors is small");
+    }
+
+    #[test]
+    fn a_phone_lends_only_its_internet() {
+        let phone = Machine {
+            android: true,
+            ..machine(false, false, 12, 8)
+        };
+        let (checks, lend) = answer(&phone);
+        assert_eq!(lend, "internet");
+        assert_eq!(checks[0].code(), "ANDROID_NO_CONTAINERS");
+        assert!(checks[1].ok);
     }
 
     #[test]

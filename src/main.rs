@@ -49,6 +49,29 @@ async fn main() -> ExitCode {
             _ => {}
         }
     }
+    // A phone lends only its internet connection: the worker needs Docker.
+    if shutup_and_run::android::PHONE
+        && !matches!(
+            args.first().map(String::as_str),
+            Some(
+                "-h" | "--help"
+                    | "version"
+                    | "--version"
+                    | "-V"
+                    | "internet"
+                    | "fit"
+                    | "status"
+                    | "relay"
+            )
+        )
+    {
+        let command = args.first().map_or("serve", String::as_str);
+        eprintln!(
+            "shutup-and-run {command}: not on Android: the worker runs containers, which need Docker\nhint: {}",
+            shutup_and_run::hints::hint(shutup_and_run::android::NO_CONTAINERS)
+        );
+        return ExitCode::from(1);
+    }
     match args.first().map(String::as_str) {
         Some("-h") | Some("--help") => {
             usage();

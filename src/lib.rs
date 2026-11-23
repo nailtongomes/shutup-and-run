@@ -2,6 +2,7 @@
 //! limit read from Docker itself.
 
 pub mod allowlist;
+pub mod android;
 pub mod api;
 pub mod auth;
 pub mod bollard_rt;

@@ -979,8 +979,13 @@ pub fn status_cli(args: &[String]) -> ExitCode {
             .map(|history| crate::status::status_path(&history))
             .map_err(|e| e.0)
     };
-    let worker_missing = path.as_ref().is_ok_and(|p| !p.exists());
+    let worker_missing = crate::android::PHONE || path.as_ref().is_ok_and(|p| !p.exists());
     let out = match path {
+        // A phone has no worker, and says so even before `internet on`.
+        _ if crate::android::PHONE => Out::ok(
+            json!({"worker": "not installed", "internet": "off"}),
+            "worker: not installed (a phone lends only its internet connection)\ninternet sharing: off",
+        ),
         Ok(path) => status_out(&path, crate::status::now_unix()),
         Err(msg) => Out::fail(EXIT_FAILED, msg),
     };
