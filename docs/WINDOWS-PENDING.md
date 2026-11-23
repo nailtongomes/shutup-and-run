@@ -158,3 +158,8 @@ O CI agora roda no runner Windows a linha de instalação com o relay, um `curl.
 - [ ] **10 de uma vez.** Do servidor, 10 navegadores pelo mesmo PC de casa (`node tests/internet/load.mjs http://ID:SENHA@172.17.0.1:8080`): anote páginas, falhas, mediana e o pico de conexões, e o upload da casa (speedtest). O PC continua usável enquanto isso.
 - [ ] **n8n.** Com o fluxo `worker-orchestrator` no servidor: a linha de instalação com `SHUTUP_AND_RUN_POLL_URL` do n8n e `SHUTUP_AND_RUN_LEND_INTERNET=1` conecta sem ninguém digitar o relay; `list` mostra o PC em `internet`; uma tarefa `via_internet` imprime o IP da casa.
 
+## Ver a tela de uma tarefa pela página local
+
+Confirmado à mão no Linux com Docker (`tests/screen/linux.sh`): o link **Ver tela** nas listas, o noVNC pela página, o WebSocket e o fim da rota quando o container termina. No Windows falta ver o mesmo pelo encaminhamento do WSL2.
+
+- [ ] **Tela.** Com `shutup-and-run config set screen_view true --apply`, uma tarefa (ou gerenciado) de `ghcr.io/nailtongomes/rpa-worker-selenium` com `USE_XVFB=1`, `USE_OPENBOX=1`, `USE_VNC=1`, `USE_NOVNC=1`: em `http://127.0.0.1:8787/` aparece **Ver tela** enquanto ela roda; o link abre o noVNC conectado e mostra os navegadores abrindo; quando a tarefa termina, o link some e a rota responde 404.

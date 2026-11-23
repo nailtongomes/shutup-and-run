@@ -951,6 +951,281 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    /// A stand-in for noVNC: any GET answers with its own path, and an
+    /// upgrade on /websockify answers 101, speaks first like a VNC server,
+    /// then echoes.
+    async fn fake_novnc() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head).to_lowercase();
+                    let path = head.split(' ').nth(1).unwrap_or("").to_string();
+                    if head.contains("upgrade: websocket") {
+                        assert_eq!(path, "/websockify");
+                        assert!(head.contains("sec-websocket-key: a2v5"), "{head}");
+                        assert!(!head.contains("origin"), "{head}");
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                                  Connection: Upgrade\r\nSec-WebSocket-Accept: fake-accept\r\n\
+                                  Sec-WebSocket-Protocol: binary\r\n\r\nRFB 003.008\n",
+                            )
+                            .await;
+                        let mut buffer = [0u8; 64];
+                        while let Ok(read) = stream.read(&mut buffer).await {
+                            if read == 0 || stream.write_all(&buffer[..read]).await.is_err() {
+                                return;
+                            }
+                        }
+                    } else {
+                        let body = format!("novnc {path}");
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn the_page_shows_a_running_jobs_screen_only_to_this_machine() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const LO: [u8; 4] = [127, 0, 0, 1];
+        let novnc = fake_novnc().await;
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let clock = Arc::new(FakeClock::new(1_700_000_000));
+        let cfg = settings_extra(1, "status_page = true\nscreen_view = true");
+        let launcher = Launcher::with_clock(cfg, runtime, clock).unwrap();
+        let app = router(launcher.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let served = app.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                served.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let id = match launcher
+            .launch(crate::launcher::LaunchRequest {
+                image: "alpine".into(),
+                env: HashMap::new(),
+                timeout_secs: None,
+                cpu: None,
+                memory_bytes: None,
+                shm_bytes: None,
+                command: None,
+                job_key: None,
+                callback_url: None,
+            })
+            .await
+            .unwrap()
+        {
+            crate::launcher::LaunchOutcome::Created(job)
+            | crate::launcher::LaunchOutcome::Existing(job) => job.id,
+        };
+        launcher.settled().await;
+        let get = |uri: String, ip: [u8; 4], origin: Option<&'static str>, upgrade: bool| {
+            let app = app.clone();
+            let host = host.clone();
+            async move {
+                let mut request = local("GET", &uri, ip, &host, origin);
+                if upgrade {
+                    let headers = request.headers_mut();
+                    headers.insert("upgrade", "websocket".parse().unwrap());
+                    headers.insert("connection", "Upgrade".parse().unwrap());
+                }
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let location = response
+                    .headers()
+                    .get("location")
+                    .map(|v| v.to_str().unwrap().to_string());
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (
+                    status,
+                    location,
+                    String::from_utf8_lossy(&bytes).to_string(),
+                )
+            }
+        };
+
+        // No screen yet: no link, nothing behind the route.
+        let (_, _, home) = get("/".into(), LO, None, false).await;
+        assert!(!home.contains("/local/screen/"), "{home}");
+        let (status, _, _) = get(format!("/local/screen/{id}"), LO, None, false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        mock.set_screen(&id, novnc).await;
+        let (_, _, home) = get("/".into(), LO, None, false).await;
+        assert!(
+            home.contains(&format!("<a href=\"/local/screen/{id}\""))
+                && home.contains("View screen"),
+            "{home}"
+        );
+        let (_, _, logs) = get("/local/logs".into(), LO, None, false).await;
+        assert!(logs.contains(&format!("/local/screen/{id}")), "{logs}");
+        let (status, location, _) = get(format!("/local/screen/{id}"), LO, None, false).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            location.unwrap(),
+            format!("/local/screen/{id}/vnc.html?path=../../../local/screen/{id}/websockify&autoconnect=1&view_only=1&resize=scale")
+        );
+        let (status, _, body) =
+            get(format!("/local/screen/{id}/app/ui.js?v=1"), LO, None, false).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::OK, "novnc /app/ui.js?v=1")
+        );
+
+        // Not from the network, not another job, not a made-up id.
+        let (status, _, _) = get(
+            format!("/local/screen/{id}/vnc.html"),
+            [203, 0, 113, 9],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = get("/local/screen/abcdef0123/vnc.html".into(), LO, None, false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = get(
+            "/local/screen/..%2F..%2Fetc/vnc.html".into(),
+            LO,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // A WebSocket only from the page's own origin: any site may open one
+        // to 127.0.0.1.
+        let ws = format!("/local/screen/{id}/websockify");
+        let (status, _, _) = get(ws.clone(), LO, Some("http://evil.example"), true).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = get(ws.clone(), LO, None, true).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // The real thing, over a socket: the 101, what the server says first,
+        // then both ways.
+        let mut socket = tokio::net::TcpStream::connect(&host).await.unwrap();
+        socket
+            .write_all(
+                format!(
+                    "GET {ws} HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\n\
+                     Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: a2V5\r\n\
+                     Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: binary\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        let mut buffer = [0u8; 256];
+        while !String::from_utf8_lossy(&seen).contains("RFB 003.008\n") {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "{}", String::from_utf8_lossy(&seen));
+            seen.extend_from_slice(&buffer[..read]);
+        }
+        let answer = String::from_utf8_lossy(&seen).to_lowercase();
+        assert!(answer.starts_with("http/1.1 101"), "{answer}");
+        assert!(
+            answer.contains("sec-websocket-accept: fake-accept"),
+            "{answer}"
+        );
+        assert!(
+            answer.contains("sec-websocket-protocol: binary"),
+            "{answer}"
+        );
+        socket.write_all(b"ping").await.unwrap();
+        let read = socket.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..read], b"ping");
+
+        // The job ends: the route and the link go with it.
+        mock.stop(&id, 0).await;
+        launcher.on_exit(&id, 0).await;
+        let (status, _, _) = get(format!("/local/screen/{id}/vnc.html"), LO, None, false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, _, home) = get("/".into(), LO, None, false).await;
+        assert!(!home.contains("/local/screen/"), "{home}");
+    }
+
+    #[tokio::test]
+    async fn without_screen_view_a_running_jobs_screen_is_not_reachable() {
+        const LO: [u8; 4] = [127, 0, 0, 1];
+        const HOST: &str = "127.0.0.1:8787";
+        let novnc = fake_novnc().await;
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let clock = Arc::new(FakeClock::new(1_700_000_000));
+        let cfg = settings_extra(1, "status_page = true");
+        let launcher = Launcher::with_clock(cfg, runtime, clock).unwrap();
+        let app = router(launcher.clone());
+        let id = match launcher
+            .launch(crate::launcher::LaunchRequest {
+                image: "alpine".into(),
+                env: HashMap::new(),
+                timeout_secs: None,
+                cpu: None,
+                memory_bytes: None,
+                shm_bytes: None,
+                command: None,
+                job_key: None,
+                callback_url: None,
+            })
+            .await
+            .unwrap()
+        {
+            crate::launcher::LaunchOutcome::Created(job)
+            | crate::launcher::LaunchOutcome::Existing(job) => job.id,
+        };
+        launcher.settled().await;
+        mock.set_screen(&id, novnc).await;
+        for uri in [
+            format!("/local/screen/{id}"),
+            format!("/local/screen/{id}/vnc.html"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(local("GET", &uri, LO, HOST, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+        let response = app
+            .clone()
+            .oneshot(local("GET", "/", LO, HOST, None))
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!String::from_utf8_lossy(&bytes).contains("/local/screen/"));
+    }
+
     #[tokio::test]
     async fn status_page_is_off_by_default_and_local_only_when_on() {
         const LO: [u8; 4] = [127, 0, 0, 1];

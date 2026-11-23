@@ -223,6 +223,25 @@ impl Runtime for BollardRuntime {
         }
     }
 
+    async fn screen_address(&self, id: &str) -> Result<Option<std::net::SocketAddr>, RuntimeError> {
+        match self
+            .docker
+            .inspect_container(&container_ref(id), None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) if is_ours(&info.config.as_ref().and_then(|c| c.labels.clone())) => {
+                if map_state(info.state) != Inspected::Running {
+                    return Ok(None);
+                }
+                let networks = info.network_settings.and_then(|n| n.networks);
+                Ok(networks.and_then(|networks| bridge_address(&networks)))
+            }
+            Ok(_) => Ok(None),
+            Err(err) if is_status(&err, 404) => Ok(None),
+            Err(err) => Err(docker_err(err)),
+        }
+    }
+
     async fn oom_killed(&self, id: &str) -> Result<bool, RuntimeError> {
         match self
             .docker
@@ -550,6 +569,21 @@ fn exit_from_event(event: &EventMessage) -> Option<(String, i64)> {
         .or_else(|| actor.id.clone().filter(|id| valid_container_id(id)))?;
     let code = attrs.get("exitCode")?.parse().ok()?;
     Some((id, code))
+}
+
+/// A job's container is on Docker's default bridge: its address there,
+/// port [`crate::runtime::SCREEN_PORT`].
+fn bridge_address(
+    networks: &HashMap<String, bollard::models::EndpointSettings>,
+) -> Option<std::net::SocketAddr> {
+    let ip = networks
+        .get("bridge")
+        .or_else(|| networks.values().next())?
+        .ip_address
+        .as_deref()?
+        .parse::<std::net::IpAddr>()
+        .ok()?;
+    Some(std::net::SocketAddr::new(ip, crate::runtime::SCREEN_PORT))
 }
 
 fn is_ours(labels: &Option<HashMap<String, String>>) -> bool {

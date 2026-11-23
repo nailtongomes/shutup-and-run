@@ -125,6 +125,10 @@ pub struct Settings {
     pub certificate_enabled: bool,
     /// The file name the certificate was imported from. For display only.
     pub certificate_name: Option<String>,
+    /// The local page shows, view only, the screen of a running job whose
+    /// image serves noVNC on port 6080 (`src/screen.rs`). Off unless set on
+    /// this machine: no request, poll answer or API call turns it on.
+    pub screen_view: bool,
     /// Where the imported certificate and its password are kept, mode 600.
     pub certificate_dir: PathBuf,
     /// Where each job's own read-only copies live while it runs.
@@ -201,6 +205,7 @@ struct FileConfig {
     certificate_enabled: Option<bool>,
     certificate_consent: Option<bool>,
     certificate_name: Option<String>,
+    screen_view: Option<bool>,
     // config.json only. config.toml refuses these three.
     poll_token: Option<String>,
     admin_user: Option<String>,
@@ -650,6 +655,7 @@ impl Settings {
             lend_on_metered,
             certificate_enabled,
             certificate_name,
+            screen_view: file.screen_view.unwrap_or(false),
             certificate_dir: PathBuf::from(CERTIFICATE_DIR),
             secrets_dir: default_secrets_dir(&history_dir),
             config_json: None,
@@ -766,6 +772,7 @@ pub const KEYS: &[Key] = &[
     key("certificate_enabled", Kind::Bool, OnPage::No),
     key("certificate_consent", Kind::Bool, OnPage::No),
     key("certificate_name", Kind::Text, OnPage::No),
+    key("screen_view", Kind::Bool, OnPage::Locked),
     key("history_path", Kind::Text, OnPage::No),
     key("history_days", Kind::Int, OnPage::No),
     key("docker_config", Kind::Text, OnPage::No),

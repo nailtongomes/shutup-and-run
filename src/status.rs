@@ -3,7 +3,8 @@
 //! asking them for a screenshot: is it running, is a job running, may the PC
 //! be turned off. On a machine whose config is config.json it also edits
 //! that file: the everyday keys directly, the dangerous ones behind the
-//! admin login. It shows no token, no env and no logs.
+//! admin login. It shows no token and no env. With `screen_view` on, it
+//! also shows a running job's screen (`src/screen.rs`).
 //!
 //! It is the one thing on the port without the bearer token, so it answers
 //! only a loopback peer that also names a loopback host. Anything else is a
@@ -47,6 +48,7 @@ pub fn router(launcher: Arc<Launcher>) -> Router {
         .route("/local/managed/edit", get(managed_edit))
         .route("/local/logs", get(logs_page))
         .route("/local/logs/{id}", get(log_file))
+        .merge(crate::screen::routes())
         .layer(from_fn(local_only))
         .with_state(launcher)
 }
@@ -82,7 +84,7 @@ fn local_host(headers: &HeaderMap) -> Option<&str> {
 
 /// A button on the page posts with `Origin: http://<this host>`. A form on
 /// some other site the person has open posts with that site's origin.
-fn same_origin(headers: &HeaderMap) -> bool {
+pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
     let Some(host) = local_host(headers) else {
         return false;
     };
@@ -207,6 +209,12 @@ async fn page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Resp
         })
         .collect();
     let programs = crate::host::programs();
+    let running = recent
+        .iter()
+        .filter(|(job, _)| !job.is_finished())
+        .map(|(job, _)| job.id.clone())
+        .collect();
+    let screens = crate::screen::available(&launcher, running).await;
     let view = View {
         memory: Some(&live.memory),
         programs: &programs,
@@ -238,6 +246,7 @@ async fn page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) -> Resp
             .filter(|m| !m.secrets_missing.is_empty())
             .map(|m| (m.definition.name.clone(), m.secrets_missing.join(", ")))
             .collect(),
+        screens,
     };
     html(StatusCode::OK, render(&view))
 }
@@ -518,8 +527,18 @@ async fn logs_page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) ->
             job: Some(job),
             log_bytes: crate::joblogs::info(&history, &job.id).map(|i| i.bytes),
             log_written_at: None,
+            screen: false,
         })
         .collect();
+    let running = rows
+        .iter()
+        .filter(|row| row.job.is_some_and(|job| !job.is_finished()))
+        .map(|row| row.id.clone())
+        .collect();
+    let screens = crate::screen::available(&launcher, running).await;
+    for row in &mut rows {
+        row.screen = screens.contains(&row.id);
+    }
     let mut orphans: Vec<crate::joblogs::Info> = crate::joblogs::ids(&history)
         .iter()
         .filter(|id| !jobs.contains_key(*id))
@@ -536,6 +555,7 @@ async fn logs_page(State(launcher): State<Arc<Launcher>>, headers: HeaderMap) ->
             job: None,
             log_bytes: Some(info.bytes),
             log_written_at: Some(info.written_at),
+            screen: false,
         }
     }));
     let table = if rows.is_empty() {
@@ -634,6 +654,8 @@ pub(crate) struct View<'a> {
     pub recent: &'a [(JobRecord, Option<u64>)],
     /// Managed containers that cannot start: a secret has no value.
     pub needs_secret: Vec<(String, String)>,
+    /// The running jobs whose screen the page can show (`src/screen.rs`).
+    pub screens: std::collections::HashSet<String>,
     /// What memory keeps from starting, and how long it did.
     pub memory: Option<&'a crate::memory::View>,
     /// The programs holding the most of the PC's memory, while it is tight.
@@ -791,6 +813,8 @@ pub(crate) struct JobRow<'a> {
     pub job: Option<&'a JobRecord>,
     pub log_bytes: Option<u64>,
     pub log_written_at: Option<i64>,
+    /// Its container shows a screen the page can open.
+    pub screen: bool,
 }
 
 fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
@@ -826,6 +850,15 @@ fn jobs_table(rows: &[JobRow], lang: Lang) -> String {
                     open = lang.t("so far", "até agora"),
                 ),
                 None => "<span class=\"muted\">&ndash;</span>".to_string(),
+            };
+            let links = if row.screen {
+                format!(
+                    "<a href=\"/local/screen/{id}\" target=\"_blank\" rel=\"noopener\"><b>{see}</b></a> &middot; {links}",
+                    id = escape(id),
+                    see = lang.t("View screen", "Ver tela"),
+                )
+            } else {
+                links
             };
             match job {
                 Some(job) => format!(
@@ -1372,6 +1405,7 @@ pub(crate) fn render(view: &View) -> String {
                 job: Some(job),
                 log_bytes: *log_bytes,
                 log_written_at: None,
+                screen: view.screens.contains(&job.id),
             })
             .collect();
         format!(
@@ -1731,6 +1765,13 @@ fn field_text(name: &str, lang: Lang) -> (&'static str, &'static str) {
             lang.t("Allowed images", "Imagens permitidas"),
             lang.t("One per line. A job with any other image is refused.", "Uma por linha. Uma tarefa com outra imagem é recusada."),
         ),
+        "screen_view" => (
+            lang.t("Show a running job's screen", "Mostrar a tela de uma tarefa rodando"),
+            lang.t(
+                "When a job's image serves noVNC on port 6080, the job lists link to its screen, view only, on this computer. You see what the job shows. noVNC has no password: another container on this computer reaches it too.",
+                "Quando a imagem da tarefa serve noVNC na porta 6080, as listas de tarefas têm um link para a tela dela, só para ver, neste computador. Você vê o que a tarefa mostra. O noVNC não tem senha: outro container neste computador também chega nela.",
+            ),
+        ),
         "poll_any_image" => (
             lang.t("Run any image the poll URL sends", "Rodar qualquer imagem que a URL de poll mandar"),
             lang.t(
@@ -1791,7 +1832,7 @@ fn field_text(name: &str, lang: Lang) -> (&'static str, &'static str) {
 
 /// The sections of the settings forms, in order. A key in none of them
 /// goes in the last one, so nothing a group has is left out.
-fn field_groups(lang: Lang) -> [(&'static str, &'static [&'static str]); 6] {
+fn field_groups(lang: Lang) -> [(&'static str, &'static [&'static str]); 7] {
     [
         (
             lang.t("Where the work comes from", "De onde vem o trabalho"),
@@ -1826,6 +1867,10 @@ fn field_groups(lang: Lang) -> [(&'static str, &'static [&'static str]); 6] {
                 "min_free_memory",
                 "min_free_disk",
             ],
+        ),
+        (
+            lang.t("What this computer shows", "O que este computador mostra"),
+            &["screen_view"],
         ),
         (
             lang.t("Tokens and the admin login", "Tokens e o login admin"),
@@ -2542,6 +2587,7 @@ fn managed_state(view: &crate::managed::View, now: i64, lang: Lang) -> String {
 pub(crate) fn managed_view(
     mode: bool,
     views: &[crate::managed::View],
+    screens: &std::collections::HashSet<String>,
     now: i64,
     lang: Lang,
     note: Option<(bool, &str)>,
@@ -2577,6 +2623,13 @@ pub(crate) fn managed_view(
             None => lang.t("never ran", "nunca rodou").to_string(),
         };
         let mut controls = String::new();
+        if let Some(id) = view.running_job.as_ref().filter(|id| screens.contains(*id)) {
+            controls += &format!(
+                "<a href=\"/local/screen/{id}\" target=\"_blank\" rel=\"noopener\"><b>{}</b></a> ",
+                lang.t("View screen", "Ver tela"),
+                id = escape(id),
+            );
+        }
         if view.running_job.is_some() {
             controls += &button(&d.name, "stop", lang.t("Stop", "Parar"));
         } else if view.enabled && mode {
@@ -2676,7 +2729,14 @@ async fn managed_list(
 ) -> Response {
     let now = launcher.now();
     match crate::managed::views(launcher.store(), now) {
-        Ok((mode, views)) => html(status, managed_view(mode, &views, now, lang, note)),
+        Ok((mode, views)) => {
+            let running = views.iter().filter_map(|v| v.running_job.clone()).collect();
+            let screens = crate::screen::available(launcher, running).await;
+            html(
+                status,
+                managed_view(mode, &views, &screens, now, lang, note),
+            )
+        }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -3775,6 +3835,7 @@ mod tests {
             last_poll: None,
             recent: &[],
             needs_secret: Vec::new(),
+            screens: Default::default(),
             memory: None,
             programs: &[],
         }

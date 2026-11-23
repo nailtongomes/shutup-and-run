@@ -1839,6 +1839,16 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
     if let Some(warning) = &settings.config_warning {
         checks.push(soft("config-in-use", false, warning.clone()).coded("CONFIG_FALLBACK_IN_USE"));
     }
+    if settings.screen_view && !settings.status_page {
+        checks.push(
+            soft(
+                "screen-view",
+                false,
+                "screen_view is on, but the local page that shows the screen is off",
+            )
+            .coded("SCREEN_VIEW_NO_PAGE"),
+        );
+    }
 
     // The flag itself, not the status file, which is up to a second behind.
     let pause = settings

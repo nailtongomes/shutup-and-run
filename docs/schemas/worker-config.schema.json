@@ -177,6 +177,11 @@
       "maxLength": 64,
       "description": "The file name the certificate was imported from, for display. Not a path."
     },
+    "screen_view": {
+      "type": "boolean",
+      "default": false,
+      "description": "The local page shows, view only, the screen of a running job whose image serves noVNC on port 6080 of its container (/local/screen/JOB_ID). Needs status_page. Set on this machine only (the page's admin login, or `shutup-and-run config set screen_view true`); no job, poll answer or API call can set it. The person at the PC sees what the job shows on its screen. noVNC usually has no password, and another container on the same Docker bridge reaches that port too."
+    },
     "history_path": {
       "type": "string",
       "description": "SQLite job history. status.json is written beside it.",

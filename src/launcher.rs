@@ -1228,6 +1228,20 @@ impl Launcher {
             .ok()
     }
 
+    /// Where the local page reaches the screen of job `id`: only with
+    /// `screen_view` on, only while the job runs, and only the address the
+    /// daemon gives for its container.
+    pub async fn screen_address(&self, id: &str) -> Option<std::net::SocketAddr> {
+        if !self.settings().screen_view || !valid_container_id(id) {
+            return None;
+        }
+        let job = self.store.get(id).ok().flatten()?;
+        if job.is_finished() {
+            return None;
+        }
+        self.runtime.screen_address(id).await.ok().flatten()
+    }
+
     /// Recent jobs, newest first, for the local page.
     pub fn recent_jobs(&self, limit: usize) -> Result<Vec<JobRecord>, LaunchError> {
         self.store.recent(limit).map_err(store_err)

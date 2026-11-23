@@ -698,3 +698,16 @@ The owner named it `shutup-and-run`. It is the whole product: send a job, get a 
 
 **Cost.** Anyone with the relay's token reads which PCs are there and how much they carried; the PCs hold that token too, but reach only port 7000, not the proxy. 32 idle connections are 32 sockets on the PC and the relay per PC, and a ping each every 10 s. The n8n flow answers any discovery that reaches it, without approval, up to 200 PCs: a stranger with the URL can lend you a connection you never use. The Windows CI step proves the path on a runner, not on a home PC behind NAT.
 
+## A running job's screen on the local page, through the page
+
+**Context.** Jobs that drive a browser run it on a virtual display, and an image like `rpa-worker-selenium` serves that display with noVNC on port 6080, without a password. The person at the PC, or support on a call with them, wants to see what the job is doing. A request has no port or network field, on purpose, and the page is the one thing on the worker's port without the token.
+
+**Decision.**
+
+- `screen_view`, a machine setting, off by default, behind the admin login on the page or `config set` at a terminal, like the certificate passthrough. No request, poll answer, manifest or API call sets it, and the request gains no field.
+- `/local/screen/JOB_ID/...` is a reverse proxy, HTTP and WebSocket, to port 6080 of that job's container. Its address comes from Docker's inspect (`Runtime::screen_address`), only while the job's row is unfinished and its container runs; the job id only picks a job of this machine's history. One port, a constant. A push, a pull and a managed job alike.
+- The page's gate as it is (a loopback peer naming a loopback host), plus the page's own `Origin` on the WebSocket, since a browser lets any site open one to `127.0.0.1`. The link (**View screen**) shows only while the container answers on the port, probed for 300 ms when a list is drawn; it opens noVNC connected, `view_only=1`, scaled.
+- The upgrade is passed on by hand: the request's key, version and protocol go to the container, its 101 comes back, and the two sockets are joined byte for byte (`hyper::upgrade`, already in the tree through axum). No WebSocket library and no frame is read.
+- On Windows the service, Docker and the container are all inside the WSL2 VM, where the bridge address is reachable, and the browser reaches the page through WSL2's forwarding of `127.0.0.1:8787`, a TCP forward that carries the upgraded connection like any other.
+
+**Cost.** The person at the PC sees what the job shows on its screen: a site the job logged in to, a document it opened. They could already read every task's env on a Windows PC; the screen adds what the job saw. `view_only` is noVNC's own option, in the page's link: the person can change it in noVNC's settings and type into the job's browser. noVNC has no password, so any other container on the same Docker bridge reaches its port 6080, as it could before this change. An open viewer keeps its connection until the container stops; a new one is refused once the job's row is finished. The probe adds up to 300 ms to drawing a list with a running job. Confirmed by hand on Linux with Docker (`tests/screen/linux.sh`); on Windows by reasoning about WSL2's forwarding, not yet on a PC (docs/WINDOWS-PENDING.md).

@@ -206,6 +206,7 @@ Ela segue o tema claro ou escuro do sistema e funciona no celular, sem rede: um 
 | --- | --- | --- |
 | `/` | O estado numa palavra e numa cor: rodando e livre, trabalhando, pausado, esperando a sua autorização, bloqueado, Docker parado. Logo abaixo, o que precisa de uma pessoa, cada coisa com o seu botão: autorizar, retomar, dar o segredo a um container gerenciado. Depois, se o PC pode ser desligado, tarefas agora, a última tarefa, a fila, as últimas tarefas com os logs e os recursos do computador. Recarrega a cada 10 segundos | nenhum |
 | Tarefas e logs (`/local/logs`) | As últimas 100 tarefas: status, imagem, início no horário local, duração, código de saída, e o que cada uma imprimiu, para abrir ou baixar | nenhum |
+| A tela de uma tarefa (`/local/screen/ID_DA_TAREFA`) | Com `screen_view` ligado: o que uma tarefa rodando mostra na tela, ao vivo e só para ver, quando a imagem serve noVNC na porta 6080. As listas de tarefas e os containers gerenciados têm o link (**Ver tela**) enquanto ela responde | nenhum |
 | Segurança (`/local/safety`) | Se este computador está saudável, em alerta ou bloqueado, e por quê. Onde o dono lê os riscos e autoriza, ou retira uma autorização | nenhum: a decisão é do dono |
 | Configuração (`/local/config`) | URL de poll, intervalo de poll, tarefas ao mesmo tempo, nome da máquina | nenhum |
 | Configuração avançada (`/local/advanced`) | Imagens permitidas, qualquer imagem, limites de tempo, os limites de recursos, os dois tokens, o login de admin | `admin` / `admin` até ser trocado |
@@ -217,6 +218,8 @@ Ela segue o tema claro ou escuro do sistema e funciona no celular, sem rede: um 
 - Os limites de recursos (`resource_profile`, `max_job_cpus`, `max_job_memory`, `min_free_memory`, `min_free_disk`) ficam em Configuração avançada. Campo vazio usa o padrão do perfil, mostrado em cinza. `shutup-and-run config show` imprime os mesmos valores em "in force", e em `effective` com `--json`.
 - As demais chaves são só pelo CLI. `shutup-and-run config keys` diz onde cada chave pode ser editada.
 - Ela fica em inglês ou em português, um idioma por vez; um link troca e a escolha é lembrada.
+
+**Ver a tela de uma tarefa.** Uma imagem que roda um navegador numa tela virtual pode servi-la com noVNC (por exemplo `ghcr.io/nailtongomes/rpa-worker-selenium` com `USE_XVFB=1`, `USE_VNC=1` e `USE_NOVNC=1`: noVNC na porta 6080, sem senha). Com `shutup-and-run config set screen_view true --apply` (ou Configuração avançada, com o login de administrador), a página abre o noVNC através dela mesma, conectado e só para ver, enquanto a tarefa roda. O endereço é o do container da tarefa na bridge do Docker, dado pelo Docker; uma requisição não escolhe porta nem outro container, e nada muda para a tarefa: nenhuma porta, nenhum campo de rede. A pessoa no PC vê o que a tarefa mostrar. O noVNC em si não tem senha, então outro container na mesma bridge também chega nessa porta. No Windows, o `127.0.0.1:8787` da página é o encaminhamento de uma porta TCP pelo WSL2, que leva o WebSocket como qualquer outra conexão. O `doctor` diz `SCREEN_VIEW_NO_PAGE` quando a chave está ligada e a página não. `tests/screen/linux.sh` é o teste à mão.
 
 A segurança da página, sem rodeios. Ela não pede token, então só responde a uma conexão de loopback que nomeia um host de loopback, e só aceita um formulário da própria origem. Nunca mostra token nem env de job; mostra o que os jobs imprimiram (os logs, abaixo). O login de admin afasta um curioso e **não** é uma barreira de segurança: quem usa o PC consegue ler o arquivo de configuração. Nada nela é acessível pela rede, e ela não foi feita para ficar atrás de um proxy. Numa máquina configurada com `config.toml` a página só mostra o status.
 
@@ -362,6 +365,7 @@ As chaves são as mesmas nos dois. Chave desconhecida é recusada.
 | `reaper_interval_secs`, `purge_interval_secs` | `SHUTUP_AND_RUN_REAPER_INTERVAL_SECS`, `_PURGE_INTERVAL_SECS` | De quanto em quanto os timeouts são aplicados (2) e o histórico antigo é apagado (3600). |
 | `docker_config` | `SHUTUP_AND_RUN_DOCKER_CONFIG` | Caminho do `config.json` do Docker, para imagens privadas. |
 | `certificate_enabled`, `certificate_consent`, `certificate_name` (só JSON) | | Repasse de certificado. Escritas por `shutup-and-run certificate set`, não à mão. Padrão desligado. |
+| `screen_view` | | A página mostra a tela de uma tarefa rodando quando a imagem serve noVNC na porta 6080. Padrão desligado. Sem variável de ambiente: liga-se na máquina. |
 
 **Allowlist.** `ghcr.io/you/worker` permite qualquer tag ou digest desse repositório e nada mais: nem `ghcr.io/you/worker-evil`, nem `ghcr.io/you/other`. Uma entrada com tag permite exatamente aquele texto. Um worker Windows usa `poll_any_image` no lugar: a única fonte de trabalho dele é a sua URL de poll.
 
