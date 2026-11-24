@@ -100,6 +100,8 @@ pub struct NewJob {
     /// The managed container definition this run belongs to. None for a
     /// pushed or polled job.
     pub managed: Option<String>,
+    /// The memory limit its container gets, in bytes. None: no limit.
+    pub memory_limit: Option<i64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -234,7 +236,8 @@ impl Store {
         // and for `managed`: NULL is a pushed or polled job. `cpu_ms` and
         // `memory_peak`, 0.2.19, `network_bytes`, 0.2.23, and `disk_bytes`,
         // 0.2.24: NULL is "not measured". `pull_done` and `pull_total`,
-        // 0.2.25, are NULL but while an image downloads.
+        // 0.2.25, are NULL but while an image downloads. `memory_limit`,
+        // 0.2.33: NULL is no limit, or a row older than the column.
         for column in [
             "callback_state TEXT",
             "oom_killed INTEGER",
@@ -245,6 +248,7 @@ impl Store {
             "disk_bytes INTEGER",
             "pull_done INTEGER",
             "pull_total INTEGER",
+            "memory_limit INTEGER",
         ] {
             match conn.execute(&format!("ALTER TABLE jobs ADD COLUMN {column}"), []) {
                 Ok(_) => {}
@@ -303,8 +307,8 @@ impl Store {
             "jobs"
         };
         let result = conn.execute(
-            "INSERT INTO jobs (id, image, job_key, started_at, callback_url, managed)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6
+            "INSERT INTO jobs (id, image, job_key, started_at, callback_url, managed, memory_limit)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?8
              WHERE COALESCE((SELECT value FROM meta WHERE key = 'mode'), 'jobs') = ?7",
             params![
                 job.id,
@@ -313,7 +317,8 @@ impl Store {
                 job.started_at,
                 job.callback_url,
                 job.managed,
-                mode
+                mode,
+                job.memory_limit
             ],
         );
         match result {
@@ -324,6 +329,19 @@ impl Store {
             }
             Err(err) => Err(sql(err)),
         }
+    }
+
+    /// The memory limits of the jobs that have not ended, added up: what
+    /// they may come to use together, whatever they use now.
+    pub fn committed_memory(&self) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.query_row(
+            "SELECT COALESCE(SUM(MAX(memory_limit, 0)), 0) FROM jobs WHERE ended_at IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|sum| sum.max(0) as u64)
+        .map_err(sql)
     }
 
     /// A start that never produced a running container. Holds `job_key` so a retry
@@ -1270,6 +1288,7 @@ mod tests {
             started_at: started,
             callback_url: None,
             managed: None,
+            memory_limit: None,
         }
     }
 

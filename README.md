@@ -161,6 +161,7 @@ The customer's interactive work has priority over job throughput. On a shared PC
 | Each job | 1 CPU, 2 GiB of memory, no swap beyond it | `max_job_cpus`, `max_job_memory` |
 | Jobs at once | 1 | `max_slots` |
 | Starting a job | only with 2 GiB of memory and 5 GiB of disk free | `min_free_memory`, `min_free_disk` |
+| Jobs at once, by memory | the memory limits of the jobs running, plus the new one's, within the machine's memory less `min_free_memory` (`JOBS_MEMORY_COMMITTED`) | `max_job_memory`, `min_free_memory` |
 | Starting a job (Windows, optional) | only after the PC was not used for N seconds; off by default | `min_idle_secs` |
 | Starting a job, when (optional) | only inside the hours the machine lends itself, like `mon-fri 19-07; sat,sun`; any time by default | `lend_hours` |
 | Starting a job (Windows) | not on the battery below 60%, not while the person presents or has a program in full screen; on the battery above 60% jobs start and the page says so | not configurable |

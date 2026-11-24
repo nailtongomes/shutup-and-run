@@ -168,6 +168,12 @@ mobile)
   pass "--mobile-data, given at the phone: it shares on mobile data"
   ;;
 battery)
+  # Without Termux:API nothing is read, and status says so.
+  wait_for 15 '"battery_unread":"TERMUX_API_MISSING"' ||
+    fail "no TERMUX_API_MISSING without termux-battery-status: $("$sar" internet status --json)"
+  "$sar" internet status | grep -q "not read (Termux:API is not installed)" ||
+    fail "status says the battery is not read: $("$sar" internet status)"
+  pass "without Termux:API: the battery is not read, and status says so"
   # Termux:API's program, as on a phone at 45% off its charger.
   fake=$PREFIX/bin/termux-battery-status
   printf '#!%s/bin/sh\ncat %s\n' "$PREFIX" "$HOME/battery.json" >"$fake"

@@ -161,6 +161,7 @@ O trabalho interativo do cliente tem prioridade sobre a vazão de jobs. Num PC c
 | Cada job | 1 CPU, 2 GiB de memória, sem swap além disso | `max_job_cpus`, `max_job_memory` |
 | Jobs ao mesmo tempo | 1 | `max_slots` |
 | Iniciar um job | só com 2 GiB de memória e 5 GiB de disco livres | `min_free_memory`, `min_free_disk` |
+| Jobs ao mesmo tempo, pela memória | os limites de memória dos jobs em execução, mais o do novo, dentro da memória da máquina menos `min_free_memory` (`JOBS_MEMORY_COMMITTED`) | `max_job_memory`, `min_free_memory` |
 | Iniciar um job (Windows, opcional) | só depois de o PC ficar N segundos sem uso; desligado por padrão | `min_idle_secs` |
 | Iniciar um job, quando (opcional) | só dentro do horário em que a máquina é emprestada, como `mon-fri 19-07; sat,sun`; a qualquer hora por padrão | `lend_hours` |
 | Iniciar um job (Windows) | não na bateria abaixo de 60%, não enquanto a pessoa apresenta ou tem um programa em tela cheia; na bateria acima de 60% os jobs começam e a página avisa | não é configurável |

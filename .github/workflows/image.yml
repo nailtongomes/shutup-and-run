@@ -13,7 +13,7 @@ jobs:
   ghcr:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -33,26 +33,26 @@ jobs:
           else
             echo "name=${image}:edge" >> "$GITHUB_OUTPUT"
           fi
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: build context
         run: cp target/x86_64-unknown-linux-musl/release/shutup-and-run ./shutup-and-run
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: true
           tags: ${{ steps.tag.outputs.name }}
       # The job scripts/smoke.sh runs by default. See examples/smoke-image.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: examples/smoke-image
           push: true
           tags: ghcr.io/nailtongomes/shutup-and-run-smoke:latest
       # The heavy job tests/poll-mock offers. See examples/selenium-probe.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: examples/selenium-probe
           push: true

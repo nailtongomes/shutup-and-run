@@ -70,8 +70,9 @@ struct Idle {
 
 /// What a PC carries now, when any of its connections was last alive, in
 /// milliseconds since the relay started, and the bytes of the streams it
-/// carried since then: sent by the containers, received by them, and how
-/// many streams it refused for carrying `PC_STREAMS` already.
+/// carried since then: sent by the containers, received by them, how
+/// many streams it refused for carrying `PC_STREAMS` already, and when the
+/// last of those was (milliseconds since the relay started, 0 for none).
 #[derive(Default)]
 pub(crate) struct Stats {
     open: AtomicUsize,
@@ -79,6 +80,7 @@ pub(crate) struct Stats {
     sent: AtomicU64,
     received: AtomicU64,
     busy: AtomicU64,
+    busy_at: AtomicU64,
 }
 
 /// One PC: its password and its idle connections, each held by a task that
@@ -150,6 +152,8 @@ impl Relay {
             Ok(Ok(permit)) => Ok(permit),
             _ => {
                 stats.busy.fetch_add(1, Ordering::Relaxed);
+                let at = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                stats.busy_at.store(at.max(1), Ordering::Relaxed);
                 Err(ClaimError::Busy)
             }
         }
@@ -336,6 +340,11 @@ fn pool_state(id: &str, pool: &mut Pool, now: u64) -> serde_json::Value {
         "open": stats.open.load(Ordering::Relaxed),
         "streams": PC_STREAMS - pool.streams.available_permits(),
         "busy": stats.busy.load(Ordering::Relaxed),
+        // Whether the limit pinches now or did once, a week ago.
+        "busy_secs_ago": match stats.busy_at.load(Ordering::Relaxed) {
+            0 => None,
+            at => Some(now.saturating_sub(at) / 1000),
+        },
         "seen_secs_ago": now.saturating_sub(stats.seen.load(Ordering::Relaxed)) / 1000,
         "sent_bytes": stats.sent.load(Ordering::Relaxed),
         "received_bytes": stats.received.load(Ordering::Relaxed),
@@ -1388,6 +1397,7 @@ mod tests {
         let state = relay.status("pc-test", SECRET).unwrap();
         assert_eq!(state["streams"], PC_STREAMS);
         assert_eq!(state["busy"], 1);
+        assert_eq!(state["busy_secs_ago"], 0);
         let mut last = HashMap::new();
         assert!(
             relay
