@@ -186,10 +186,16 @@ battery)
   pass "on a charger: it shares again"
   ;;
 restart)
-  # What an update looks like to `on`: the process is of another version.
+  # What an update looks like to `on`: the process is of another version,
+  # and it wrote `connected` in the second `on` starts (or later), which
+  # `--wait` must not take as the new process's answer.
   old=$(pid)
   status=$HOME/.shutup-and-run/internet-status.json
-  sed 's/"version": "[^"]*"/"version": "0.0.1"/' "$status" >"$status.new" && mv "$status.new" "$status"
+  later=$(date -u -d @$(($(date +%s) + 30)) +%Y-%m-%dT%H:%M:%SZ)
+  sed -e 's/"version": "[^"]*"/"version": "0.0.1"/' \
+    -e "s/\"updated_at\": \"[^\"]*\"/\"updated_at\": \"$later\"/" "$status" >"$status.new" &&
+    mv "$status.new" "$status"
+  grep -q "\"updated_at\": \"$later\"" "$status" || fail "the status file's form changed"
   out=$("$sar" internet on --relay 127.0.0.1:7000 --wait 30) || fail "on after an update: $out"
   grep -q "stopped 0.0.1 (pid $old)" <<<"$out" || fail "the old version was not stopped: $out"
   wait_for 15 '"state":"connected"' || fail "not connected after the update"

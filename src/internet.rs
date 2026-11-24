@@ -1824,6 +1824,9 @@ fn android_start(dir: &Path) -> Result<String, String> {
         crate::android::terminate(old.pid);
         for _ in 0..50 {
             if free() {
+                // What it last wrote is not the new process's: `--wait`
+                // would read it as the answer, connected, in that second.
+                let _ = std::fs::remove_file(dir.join(STATUS_FILE));
                 break;
             }
             std::thread::sleep(Duration::from_millis(200));
