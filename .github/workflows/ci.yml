@@ -101,7 +101,11 @@ jobs:
           $want = (Get-FileHash -Algorithm SHA256 (Join-Path $rel $asset)).Hash.ToLower()
           Set-Content -Encoding ascii -Path (Join-Path $rel "SHA256SUMS") -Value "$want  $asset"
           $server = Start-Process python -ArgumentList "-m", "http.server", "8099", "--bind", "127.0.0.1", "--directory", $rel -PassThru -WindowStyle Hidden
-          Start-Sleep -Seconds 3
+          # Until it answers: a cold Python can take longer than a fixed sleep.
+          for ($i = 0; ; $i++) {
+            try { Invoke-WebRequest -Uri "http://127.0.0.1:8099/SHA256SUMS" -UseBasicParsing -TimeoutSec 2 | Out-Null; break }
+            catch { if ($i -ge 60 -or $server.HasExited) { throw "the local release server on 8099 did not answer" }; Start-Sleep -Milliseconds 500 }
+          }
           $env:SHUTUP_AND_RUN_EXE_URL = "http://127.0.0.1:8099/$asset"
           $env:SHUTUP_AND_RUN_POLL_URL = ""
           $installed = Join-Path $env:ProgramData "shutup-and-run\shutup-and-run.exe"
@@ -155,6 +159,11 @@ jobs:
           $want = (Get-FileHash -Algorithm SHA256 (Join-Path $rel $asset)).Hash.ToLower()
           Set-Content -Encoding ascii -Path (Join-Path $rel "SHA256SUMS") -Value "$want  $asset"
           $server = Start-Process python -ArgumentList "-m", "http.server", "8097", "--bind", "127.0.0.1", "--directory", $rel -PassThru -WindowStyle Hidden
+          # Until it answers: a cold Python can take longer than a fixed sleep.
+          for ($i = 0; ; $i++) {
+            try { Invoke-WebRequest -Uri "http://127.0.0.1:8097/SHA256SUMS" -UseBasicParsing -TimeoutSec 2 | Out-Null; break }
+            catch { if ($i -ge 60 -or $server.HasExited) { throw "the local release server on 8097 did not answer" }; Start-Sleep -Milliseconds 500 }
+          }
           $token = "ci-relay-token-0123"
           $tokenFile = Join-Path $env:RUNNER_TEMP "relay_token"
           Set-Content -Encoding ascii -Path $tokenFile -Value $token
@@ -293,7 +302,11 @@ jobs:
           $linux = (Get-FileHash -Algorithm SHA256 (Join-Path $rel $musl)).Hash.ToLower()
           Set-Content -Encoding ascii -Path (Join-Path $rel "SHA256SUMS") -Value "$want  $asset", "$linux  $musl"
           $server = Start-Process python -ArgumentList "-m", "http.server", "8098", "--bind", "127.0.0.1", "--directory", $rel -PassThru -WindowStyle Hidden
-          Start-Sleep -Seconds 3
+          # Until it answers: a cold Python can take longer than a fixed sleep.
+          for ($i = 0; ; $i++) {
+            try { Invoke-WebRequest -Uri "http://127.0.0.1:8098/SHA256SUMS" -UseBasicParsing -TimeoutSec 2 | Out-Null; break }
+            catch { if ($i -ge 60 -or $server.HasExited) { throw "the local release server on 8098 did not answer" }; Start-Sleep -Milliseconds 500 }
+          }
           $env:SHUTUP_AND_RUN_EXE_URL = "http://127.0.0.1:8098/$asset"
           # `wsl update` fetches the Linux binary from here, not from a release.
           $env:SHUTUP_AND_RUN_URL = "http://127.0.0.1:8098/$musl"
@@ -461,14 +474,16 @@ jobs:
           sha256sum dist/shutup-and-run-x86_64-unknown-linux-musl > dist/SHA256SUMS
           grep -q ' dist/shutup-and-run-x86_64-unknown-linux-musl$' dist/SHA256SUMS
           (cd dist && nohup python3 -m http.server 8099 --bind 127.0.0.1 >/dev/null 2>&1 &)
-          sleep 1
+          for _ in $(seq 1 60); do curl -fsS -o /dev/null http://127.0.0.1:8099/SHA256SUMS 2>/dev/null && break; sleep 0.5; done
+          curl -fsS -o /dev/null http://127.0.0.1:8099/SHA256SUMS || { echo "the release server on 8099 did not answer"; exit 1; }
       - name: install.sh refuses a wrong checksum
         run: |
           mkdir -p bad
           cp dist/shutup-and-run-x86_64-unknown-linux-musl bad/
           echo "$(printf '0%.0s' {1..64})  shutup-and-run-x86_64-unknown-linux-musl" > bad/SHA256SUMS
           (cd bad && nohup python3 -m http.server 8098 --bind 127.0.0.1 >/dev/null 2>&1 &)
-          sleep 1
+          for _ in $(seq 1 60); do curl -fsS -o /dev/null http://127.0.0.1:8098/SHA256SUMS 2>/dev/null && break; sleep 0.5; done
+          curl -fsS -o /dev/null http://127.0.0.1:8098/SHA256SUMS || { echo "the bad release server on 8098 did not answer"; exit 1; }
           if sudo SHUTUP_AND_RUN_URL=http://127.0.0.1:8098/shutup-and-run-x86_64-unknown-linux-musl bash scripts/install.sh; then
             echo "install.sh accepted a binary that does not match SHA256SUMS"
             exit 1

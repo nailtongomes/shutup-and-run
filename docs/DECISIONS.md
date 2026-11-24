@@ -736,7 +736,7 @@ Decision: `relay::PC_STREAMS` is 7 × 20 = 140, a constant. A semaphore per PC, 
 
 Cost: a consumer that holds more than 20 streams, or more than 7 consumers at once, sees `503` after a 10-second wait, and the operator sees nothing but that answer (the relay's log has a line per stream). The number is a constant; changing it is a patch. The stand-in for noVNC tests the proxy and the WebSocket, not noVNC's own page.
 
-## What the relay refused, a phone's battery, and the Wi-Fi rule tested in CI
+## What the relay refused, a phone's battery, and the Wi-Fi rule tested in CI (0.2.32)
 
 Context: with 140 streams per PC the operator saw a refusal only as a `503` at the consumer; whether 7 consumers are enough could only be measured by hand. A phone read no battery, so a phone off its charger shared until it died. The Wi-Fi rule had only unit tests, and the person with the phone had steps only in English.
 
