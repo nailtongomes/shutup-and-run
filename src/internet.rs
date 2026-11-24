@@ -253,6 +253,10 @@ pub struct Status {
     /// The phone's battery, when Termux:API reads it. Only on Android.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery: Option<crate::android::Battery>,
+    /// Why a phone reads no battery (`TERMUX_API_MISSING`,
+    /// `TERMUX_API_NO_ANSWER`). Only on Android.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_unread: Option<String>,
     pub updated_at: String,
 }
 
@@ -1015,6 +1019,10 @@ pub async fn serve(dir: &Path, background: bool) -> Result<ExitCode, String> {
             battery: crate::android::PHONE
                 .then(crate::android::battery)
                 .flatten(),
+            battery_unread: crate::android::PHONE
+                .then(crate::android::battery_unread)
+                .flatten()
+                .map(str::to_string),
             updated_at: String::new(),
         };
         if status.state != last_state {
@@ -1127,7 +1135,25 @@ pub fn checks(settings: &Settings, status: Option<&Status>, now: i64) -> Vec<Che
         .coded(RELAY_UNREACHABLE)
         .with(settings.relay.clone()),
     };
-    vec![line]
+    let mut checks = vec![line];
+    // A phone that reads no battery shares down to an empty one: said, so
+    // the person knows the 60% wait is off, never a reason to hold.
+    if let Some(code) = &status.battery_unread {
+        let why = if code == crate::android::TERMUX_API_MISSING {
+            "Termux:API is not installed"
+        } else {
+            "Termux:API did not answer"
+        };
+        checks.push(
+            soft(
+                "battery",
+                false,
+                format!("not read ({why}); new streams do not wait for a low battery"),
+            )
+            .coded(code),
+        );
+    }
+    checks
 }
 
 /// `http://ID:SECRET@HOST:PORT`, with the relay's host and the proxy port
@@ -2060,6 +2086,23 @@ pub(crate) fn render(
                         }
                     ));
                 }
+                if let Some(code) = status.and_then(|s| s.battery_unread.as_deref()) {
+                    body.push_str(&format!(
+                        "<tr><th>{}</th><td>{}</td></tr>",
+                        t("Battery", "Bateria"),
+                        if code == crate::android::TERMUX_API_MISSING {
+                            t(
+                                "not read: Termux:API is not installed, so a low battery does not stop new connections",
+                                "não lida: falta o Termux:API, então a bateria fraca não segura novas conexões",
+                            )
+                        } else {
+                            t(
+                                "not read: Termux:API did not answer, so a low battery does not stop new connections",
+                                "não lida: o Termux:API não respondeu, então a bateria fraca não segura novas conexões",
+                            )
+                        }
+                    ));
+                }
                 if let Some(battery) = status.and_then(|s| s.battery) {
                     body.push_str(&format!(
                         "<tr><th>{}</th><td>{}% ({})</td></tr>",
@@ -2561,6 +2604,38 @@ mod tests {
         assert!(render(Some(&s), Some(&status), now, true).contains("45% (na bateria"));
         let pc = serde_json::to_value(Status::default()).unwrap();
         assert!(pc.get("battery").is_none(), "{pc}");
+    }
+
+    #[test]
+    fn a_phone_without_termux_api_says_its_battery_is_not_read() {
+        let now = 1_800_000_000;
+        let s = settings("relay.example.com:7000");
+        let status = Status {
+            state: "connected".to_string(),
+            id: s.id.clone(),
+            relay: s.relay.clone(),
+            battery_unread: Some(crate::android::TERMUX_API_MISSING.to_string()),
+            updated_at: crate::status::unix_to_iso(now),
+            ..Status::default()
+        };
+        let (value, text, code) = status_out(Some(&s), Some(&status), now);
+        // Something to know, not a failure: it still shares.
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains("not read (Termux:API is not installed)"),
+            "{text}"
+        );
+        assert!(text.contains("pkg install termux-api"), "{text}");
+        let checks = value["checks"].as_array().unwrap();
+        assert!(
+            checks.iter().any(|c| c["code"] == "TERMUX_API_MISSING"),
+            "{value}"
+        );
+        assert_eq!(value["status"]["battery_unread"], "TERMUX_API_MISSING");
+        assert!(render(Some(&s), Some(&status), now, true).contains("falta o Termux:API"));
+        // A PC never carries it.
+        let pc = serde_json::to_value(Status::default()).unwrap();
+        assert!(pc.get("battery_unread").is_none(), "{pc}");
     }
 
     #[test]

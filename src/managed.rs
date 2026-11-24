@@ -1430,6 +1430,7 @@ mod tests {
             started_at: 0,
             callback_url: None,
             managed: None,
+            memory_limit: None,
         };
         assert!(matches!(
             m.store().insert_running(&outside),
@@ -1542,6 +1543,7 @@ mod tests {
                 started_at: T0 as i64,
                 callback_url: None,
                 managed: Some("rpa".into()),
+                memory_limit: None,
             })
             .unwrap();
         m.mock.seed_running("feed01", T0 + 3600).await;

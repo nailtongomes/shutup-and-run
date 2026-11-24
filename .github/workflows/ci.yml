@@ -8,7 +8,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -25,7 +25,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked
       - run: cargo test --locked
@@ -227,7 +227,7 @@ jobs:
           }
           exit 0
       # For tests/windows-sandbox/run.ps1 -Exe, before a release has this build.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: shutup-and-run-windows-exe
           path: target/release/shutup-and-run.exe
@@ -243,12 +243,12 @@ jobs:
     runs-on: windows-latest
     needs: [windows, musl]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: shutup-and-run-windows-exe
           path: build
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: shutup-and-run-musl
           path: build
@@ -342,7 +342,7 @@ jobs:
   accept:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: release binary
         run: cargo build --release --locked
@@ -382,7 +382,7 @@ jobs:
       - name: internet sharing, relay and PC on this runner
         timeout-minutes: 10
         run: sudo bash tests/internet/local.sh "${GITHUB_WORKSPACE}/target/release/shutup-and-run"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: probe-screenshot
@@ -397,7 +397,7 @@ jobs:
   android:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android, x86_64-linux-android
@@ -414,7 +414,7 @@ jobs:
             echo "a library Android does not have"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: shutup-and-run-aarch64-linux-android
           path: target/aarch64-linux-android/release/shutup-and-run
@@ -427,7 +427,7 @@ jobs:
   musl:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -440,7 +440,7 @@ jobs:
         run: cargo build --release --locked --target x86_64-unknown-linux-musl
       # For the Windows update job: the Linux binary of this build's version,
       # which no release has yet.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: shutup-and-run-musl
           path: target/x86_64-unknown-linux-musl/release/shutup-and-run

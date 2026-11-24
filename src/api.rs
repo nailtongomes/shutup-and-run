@@ -200,6 +200,16 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
                 "needed_bytes": shortage.needed_bytes,
             })),
         ),
+        Err(LaunchError::Committed(committed)) => error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "memory committed",
+            Some(json!({
+                "code": "JOBS_MEMORY_COMMITTED",
+                "committed_bytes": committed.committed_bytes,
+                "quota_bytes": committed.quota_bytes,
+                "needed_bytes": committed.needed_bytes,
+            })),
+        ),
         Err(LaunchError::UserActive(active)) => error_body(
             StatusCode::SERVICE_UNAVAILABLE,
             "user active",

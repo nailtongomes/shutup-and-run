@@ -747,12 +747,20 @@ pub fn capacity_of(
     settings: &crate::config::Settings,
     machine: Machine,
 ) -> Option<Capacity> {
+    // On a shared PC its jobs may commit its memory less what it keeps
+    // for its owner (`Launcher::committed_for`): more slots would wait.
+    let memory = match settings.shared_pc {
+        true => machine
+            .memory_total
+            .map(|total| total.saturating_sub(settings.min_free_memory)),
+        false => machine.memory_total,
+    };
     capacity(
         summary,
         settings.max_job_memory,
         settings.max_job_cpus,
         settings.max_slots,
-        machine.memory_total,
+        memory,
         machine.cpus,
     )
 }
@@ -892,6 +900,7 @@ mod tests {
                     started_at: n * 1000,
                     callback_url: None,
                     managed: None,
+                    memory_limit: None,
                 })
                 .unwrap();
             store
@@ -944,6 +953,15 @@ mod tests {
         assert!(check
             .detail
             .contains("at max_job_memory 768m, 4 slots fit (now 1)"));
+        // On a shared PC that keeps 4 GiB for its owner, its jobs may
+        // commit 2 GiB together: 2 of 768m, not 4.
+        let mut shared = settings.clone();
+        shared.shared_pc = true;
+        shared.min_free_memory = 4 * 1024 * mib;
+        let check = crate::cli::capacity_check(&shared, &path, machine).unwrap();
+        assert!(check
+            .detail
+            .contains("at max_job_memory 768m, 2 slots fit (now 1)"));
 
         // Already as many slots as fit: nothing to say.
         settings.max_slots = 4;
@@ -989,6 +1007,7 @@ mod tests {
                     started_at: at,
                     callback_url: Some("https://api.example/result?secret=callback-secret".into()),
                     managed: None,
+                    memory_limit: None,
                 })
                 .unwrap();
         };

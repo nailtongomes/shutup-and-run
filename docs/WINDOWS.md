@@ -76,6 +76,7 @@ The person who owns the PC is working on it. Their work comes first, and three l
 | The WSL2 VM | 40% of the PC's RAM, half its logical processors | `%UserProfile%\.wslconfig` |
 | Each job | 1 CPU, 2 GiB of memory, no swap beyond it; one job at a time | `config.json`: `max_job_cpus`, `max_job_memory`, `max_slots` |
 | Starting a job | not while the VM has under 2 GiB of memory or 5 GiB of disk free | `config.json`: `min_free_memory`, `min_free_disk` |
+| Jobs at once, by memory | not while the memory limits of the jobs running, plus the new one's, pass the VM's memory less `min_free_memory` | `config.json`: `max_job_memory`, `min_free_memory` |
 | Starting a job, optional | only after the PC was not used for some time (off by default) | `config.json`: `min_idle_secs` |
 | Starting a job, optional | only inside the hours agreed with the owner, like `mon-fri 19-07; sat,sun` (any time by default) | `config.json`: `lend_hours` |
 | Starting a job | not on the battery below 60%, not while the person presents or has a program in full screen | fixed |

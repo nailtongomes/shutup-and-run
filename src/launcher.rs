@@ -64,6 +64,11 @@ pub enum LaunchError {
     /// The machine is short of memory or disk right now. Nothing was stored.
     #[error("{0}")]
     LowResources(crate::resources::Shortage),
+    /// On a shared PC, the memory limits of the jobs that have not ended
+    /// leave no room for this one's, however much is free right now. It
+    /// clears when one of them ends. Nothing was stored.
+    #[error("{0}")]
+    Committed(Committed),
     /// `min_idle_secs` is set and the person at the PC is using it.
     #[error("{0}")]
     UserActive(UserActive),
@@ -133,6 +138,29 @@ impl Sampled {
         self.cpu_ns = self.cpu_ns.max(read.cpu_ns);
         self.memory_peak = self.memory_peak.max(read.memory_bytes);
         self.network_bytes = self.network_bytes.max(read.network_bytes);
+    }
+}
+
+/// The memory limits of the jobs that have not ended, what a shared PC lets
+/// them commit together (`memory_total - min_free_memory`, the room the
+/// machine keeps for its owner taken off), and what one more job asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Committed {
+    pub committed_bytes: u64,
+    pub quota_bytes: u64,
+    pub needed_bytes: u64,
+}
+
+impl std::fmt::Display for Committed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::resources::human;
+        write!(
+            f,
+            "memory committed to jobs: {} of {}, {} more asked",
+            human(self.committed_bytes),
+            human(self.quota_bytes),
+            human(self.needed_bytes)
+        )
     }
 }
 
@@ -425,6 +453,36 @@ impl Launcher {
         crate::resources::shortage(free, memory, disk)
     }
 
+    /// Whether one more job with this memory limit fits beside the limits of
+    /// the jobs that have not ended. A different question from
+    /// `shortage_for`: a job that has just started uses little of its limit,
+    /// so the memory free now says nothing of what the jobs may come to use
+    /// together. Only on a shared PC, where every container has a limit;
+    /// without a reading of the machine's total, nothing to compare with.
+    fn committed_for(
+        &self,
+        job_memory: Option<i64>,
+        machine: &crate::safety::Readings,
+    ) -> Result<Option<Committed>, LaunchError> {
+        let (true, Some(job), Some(total)) = (
+            self.settings.shared_pc,
+            job_memory,
+            machine.inner.memory_total,
+        ) else {
+            return Ok(None);
+        };
+        let quota = total.saturating_sub(self.settings.min_free_memory);
+        let committed = self.store.committed_memory().map_err(store_err)?;
+        let needed = job.max(0) as u64;
+        Ok(
+            (committed.saturating_add(needed) > quota).then_some(Committed {
+                committed_bytes: committed,
+                quota_bytes: quota,
+                needed_bytes: needed,
+            }),
+        )
+    }
+
     /// Is it safe for the owner of this computer to start one more job, and
     /// did the owner agree to the risks there are? Only under the shared-PC
     /// profile; elsewhere the answer is always "open".
@@ -558,6 +616,19 @@ impl Launcher {
         safety
             .waiting_for()
             .or_else(|| self.shortage_for(None, machine).map(|s| s.to_string()))
+            .or_else(|| {
+                // A task that names no memory gets the machine's limit. With
+                // no job running there is nothing committed to wait for.
+                let job = self
+                    .settings
+                    .max_job_memory
+                    .map(|m| m.min(i64::MAX as u64) as i64);
+                self.committed_for(job, machine)
+                    .ok()
+                    .flatten()
+                    .filter(|c| c.committed_bytes > 0)
+                    .map(|c| c.to_string())
+            })
             .or_else(|| self.user_active().map(|u| u.to_string()))
             .or_else(|| self.lending_hold().map(|h| h.to_string()))
     }
@@ -897,8 +968,21 @@ impl Launcher {
                 ))
             }
         }
+        let committed = self.committed_for(spec.memory_bytes, &machine)?;
+        // A job whose limit alone is more than the machine commits to all
+        // its jobs would wait forever, here or on the memory free: refused,
+        // never cut down.
+        if let Some(over) = committed.filter(|c| c.needed_bytes > c.quota_bytes) {
+            return Err(LaunchError::BadRequest(format!(
+                "memory {} is above the {} bytes this machine commits to all its jobs",
+                over.needed_bytes, over.quota_bytes
+            )));
+        }
         if let Some(shortage) = self.shortage_for(spec.memory_bytes, &machine) {
             return Err(LaunchError::LowResources(shortage));
+        }
+        if let Some(committed) = committed {
+            return Err(LaunchError::Committed(committed));
         }
         if let Some(active) = self.user_active() {
             return Err(LaunchError::UserActive(active));
@@ -914,6 +998,7 @@ impl Launcher {
             started_at: self.clock.now_unix() as i64,
             callback_url,
             managed: managed.map(str::to_string),
+            memory_limit: spec.memory_bytes,
         };
         match self.store.insert_running(&record) {
             Ok(()) => {}
@@ -2870,6 +2955,103 @@ mod tests {
         // A job of the usual size still fits.
         started(&launcher, job("alpine", None)).await;
         assert_eq!(mock.start_count().await, 1);
+    }
+
+    /// A shared PC of 8 GiB (on Windows, the WSL2 VM), 1 GiB kept for its
+    /// owner: its jobs may commit 7 GiB together.
+    fn eight_gib(max_job_memory: Option<u64>) -> (Arc<Launcher>, Arc<MockRuntime>) {
+        let mock = Arc::new(MockRuntime::new());
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let mut cfg = settings(3);
+        cfg.shared_pc = true;
+        cfg.min_free_memory = GIB;
+        cfg.max_job_memory = max_job_memory;
+        let launcher = Launcher::with_clock(cfg, runtime, Arc::new(FakeClock::new(T0))).unwrap();
+        launcher.set_readings(eight_gib_free(7 * GIB + GIB / 2));
+        (launcher, mock)
+    }
+
+    fn eight_gib_free(available: u64) -> Readings {
+        let mut readings = with_memory(available);
+        readings.inner.memory_total = Some(8 * GIB);
+        readings
+    }
+
+    fn asking(memory: u64) -> LaunchRequest {
+        let mut request = job("alpine", None);
+        request.memory_bytes = Some(memory as i64);
+        request
+    }
+
+    #[tokio::test]
+    async fn two_jobs_that_each_fit_the_machine_wait_when_their_limits_together_do_not() {
+        let (launcher, mock) = eight_gib(Some(4 * GIB));
+        let first = started(&launcher, asking(4 * GIB)).await;
+        // The first has not used its memory yet: 7.3 GiB are free, more
+        // than the second's 4. What it may come to use is counted, not that.
+        launcher.set_readings(eight_gib_free(7 * GIB + 300 * MIB));
+        for source in [JobSource::Push, JobSource::Poll] {
+            match launcher.launch_from(asking(4 * GIB), source).await {
+                Err(LaunchError::Committed(c)) => assert_eq!(
+                    (c.committed_bytes, c.quota_bytes, c.needed_bytes),
+                    (4 * GIB, 7 * GIB, 4 * GIB)
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(mock.start_count().await, 1);
+        // A pull worker does not ask for a task of the machine's size, and
+        // the status says why.
+        assert_eq!(
+            launcher.live_status().await.waiting_for.as_deref(),
+            Some("memory committed to jobs: 4.0 GiB of 7.0 GiB, 4.0 GiB more asked")
+        );
+        // One that fits beside it starts: 7 of 7.
+        let second = started(&launcher, asking(3 * GIB)).await;
+        assert_eq!(mock.start_count().await, 2);
+
+        // When one ends, its limit is no longer counted.
+        mock.stop(&first, 0).await;
+        launcher.job(&first, false).await.unwrap();
+        let third = started(&launcher, asking(4 * GIB)).await;
+        assert_eq!(mock.start_count().await, 3);
+        for id in [&second, &third] {
+            mock.stop(id, 0).await;
+            launcher.job(id, false).await.unwrap();
+        }
+        assert!(launcher.live_status().await.waiting_for.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_memory_free_now_and_the_memory_committed_are_two_waits() {
+        // Within what the jobs may commit (3 of 7), but the person at the PC
+        // uses the memory: the physical wait, not the committed one.
+        let (launcher, mock) = eight_gib(None);
+        launcher.set_readings(eight_gib_free(2 * GIB));
+        match launcher.launch(asking(3 * GIB)).await {
+            Err(LaunchError::LowResources(short)) => {
+                assert_eq!((short.resource, short.needed_bytes), ("memory", 3 * GIB))
+            }
+            other => panic!("{other:?}"),
+        }
+        // A job whose limit alone is more than the 7 GiB would wait forever:
+        // refused, never cut down, even with nothing running.
+        launcher.set_readings(eight_gib_free(7 * GIB + GIB / 2));
+        match launcher.launch(asking(7 * GIB + GIB / 2)).await {
+            Err(LaunchError::BadRequest(msg)) => assert_eq!(
+                msg,
+                "memory 8053063680 is above the 7516192768 bytes this machine commits to all its jobs"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(mock.start_count().await, 0);
+
+        // Not a shared PC: no limit is given or counted.
+        let (launcher, mock, _) = harness(2);
+        launcher.set_readings(eight_gib_free(7 * GIB));
+        started(&launcher, asking(4 * GIB)).await;
+        started(&launcher, asking(4 * GIB)).await;
+        assert_eq!(mock.start_count().await, 2);
     }
 
     #[tokio::test]

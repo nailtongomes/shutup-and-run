@@ -42,7 +42,7 @@ jobs:
       tag: ${{ steps.read.outputs.tag }}
       release: ${{ steps.read.outputs.release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: read
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,7 +69,7 @@ jobs:
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -80,7 +80,7 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --target x86_64-unknown-linux-musl
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: shutup-and-run-x86_64-unknown-linux-musl
           path: target/x86_64-unknown-linux-musl/release/shutup-and-run
@@ -93,13 +93,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
       - run: bash scripts/android-ndk.sh >> "$GITHUB_ENV"
       - run: cargo build --release --locked --target aarch64-linux-android
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: shutup-and-run-aarch64-linux-android
           path: target/aarch64-linux-android/release/shutup-and-run
@@ -111,11 +111,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked
       - run: .\target\release\shutup-and-run.exe --help
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: shutup-and-run-x86_64-pc-windows-msvc.exe
           path: target/release/shutup-and-run.exe
@@ -124,15 +124,15 @@ jobs:
     needs: [version, musl, windows, android]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: shutup-and-run-x86_64-unknown-linux-musl
           path: musl
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: shutup-and-run-x86_64-pc-windows-msvc.exe
           path: windows
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: shutup-and-run-aarch64-linux-android
           path: android
@@ -148,7 +148,7 @@ jobs:
             shutup-and-run-aarch64-linux-android > SHA256SUMS)
           cat dist/SHA256SUMS
       # Creates the tag on this commit when it does not exist yet.
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           target_commitish: ${{ github.sha }}
@@ -194,7 +194,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: the release's binary, checked
@@ -221,7 +221,7 @@ jobs:
           worker=ghcr.io/nailtongomes/shutup-and-run
           docker build -t "${worker}:${TAG}" -t "${worker}:latest" .
           docker run --rm "${worker}:${TAG}" version --json
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -243,7 +243,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: the README one-liner

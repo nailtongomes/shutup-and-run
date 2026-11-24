@@ -23,6 +23,12 @@ pub const NOT_ON_WIFI: &str = "INTERNET_NOT_ON_WIFI";
 
 /// This build runs on Android.
 pub const PHONE: bool = cfg!(target_os = "android");
+/// `termux-battery-status` is not there: the `termux-api` package is not
+/// installed. No battery is read, so none holds a stream.
+pub const TERMUX_API_MISSING: &str = "TERMUX_API_MISSING";
+/// `termux-battery-status` is there and gave no reading in 15 seconds: the
+/// Termux:API app is not installed, or Android stopped it.
+pub const TERMUX_API_NO_ANSWER: &str = "TERMUX_API_NO_ANSWER";
 
 const TERMUX_PREFIX: &str = "/data/data/com.termux/files/usr";
 const TERMUX_HOME: &str = "/data/data/com.termux/files/home";
@@ -282,39 +288,61 @@ const BATTERY_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 /// package is there and the app is not.
 const BATTERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-type Reading = std::sync::Mutex<Option<(Battery, std::time::Instant)>>;
+/// The last reading and when, and why the last try gave none.
+type Reading = std::sync::Mutex<(Option<(Battery, std::time::Instant)>, Option<&'static str>)>;
+
+fn reading() -> &'static Reading {
+    static READING: std::sync::OnceLock<std::sync::Arc<Reading>> = std::sync::OnceLock::new();
+    READING.get_or_init(|| {
+        let reading = std::sync::Arc::new(Reading::default());
+        let writer = reading.clone();
+        std::thread::spawn(move || loop {
+            let read = read_battery();
+            {
+                let mut last = writer.lock().unwrap();
+                match read {
+                    Ok(battery) => *last = (Some((battery, std::time::Instant::now())), None),
+                    Err(why) => last.1 = Some(why),
+                }
+            }
+            std::thread::sleep(BATTERY_EVERY);
+        });
+        reading
+    })
+}
 
 /// The last reading, or None: without Termux:API, before the first reading
 /// and when it is stale. No reading never holds. The first call starts a
 /// thread that reads once a minute: each reading is a Java process, too
 /// slow and too costly for every 5 seconds.
 pub fn battery() -> Option<Battery> {
-    static READING: std::sync::OnceLock<std::sync::Arc<Reading>> = std::sync::OnceLock::new();
-    let reading = READING.get_or_init(|| {
-        let reading = std::sync::Arc::new(Reading::default());
-        let writer = reading.clone();
-        std::thread::spawn(move || loop {
-            if let Some(battery) = read_battery() {
-                *writer.lock().unwrap() = Some((battery, std::time::Instant::now()));
-            }
-            std::thread::sleep(BATTERY_EVERY);
-        });
-        reading
-    });
-    let reading = *reading.lock().unwrap();
-    reading
-        .filter(|(_, at)| at.elapsed() < BATTERY_STALE)
+    let (last, _) = *reading().lock().unwrap();
+    last.filter(|(_, at)| at.elapsed() < BATTERY_STALE)
         .map(|(battery, _)| battery)
 }
 
-fn read_battery() -> Option<Battery> {
+/// Why there is no battery reading: `TERMUX_API_MISSING` or
+/// `TERMUX_API_NO_ANSWER`. None while a fresh reading is there, or before
+/// the first try ended.
+pub fn battery_unread() -> Option<&'static str> {
+    let (last, why) = *reading().lock().unwrap();
+    match last {
+        Some((_, at)) if at.elapsed() < BATTERY_STALE => None,
+        _ => why,
+    }
+}
+
+fn read_battery() -> Result<Battery, &'static str> {
     use std::io::Read;
     let mut child = std::process::Command::new("termux-battery-status")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .ok()?;
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => TERMUX_API_MISSING,
+            _ => TERMUX_API_NO_ANSWER,
+        })?;
     let began = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -325,13 +353,18 @@ fn read_battery() -> Option<Battery> {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err(TERMUX_API_NO_ANSWER);
             }
         }
     }
     let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    parse_battery(&out)
+    child
+        .stdout
+        .take()
+        .ok_or(TERMUX_API_NO_ANSWER)?
+        .read_to_string(&mut out)
+        .map_err(|_| TERMUX_API_NO_ANSWER)?;
+    parse_battery(&out).ok_or(TERMUX_API_NO_ANSWER)
 }
 
 /// `~/.termux/boot/shutup-and-run-internet`: Termux:Boot runs every file of

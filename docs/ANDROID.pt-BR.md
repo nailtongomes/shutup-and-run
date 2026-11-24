@@ -70,12 +70,13 @@ battery: 72%, on a charger; below 60% on its battery, new streams wait
 
 Também dá para ver no navegador do próprio celular: `http://127.0.0.1:8788/`. A página tem os botões **Pausar 1 hora** e **Parar de compartilhar**.
 
-Quando novas conexões esperam, e por quê:
+Quando novas conexões esperam, e por quê (e um aviso que não para nada):
 
 | O status diz | O que acontece | O que fazer |
 | --- | --- | --- |
 | `INTERNET_NOT_ON_WIFI` | o celular saiu do Wi-Fi e você não liberou os dados móveis | voltar ao Wi-Fi; volta sozinho |
 | `BATTERY_LOW` | bateria abaixo de 60% e fora do carregador (só com o Termux:API) | ligar no carregador; volta em até 1 minuto |
+| `TERMUX_API_MISSING` ou `TERMUX_API_NO_ANSWER` | a bateria não é lida, então a bateria fraca não segura nada (compartilha até descarregar) | instalar o Termux:API (passo 1) e `pkg install termux-api`; abrir o app uma vez |
 | `INTERNET_NOT_RUNNING` | a economia de bateria fechou o Termux | o passo 3, e rodar `shutup-and-run internet on` de novo |
 
 Uma conexão que já começou nunca é cortada por essas esperas.
