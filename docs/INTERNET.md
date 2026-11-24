@@ -57,13 +57,13 @@ docker compose logs -f relay        # "PC <id> connected from <ip>", a line per 
 
 The image is the release's own musl binary on `scratch` (`examples/relay/Dockerfile`), so what the relay speaks is what that release's PCs speak. A 0.2.27 relay refuses 0.2.26 PCs (`update it`): update the PCs with the relay. To run a build of your own, copy a musl binary (AGENTS.md) beside the Dockerfile as `shutup-and-run` and `docker build`.
 
-The relay keeps nothing on disk. A restart drops every stream; the PCs come back by themselves within seconds. Once a minute the log has a line per PC whose numbers changed: `relay: PC <id>: 32 idle, 2 open`.
+The relay keeps nothing on disk. A restart drops every stream; the PCs come back by themselves within seconds. Once a minute the log has a line per PC whose numbers changed: `relay: PC <id>: 32 idle, 2 open`, and `, 3 refused at 140 streams` once it refused any ("How many at once").
 
-**Which PCs are there.** `GET /pcs` on the proxy port, with the relay's token as a bearer, lists every PC the relay knows, connected first: `id`, `connected`, `idle`, `open` (streams now), `seen_secs_ago`, and `sent_bytes` and `received_bytes` (the containers', since the relay started). Never a password or an address. A relay without a token answers `404`.
+**Which PCs are there.** `GET /pcs` on the proxy port, with the relay's token as a bearer, lists every PC the relay knows, connected first: `id`, `connected`, `idle`, `open` (streams now), `streams` (places taken of the 140, streams still being set up included), `busy` (streams refused for the 140, since the relay started), `seen_secs_ago`, and `sent_bytes` and `received_bytes` (the containers', since the relay started). Never a password or an address. A relay without a token answers `404`.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" http://172.17.0.1:8080/pcs
-# {"pcs":[{"connected":true,"id":"pc-cliente-01","idle":32,"open":3,"received_bytes":5120334,"seen_secs_ago":2,"sent_bytes":80211}]}
+# {"pcs":[{"busy":0,"connected":true,"id":"pc-cliente-01","idle":32,"open":3,"received_bytes":5120334,"seen_secs_ago":2,"sent_bytes":80211,"streams":3}]}
 ```
 
 By hand: `shutup-and-run relay --agents 0.0.0.0:7000 --proxy 172.17.0.1:8080 --token-file FILE` (the proxy on a private address).
@@ -109,14 +109,15 @@ What is different from a PC:
 
 - **Wi-Fi only, unless the person allows mobile data.** Every 5 seconds the phone reads which network its traffic leaves through: the address the kernel picks for the default route, and the interface that has it. `wlan0` is Wi-Fi; `rmnet_data0`, `ccmni0`, `seth_lte0` and the like are mobile data. On mobile data new connections wait (`INTERNET_NOT_ON_WIFI`) unless `--mobile-data`. A network it cannot name (a VPN's `tun0`, a maker's own name) counts as mobile data: the cost would fall on the person. `internet status` and the page show it: `network: Wi-Fi (wlan0); shares only on Wi-Fi`.
 - **A new network dials the relay at once.** When the interface or the address changes (Wi-Fi to mobile data, another Wi-Fi, the carrier gives a new IP, the signal comes back), the idle connections are closed and dialed again at once, and those waiting to retry stop waiting. Android itself closes the connections of a network that goes away. A stream open at that moment ends with its network, and the consumer's request fails; there is no failover.
-- **What it does not read.** The battery under 60%, presenting and Windows' metered flag come from Windows; nothing reads them on a phone. Keep it on its charger. `--hours`, `--max-day`, `pause` and the page's buttons work as on a PC.
+- **The battery, with Termux:API.** With the **Termux:API** app and Termux's `termux-api` package (`pkg install termux-api`), the phone reads its battery once a minute (`termux-battery-status`, a Java process each time, so not every 5 seconds): off its charger and under 60%, new connections wait (`BATTERY_LOW`), as on a Windows laptop. `internet status` and the page show it: `battery: 72%, on a charger`. Without Termux:API there is no reading, and no reading never holds: keep it on its charger. A reading older than 3 minutes counts as none.
+- **What it does not read.** Presenting and Windows' metered flag come from Windows. `--hours`, `--max-day`, `pause` and the page's buttons work as on a PC.
 - **Files.** `~/.shutup-and-run/` in Termux (`internet.json` mode 600, the status, the log). Uninstalling Termux deletes them.
 
 The binary is for 64-bit ARM, which nearly every phone sold since 2017 is (`uname -m` says `aarch64`). It links only Android's own C library, never a static one: a static binary resolves names from `/etc/resolv.conf`, which Android does not have.
 
 ### Install, once
 
-1. Install **Termux** from [F-Droid](https://f-droid.org/packages/com.termux/) or its [GitHub releases](https://github.com/termux/termux-app/releases), not from Google Play: the Play build is another one, and these steps were written for the F-Droid and GitHub builds. Install **Termux:Boot** from the same place, and open it once, so Android lets it start at boot.
+1. Install **Termux** from [F-Droid](https://f-droid.org/packages/com.termux/) or its [GitHub releases](https://github.com/termux/termux-app/releases), not from Google Play: the Play build is another one, and these steps were written for the F-Droid and GitHub builds. Install **Termux:Boot** from the same place, and open it once, so Android lets it start at boot. For the battery, **Termux:API** from the same place too, and `pkg install termux-api` in Termux. In Portuguese, step by step for the person with the phone: [ANDROID.pt-BR.md](ANDROID.pt-BR.md).
 2. In Termux, one line installs it and turns it on (0.2.31):
 
    ```sh
@@ -169,7 +170,7 @@ The [risks](#risks-and-what-is-left-out) of a PC, and:
 
 ### Testing it on a phone
 
-`tests/internet/termux.sh` runs in CI: the Android build in termux/termux-docker (Android's C library and Termux's files, on x86_64), with `fit`, the worker's commands refused, `on --wait`, `status` with the network, curl over HTTP and HTTPS through the relay, the bytes, the container's network removed (offline) and back (dialed again, curl works) and `off`. It cannot test a phone's radio, battery savers or IP. On a phone, with a relay on the server (the `docker run` above, `--open=8101=ID:PASSWORD` and `-p 172.17.0.1:8101:8101` for Chrome):
+`tests/internet/termux.sh` runs in CI: the Android build in termux/termux-docker (Android's C library and Termux's files, on x86_64), with `fit`, the worker's commands refused, `on --wait`, `status` with the network, curl over HTTP and HTTPS through the relay, the bytes, the container's network removed (offline) and back (dialed again, curl works), its interface renamed `rmnet0` (mobile data: new connections wait, then `--mobile-data` shares), a `termux-battery-status` that says 45% off the charger (`BATTERY_LOW`, then on a charger it shares again), a new version, `kill -9` and `off`. It cannot test a phone's radio, battery savers or IP. On a phone, with a relay on the server (the `docker run` above, `--open=8101=ID:PASSWORD` and `-p 172.17.0.1:8101:8101` for Chrome):
 
 1. Phone on Wi-Fi. In Termux: `curl https://api.ipify.org` prints the home's IP, `IP_WIFI`. `internet on --relay SERVER:7000 --token TOKEN --wait 60` says connected; `internet status` says `network: Wi-Fi (wlan0)`.
 2. Server: `curl https://api.ipify.org` prints the datacenter's IP. Through the phone, `docker run --rm curlimages/curl -s -x http://ID:PASSWORD@172.17.0.1:8080 https://api.ipify.org` prints `IP_WIFI`.
@@ -189,7 +190,7 @@ The [risks](#risks-and-what-is-left-out) of a PC, and:
 4. Wi-Fi off on the phone: within 10 seconds `internet status` says `INTERNET_NOT_ON_WIFI` and `network: mobile data (...)`; step 2 answers `503` after 10 seconds.
 5. `internet on --relay SERVER:7000 --mobile-data --max-day 1g --wait 60`: connected. Termux's `curl https://api.ipify.org` prints the carrier's IP, `IP_MOBILE`; steps 2 and 3 print `IP_MOBILE`.
 6. On the server, `while sleep 5; do curl -s -m 20 -x http://ID:PASSWORD@172.17.0.1:8080 https://api.ipify.org; echo; done`, and turn Wi-Fi on: `IP_MOBILE`, a few failures for at most about 20 seconds, then `IP_WIFI`. `~/.shutup-and-run/internet.log` has `network mobile data (...) -> Wi-Fi (wlan0)`. Airplane mode for a minute and off again: `offline`, then back the same way.
-7. Screen off for 30 minutes, on the charger and then on the battery: the loop goes on. If it stops, the battery section above.
+7. Screen off for 30 minutes, on the charger and then on the battery: the loop goes on. If it stops, the battery section above. With Termux:API, `internet status` says `battery: ..%, on its battery`; under 60% off the charger, step 2 answers `503`, and on the charger it works again within about a minute.
 8. Reboot the phone and unlock it without opening Termux: within a minute the loop prints the IP again.
 9. `internet status` counts the bytes; the operator's `GET /pcs` too. `internet off`: Termux's wake lock notification goes, and `/pcs` says `"connected":false`.
 
@@ -254,7 +255,7 @@ With the relay's limit (0.2.31), same server:
 | 140 streams | 7 | 105 | 0 | 1.1 s | 4.0 s | 135 |
 | 140 streams | 10 | 150 | 1 (`503`) | 1.3 s | 8.6 s | 140 |
 
-Seven streams were not enough for one browser: Chrome keeps several tunnels open between pages, and the next ones waited and failed. 140 carried seven browsers with no failure; ten went past it and one page of 150 got the `503`.
+Seven streams were not enough for one browser: Chrome keeps several tunnels open between pages, and the next ones waited and failed. 140 carried seven browsers with no failure; ten went past it and one page of 150 got the `503`. Whether 140 is enough for real tasks shows on the relay: `streams` and `busy` in `GET /pcs`, and the log line's `refused at 140 streams`. A `busy` that grows means more consumers than the PC carries; send them to another PC.
 
 Before the limit, both carried 10 browsers with no failure and in about the same time: more idle connections did not make pages faster here. What changed is the margin: 10 browsers held up to 192 streams at once, three quarters of the old 256, past which a PC starts no new idle connection; 512 leaves room for heavier pages or a few more consumers. On a client's PC the limit that counts is the home connection's upload: every page a consumer loads leaves the relay as the PC's download and comes back as its upload. A 10 Mbit/s upload is about 1 MB/s for all of them together; ten browsers on heavy pages share that. The relay's own cost is small: an idle connection is a socket and a ping every 10 s.
 

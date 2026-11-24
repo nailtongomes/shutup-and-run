@@ -250,6 +250,9 @@ pub struct Status {
     /// The network the phone's traffic leaves through. Only on Android.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<crate::android::Seen>,
+    /// The phone's battery, when Termux:API reads it. Only on Android.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery: Option<crate::android::Battery>,
     pub updated_at: String,
 }
 
@@ -766,8 +769,12 @@ where
 // ---------------------------------------------------------------------------
 // The waits
 
-/// What Windows says that only it knows; a Linux machine reads its own clock.
+/// What Windows says that only it knows; a phone, its battery; a Linux
+/// machine reads its own clock.
 fn feed() -> Option<crate::host::Feed> {
+    if crate::android::PHONE {
+        return crate::android::battery().map(crate::android::Battery::feed);
+    }
     cfg!(windows).then(|| crate::wsl::host_feed(None))
 }
 
@@ -1005,6 +1012,9 @@ pub async fn serve(dir: &Path, background: bool) -> Result<ExitCode, String> {
             last_error: shared.last_error.lock().unwrap().clone(),
             hold,
             network: network.as_ref().map(|n| n.seen.clone()),
+            battery: crate::android::PHONE
+                .then(crate::android::battery)
+                .flatten(),
             updated_at: String::new(),
         };
         if status.state != last_state {
@@ -1696,6 +1706,13 @@ pub fn status_out(
                 }
             ));
         }
+        if let Some(battery) = status.and_then(|s| s.battery) {
+            text.push_str(&format!(
+                "\nbattery: {}; below {}% on its battery, new streams wait",
+                battery.text(),
+                crate::lending::BATTERY_MIN_PERCENT
+            ));
+        }
         if let Some(hours) = &settings.lend_hours {
             text.push_str(&format!("\nhours: {hours}"));
         }
@@ -2037,6 +2054,21 @@ pub(crate) fn render(
                             t("mobile data allowed", "dados móveis permitidos")
                         } else {
                             t("only Wi-Fi", "só Wi-Fi")
+                        }
+                    ));
+                }
+                if let Some(battery) = status.and_then(|s| s.battery) {
+                    body.push_str(&format!(
+                        "<tr><th>{}</th><td>{}% ({})</td></tr>",
+                        t("Battery", "Bateria"),
+                        battery.percent,
+                        if battery.plugged {
+                            t("on a charger", "no carregador")
+                        } else {
+                            t(
+                                "on its battery; below 60% new streams wait",
+                                "na bateria; abaixo de 60% as novas conexões esperam",
+                            )
                         }
                     ));
                 }
@@ -2484,6 +2516,48 @@ mod tests {
             "dialed {} times after the change",
             dialed.load(Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn a_phone_on_its_battery_below_sixty_percent_holds_new_streams() {
+        use crate::android::Battery;
+        let now = 1_800_000_000;
+        let s = settings("relay.example.com:7000");
+        let low = Battery {
+            percent: 45,
+            plugged: false,
+        };
+        let hold = hold_now(&s, None, Some(low.feed()), None, now, 0).unwrap();
+        assert_eq!(hold.code, crate::lending::BATTERY_LOW);
+        assert!(hold.detail.contains("45%"), "{}", hold.detail);
+        let charging = Battery {
+            plugged: true,
+            ..low
+        };
+        assert_eq!(
+            hold_now(&s, None, Some(charging.feed()), None, now, 0),
+            None
+        );
+        let full = Battery { percent: 90, ..low };
+        assert_eq!(hold_now(&s, None, Some(full.feed()), None, now, 0), None);
+        let status = Status {
+            state: "waiting".to_string(),
+            hold: Some(hold),
+            battery: Some(low),
+            updated_at: crate::status::unix_to_iso(now),
+            ..Status::default()
+        };
+        let (value, text, _) = status_out(Some(&s), Some(&status), now);
+        assert!(
+            text.contains(
+                "battery: 45%, on its battery; below 60% on its battery, new streams wait"
+            ),
+            "{text}"
+        );
+        assert_eq!(value["status"]["battery"]["percent"], 45);
+        assert!(render(Some(&s), Some(&status), now, true).contains("45% (na bateria"));
+        let pc = serde_json::to_value(Status::default()).unwrap();
+        assert!(pc.get("battery").is_none(), "{pc}");
     }
 
     #[test]

@@ -408,7 +408,7 @@ jobs:
           retention-days: 7
       - run: cargo build --release --locked --target x86_64-linux-android
       - name: internet sharing in Termux
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: bash tests/internet/termux.sh target/x86_64-linux-android/release/shutup-and-run
 
   musl:

@@ -70,13 +70,15 @@ struct Idle {
 
 /// What a PC carries now, when any of its connections was last alive, in
 /// milliseconds since the relay started, and the bytes of the streams it
-/// carried since then: sent by the containers, received by them.
+/// carried since then: sent by the containers, received by them, and how
+/// many streams it refused for carrying `PC_STREAMS` already.
 #[derive(Default)]
 pub(crate) struct Stats {
     open: AtomicUsize,
     seen: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
+    busy: AtomicU64,
 }
 
 /// One PC: its password and its idle connections, each held by a task that
@@ -136,18 +138,20 @@ impl Relay {
         id: &str,
         secret: &str,
     ) -> Result<OwnedSemaphorePermit, ClaimError> {
-        let streams = {
+        let (streams, stats) = {
             let pools = self.pools.lock().unwrap();
-            pools
+            let pool = pools
                 .get(id)
                 .filter(|pool| same(&pool.secret, secret))
-                .ok_or(ClaimError::Login)?
-                .streams
-                .clone()
+                .ok_or(ClaimError::Login)?;
+            (pool.streams.clone(), pool.stats.clone())
         };
         match tokio::time::timeout(self.stream_wait, streams.acquire_owned()).await {
             Ok(Ok(permit)) => Ok(permit),
-            _ => Err(ClaimError::Busy),
+            _ => {
+                stats.busy.fetch_add(1, Ordering::Relaxed);
+                Err(ClaimError::Busy)
+            }
         }
     }
 
@@ -294,14 +298,26 @@ impl Relay {
     }
 
     /// One line per PC whose numbers changed: `id: idle N, open M`.
-    fn summary(&self, last: &mut HashMap<String, (usize, usize)>) -> Vec<String> {
+    fn summary(&self, last: &mut HashMap<String, (usize, usize, u64)>) -> Vec<String> {
         let mut pools = self.pools.lock().unwrap();
         let mut lines = Vec::new();
         for (id, pool) in pools.iter_mut() {
             pool.idle.retain(|idle| !idle.claim.is_closed());
-            let now = (pool.idle.len(), pool.stats.open.load(Ordering::Relaxed));
+            let stats = &pool.stats;
+            let now = (
+                pool.idle.len(),
+                stats.open.load(Ordering::Relaxed),
+                stats.busy.load(Ordering::Relaxed),
+            );
             if last.get(id) != Some(&now) {
-                lines.push(format!("relay: PC {id}: {} idle, {} open", now.0, now.1));
+                let busy = match now.2 {
+                    0 => String::new(),
+                    n => format!(", {n} refused at {PC_STREAMS} streams"),
+                };
+                lines.push(format!(
+                    "relay: PC {id}: {} idle, {} open{busy}",
+                    now.0, now.1
+                ));
                 last.insert(id.clone(), now);
             }
         }
@@ -318,6 +334,8 @@ fn pool_state(id: &str, pool: &mut Pool, now: u64) -> serde_json::Value {
         "connected": !pool.idle.is_empty(),
         "idle": pool.idle.len(),
         "open": stats.open.load(Ordering::Relaxed),
+        "streams": PC_STREAMS - pool.streams.available_permits(),
+        "busy": stats.busy.load(Ordering::Relaxed),
         "seen_secs_ago": now.saturating_sub(stats.seen.load(Ordering::Relaxed)) / 1000,
         "sent_bytes": stats.sent.load(Ordering::Relaxed),
         "received_bytes": stats.received.load(Ordering::Relaxed),
@@ -1334,7 +1352,7 @@ mod tests {
         let proxy = listener.local_addr().unwrap();
         let relay = Relay::with_stream_wait(proxy.port(), Duration::from_millis(800));
         tokio::spawn(accept_agents(relay.clone(), agents));
-        tokio::spawn(accept_proxy(relay, listener, None));
+        tokio::spawn(accept_proxy(relay.clone(), listener, None));
         let (_s_tx, s_rx) = watch::channel(settings(agents_addr));
         let (_h_tx, h_rx) = watch::channel(None);
         let shared = Arc::new(Shared::default());
@@ -1365,6 +1383,18 @@ mod tests {
         assert!(
             began.elapsed() >= Duration::from_millis(700),
             "it waited first"
+        );
+        // The operator sees it: every place taken, one refused.
+        let state = relay.status("pc-test", SECRET).unwrap();
+        assert_eq!(state["streams"], PC_STREAMS);
+        assert_eq!(state["busy"], 1);
+        let mut last = HashMap::new();
+        assert!(
+            relay
+                .summary(&mut last)
+                .iter()
+                .any(|line| line.ends_with(", 1 refused at 140 streams")),
+            "{last:?}"
         );
 
         // One ends while the next waits: the next gets through.

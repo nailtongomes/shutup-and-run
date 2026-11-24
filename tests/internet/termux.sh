@@ -5,9 +5,11 @@
 # scripts/install-termux.sh (a wrong checksum refused, then the install and
 # `internet on` from its variables), `fit` and the worker's commands,
 # `status`, `credentials`, curl through the proxy, the bytes, a change of
-# network (the container's network disconnected and connected again), a
-# new version stopping the old process, the process killed and started
-# again by its boot script, and `off`.
+# network (the container's network disconnected and connected again), mobile
+# data (its interface renamed rmnet0: new streams wait, until
+# `--mobile-data`), a battery below 60% (a `termux-battery-status` that
+# prints one), a new version stopping the old process, the process killed
+# and started again by its boot script, and `off`.
 # It proves the Android code paths, not a phone's radio, battery or IP:
 # docs/INTERNET.md, "Android", has the test on a phone.
 #
@@ -15,7 +17,8 @@
 #   cargo build --release --locked --target x86_64-linux-android
 #   bash tests/internet/termux.sh target/x86_64-linux-android/release/shutup-and-run
 #
-# Needs Docker and the internet. CA_BUNDLE=FILE gives curl inside the
+# Needs Docker, `ip` and `nsenter` (as root, or sudo) and the internet. About
+# five minutes: the battery is read once a minute. CA_BUNDLE=FILE gives curl inside the
 # container a CA bundle, behind a proxy that inspects TLS.
 set -euo pipefail
 
@@ -39,6 +42,18 @@ if [[ "${1:-}" != inside ]]; then
   docker run -d --name "$name" -v "$dist:/dist:ro" -v "$here:/t:ro" \
     -v "$here/../../scripts:/s:ro" "${ca[@]}" "$image" sleep 900 >/dev/null
   phase() { docker exec "$name" bash /t/termux.sh inside "$@"; }
+  sudo=()
+  [[ $EUID -eq 0 ]] || sudo=(sudo)
+  netns() { "${sudo[@]}" nsenter -t "$(docker inspect -f '{{.State.Pid}}' "$name")" -n "$@"; }
+  # The container's interface renamed, as a phone's modem is named.
+  rename() {
+    local gw
+    gw=$(netns ip -4 route show default | awk '{ print $3; exit }')
+    netns ip link set "$1" down
+    netns ip link set "$1" name "$2"
+    netns ip link set "$2" up
+    netns ip route add default via "$gw" dev "$2"
+  }
   phase on
   # A new address, as when a phone moves from Wi-Fi to mobile data: the
   # relay is on loopback and stays, the links are dialed again.
@@ -46,6 +61,10 @@ if [[ "${1:-}" != inside ]]; then
   phase offline
   docker network connect bridge "$name"
   phase back
+  rename eth0 rmnet0
+  phase mobile
+  rename rmnet0 eth0
+  phase battery
   phase restart
   phase off
   echo "termux.sh: all passed"
@@ -132,6 +151,39 @@ back)
     fail "curl after the change"
   [[ "$code" == 200 ]] || fail "after the change: $code"
   pass "network back: dialed again, connected, curl works"
+  ;;
+mobile)
+  wait_for 20 '"kind":"mobile"' || fail "rmnet0 is not mobile data"
+  wait_for 10 INTERNET_NOT_ON_WIFI || fail "no wait on mobile data"
+  "$sar" internet status | grep -q "^network: mobile data (rmnet0); shares only on Wi-Fi" ||
+    fail "status on mobile data: $("$sar" internet status)"
+  code=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' -x "$(proxy)" https://example.com 2>/dev/null) || true
+  [[ "$code" != 200 ]] || fail "a stream went out on mobile data"
+  pass "on mobile data (rmnet0): new streams wait, INTERNET_NOT_ON_WIFI"
+  out=$("$sar" internet on --relay 127.0.0.1:7000 --mobile-data --wait 30) || fail "on --mobile-data: $out"
+  wait_for 15 '"state":"connected"' || fail "not connected with --mobile-data"
+  code=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' -x "$(proxy)" https://example.com) ||
+    fail "curl on mobile data"
+  [[ "$code" == 200 ]] || fail "on mobile data with --mobile-data: $code"
+  pass "--mobile-data, given at the phone: it shares on mobile data"
+  ;;
+battery)
+  # Termux:API's program, as on a phone at 45% off its charger.
+  fake=$PREFIX/bin/termux-battery-status
+  printf '#!%s/bin/sh\ncat %s\n' "$PREFIX" "$HOME/battery.json" >"$fake"
+  chmod 755 "$fake"
+  echo '{"percentage":45,"plugged":"UNPLUGGED","status":"DISCHARGING"}' >"$HOME/battery.json"
+  wait_for 75 BATTERY_LOW || fail "no wait at 45% on the battery"
+  "$sar" internet status | grep -q "^battery: 45%, on its battery" ||
+    fail "status names the battery: $("$sar" internet status)"
+  pass "45% on its battery: new streams wait, BATTERY_LOW"
+  echo '{"percentage":45,"plugged":"PLUGGED_AC","status":"CHARGING"}' >"$HOME/battery.json"
+  wait_for 75 '"plugged":true' || fail "the charger was not seen"
+  wait_for 15 '"state":"connected"' || fail "not connected on the charger"
+  code=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' -x "$(proxy)" https://example.com) ||
+    fail "curl on the charger"
+  [[ "$code" == 200 ]] || fail "on the charger: $code"
+  pass "on a charger: it shares again"
   ;;
 restart)
   # What an update looks like to `on`: the process is of another version.

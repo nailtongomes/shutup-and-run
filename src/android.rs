@@ -232,6 +232,108 @@ fn interface_of(_address: IpAddr) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Termux: the process, the boot and the wake lock
 
+/// The phone's battery, as Termux:API's `termux-battery-status` says it:
+/// its charge, and whether it is on a charger. Below
+/// `lending::BATTERY_MIN_PERCENT` and off the charger a new stream waits,
+/// as on a Windows laptop (`BATTERY_LOW`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Battery {
+    pub percent: u64,
+    pub plugged: bool,
+}
+
+impl Battery {
+    /// The same reading a Windows PC sends, so the same wait applies.
+    pub fn feed(self) -> crate::host::Feed {
+        crate::host::Feed {
+            on_battery: Some(!self.plugged),
+            battery_percent: Some(self.percent),
+            ..Default::default()
+        }
+    }
+
+    pub fn text(self) -> String {
+        format!(
+            "{}%, {}",
+            self.percent,
+            if self.plugged {
+                "on a charger"
+            } else {
+                "on its battery"
+            }
+        )
+    }
+}
+
+/// What `termux-battery-status` prints: `{"percentage": 85, "plugged":
+/// "UNPLUGGED", ...}`.
+pub fn parse_battery(json: &str) -> Option<Battery> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    Some(Battery {
+        percent: value["percentage"].as_u64().filter(|p| *p <= 100)?,
+        plugged: value["plugged"].as_str()? != "UNPLUGGED",
+    })
+}
+
+/// A reading older than this is no reading.
+const BATTERY_STALE: std::time::Duration = std::time::Duration::from_secs(180);
+const BATTERY_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// `termux-battery-status` waits for the Termux:API app forever when the
+/// package is there and the app is not.
+const BATTERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+type Reading = std::sync::Mutex<Option<(Battery, std::time::Instant)>>;
+
+/// The last reading, or None: without Termux:API, before the first reading
+/// and when it is stale. No reading never holds. The first call starts a
+/// thread that reads once a minute: each reading is a Java process, too
+/// slow and too costly for every 5 seconds.
+pub fn battery() -> Option<Battery> {
+    static READING: std::sync::OnceLock<std::sync::Arc<Reading>> = std::sync::OnceLock::new();
+    let reading = READING.get_or_init(|| {
+        let reading = std::sync::Arc::new(Reading::default());
+        let writer = reading.clone();
+        std::thread::spawn(move || loop {
+            if let Some(battery) = read_battery() {
+                *writer.lock().unwrap() = Some((battery, std::time::Instant::now()));
+            }
+            std::thread::sleep(BATTERY_EVERY);
+        });
+        reading
+    });
+    let reading = *reading.lock().unwrap();
+    reading
+        .filter(|(_, at)| at.elapsed() < BATTERY_STALE)
+        .map(|(battery, _)| battery)
+}
+
+fn read_battery() -> Option<Battery> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("termux-battery-status")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let began = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if began.elapsed() < BATTERY_TIMEOUT => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    parse_battery(&out)
+}
+
 /// `~/.termux/boot/shutup-and-run-internet`: Termux:Boot runs every file of
 /// that folder once the phone has started.
 pub fn boot_script_path() -> PathBuf {
@@ -346,6 +448,32 @@ pub fn terminate(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_battery_is_read_from_termux_api() {
+        let out = r#"{"health":"GOOD","percentage":45,"plugged":"UNPLUGGED","status":"DISCHARGING","temperature":30.1}"#;
+        let battery = parse_battery(out).unwrap();
+        assert_eq!(
+            battery,
+            Battery {
+                percent: 45,
+                plugged: false
+            }
+        );
+        assert_eq!(battery.text(), "45%, on its battery");
+        assert_eq!(battery.feed().on_battery, Some(true));
+        let charging = parse_battery(r#"{"percentage":80,"plugged":"PLUGGED_AC"}"#).unwrap();
+        assert!(charging.plugged);
+        assert_eq!(charging.text(), "80%, on a charger");
+        for bad in [
+            "",
+            "{}",
+            r#"{"percentage":"x","plugged":"UNPLUGGED"}"#,
+            r#"{"percentage":140,"plugged":"UNPLUGGED"}"#,
+        ] {
+            assert_eq!(parse_battery(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn the_interface_names_the_network() {

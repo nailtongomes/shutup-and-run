@@ -736,3 +736,10 @@ Decision: `relay::PC_STREAMS` is 7 × 20 = 140, a constant. A semaphore per PC, 
 
 Cost: a consumer that holds more than 20 streams, or more than 7 consumers at once, sees `503` after a 10-second wait, and the operator sees nothing but that answer (the relay's log has a line per stream). The number is a constant; changing it is a patch. The stand-in for noVNC tests the proxy and the WebSocket, not noVNC's own page.
 
+## What the relay refused, a phone's battery, and the Wi-Fi rule tested in CI
+
+Context: with 140 streams per PC the operator saw a refusal only as a `503` at the consumer; whether 7 consumers are enough could only be measured by hand. A phone read no battery, so a phone off its charger shared until it died. The Wi-Fi rule had only unit tests, and the person with the phone had steps only in English.
+
+Decision: the relay counts, per PC, the places taken of the 140 (`streams`) and the streams it refused for them (`busy`), in `GET /pcs`, the PC's `/status` and the minute's log line (`, 3 refused at 140 streams`). A phone with Termux:API reads its battery with `termux-battery-status` once a minute, on a thread of its own with a 15-second limit (the program waits forever when the package is there and the app is not), and gives it to the same wait as a Windows laptop (`lending::hold`, `BATTERY_LOW` under 60% off the charger); `internet status` and the page show it. `tests/internet/termux.sh` renames the container's interface `rmnet0` from the host (`nsenter`) and checks the wait and `--mobile-data`, and puts a `termux-battery-status` that prints 45% in Termux's `bin`. `docs/ANDROID.pt-BR.md` is the step by step in Portuguese. A file committed by mistake (`shot.bin`) is gone.
+
+Cost: Termux:API is a third app and a package; without it nothing changes, and no reading never holds. A reading is a Java process a minute, and the wait can start up to a minute late; one older than 3 minutes counts as none. The battery test makes `termux.sh` about two minutes longer. `busy` counts since the relay started and is not kept across a restart.
