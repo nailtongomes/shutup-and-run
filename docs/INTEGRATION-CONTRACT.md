@@ -41,6 +41,7 @@ The runner starts a container and reports how the container ended. It keeps no q
 {
   "image": "ghcr.io/you/worker:1.4.2",
   "job_key": "case-0001-attempt-1",
+  "concurrency_key": "account-0001",
   "env": {
     "SCRIPT_URL": "https://scripts.example.com/protocolar.py",
     "CUSTOMER_ID": "customer-placeholder",
@@ -61,12 +62,13 @@ The smallest one is `{"image": "ghcr.io/nailtongomes/shutup-and-run-smoke"}`.
 | --- | --- | --- | --- | --- |
 | `image` | yes | string, 1 to 512 bytes | | Lowercase. No whitespace or control characters, no `..`, no `//`, not starting with `-`, not ending with `:`. On a push it must match the allowlist. |
 | `job_key` | no | string, 1 to 200 of `A-Z a-z 0-9 . _ : -` | none | Idempotency on this one machine. See [section 6](#6-idempotency-and-delivery). |
+| `concurrency_key` | no | string, 1 to 200 of `A-Z a-z 0-9 . _ : -` | none | 0.2.34. Your own id for whose work this is: a person, a login, an account. At most `max_jobs_per_key` (2 by default) jobs with the same key that have not ended on this machine; one more is `429` `CONCURRENCY_KEY_BUSY`. An opaque id, never a person's own data (a tax id, an e-mail). A job with none is not counted. |
 | `env` | no | object of string to string, at most 128 entries | `{}` | A name matches `^[A-Za-z_][A-Za-z0-9_]*$`, at most 256 bytes. A value is at most 16384 bytes and has no NUL. |
 | `command` | no | array of at most 32 strings, each 1 to 4096 bytes, no NUL | the image's own | Docker `Cmd`. It replaces the image's default command, not its entrypoint. `[]` is the same as leaving it out. |
 | `timeout_secs` | no | integer, 1 to the machine's `max_timeout_secs` | the machine's `default_timeout_secs` (3600) | `max_timeout_secs` is 21600 by default and never above 604800. Counted from the container's start. Then SIGTERM, and SIGKILL 10 seconds later; `exit_code` is 137 either way. The image pull has its own limit, 30 minutes. |
 | `cpu` | no | number, above 0, at most 128 and at most the machine's `max_job_cpus` | the machine's `max_job_cpus`; no limit when it has none | Cores. `0.5`, `1`. A shared PC allows 1 by default. |
 | `memory` | no | positive integer of bytes, or a string such as `512m`, `1.5g`, `2GiB`, at most the machine's `max_job_memory` | the machine's `max_job_memory`; no limit when it has none | Units `b k kb kib m mb mib g gb gib`, any case, all powers of 1024. Swap is set to the same value, so the container gets no swap beyond it. A shared PC allows `2g` by default, less on a small one. See [Resource limits](#resource-limits-of-a-machine). |
-| `shm` | no | as `memory` | Docker's 64 MiB | Size of `/dev/shm`. A browser usually needs `1g` or more. |
+| `shm` | no | as `memory` | the machine's `default_job_shm`: 1 GiB under the `server` profile, otherwise Docker's 64 MiB | Size of `/dev/shm`. A browser usually needs `1g` or more. What a job writes there counts against its `memory`. |
 | `callback_url` | no | string, at most 2048 bytes, `http` or `https` with a host, no whitespace | none | See [section 5](#5-callback). |
 
 Rules that hold for every field:
@@ -111,9 +113,10 @@ Content-Type: application/json
 | `403` | `{"error":"image is not allowlisted"}` | | Fix the image or the machine's allowlist. |
 | `413` | plain text | The body is over 64 KiB. | Fix the request. |
 | `429` | `{"error":"no free slots","slots_total":2,"slots_used":2,"slots_free":0}` | Full. Nothing was stored, the `job_key` included. | Try the next machine, or this one later. |
+| `429` | `{"error":"concurrency key busy","code":"CONCURRENCY_KEY_BUSY","concurrency_key":"account-0001","running":2,"limit":2}` | `max_jobs_per_key` jobs with this `concurrency_key` have not ended on this machine (0.2.34). Nothing was stored, the `job_key` included. | Put it back in your queue; send it when one of that key ends. |
 | `503` | `{"error":"draining","draining":true}` | Draining for maintenance. Nothing was stored. | Try the next machine. |
 | `503` | `{"error":"insufficient resources","resource":"memory","free_bytes":536870912,"needed_bytes":2147483648}` | The machine is short of memory or disk right now (`resource` is `memory` or `disk`). Nothing was stored, the `job_key` included. It clears by itself. | Try the next machine, or this one later. |
-| `503` | `{"error":"memory committed","code":"JOBS_MEMORY_COMMITTED","committed_bytes":4294967296,"quota_bytes":7516192768,"needed_bytes":4294967296}` | A shared PC (`resource_profile` `shared-pc`) where the memory limits of the jobs that have not ended, plus this one's, are more than its jobs may commit together: its memory (on Windows, the WSL2 VM's) less `min_free_memory`. However much is free now: a job that has just started uses little of its limit. Nothing was stored, the `job_key` included. It clears when one of them ends. A job whose limit alone is more than that is a `400` instead. | Try the next machine, or this one later. |
+| `503` | `{"error":"memory committed","code":"JOBS_MEMORY_COMMITTED","committed_bytes":4294967296,"quota_bytes":7516192768,"needed_bytes":4294967296}` | A shared PC (`resource_profile` `shared-pc`) or a server (`server`, 0.2.34) where the memory limits of the jobs that have not ended, plus this one's, are more than its jobs may commit together: its memory (on Windows, the WSL2 VM's) less `min_free_memory`. However much is free now: a job that has just started uses little of its limit. Nothing was stored, the `job_key` included. It clears when one of them ends. A job whose limit alone is more than that is a `400` instead. | Try the next machine, or this one later. |
 | `503` | `{"error":"user active","idle_secs":12,"needed_secs":300}` | A Windows PC with `min_idle_secs` set, and its owner is using it. Nothing was stored, the `job_key` included. It clears by itself. | Try the next machine, or this one later. |
 | `503` | `{"error":"not lending now","code":"OUTSIDE_LEND_HOURS","detail":"outside lend_hours mon-fri 19-07 (now wed 14:05)"}` | The machine does not lend itself now: outside its `lend_hours` (`OUTSIDE_LEND_HOURS`), a Windows PC on its battery below 60% (`BATTERY_LOW`), a person at the PC presenting or with a program in full screen (`USER_PRESENTING`), or a Windows PC on a metered network (`METERED_NETWORK`). Nothing was stored, the `job_key` included. It clears by itself. | Try the next machine, or this one later. |
 | `503` | `{"error":"blocked for safety","code":"SAFETY_BLOCKED","reasons":[{"code":"SAFETY_MEMORY_CRITICAL","level":"blocked","detail":"this PC: 600 MiB of 5.0 GiB available"}]}` | A shared PC (`resource_profile` `shared-pc`) in a critical state: memory, disk or processor at a critical level, a reading the worker could not take, or three jobs killed for memory in half an hour (`SAFETY_OOM_BREAKER`, a 15 minute pause). Nothing was stored, the `job_key` included. It clears by itself, and nothing a caller or the owner does lifts it sooner. | Try the next machine, or this one later. After `SAFETY_OOM_BREAKER`, send work that needs less memory, or give it more. |
@@ -122,9 +125,9 @@ Content-Type: application/json
 | `502` | `{"error":"job history is unavailable"}` | The SQLite file could not be read or written. | Same. |
 | `409` | `{"error":"managed mode","code":"MANAGED_MODE"}` | The machine is in managed mode: it runs containers defined on it and takes no job from outside, by push or by poll. Nothing was stored, the `job_key` included. It stays until a person at the machine turns managed mode off. | Try the next machine. Do not retry this one in a loop. |
 
-A request is checked in this order, and the first failure answers: ban, token, body size, JSON shape, `image` name, allowlist, `timeout_secs`, `env`, `command`, `job_key`, `callback_url`, `cpu`, `memory`, managed mode, drain, `job_key` lookup, slots, safety block, owner's authorization, a memory limit above what the machine commits to all its jobs (`400`), free memory and disk, memory committed to jobs, idle time. Two consequences: a draining machine answers `503` even for a `job_key` it already holds, and a repeat of a known `job_key` with an invalid body is a `400`.
+A request is checked in this order, and the first failure answers: ban, token, body size, JSON shape, `image` name, allowlist, `timeout_secs`, `env`, `command`, `job_key`, `concurrency_key`, `callback_url`, `cpu`, `memory`, managed mode, drain, `job_key` lookup, slots, `concurrency_key` count, safety block, owner's authorization, a memory limit above what the machine commits to all its jobs (`400`), free memory and disk, memory committed to jobs, idle time. Two consequences: a draining machine answers `503` even for a `job_key` it already holds, and a repeat of a known `job_key` with an invalid body is a `400`.
 
-The `400` messages: `invalid image name`, `timeout_secs must be greater than zero`, `timeout_secs <n> is above the maximum <max>`, `env accepts at most 128 variables`, `invalid environment variable: <name>`, `invalid value for <name>`, `command accepts at most 32 arguments`, `invalid command argument`, `job_key must be 1-200 characters of letters, digits, '.', '_', ':' or '-'`, `callback_url is invalid`, `callback_url must be http or https`, `cpu must be a number between 0 and 128`, `cpu is invalid`, `cpu <n> is above this machine's limit of <max> per job`, `memory <bytes> is above this machine's limit of <max> bytes per job`. Match on the status, not on the text.
+The `400` messages: `invalid image name`, `timeout_secs must be greater than zero`, `timeout_secs <n> is above the maximum <max>`, `env accepts at most 128 variables`, `invalid environment variable: <name>`, `invalid value for <name>`, `command accepts at most 32 arguments`, `invalid command argument`, `job_key must be 1-200 characters of letters, digits, '.', '_', ':' or '-'`, `concurrency_key must be 1-200 characters of letters, digits, '.', '_', ':' or '-'`, `callback_url is invalid`, `callback_url must be http or https`, `cpu must be a number between 0 and 128`, `cpu is invalid`, `cpu <n> is above this machine's limit of <max> per job`, `memory <bytes> is above this machine's limit of <max> bytes per job`. Match on the status, not on the text.
 
 ### Resource limits of a machine
 
@@ -134,6 +137,7 @@ A machine may cap what one job gets (`max_job_cpus`, `max_job_memory`) and refus
 - A job that names more than the limit is a `400`, on a push and on a polled task alike. It is not cut down silently: the sender should know the machine is smaller than it thought.
 - Short of memory or disk, a push gets the `503` above, and a pull worker **does not poll**, the same as when it has no free slot. A task is never asked for and then dropped for lack of memory.
 - Under `shared-pc` the limits of the jobs that have not ended add up, and with this one's they may not pass the machine's memory less `min_free_memory`: on a 4 GiB machine with the defaults, one job of `2g` at a time, whatever `max_slots` says. Two jobs that each fit what is free now can be more than that together, since a job that has just started uses little of its limit. The second gets `503` `memory committed`, and a pull worker with a job running does not poll while a task of `max_job_memory` would not fit beside it.
+- The `server` profile (0.2.34, Linux, asked for by name: `resource_profile = "server"`) is a machine that only runs jobs: 1 CPU, `1.5g` and a `1g` `/dev/shm` per job, a new job needs `10g` of disk and a sixteenth of the memory (2 to 8 GiB) left over, the limits add up as on a shared PC, and at most `max_starting` (5) jobs start at once. A job over that last number is still `202`: it holds its slot and waits its turn before its pull, and its `timeout_secs` counts from its own start. No safety assessment and no owner's consent apply. See [SERVER.md](SERVER.md).
 - The limits are not in the poll body. An orchestrator that serves shared PCs sends tasks that fit the defaults, or names `cpu` and `memory` at or below them.
 
 ### Acceptance is not a started container
@@ -157,12 +161,12 @@ If the pull or the start fails, the job ends with `reason` `start_failed` and `e
 | `started_at` | integer | Unix seconds, UTC. When the job was accepted, before the pull. |
 | `ended_at` | integer or `null` | Unix seconds, UTC. |
 | `exit_code` | integer or `null` | The container's exit code. `137` after a timeout kill. `null` while running, after `start_failed`, and for an `interrupted` job whose container was gone. |
-| `reason` | `exited`, `timeout_kill`, `start_failed`, `interrupted`, or `null` | `null` while running. |
+| `reason` | `exited`, `timeout_kill`, `start_failed`, `interrupted`, `launcher_kill`, or `null` | `null` while running. `launcher_kill` is a cancel (0.2.34). |
 | `duration_secs` | integer or `null` | `ended_at - started_at`. It includes the pull. |
 
 All nine keys are always present. A tenth, `"oom_killed": true`, is added only when Docker recorded that the kernel killed a process of the container for memory: the job reached its memory limit. It is never `false`: a job that was not killed for memory, a plain `SIGKILL` with `exit_code` 137 included, does not carry the key. `reason` stays `exited`. The same work with the same `memory` will most likely end the same way, so change one of the two before sending it again.
 
-`GET /v1/jobs/{id}` returns the same object, for as long as the row is in the history (`history_days`, 30 by default), across restarts. `?logs=true` adds `logs`, the last `log_lines` (200) lines the container printed, or one line saying why the start failed. An unknown id is `404` `{"id":"<id>","status":"not_found"}`. There is no listing of jobs and no lookup by `job_key` other than pushing the same key again. There is no cancel.
+`GET /v1/jobs/{id}` returns the same object, for as long as the row is in the history (`history_days`, 30 by default), across restarts. `?logs=true` adds `logs`, the last `log_lines` (200) lines the container printed, or one line saying why the start failed. An unknown id is `404` `{"id":"<id>","status":"not_found"}`. There is no lookup by `job_key` other than pushing the same key again. The jobs that have not ended are listed by `GET /v1/jobs?state=running`, and one is canceled by `DELETE /v1/jobs/{id}` (both 0.2.34, [section 7](#7-other-routes)).
 
 ### Examples
 
@@ -428,6 +432,7 @@ The body is the [JobResult](#jobresult) of a job that has ended: the same nine k
 | `interrupted` | `null`, or not `0` (often `137`, `143` or `255`) | Something stopped under the job and the runner cannot say how it ended: the PC was shut down, signed out or lost power, WSL or Docker stopped, or the runner itself was not running. Either the container was gone (`null`), or it was found stopped with that code when the runner started again. Whether the work was done is unknown. **The runner does not start it again**: the orchestrator decides. |
 | `timeout_kill` | `137` | SIGTERM at `timeout_secs`, SIGKILL 10 seconds later. 137 even when the job exited on SIGTERM. |
 | `start_failed` | `null` | The image could not be pulled, or the container could not be started. Nothing ran. |
+| `launcher_kill` | `137`, or `null` | Canceled (0.2.34): `DELETE /v1/jobs/{id}`, or a person at the machine. SIGTERM, SIGKILL 10 seconds later, 137 whatever the job answered; `null` when it was canceled before its container started. |
 
 **Delivery.**
 
@@ -473,7 +478,7 @@ Match the callback to the task by `job_key`. `id` is the worker's own name for t
 
 **If the API offers the same task again** (same `job_key`, same machine): the worker finds the key in its history, starts no container, and sends no callback for the repeat. Its log says `poll task already recorded`. This holds while the first job runs, after it ended, and after it failed. So offering a task until its callback arrives is safe on that machine, and a task whose callback was lost is not recovered by offering it again ([limit 3](#9-limits-of-the-current-contract)).
 
-**This idempotency is per worker and lives in that worker's local history.** It is one SQLite file on the machine. Another worker runs the same key as new work. The same worker forgets a key when its row leaves the history (`history_days`, 30 by default, and at most 500 finished jobs) or when the history file is gone: a reinstall on Linux that removes `/var/lib/shutup-and-run`, an uninstall of the Windows distribution. After that the key runs again. The queue, and the record of which task went to which machine, stay with your API.
+**This idempotency is per worker and lives in that worker's local history.** It is one SQLite file on the machine. Another worker runs the same key as new work. The same worker forgets a key when its row leaves the history (`history_days`, 30 by default, and at most 500 finished jobs, 50 000 on a server) or when the history file is gone: a reinstall on Linux that removes `/var/lib/shutup-and-run`, an uninstall of the Windows distribution. After that the key runs again. The queue, and the record of which task went to which machine, stay with your API.
 
 `tests/poll-mock` runs exactly this with the key `task-1042-attempt-1`: one task, its callback, and the second offer that starts nothing. See [its README](../tests/poll-mock/README.md#one-task-from-the-poll-to-its-callback).
 
@@ -509,8 +514,10 @@ Every route needs `Authorization: Bearer <runner-token>`, `/health` and `/metric
 | Route | |
 | --- | --- |
 | `GET /v1/jobs/{id}` | A [JobResult](#jobresult). `?logs=true` adds `logs`. `404` `{"id":"...","status":"not_found"}`. |
+| `GET /v1/jobs?state=running` | 0.2.34. `200` `{"state":"running","slots_total":75,"slots_used":2,"slots_free":73,"jobs":[...]}`, the jobs that have not ended, oldest first. Each: `id`, `image`, `job_key`, `concurrency_key`, `phase` (`starting` while it waits its turn or pulls, then `running`), `started_at`, and what it used so far, from a reading every 30 seconds: `cpu_ms`, `memory_peak_bytes`, `network_bytes` (`null` before the first), `pull_done_bytes`, `pull_total_bytes` (while it pulls). Another `state` is `400`. Never its env, command or callback. |
+| `DELETE /v1/jobs/{id}` | 0.2.34. Cancel: SIGTERM, SIGKILL 10 seconds later, `reason` `launcher_kill`, and the callback. `200` with the ended [JobResult](#jobresult); `202` with it still `running` when it had not started yet (it ends in a moment, without starting); a job that already ended is `200` as it is, so a repeat is harmless; `404` for an unknown id; `409` `managed mode` on a machine in managed mode. |
 | `GET /health` | `200` `{"status":"ok","draining":false,"slots_total":2,"slots_used":1,"slots_free":1,"mode":"jobs"}`. `status` is `draining` while draining. `mode` is `managed` while the machine runs its own managed containers and answers every push with `409`; do not send it work then, whatever `slots_free` says. `503` `{"error":"docker is unavailable","draining":false}`. |
-| `GET /metrics` | Prometheus text. |
+| `GET /metrics` | Prometheus text. From 0.2.34 also jobs by state and by end reason, refusals by reason, and the time of pulls and starts ([SERVER.md](SERVER.md#cancel-list-metrics)). |
 | `POST /v1/drain` | Body `{"draining": true}` or `{"draining": false}`. Answers the same object. The flag survives a restart. |
 
 On a Windows worker these exist only on `127.0.0.1` inside the WSL2 distribution. Nothing outside the PC can call them.
@@ -552,7 +559,7 @@ Found while writing this document. None was changed here. Each is something an o
 5. **Drain hides `job_key`.** `503` comes before the key lookup. See [section 6](#6-idempotency-and-delivery).
 6. **A repeat with a different body is not an error.** The first request with a key wins and the caller is not told that the bodies differ.
 7. **No output in the contract.** A job returns an exit code and a reason. Its last log lines are readable only on the machine, with the machine's token. A result that is data is sent by the container itself.
-8. **No cancel.** A job ends by itself, at its timeout, or because someone on the machine killed the container.
+8. **A cancel is not a rollback.** `DELETE /v1/jobs/{id}` (0.2.34) stops the container; whatever it already did outside stays done.
 9. **The poll needs a public certificate.** See the TLS row in [section 3](#3-poll). An n8n behind a private certificate authority cannot be polled over `https`.
 10. **One task per poll, no jitter.** Many machines started at the same moment poll at the same moment. With hundreds of them, spread the load at the server.
 11. **`reason` is coarse.** A job cut by an out-of-memory kill or by `docker kill` while the runner watched is `exited` with a non-zero `exit_code`. `interrupted` says only that the runner did not see the end; a job that failed by itself in the seconds the runner was restarting is `interrupted` too, with its own exit code.
@@ -561,7 +568,6 @@ Found while writing this document. None was changed here. Each is something an o
 14. **Free memory is measured where the service runs.** On Windows that is the WSL2 VM, not the PC: the VM can have memory free while Windows is short, and the check does not see it. `.wslconfig` is what bounds the VM. The check is also taken once, at admission: a job that grows later is held by its own memory limit, and a PC can still slow down.
 15. **A task claimed in the instant memory runs out is dropped.** The worker checks before it polls and again when it starts the task. Between the two, another program can take the memory. The window is one HTTP round trip (limit 1 applies).
 
-One constant in the source, `launcher_kill`, is a `reason` that no code path emits. It is not part of the contract.
 
 ## 10. Compatibility
 
@@ -573,6 +579,7 @@ What an orchestrator may rely on, and what `src/contract.rs` fails on if it chan
 - `503` `blocked for safety` and `503` `authorization required` were added in 0.2.13, on machines with the `shared-pc` profile only. Both are one more "not now, on this machine", and a caller that routes on `503` needs no change.
 - `503` `not lending now` was added in 0.2.19, with `lend_hours` and the battery and full-screen waits. One more "not now, on this machine": a caller that routes on `503` needs no change.
 - `503` `memory committed` (`JOBS_MEMORY_COMMITTED`) was added in 0.2.33, on machines with the `shared-pc` profile only, with the `400` for a memory limit above what the machine commits to all its jobs. One more "not now, on this machine": a caller that routes on `503` needs no change.
+- `concurrency_key`, `429` `concurrency key busy`, the `reason` `launcher_kill`, `GET /v1/jobs?state=running`, `DELETE /v1/jobs/{id}` and the `server` profile were added in 0.2.34. A caller that sends no `concurrency_key` and calls neither route sees nothing new; a reader that treats a `reason` it does not know as "not succeeded" needs no change, and one that validates against the schema needs the new one.
 - Every poll answer form in [section 3](#3-poll), the bare task and the empty forms included.
 - Unknown fields rejected in a JobRequest, a poll answer and a manifest.
 - No `schema_version`, no register call, no new required field.

@@ -185,7 +185,7 @@ These are accepted, not a bug list. A review should confirm they are still true 
 - Stopping the service does not kill containers. A timeout is SIGTERM, then SIGKILL 10 seconds later. While the service is stopped nothing enforces a timeout.
 - A client that keeps reconnecting can still hold connections on the TLS listener. It sends no token, so it is not banned. The defense is a firewall rule ([RECIPES.md](RECIPES.md)).
 - Four medium and six low findings in [REVIEW-2026-11-11.md](REVIEW-2026-11-11.md) are open. The allowlist ones are fixed.
-- There is no cancel call, by decision. Ending a job early needs a shell on the machine.
+- `DELETE /v1/jobs/{id}` cancels a job (0.2.34; before, by decision, there was no cancel call).
 
 ## Open TODOs
 

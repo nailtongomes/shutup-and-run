@@ -180,6 +180,11 @@ pub(crate) async fn poll_once(
         tracing::debug!(%why, "poll skipped");
         return Ok(PollOutcome::Idle);
     }
+    // `max_starting` jobs are starting: a task now would only wait its turn.
+    if launcher.starts_full() {
+        tracing::debug!("poll skipped: max_starting jobs are starting");
+        return Ok(PollOutcome::Idle);
+    }
 
     let settings = launcher.settings();
     let mut request = client

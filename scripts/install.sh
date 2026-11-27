@@ -24,6 +24,11 @@
 # bridge address, 172.17.0.1:8080; docs/SERVIDOR.pt-BR.md):
 #   curl -fsSL .../install.sh | sudo SHUTUP_AND_RUN_RELAY_SERVER=1 bash
 # Run the plain line too, before or after, for a worker on the same server.
+# A server that only runs jobs, many at once (docs/SERVER.md: config.json,
+# resource_profile "server", Restart=always, journald capped at 1 GiB):
+#   curl -fsSL .../install.sh | sudo SHUTUP_AND_RUN_PROFILE=server \
+#     SHUTUP_AND_RUN_ALLOWLIST=ghcr.io/you/worker SHUTUP_AND_RUN_ALLOW_FROM=203.0.113.20 bash
+# Optional there: SHUTUP_AND_RUN_MAX_SLOTS, SHUTUP_AND_RUN_BIND (default 0.0.0.0).
 # Remove it:            sudo bash scripts/install.sh --uninstall
 # Remove config too:    sudo bash scripts/install.sh --uninstall --purge
 set -euo pipefail
@@ -34,7 +39,17 @@ ETC=/etc/shutup-and-run
 LIB=/var/lib/shutup-and-run
 UNIT=/etc/systemd/system/shutup-and-run.service
 RELAY_UNIT=/etc/systemd/system/shutup-and-run-relay.service
+JOURNALD=/etc/systemd/journald.conf.d/shutup-and-run.conf
 PORT="${SHUTUP_AND_RUN_PORT:-8787}"
+server=
+case "${SHUTUP_AND_RUN_PROFILE:-}" in
+  "") ;;
+  server) server=1 ;;
+  *)
+    echo "SHUTUP_AND_RUN_PROFILE must be server, or unset" >&2
+    exit 2
+    ;;
+esac
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "run as root (sudo)" >&2
@@ -47,6 +62,10 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   fi
   systemctl disable --now "$NAME" "$NAME-relay" >/dev/null 2>&1 || true
   rm -f "$UNIT" "$RELAY_UNIT" "$PREFIX/$NAME"
+  if [[ -f "$JOURNALD" ]]; then
+    rm -f "$JOURNALD"
+    systemctl restart systemd-journald >/dev/null 2>&1 || true
+  fi
   systemctl daemon-reload >/dev/null 2>&1 || true
   if [[ "${2:-}" == "--purge" ]]; then
     rm -rf "$ETC" "$LIB"
@@ -256,15 +275,33 @@ fi
 if [[ "$slots" -gt 16 ]]; then
   slots=16
 fi
+if [[ -n "$server" ]]; then
+  # 1 CPU and 1.5 GiB per job: the memory less what the server keeps for
+  # itself (a sixteenth, 2 to 8 GiB), and the CPUs half again, since a
+  # browser job waits on pages most of the time. 128 GiB, 48 CPUs: 72.
+  reserve=$((mem_gb / 16))
+  if [[ "$reserve" -lt 2 ]]; then reserve=2; fi
+  if [[ "$reserve" -gt 8 ]]; then reserve=8; fi
+  by_mem=$(((mem_gb - reserve) * 2 / 3))
+  by_cpu=$((cpus * 3 / 2))
+  slots=$by_mem
+  if [[ "$by_cpu" -lt "$slots" ]]; then slots=$by_cpu; fi
+  if [[ "$slots" -lt 1 ]]; then slots=1; fi
+  if [[ "$slots" -gt 256 ]]; then slots=256; fi
+fi
 if [[ -n "${SHUTUP_AND_RUN_MAX_SLOTS:-}" ]]; then
   slots=$SHUTUP_AND_RUN_MAX_SLOTS
 fi
-echo "suggested max_slots=${slots} (${cpus} CPUs, ${mem_gb} GiB RAM; about 1 CPU and 2 GiB per slot)"
+if [[ -n "$server" ]]; then
+  echo "server profile: max_slots=${slots} (${cpus} CPUs, ${mem_gb} GiB RAM; 1 CPU and 1.5 GiB per job)"
+else
+  echo "suggested max_slots=${slots} (${cpus} CPUs, ${mem_gb} GiB RAM; about 1 CPU and 2 GiB per slot)"
+fi
 
 mkdir -p "$ETC" "$LIB"
 chmod 700 "$ETC" "$LIB"
 
-if [[ ! -f "$ETC/env" ]] || ! grep -q '^SHUTUP_AND_RUN_TOKEN=.\+' "$ETC/env"; then
+if [[ -z "$server" ]] && { [[ ! -f "$ETC/env" ]] || ! grep -q '^SHUTUP_AND_RUN_TOKEN=.\+' "$ETC/env"; }; then
   umask 077
   printf 'SHUTUP_AND_RUN_TOKEN=%s\n' "$(openssl rand -hex 32)" >"$ETC/env"
   chmod 600 "$ETC/env"
@@ -297,22 +334,65 @@ EOF
 fi
 fingerprint=$(openssl x509 -in "$ETC/cert.pem" -noout -fingerprint -sha256 | sed 's/^[^=]*=//')
 
-if [[ ! -f "$ETC/config.toml" ]]; then
-  # The service does not see this variable. It only fills the first config.toml.
-  if [[ -z "${SHUTUP_AND_RUN_ALLOWLIST:-}" ]]; then
-    placeholder=1
+# The service does not see this variable. It only fills the first config.
+if [[ -z "${SHUTUP_AND_RUN_ALLOWLIST:-}" ]]; then
+  placeholder=1
+fi
+allow=
+IFS=',' read -ra images <<<"${SHUTUP_AND_RUN_ALLOWLIST:-ghcr.io/owner/selenium-worker}"
+for image in "${images[@]}"; do
+  image="${image//[[:space:]]/}"
+  [[ -z "$image" ]] && continue
+  if [[ ! "$image" =~ ^[a-z0-9._:/@-]+$ ]]; then
+    echo "SHUTUP_AND_RUN_ALLOWLIST: invalid image name: ${image}" >&2
+    exit 1
   fi
-  allow=
-  IFS=',' read -ra images <<<"${SHUTUP_AND_RUN_ALLOWLIST:-ghcr.io/owner/selenium-worker}"
-  for image in "${images[@]}"; do
-    image="${image//[[:space:]]/}"
-    [[ -z "$image" ]] && continue
-    if [[ ! "$image" =~ ^[a-z0-9._:/@-]+$ ]]; then
-      echo "SHUTUP_AND_RUN_ALLOWLIST: invalid image name: ${image}" >&2
-      exit 1
-    fi
-    allow+="  \"${image}\","$'\n'
-  done
+  allow+="  \"${image}\","$'\n'
+done
+bind="${SHUTUP_AND_RUN_BIND:-0.0.0.0}"
+if [[ ! "$bind" =~ ^[0-9.]+$ ]]; then
+  echo "SHUTUP_AND_RUN_BIND must be an IPv4 address, like 0.0.0.0 or 127.0.0.1" >&2
+  exit 2
+fi
+config="$ETC/config.toml"
+if [[ -n "$server" ]]; then
+  config="$ETC/config.json"
+fi
+
+if [[ -n "$server" && -f "$ETC/config.toml" && ! -f "$ETC/config.json" ]]; then
+  echo "this machine has $ETC/config.toml; the server profile is config.json." >&2
+  echo "Move config.toml away (keep its token and allowlist), then run this again." >&2
+  exit 1
+elif [[ -n "$server" && ! -f "$ETC/config.json" ]]; then
+  # config.json: the file `shutup-and-run config` and the local page edit,
+  # every key in it, mode 600. The token and the page's admin password are
+  # made here and stay in it.
+  umask 077
+  cat >"$ETC/config.json" <<JSON_END
+{
+  "listen": "${bind}:${PORT}",
+  "token": "$(openssl rand -hex 32)",
+  "max_slots": ${slots},
+  "allowlist": [
+${allow%,$'\n'}
+  ],
+  "resource_profile": "server",
+  "tls_cert": "${ETC}/cert.pem",
+  "tls_key": "${ETC}/key.pem",
+  "history_path": "${LIB}/jobs.sqlite",
+  "status_page": true,
+  "admin_password": "$(openssl rand -hex 16)"
+}
+JSON_END
+  chmod 600 "$ETC/config.json"
+  if ! "$PREFIX/$NAME" config validate >/dev/null; then
+    "$PREFIX/$NAME" config validate || true
+    rm -f "$ETC/config.json"
+    exit 1
+  fi
+elif [[ -n "$server" ]]; then
+  echo "kept existing $ETC/config.json"
+elif [[ ! -f "$ETC/config.toml" ]]; then
   umask 077
   cat >"$ETC/config.toml" <<EOF
 listen = "0.0.0.0:${PORT}"
@@ -328,6 +408,19 @@ else
   echo "kept existing $ETC/config.toml"
 fi
 
+# A server comes back whatever stopped it, and its journal is capped.
+restart="on-failure"
+if [[ -n "$server" ]]; then
+  restart=always
+  mkdir -p "$(dirname "$JOURNALD")"
+  cat >"$JOURNALD" <<JOURNAL_END
+[Journal]
+SystemMaxUse=1G
+MaxRetentionSec=1month
+JOURNAL_END
+  systemctl restart systemd-journald || true
+fi
+
 cat >"$UNIT" <<EOF
 [Unit]
 Description=shutup-and-run — on-demand container slots
@@ -337,10 +430,10 @@ Requires=docker.service
 [Service]
 Type=simple
 ExecStart=${PREFIX}/${NAME}
-Environment=SHUTUP_AND_RUN_CONFIG=${ETC}/config.toml
+Environment=SHUTUP_AND_RUN_CONFIG=${config}
 Environment=HOME=/root
 EnvironmentFile=-${ETC}/env
-Restart=on-failure
+Restart=${restart}
 RestartSec=2
 LimitNOFILE=65536
 
@@ -354,11 +447,23 @@ systemctl restart "$NAME"
 
 if [[ "${SHUTUP_AND_RUN_NO_UFW:-}" != 1 ]] && command -v ufw >/dev/null 2>&1; then
   if ufw status | grep -q 'Status: active'; then
-    ufw allow "${PORT}/tcp" || true
+    if [[ -n "${SHUTUP_AND_RUN_ALLOW_FROM:-}" ]]; then
+      # Only the orchestrator's addresses reach the API.
+      IFS=',' read -ra sources <<<"$SHUTUP_AND_RUN_ALLOW_FROM"
+      for source in "${sources[@]}"; do
+        ufw allow from "${source//[[:space:]]/}" to any port "$PORT" proto tcp || true
+      done
+    else
+      ufw allow "${PORT}/tcp" || true
+    fi
   fi
 fi
 
-token=$(sed -n 's/^SHUTUP_AND_RUN_TOKEN=//p' "$ETC/env" | head -n 1)
+if [[ -n "$server" ]]; then
+  token=$(sed -n 's/^ *"token": *"\([^"]*\)".*/\1/p' "$ETC/config.json" | head -n 1)
+else
+  token=$(sed -n 's/^SHUTUP_AND_RUN_TOKEN=//p' "$ETC/env" | head -n 1)
+fi
 health=0
 for _ in $(seq 1 50); do
   if curl -fsS --cacert "$ETC/cert.pem" \
@@ -373,11 +478,19 @@ done
 echo
 echo "shutup-and-run"
 echo "  url:           https://${ip}:${PORT}"
-echo "  token file:    ${ETC}/env"
+if [[ -n "$server" ]]; then
+  echo "  token:         sudo ${NAME} config get token --reveal"
+else
+  echo "  token file:    ${ETC}/env"
+fi
 echo "  certificate:   ${ETC}/cert.pem"
 echo "  fingerprint:   ${fingerprint}"
-echo "  config:        ${ETC}/config.toml"
-echo "  allowlist:     $(tr -d '\n"' <"$ETC/config.toml" | sed -n 's/.*allowlist = \[ *\([^]]*[^], ]\)[, ]*\].*/\1/p' | tr -s ' ')"
+echo "  config:        ${config}"
+if [[ -n "$server" ]]; then
+  echo "  allowlist:     $("$PREFIX/$NAME" config get allowlist 2>/dev/null | tr '\n' ' ')"
+else
+  echo "  allowlist:     $(tr -d '\n"' <"$ETC/config.toml" | sed -n 's/.*allowlist = \[ *\([^]]*[^], ]\)[, ]*\].*/\1/p' | tr -s ' ')"
+fi
 if [[ "$health" == 1 ]]; then
   echo "  health:        ok"
 else
@@ -388,10 +501,21 @@ if [[ "${placeholder:-}" == 1 ]]; then
   echo
   echo "WARNING: SHUTUP_AND_RUN_ALLOWLIST was not set. The allowlist is the placeholder"
   echo "  ghcr.io/owner/selenium-worker, which is not yours. No job of yours will start."
-  echo "  Edit ${ETC}/config.toml, then: sudo systemctl restart ${NAME}"
+  if [[ -n "$server" ]]; then
+    echo "  sudo ${NAME} config set allowlist ghcr.io/you/worker --apply"
+  else
+    echo "  Edit ${ETC}/config.toml, then: sudo systemctl restart ${NAME}"
+  fi
 fi
 if [[ "${SHUTUP_AND_RUN_SHOW_TOKEN:-}" == 1 ]]; then
   echo "  token:         ${token}"
+fi
+if [[ -n "$server" ]]; then
+  echo
+  echo "Status page (slots, running jobs), from your computer:"
+  echo "  ssh -N -L 8787:127.0.0.1:${PORT} root@${ip}   then open https://127.0.0.1:8787/"
+  echo "  admin login: admin / sudo ${NAME} config get admin_password --reveal"
+  echo "Check it:      sudo ${NAME} doctor --json"
 fi
 echo
 echo "Pin the fingerprint, or trust ${ETC}/cert.pem."

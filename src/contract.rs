@@ -87,6 +87,7 @@ const CALLBACK_EXAMPLES: &[(&str, &str)] = &[
     example!("callback.start-failed.json"),
     example!("callback.interrupted.json"),
     example!("callback.oom.json"),
+    example!("callback.canceled.json"),
 ];
 
 /// A Draft 2020-12 validator for one published schema, or for a `$defs`
@@ -1094,9 +1095,10 @@ async fn the_existing_surface_did_not_move() {
             "status"
         ]
     );
+    // `GET /v1/jobs` and `DELETE /v1/jobs/{id}` exist since 0.2.34.
     for (method, uri) in [
-        ("GET", "/v1/jobs"),
-        ("DELETE", "/v1/jobs/abc"),
+        ("PATCH", "/v1/jobs/abc"),
+        ("DELETE", "/v1/jobs"),
         ("PUT", "/v1/jobs"),
     ] {
         let (status, _) = call(&m.app, method, uri, Some(TOKEN), Vec::new()).await;
@@ -1278,6 +1280,7 @@ async fn a_job_killed_for_memory_says_so_and_matches_the_schema() {
         command: None,
         job_key: None,
         callback_url: None,
+        concurrency_key: None,
     });
     let id = match killed.await.unwrap() {
         crate::launcher::LaunchOutcome::Created(job) => job.id,
@@ -1291,4 +1294,48 @@ async fn a_job_killed_for_memory_says_so_and_matches_the_schema() {
     assert!(body.get("oom_killed").is_none());
     assert_valid(&callback, &body, "plain kill callback");
     assert!(!callback.is_valid(&json!({"oom_killed": false})));
+}
+
+#[tokio::test]
+async fn a_canceled_job_and_a_busy_concurrency_key_match_the_contract() {
+    let callback = schema("job-result.schema.json#/$defs/callback");
+    let request = schema("job-request.schema.json");
+    let m = machine(3, "max_jobs_per_key = 1", &[]);
+    let body = r#"{"image":"alpine","concurrency_key":"account-0001"}"#;
+    assert_valid(&request, &parse(body, "keyed request"), "keyed request");
+    let (status, accepted) = push(&m.app, body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let (status, busy) = push(&m.app, body).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        busy,
+        json!({"error": "concurrency key busy", "code": "CONCURRENCY_KEY_BUSY",
+               "concurrency_key": "account-0001", "running": 1, "limit": 1})
+    );
+    m.launcher.settled().await;
+    let id = accepted["id"].as_str().unwrap();
+    let (status, ended) = call(
+        &m.app,
+        "DELETE",
+        &format!("/v1/jobs/{id}"),
+        Some(TOKEN),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ended["reason"], "launcher_kill");
+    let job = m.launcher.job(id, false).await.unwrap().unwrap();
+    let body = crate::launcher::callback_body(&job);
+    assert_eq!(body, ended);
+    assert_valid(&callback, &body, "canceled callback");
+    let (status, listed) = call(
+        &m.app,
+        "GET",
+        "/v1/jobs?state=running",
+        Some(TOKEN),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["jobs"], json!([]));
 }

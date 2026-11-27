@@ -58,12 +58,13 @@
       ]
     },
     "reason": {
-      "description": "null while running. 'exited': the container ended by itself or was killed by something other than the timeout; read exit_code. 'timeout_kill': SIGTERM at timeout_secs, SIGKILL 10 seconds later (exit_code 137 either way). 'start_failed': the pull or the start failed and no container ran. 'interrupted' (0.2.11): the PC, WSL, Docker or the runner stopped under the job, so the runner cannot say how it ended: its container was gone, or it stopped with a non-zero exit_code while the runner was not running. The runner does not run it again.",
+      "description": "null while running. 'exited': the container ended by itself or was killed by something other than the timeout; read exit_code. 'timeout_kill': SIGTERM at timeout_secs, SIGKILL 10 seconds later (exit_code 137 either way). 'start_failed': the pull or the start failed and no container ran. 'interrupted' (0.2.11): the PC, WSL, Docker or the runner stopped under the job, so the runner cannot say how it ended: its container was gone, or it stopped with a non-zero exit_code while the runner was not running. The runner does not run it again. 'launcher_kill' (0.2.34 in the contract): canceled on request, by DELETE /v1/jobs/{id} or by a person at the machine: SIGTERM, SIGKILL 10 seconds later, exit_code 137, or null when it was canceled before its container started.",
       "enum": [
         "exited",
         "timeout_kill",
         "start_failed",
         "interrupted",
+        "launcher_kill",
         null
       ]
     },
@@ -105,7 +106,8 @@
             "exited",
             "timeout_kill",
             "start_failed",
-            "interrupted"
+            "interrupted",
+            "launcher_kill"
           ]
         },
         "duration_secs": {

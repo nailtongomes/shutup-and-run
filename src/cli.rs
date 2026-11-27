@@ -1825,6 +1825,11 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
         crate::resources::read(&crate::resources::disk_path(&settings.history_path)),
     ));
     checks.extend(certificate_check(settings));
+    if settings.server {
+        checks.push(cgroup_check(std::path::Path::new(
+            "/sys/fs/cgroup/cgroup.controllers",
+        )));
+    }
     if let Some(report) = fresh
         .and_then(|s| serde_json::from_value::<crate::safety::Report>(s["safety"].clone()).ok())
         .filter(|report| report.applies)
@@ -1981,6 +1986,26 @@ pub fn certificate_check(settings: &Settings) -> Option<Check> {
 
 /// The limits in force, and whether the machine can take a job under them
 /// right now. Never a hard failure: the worker runs, and waits.
+/// A server runs many limited containers: cgroup v2 is where Docker's
+/// memory and CPU limits and their readings are exact. v1 works, with a
+/// warning.
+pub fn cgroup_check(controllers: &Path) -> Check {
+    match std::fs::read_to_string(controllers) {
+        Ok(list) if list.contains("memory") && list.contains("cpu") => {
+            check("cgroup", true, format!("v2: {}", list.trim()))
+        }
+        Ok(list) => soft(
+            "cgroup",
+            false,
+            format!("v2 without the memory or cpu controller: {}", list.trim()),
+        )
+        .coded("CGROUP_V1"),
+        Err(_) => {
+            soft("cgroup", false, "v1 (no /sys/fs/cgroup/cgroup.controllers)").coded("CGROUP_V1")
+        }
+    }
+}
+
 pub fn resources_check(
     settings: &Settings,
     memory_total: Option<u64>,
@@ -2003,16 +2028,26 @@ pub fn resources_check(
         });
     }
     if let (Some(per_job), Some(total)) = (settings.max_job_memory, memory_total) {
-        let fit = (total / per_job.max(1)).max(1);
+        // On a server the limits add up against the memory less what the
+        // machine keeps for itself.
+        let (room, what) = if settings.server {
+            (
+                total.saturating_sub(settings.min_free_memory),
+                "this machine commits to its jobs",
+            )
+        } else {
+            (total, "this machine has")
+        };
+        let fit = (room / per_job.max(1)).max(1);
         if settings.max_slots as u64 > fit {
             return soft(
                 "resources",
                 false,
                 format!(
-                    "{} jobs of {} each is more than the {} this machine has. {limits}",
+                    "{} jobs of {} each is more than the {} {what}. {limits}",
                     settings.max_slots,
                     human(per_job),
-                    human(total)
+                    human(room)
                 ),
             )
             .coded("SLOTS_EXCEED_MEMORY")
@@ -2833,6 +2868,41 @@ mod tests {
         );
         // A soft line never makes the doctor exit 1.
         assert!(report(&[many]).1);
+
+        // A server: 75 slots of 1.5 GiB against 128 GiB less the 8 it keeps.
+        settings.shared_pc = false;
+        settings.server = true;
+        settings.max_job_memory = Some(3 * GIB / 2);
+        settings.min_free_memory = 8 * GIB;
+        settings.max_slots = 75;
+        let fits = resources_check(&settings, Some(128 * GIB), free(100 * GIB, 500 * GIB));
+        assert!(fits.ok, "{}", fits.detail);
+        settings.max_slots = 90;
+        let over = resources_check(&settings, Some(128 * GIB), free(100 * GIB, 500 * GIB));
+        assert!(!over.ok && over.soft);
+        assert!(
+            over.detail.contains("commits to its jobs"),
+            "{}",
+            over.detail
+        );
+        assert!(
+            over.hint().contains("config set max_slots 80 --apply"),
+            "{}",
+            over.hint()
+        );
+    }
+
+    #[test]
+    fn a_server_says_which_cgroup_version_limits_its_jobs() {
+        let dir = temp("cgroup");
+        let file = dir.with_file_name("cgroup.controllers");
+        std::fs::write(&file, "cpuset cpu io memory pids\n").unwrap();
+        assert!(cgroup_check(&file).ok);
+        std::fs::write(&file, "cpuset io pids\n").unwrap();
+        assert_eq!(cgroup_check(&file).code(), "CGROUP_V1");
+        let gone = cgroup_check(&dir.with_file_name("not-there"));
+        assert!(!gone.ok && gone.soft);
+        assert_eq!(gone.code(), "CGROUP_V1");
     }
 
     #[test]

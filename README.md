@@ -131,7 +131,7 @@ curl -sk -X POST https://203.0.113.10:8787/v1/jobs -H "Authorization: Bearer $SA
 curl -sk -H "Authorization: Bearer $SAR_TOKEN" "https://203.0.113.10:8787/v1/jobs/PASTE_ID?logs=true"
 ```
 
-`-k` skips certificate verification; pinning the fingerprint is in [docs/RECIPES.md](docs/RECIPES.md). Ready-made flows: [examples/kestra-dispatch.yml](examples/kestra-dispatch.yml), [examples/n8n-dispatch.json](examples/n8n-dispatch.json), and for pull [examples/kestra-poll.yml](examples/kestra-poll.yml), [examples/n8n-poll.json](examples/n8n-poll.json).
+`-k` skips certificate verification; pinning the fingerprint is in [docs/RECIPES.md](docs/RECIPES.md). A machine that only runs jobs, many at once (`SHUTUP_AND_RUN_PROFILE=server`: config.json, limits per job, a few starting at a time, a key per caller, cancel and list): [docs/SERVER.md](docs/SERVER.md). Ready-made flows: [examples/kestra-dispatch.yml](examples/kestra-dispatch.yml), [examples/n8n-dispatch.json](examples/n8n-dispatch.json), and for pull [examples/kestra-poll.yml](examples/kestra-poll.yml), [examples/n8n-poll.json](examples/n8n-poll.json).
 
 ## First run without an orchestrator
 
@@ -456,7 +456,7 @@ A task, the same JSON on a push, in a poll answer, and in a manifest:
 }
 ```
 
-Only `image` is required. Unknown fields are refused. `job_key` makes a retry safe on that one machine: the same key returns the same job and starts nothing. `reason` in the result is `exited`, `timeout_kill`, `start_failed` or `interrupted` (the machine, WSL, Docker or the worker stopped under the job; it is not run again). There is no cancel call.
+Only `image` is required. Unknown fields are refused. `job_key` makes a retry safe on that one machine: the same key returns the same job and starts nothing. `reason` in the result is `exited`, `timeout_kill`, `start_failed`, `interrupted` (the machine, WSL, Docker or the worker stopped under the job; it is not run again) or `launcher_kill` (canceled). `DELETE /v1/jobs/{id}` cancels a job, and `GET /v1/jobs?state=running` lists the ones running.
 
 **Pull.** With `poll_url` set, the machine POSTs to it every `poll_interval_secs` (30 seconds, and never less), only when it has a free slot, is not paused and is not short of memory or disk:
 
@@ -536,7 +536,7 @@ The image needs `sh` and `sleep`; the default is `ghcr.io/nailtongomes/shutup-an
 - On Linux, stopping the service does not stop containers, and while it is stopped nothing enforces timeouts.
 - A timeout is SIGTERM, then SIGKILL 10 seconds later; the job's `exit_code` is 137 either way.
 - `job_key` is per machine. Another machine does not know it.
-- No cancel call, no queue, no retry of a job that failed. A managed container has no cron expression, no dependencies and no output capture; an `always` one that keeps failing is retried every 15 minutes until someone stops or disables it.
+- No queue, no retry of a job that failed. A managed container has no cron expression, no dependencies and no output capture; an `always` one that keeps failing is retried every 15 minutes until someone stops or disables it.
 - Managed mode and push/pull are exclusive on a machine. A machine that should do both needs two machines.
 - Managed definitions, their secrets and the mode are in the job history file. On Windows `shutup-and-run wsl reset` rebuilds the distribution and that file with it: keep the definition files (`managed show NAME` prints one) and apply them again.
 - In pull mode the server is never told that a task was refused or dropped; the worker's own log is. See [the contract's limits](docs/INTEGRATION-CONTRACT.md#9-limits-of-the-current-contract).

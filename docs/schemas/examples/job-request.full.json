@@ -1,6 +1,7 @@
 {
   "image": "ghcr.io/you/worker:1.4.2",
   "job_key": "case-0001-attempt-1",
+  "concurrency_key": "account-0001",
   "env": {
     "SCRIPT_URL": "https://scripts.example.com/protocolar.py",
     "CUSTOMER_ID": "customer-placeholder",

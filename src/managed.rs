@@ -262,6 +262,7 @@ fn request_with(definition: &Definition, secrets: Secrets, settings: &Settings) 
         command: definition.command.clone(),
         job_key: None,
         callback_url: None,
+        concurrency_key: None,
     }
 }
 
@@ -1207,6 +1208,7 @@ mod tests {
             command: None,
             job_key: None,
             callback_url: None,
+            concurrency_key: None,
         }
     }
 
@@ -1431,6 +1433,7 @@ mod tests {
             callback_url: None,
             managed: None,
             memory_limit: None,
+            concurrency_key: None,
         };
         assert!(matches!(
             m.store().insert_running(&outside),
@@ -1544,6 +1547,7 @@ mod tests {
                 callback_url: None,
                 managed: Some("rpa".into()),
                 memory_limit: None,
+                concurrency_key: None,
             })
             .unwrap();
         m.mock.seed_running("feed01", T0 + 3600).await;
