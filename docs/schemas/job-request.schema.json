@@ -26,6 +26,16 @@
       "maxLength": 200,
       "pattern": "^[A-Za-z0-9._:-]+$"
     },
+    "concurrency_key": {
+      "description": "0.2.34. The caller's own id for whose work this is: a person, an account. At most max_jobs_per_key jobs (2 by default) that have not ended on this machine share one; one more is refused with 429 CONCURRENCY_KEY_BUSY and nothing is stored. An opaque id, never the person's own data (a tax id, an e-mail). A job with none is not counted.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
     "env": {
       "description": "Environment of the container. Opaque strings: the runner does not read, interpret or log them. At most 128 variables. A value is at most 16384 bytes and holds no NUL.",
       "type": "object",

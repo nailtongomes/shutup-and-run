@@ -24,6 +24,9 @@ pub struct LaunchRequest {
     pub command: Option<Vec<String>>,
     pub job_key: Option<String>,
     pub callback_url: Option<String>,
+    /// The caller's name for whose work this is (a person, an account):
+    /// at most `max_jobs_per_key` jobs that have not ended share one.
+    pub concurrency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +72,10 @@ pub enum LaunchError {
     /// clears when one of them ends. Nothing was stored.
     #[error("{0}")]
     Committed(Committed),
+    /// `max_jobs_per_key` jobs with this `concurrency_key` have not ended.
+    /// Nothing was stored.
+    #[error("{0}")]
+    KeyBusy(KeyBusy),
     /// `min_idle_secs` is set and the person at the PC is using it.
     #[error("{0}")]
     UserActive(UserActive),
@@ -164,6 +171,40 @@ impl std::fmt::Display for Committed {
     }
 }
 
+/// Why a job with a `concurrency_key` is refused. It can start later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyBusy {
+    pub concurrency_key: String,
+    pub running: u64,
+    pub limit: usize,
+}
+
+impl std::fmt::Display for KeyBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} jobs with concurrency_key {} have not ended; the limit is {}",
+            self.running, self.concurrency_key, self.limit
+        )
+    }
+}
+
+/// How long a started container still counts as starting, for
+/// `max_starting`: a browser's first seconds are the heaviest. A constant.
+pub const STARTING_SECS: u64 = 20;
+
+/// The machine's own counters since the process started, for `/metrics`:
+/// refusals by reason, and how long pulls and starts took.
+#[derive(Debug, Default)]
+struct Counters {
+    refusals: std::collections::BTreeMap<&'static str, u64>,
+    pull_secs: f64,
+    pulls: u64,
+    pulls_skipped: u64,
+    start_secs: f64,
+    starts: u64,
+}
+
 /// Why a job waits under `min_idle_secs`. It can start later, unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserActive {
@@ -189,6 +230,9 @@ const CALLBACK_SETTLE_SECS: i64 = 30;
 
 /// The most finished jobs the history keeps, whatever `history_days` is.
 pub const MAX_HISTORY_ROWS: usize = 500;
+/// The same on a server (`resource_profile = "server"`): a month of a
+/// thousand jobs a day, and room to spare.
+pub const SERVER_HISTORY_ROWS: usize = 50_000;
 
 pub struct Launcher {
     settings: Settings,
@@ -241,6 +285,10 @@ pub struct Launcher {
     /// Since when new jobs wait for memory, and up to when that wait is
     /// already counted in `memory_waits`.
     memory_wait: std::sync::Mutex<Option<(i64, i64)>>,
+    /// One permit per job allowed to be starting (`max_starting`). None:
+    /// no limit.
+    starts: Option<Arc<tokio::sync::Semaphore>>,
+    counters: std::sync::Mutex<Counters>,
 }
 
 impl Launcher {
@@ -282,6 +330,10 @@ impl Launcher {
             samples: std::sync::Mutex::new(HashMap::new()),
             memory_hour: std::sync::Mutex::new(None),
             memory_wait: std::sync::Mutex::new(None),
+            starts: settings
+                .max_starting
+                .map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
+            counters: std::sync::Mutex::new(Counters::default()),
             settings,
             runtime,
             clock,
@@ -457,7 +509,7 @@ impl Launcher {
     /// the jobs that have not ended. A different question from
     /// `shortage_for`: a job that has just started uses little of its limit,
     /// so the memory free now says nothing of what the jobs may come to use
-    /// together. Only on a shared PC, where every container has a limit;
+    /// together. Only on a shared PC and a server, where every container has a limit;
     /// without a reading of the machine's total, nothing to compare with.
     fn committed_for(
         &self,
@@ -465,7 +517,7 @@ impl Launcher {
         machine: &crate::safety::Readings,
     ) -> Result<Option<Committed>, LaunchError> {
         let (true, Some(job), Some(total)) = (
-            self.settings.shared_pc,
+            self.settings.commits_memory(),
             job_memory,
             machine.inner.memory_total,
         ) else {
@@ -889,7 +941,107 @@ impl Launcher {
                 "a managed run names its definition".into(),
             ));
         }
-        self.admit(req, source, None).await
+        let outcome = self.admit(req, source, None).await;
+        if let Err(err) = &outcome {
+            self.count_refusal(err);
+        }
+        outcome
+    }
+
+    fn count_refusal(&self, err: &LaunchError) {
+        let reason = refusal_reason(err);
+        *self
+            .counters
+            .lock()
+            .expect("counters")
+            .refusals
+            .entry(reason)
+            .or_default() += 1;
+    }
+
+    /// Every permit of `max_starting` is taken: a poll would only fetch a
+    /// task that waits.
+    pub fn starts_full(&self) -> bool {
+        self.starts
+            .as_ref()
+            .is_some_and(|starts| starts.available_permits() == 0)
+    }
+
+    /// The jobs that have not ended, oldest first, each with whether it is
+    /// still starting (waiting its turn, pulling, or not started yet).
+    pub async fn unfinished(&self) -> Result<Vec<(crate::store::Unfinished, bool)>, LaunchError> {
+        let rows = self.store.unfinished().map_err(store_err)?;
+        let starting = self.starting.lock().await;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let is_starting = starting.contains(&row.job.id);
+                (row, is_starting)
+            })
+            .collect())
+    }
+
+    /// The lines `/metrics` adds to `metrics_text`: refusals by reason since
+    /// the process started, pull and start times, jobs by state.
+    pub async fn metrics_more(&self) -> Result<String, LaunchError> {
+        use std::fmt::Write;
+        let ended = self.store.ended_by_reason().map_err(store_err)?;
+        let unfinished = self.store.running_ids().map_err(store_err)?.len();
+        let starting = self.starting.lock().await.len().min(unfinished);
+        let counters = self.counters.lock().expect("counters");
+        let mut out = String::new();
+        let _ = writeln!(out, "# HELP shutup_and_run_jobs Jobs that have not ended, by state: starting (waiting its turn, pulling its image) or running.");
+        let _ = writeln!(out, "# TYPE shutup_and_run_jobs gauge");
+        let _ = writeln!(out, "shutup_and_run_jobs{{state=\"starting\"}} {starting}");
+        let _ = writeln!(
+            out,
+            "shutup_and_run_jobs{{state=\"running\"}} {}",
+            unfinished - starting
+        );
+        let _ = writeln!(
+            out,
+            "# HELP shutup_and_run_jobs_ended Jobs in the history that have ended, by reason."
+        );
+        let _ = writeln!(out, "# TYPE shutup_and_run_jobs_ended gauge");
+        for (reason, n) in &ended {
+            let _ = writeln!(out, "shutup_and_run_jobs_ended{{reason=\"{reason}\"}} {n}");
+        }
+        let _ = writeln!(out, "# HELP shutup_and_run_refusals_total Jobs refused since the process started, by reason. Nothing of them was stored.");
+        let _ = writeln!(out, "# TYPE shutup_and_run_refusals_total counter");
+        for (reason, n) in &counters.refusals {
+            let _ = writeln!(
+                out,
+                "shutup_and_run_refusals_total{{reason=\"{reason}\"}} {n}"
+            );
+        }
+        let _ = writeln!(out, "# HELP shutup_and_run_pull_seconds Image pulls since the process started and the seconds they took. A pull skipped under pull_policy missing is not one.");
+        let _ = writeln!(out, "# TYPE shutup_and_run_pull_seconds summary");
+        let _ = writeln!(
+            out,
+            "shutup_and_run_pull_seconds_sum {:.3}",
+            counters.pull_secs
+        );
+        let _ = writeln!(out, "shutup_and_run_pull_seconds_count {}", counters.pulls);
+        let _ = writeln!(out, "# HELP shutup_and_run_pulls_skipped_total Pulls not made: the image was here and pull_policy is missing.");
+        let _ = writeln!(out, "# TYPE shutup_and_run_pulls_skipped_total counter");
+        let _ = writeln!(
+            out,
+            "shutup_and_run_pulls_skipped_total {}",
+            counters.pulls_skipped
+        );
+        let _ = writeln!(out, "# HELP shutup_and_run_start_seconds Containers started since the process started and the seconds from acceptance to start: the wait for max_starting, the pull, the create.");
+        let _ = writeln!(out, "# TYPE shutup_and_run_start_seconds summary");
+        let _ = writeln!(
+            out,
+            "shutup_and_run_start_seconds_sum {:.3}",
+            counters.start_secs
+        );
+        let _ = writeln!(
+            out,
+            "shutup_and_run_start_seconds_count {}",
+            counters.starts
+        );
+        Ok(out)
     }
 
     /// One run of the managed container `name`. Every check a pushed job
@@ -915,6 +1067,7 @@ impl Launcher {
             timeout,
             job_key,
             callback_url,
+            concurrency_key,
         } = check_request(req, &self.settings, source)?;
 
         let guard = self.slots.lock().await;
@@ -949,6 +1102,18 @@ impl Launcher {
                 total: self.settings.max_slots,
                 used,
             });
+        }
+        // Inside the slot lock, like the slots: two requests of one key
+        // cannot both pass on the last place.
+        if let Some(key) = &concurrency_key {
+            let running = self.store.unfinished_with_key(key).map_err(store_err)?;
+            if running >= self.settings.max_jobs_per_key as u64 {
+                return Err(LaunchError::KeyBusy(KeyBusy {
+                    concurrency_key: key.clone(),
+                    running,
+                    limit: self.settings.max_jobs_per_key,
+                }));
+            }
         }
         // Inside the slot lock, so two requests cannot both pass on the
         // memory that only one of them will get. The computer's owner comes
@@ -999,6 +1164,7 @@ impl Launcher {
             callback_url,
             managed: managed.map(str::to_string),
             memory_limit: spec.memory_bytes,
+            concurrency_key,
         };
         match self.store.insert_running(&record) {
             Ok(()) => {}
@@ -1026,11 +1192,37 @@ impl Launcher {
 
         tracing::info!(%id, image = %spec.image, timeout_secs = timeout, "job accepted");
         let launcher = self.clone();
-        tokio::spawn(async move { launcher.pull_and_start(id, spec, timeout).await });
+        let accepted = std::time::Instant::now();
+        tokio::spawn(async move { launcher.pull_and_start(id, spec, timeout, accepted).await });
         Ok(LaunchOutcome::Created(saved))
     }
 
-    async fn pull_and_start(&self, id: String, mut spec: StartSpec, timeout: u64) {
+    /// Waits for a permit of `max_starting`, or for a stop asked meanwhile.
+    /// The permit is held until `STARTING_SECS` after the container started.
+    async fn start_permit(&self, id: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let starts = self.starts.as_ref()?;
+        loop {
+            if self.stops.lock().await.contains(id) {
+                return None;
+            }
+            let wait = std::time::Duration::from_millis(250);
+            match tokio::time::timeout(wait, starts.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => return Some(permit),
+                Ok(Err(_)) => return None,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    async fn pull_and_start(
+        &self,
+        id: String,
+        mut spec: StartSpec,
+        timeout: u64,
+        accepted: std::time::Instant,
+    ) {
+        let permit = self.start_permit(&id).await;
+        let stopped_early = self.stops.lock().await.contains(&id);
         // A pull that hangs would hold the slot forever. Its limit is its
         // own, not the job's: a short job of a big image on a slow line still
         // starts, and a long job does not let a stuck pull hold the slot.
@@ -1040,7 +1232,22 @@ impl Launcher {
         let progress = |done: u64, total: u64| {
             let _ = self.store.set_pull(&id, Some((done, total)));
         };
-        let pulled = tokio::time::timeout(limit, self.runtime.pull(&spec.image, &progress)).await;
+        let skip = stopped_early
+            || (self.settings.pull_missing && self.runtime.has_image(&spec.image).await);
+        let pulled = if skip {
+            if !stopped_early {
+                self.counters.lock().expect("counters").pulls_skipped += 1;
+            }
+            Ok(Ok(()))
+        } else {
+            let began = std::time::Instant::now();
+            let pulled =
+                tokio::time::timeout(limit, self.runtime.pull(&spec.image, &progress)).await;
+            let mut counters = self.counters.lock().expect("counters");
+            counters.pulls += 1;
+            counters.pull_secs += began.elapsed().as_secs_f64();
+            pulled
+        };
         let _ = self.store.set_pull(&id, None);
         let stopped = self.stops.lock().await.remove(&id);
         let failure = match pulled {
@@ -1065,7 +1272,12 @@ impl Launcher {
                         Some("certificate passthrough is on, but the certificate could not be given to the job")
                     }
                     Ok(()) => match self.runtime.start(&id, &spec).await {
-                        Ok(()) => None,
+                        Ok(()) => {
+                            let mut counters = self.counters.lock().expect("counters");
+                            counters.starts += 1;
+                            counters.start_secs += accepted.elapsed().as_secs_f64();
+                            None
+                        }
                         Err(err) => {
                             tracing::warn!(%id, image = %spec.image, error = %err, "start failed");
                             Some("failed to start container")
@@ -1091,6 +1303,13 @@ impl Launcher {
             }
         }
         self.starting.lock().await.remove(&id);
+        // A started container keeps its permit for its first seconds.
+        if let (Some(permit), None) = (permit, failure) {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(STARTING_SECS)).await;
+                drop(permit);
+            });
+        }
         // A stop asked between the pull and the start.
         if failure.is_none() && self.stops.lock().await.contains(&id) {
             let _ = self.stop(&id).await;
@@ -1395,7 +1614,7 @@ impl Launcher {
         let removed = removed
             + self
                 .store
-                .purge_beyond(MAX_HISTORY_ROWS)
+                .purge_beyond(self.settings.history_rows())
                 .map_err(store_err)?;
         if removed > 0 {
             tracing::info!(removed, "purged old jobs");
@@ -1750,6 +1969,47 @@ fn validate_job_key(job_key: Option<String>) -> Result<Option<String>, LaunchErr
     Ok(Some(key))
 }
 
+/// The same characters as a `job_key`: a caller's id for a person or an
+/// account, never the person's own data (a tax id, an e-mail).
+fn validate_concurrency_key(key: Option<String>) -> Result<Option<String>, LaunchError> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    if key.is_empty()
+        || key.len() > 200
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+    {
+        return Err(LaunchError::BadRequest(
+            "concurrency_key must be 1-200 characters of letters, digits, '.', '_', ':' or '-'"
+                .into(),
+        ));
+    }
+    Ok(Some(key))
+}
+
+/// The label of a refusal in `/metrics`.
+fn refusal_reason(err: &LaunchError) -> &'static str {
+    match err {
+        LaunchError::BadRequest(_) => "bad_request",
+        LaunchError::Forbidden => "not_allowlisted",
+        LaunchError::NoSlots { .. } => "no_slots",
+        LaunchError::Draining => "draining",
+        LaunchError::LowResources(short) if short.resource == "disk" => "low_disk",
+        LaunchError::LowResources(_) => "low_memory",
+        LaunchError::Committed(_) => "memory_committed",
+        LaunchError::KeyBusy(_) => "concurrency_key_busy",
+        LaunchError::UserActive(_) => "user_active",
+        LaunchError::NotLending(_) => "not_lending",
+        LaunchError::SafetyBlocked(_) => "safety_blocked",
+        LaunchError::AuthorizationRequired(_) => "authorization_required",
+        LaunchError::ManagedMode => "managed_mode",
+        LaunchError::JobsMode | LaunchError::AlreadyRunning => "other",
+        LaunchError::Unavailable(_) => "unavailable",
+    }
+}
+
 fn validate_callback(callback_url: Option<String>) -> Result<Option<String>, LaunchError> {
     let Some(url) = callback_url else {
         return Ok(None);
@@ -1765,6 +2025,7 @@ pub struct Checked {
     pub timeout: u64,
     pub job_key: Option<String>,
     pub callback_url: Option<String>,
+    pub concurrency_key: Option<String>,
 }
 
 /// The static half of admission: the image name, the allowlist, the timeout,
@@ -1785,6 +2046,7 @@ pub fn check_request(
     let env = validate_env(req.env)?;
     let command = validate_command(req.command)?;
     let job_key = validate_job_key(req.job_key)?;
+    let concurrency_key = validate_concurrency_key(req.concurrency_key)?;
     let callback_url = validate_callback(req.callback_url)?;
     let nano_cpus = limit_cpu(req.cpu, settings.max_job_cpus)?;
     let memory_bytes = limit_memory(req.memory_bytes, settings.max_job_memory)?;
@@ -1797,12 +2059,17 @@ pub fn check_request(
             deadline_unix: 0,
             nano_cpus,
             memory_bytes,
-            shm_bytes: req.shm_bytes,
+            shm_bytes: req.shm_bytes.or_else(|| {
+                settings
+                    .default_job_shm
+                    .map(|bytes| bytes.min(i64::MAX as u64) as i64)
+            }),
             binds: Vec::new(),
         },
         timeout,
         job_key,
         callback_url,
+        concurrency_key,
     })
 }
 
@@ -1937,6 +2204,7 @@ mod tests {
             command: Some(vec!["sleep".into(), "30".into()]),
             job_key: None,
             callback_url: None,
+            concurrency_key: None,
         }
     }
 
@@ -3459,5 +3727,194 @@ mod tests {
         mock.fail_lists(false).await;
         started(&launcher, job("alpine", None)).await;
         assert_eq!(mock.start_count().await, 1);
+    }
+
+    /// Waits, up to two seconds, for something the background start does.
+    async fn eventually(
+        what: &str,
+        mut done: impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+    ) {
+        for _ in 0..200 {
+            if done().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("never: {what}");
+    }
+
+    /// A server of 8 GiB that keeps 1 GiB: two jobs of 4 GiB each fit what
+    /// is free now, not what they may come to use together.
+    #[tokio::test]
+    async fn a_server_refuses_a_job_whose_memory_the_running_ones_already_committed() {
+        let (launcher, mock) = harness_with(4, |s| {
+            s.server = true;
+            s.min_free_memory = GIB;
+            s.max_job_memory = Some(4 * GIB);
+        });
+        launcher.set_readings(eight_gib_free(7 * GIB + GIB / 2));
+        started(&launcher, asking(4 * GIB)).await;
+        match launcher.launch(asking(4 * GIB)).await {
+            Err(LaunchError::Committed(c)) => {
+                assert_eq!((c.committed_bytes, c.quota_bytes), (4 * GIB, 7 * GIB))
+            }
+            other => panic!("{other:?}"),
+        }
+        // No safety assessment and no owner's consent: nobody uses a server.
+        assert!(!launcher.safety().applies);
+        assert_eq!(mock.start_count().await, 1);
+        let metrics = launcher.metrics_more().await.unwrap();
+        assert!(
+            metrics.contains("shutup_and_run_refusals_total{reason=\"memory_committed\"} 1"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("shutup_and_run_start_seconds_count 1"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("shutup_and_run_jobs{state=\"running\"} 1"),
+            "{metrics}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_more_than_max_starting_jobs_start_at_once_and_the_rest_wait_their_turn() {
+        let (launcher, mock) = harness_with(5, |s| s.max_starting = Some(2));
+        mock.hold_pull(1, 2).await;
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            // Accepted at once, each with its slot.
+            match launcher.launch(job("alpine", None)).await.unwrap() {
+                LaunchOutcome::Created(job) => ids.push(job.id),
+                other => panic!("{other:?}"),
+            }
+        }
+        let m = mock.clone();
+        eventually("two pulls", move || {
+            let m = m.clone();
+            Box::pin(async move { m.pulls().await.len() == 2 })
+        })
+        .await;
+        assert!(launcher.starts_full());
+        assert_eq!(launcher.slots().await.unwrap().used, 3);
+        let listed = launcher.unfinished().await.unwrap();
+        assert_eq!(listed.len(), 3);
+        assert!(listed.iter().all(|(_, starting)| *starting));
+
+        // The two start; each keeps its turn for its first seconds, so the
+        // third still waits and has not even pulled.
+        mock.release_pull().await;
+        mock.release_pull().await;
+        let m = mock.clone();
+        eventually("two starts", move || {
+            let m = m.clone();
+            Box::pin(async move { m.start_count().await == 2 })
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(mock.pulls().await.len(), 2);
+        assert_eq!(mock.start_count().await, 2);
+
+        // Canceled while it waits: it ends without pulling or starting.
+        assert!(launcher.stop(&ids[2]).await.unwrap());
+        launcher.settled().await;
+        let third = launcher.job(&ids[2], false).await.unwrap().unwrap();
+        assert_eq!(third.reason.as_deref(), Some(REASON_LAUNCHER));
+        assert_eq!(mock.pulls().await.len(), 2);
+
+        // Without the setting nothing waits.
+        let (launcher, mock) = harness_with(5, |_| {});
+        assert!(!launcher.starts_full());
+        for _ in 0..3 {
+            started(&launcher, job("alpine", None)).await;
+        }
+        assert_eq!(mock.start_count().await, 3);
+    }
+
+    #[tokio::test]
+    async fn two_jobs_of_one_concurrency_key_run_and_a_third_is_refused_until_one_ends() {
+        let (launcher, mock, _) = harness(6);
+        let of = |key: &str| {
+            let mut request = job("alpine", None);
+            request.concurrency_key = Some(key.into());
+            request
+        };
+        let first = started(&launcher, of("lawyer-0001")).await;
+        started(&launcher, of("lawyer-0001")).await;
+        for source in [JobSource::Push, JobSource::Poll] {
+            match launcher.launch_from(of("lawyer-0001"), source).await {
+                Err(LaunchError::KeyBusy(busy)) => assert_eq!(
+                    (busy.concurrency_key.as_str(), busy.running, busy.limit),
+                    ("lawyer-0001", 2, 2)
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+        // Another key, and a job with none, are not counted against it.
+        started(&launcher, of("lawyer-0002")).await;
+        started(&launcher, job("alpine", None)).await;
+        let listed = launcher.unfinished().await.unwrap();
+        let keys: Vec<Option<&str>> = listed
+            .iter()
+            .map(|(row, _)| row.concurrency_key.as_deref())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                Some("lawyer-0001"),
+                Some("lawyer-0001"),
+                Some("lawyer-0002"),
+                None
+            ]
+        );
+        // One ends: the key has room again.
+        mock.stop(&first, 0).await;
+        launcher.job(&first, false).await.unwrap();
+        started(&launcher, of("lawyer-0001")).await;
+        assert_eq!(mock.start_count().await, 5);
+        let metrics = launcher.metrics_more().await.unwrap();
+        assert!(
+            metrics.contains("shutup_and_run_refusals_total{reason=\"concurrency_key_busy\"} 2"),
+            "{metrics}"
+        );
+        // The key has the shape of a job_key, never more.
+        match launcher.launch(of("a key with spaces")).await {
+            Err(LaunchError::BadRequest(msg)) => {
+                assert!(msg.starts_with("concurrency_key must be"))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_policy_missing_pulls_an_image_once_and_default_shm_fills_a_job_that_names_none() {
+        let (launcher, mock) = harness_with(3, |s| {
+            s.pull_missing = true;
+            s.default_job_shm = Some(GIB);
+        });
+        started(&launcher, job("alpine", None)).await;
+        let mut own = job("alpine", None);
+        own.shm_bytes = Some(2 * GIB as i64);
+        started(&launcher, own).await;
+        assert_eq!(mock.pulls().await, ["alpine"]);
+        let shm: Vec<Option<i64>> = mock.specs().await.iter().map(|s| s.shm_bytes).collect();
+        assert_eq!(shm, [Some(GIB as i64), Some(2 * GIB as i64)]);
+        let metrics = launcher.metrics_more().await.unwrap();
+        assert!(
+            metrics.contains("shutup_and_run_pulls_skipped_total 1"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("shutup_and_run_pull_seconds_count 1"),
+            "{metrics}"
+        );
+
+        // The default: every job asks the registry.
+        let (launcher, mock, _) = harness(3);
+        started(&launcher, job("alpine", None)).await;
+        started(&launcher, job("alpine", None)).await;
+        assert_eq!(mock.pulls().await.len(), 2);
+        assert_eq!(mock.specs().await[0].shm_bytes, None);
     }
 }

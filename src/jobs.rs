@@ -901,6 +901,7 @@ mod tests {
                     callback_url: None,
                     managed: None,
                     memory_limit: None,
+                    concurrency_key: None,
                 })
                 .unwrap();
             store
@@ -1008,6 +1009,7 @@ mod tests {
                     callback_url: Some("https://api.example/result?secret=callback-secret".into()),
                     managed: None,
                     memory_limit: None,
+                    concurrency_key: None,
                 })
                 .unwrap();
         };

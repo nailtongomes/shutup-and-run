@@ -122,9 +122,10 @@
       "type": "string",
       "enum": [
         "shared-pc",
+        "server",
         "none"
       ],
-      "description": "shared-pc: the machine is someone's everyday computer. Each job gets at most 1 CPU and 2g of memory with no extra swap, and no new job starts with less than 2g of memory or 5g of disk free; on a machine (on Windows, the WSL2 VM) with under 4g the two memory figures are half of what it has. none: no such defaults. Default: shared-pc when worker_os is windows, otherwise none. The four keys below replace one figure each, under either profile."
+      "description": "shared-pc: the machine is someone's everyday computer. Each job gets at most 1 CPU and 2g of memory with no extra swap, and no new job starts with less than 2g of memory or 5g of disk free; on a machine (on Windows, the WSL2 VM) with under 4g the two memory figures are half of what it has. server (0.2.34, Linux only, never with worker_os windows): a machine that only runs jobs, many at once. Each job gets at most 1 CPU, 1.5g of memory and a 1g /dev/shm; a new job needs 10g of disk free and a sixteenth of the memory (2g to 8g) left over; at most 5 start at once; the memory limits of the jobs that have not ended add up against the memory less min_free_memory; no safety assessment and no owner's consent, since nobody uses it. none: no such defaults. Default: shared-pc when worker_os is windows, otherwise none. The keys below replace one figure each, under any profile."
     },
     "max_job_cpus": {
       "type": "string",
@@ -145,6 +146,30 @@
       "type": "string",
       "pattern": "^(0|[0-9]+(\\.[0-9]+)?\\s*([kKmMgG]([iI]?[bB])?|[bB])?)$",
       "description": "No new job starts while the disk Docker writes to has less than this free. \"0\" turns the check off."
+    },
+    "max_starting": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 256,
+      "description": "Jobs starting at the same time: from acceptance to 20 seconds after the container started. Further jobs are accepted and wait their turn before their pull, holding their slot; their timeout counts from their own start. 0: no limit. Default: 5 under the server profile, otherwise no limit."
+    },
+    "max_jobs_per_key": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 256,
+      "default": 2,
+      "description": "Jobs that have not ended with the same concurrency_key. A job that names one more is refused with 429 CONCURRENCY_KEY_BUSY. A job with no concurrency_key is not counted."
+    },
+    "default_job_shm": {
+      "type": "string",
+      "pattern": "^(0|[0-9]+(\\.[0-9]+)?\\s*([kKmMgG]([iI]?[bB])?|[bB])?)$",
+      "description": "Size of /dev/shm of a job whose request names no shm. \"0\": Docker's 64 MiB. Default: 1g under the server profile, otherwise Docker's."
+    },
+    "pull_policy": {
+      "type": "string",
+      "enum": ["always", "missing"],
+      "default": "always",
+      "description": "always: every job asks the registry for its tag, so a pushed tag is picked up. missing: an image already on this machine is used as it is, with no registry call; pin a version tag or a digest. An image named by its digest is never asked again under either."
     },
     "min_idle_secs": {
       "type": "integer",

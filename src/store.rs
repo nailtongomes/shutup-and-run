@@ -102,6 +102,17 @@ pub struct NewJob {
     pub managed: Option<String>,
     /// The memory limit its container gets, in bytes. None: no limit.
     pub memory_limit: Option<i64>,
+    /// The caller's `concurrency_key`: at most `max_jobs_per_key` unfinished
+    /// rows carry the same one.
+    pub concurrency_key: Option<String>,
+}
+
+/// A job that has not ended, for `GET /v1/jobs?state=running`: its row and
+/// its `concurrency_key`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unfinished {
+    pub job: JobRecord,
+    pub concurrency_key: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -238,6 +249,7 @@ impl Store {
         // 0.2.24: NULL is "not measured". `pull_done` and `pull_total`,
         // 0.2.25, are NULL but while an image downloads. `memory_limit`,
         // 0.2.33: NULL is no limit, or a row older than the column.
+        // `concurrency_key`, 0.2.34: NULL is a job that named none.
         for column in [
             "callback_state TEXT",
             "oom_killed INTEGER",
@@ -249,6 +261,7 @@ impl Store {
             "pull_done INTEGER",
             "pull_total INTEGER",
             "memory_limit INTEGER",
+            "concurrency_key TEXT",
         ] {
             match conn.execute(&format!("ALTER TABLE jobs ADD COLUMN {column}"), []) {
                 Ok(_) => {}
@@ -307,8 +320,8 @@ impl Store {
             "jobs"
         };
         let result = conn.execute(
-            "INSERT INTO jobs (id, image, job_key, started_at, callback_url, managed, memory_limit)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?8
+            "INSERT INTO jobs (id, image, job_key, started_at, callback_url, managed, memory_limit, concurrency_key)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?8, ?9
              WHERE COALESCE((SELECT value FROM meta WHERE key = 'mode'), 'jobs') = ?7",
             params![
                 job.id,
@@ -318,7 +331,8 @@ impl Store {
                 job.callback_url,
                 job.managed,
                 mode,
-                job.memory_limit
+                job.memory_limit,
+                job.concurrency_key
             ],
         );
         match result {
@@ -342,6 +356,62 @@ impl Store {
         )
         .map(|sum| sum.max(0) as u64)
         .map_err(sql)
+    }
+
+    /// The jobs that have not ended with this `concurrency_key`.
+    pub fn unfinished_with_key(&self, key: &str) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE ended_at IS NULL AND concurrency_key = ?1",
+            [key],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n.max(0) as u64)
+        .map_err(sql)
+    }
+
+    /// Every job that has not ended, oldest first, with its `concurrency_key`.
+    pub fn unfinished(&self) -> Result<Vec<Unfinished>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, image, job_key, started_at, ended_at, exit_code, reason, callback_url, logs, oom_killed, cpu_ms, memory_peak, network_bytes, disk_bytes, pull_done, pull_total, concurrency_key
+                 FROM jobs WHERE ended_at IS NULL ORDER BY started_at, rowid",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Unfinished {
+                    job: map_job(row)?,
+                    concurrency_key: row.get(16)?,
+                })
+            })
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)?;
+        Ok(rows)
+    }
+
+    /// How many ended jobs the history holds, by `reason`.
+    pub fn ended_by_reason(&self) -> Result<Vec<(String, u64)>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn
+            .prepare(
+                "SELECT reason, COUNT(*) FROM jobs WHERE ended_at IS NOT NULL AND reason IS NOT NULL
+                 GROUP BY reason ORDER BY reason",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)?;
+        Ok(rows)
     }
 
     /// A start that never produced a running container. Holds `job_key` so a retry
@@ -1289,6 +1359,7 @@ mod tests {
             callback_url: None,
             managed: None,
             memory_limit: None,
+            concurrency_key: None,
         }
     }
 

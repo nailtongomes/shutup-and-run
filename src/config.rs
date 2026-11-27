@@ -38,6 +38,10 @@ const ENV_KEYS: &[&str] = &[
     "SHUTUP_AND_RUN_MAX_JOB_MEMORY",
     "SHUTUP_AND_RUN_MIN_FREE_MEMORY",
     "SHUTUP_AND_RUN_MIN_FREE_DISK",
+    "SHUTUP_AND_RUN_MAX_STARTING",
+    "SHUTUP_AND_RUN_MAX_JOBS_PER_KEY",
+    "SHUTUP_AND_RUN_DEFAULT_JOB_SHM",
+    "SHUTUP_AND_RUN_PULL_POLICY",
 ];
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
@@ -111,6 +115,22 @@ pub struct Settings {
     pub min_free_memory: u64,
     /// The same for the disk Docker writes to.
     pub min_free_disk: u64,
+    /// The `server` profile: a Linux machine that only runs jobs, many at
+    /// once. Like `shared_pc`, the memory limits of the jobs that have not
+    /// ended add up against the machine's memory; unlike it, there is no
+    /// person at it, so no safety assessment and no owner's consent.
+    pub server: bool,
+    /// The most jobs between acceptance and `STARTING_SECS` after their
+    /// container started, so a burst does not start every browser in the
+    /// same second. None: no limit.
+    pub max_starting: Option<usize>,
+    /// The most jobs that have not ended with the same `concurrency_key`.
+    pub max_jobs_per_key: usize,
+    /// `/dev/shm` of a job that names no `shm`. None: Docker's 64 MiB.
+    pub default_job_shm: Option<u64>,
+    /// `pull_policy = "missing"`: an image already on the machine is not
+    /// asked of the registry again. Off: every job pulls its tag.
+    pub pull_missing: bool,
     /// Windows only: no new job starts until the person has not touched the
     /// keyboard or mouse for this many seconds. Zero: off.
     pub min_idle_secs: u64,
@@ -199,6 +219,10 @@ struct FileConfig {
     max_job_memory: Option<String>,
     min_free_memory: Option<String>,
     min_free_disk: Option<String>,
+    max_starting: Option<u64>,
+    max_jobs_per_key: Option<u64>,
+    default_job_shm: Option<String>,
+    pull_policy: Option<String>,
     min_idle_secs: Option<u64>,
     lend_hours: Option<String>,
     lend_on_metered: Option<bool>,
@@ -214,6 +238,22 @@ struct FileConfig {
 }
 
 impl Settings {
+    /// The memory limits of the jobs that have not ended add up against the
+    /// machine's memory less `min_free_memory`: on a shared PC and a server.
+    pub fn commits_memory(&self) -> bool {
+        self.shared_pc || self.server
+    }
+
+    /// The most finished jobs the history keeps. A server runs a thousand
+    /// a day and its caller looks them up by `job_key` for a month.
+    pub fn history_rows(&self) -> usize {
+        if self.server {
+            crate::launcher::SERVER_HISTORY_ROWS
+        } else {
+            crate::launcher::MAX_HISTORY_ROWS
+        }
+    }
+
     pub fn load() -> Result<Self, ConfigError> {
         let env = process_env();
         if let Some(path) = json_path(&env) {
@@ -494,28 +534,36 @@ impl Settings {
             None if cfg!(test) => "linux".to_string(),
             None => std::env::consts::OS.to_string(),
         };
-        let shared_pc = match take_string(
+        let (shared_pc, server) = match take_string(
             env,
             "SHUTUP_AND_RUN_RESOURCE_PROFILE",
             file.resource_profile,
         )
         .as_deref()
         {
-            Some(PROFILE_SHARED_PC) => true,
-            Some(PROFILE_NONE) => false,
+            Some(PROFILE_SHARED_PC) => (true, false),
+            Some(PROFILE_NONE) => (false, false),
+            // A client's PC is never a server: its person comes first.
+            Some(PROFILE_SERVER) if worker_os == "windows" => {
+                return Err(ConfigError(
+                    "resource_profile server is for a Linux machine that only runs jobs, not for worker_os windows".into(),
+                ))
+            }
+            Some(PROFILE_SERVER) => (false, true),
             Some(other) => {
                 return Err(ConfigError(format!(
-                    "resource_profile must be {PROFILE_SHARED_PC} or {PROFILE_NONE}, not {other:?}"
+                    "resource_profile must be {PROFILE_SHARED_PC}, {PROFILE_SERVER} or {PROFILE_NONE}, not {other:?}"
                 )))
             }
             // A Windows machine is a client's PC. A Linux one is the owner's
             // server unless its config says otherwise.
-            None => worker_os == "windows",
+            None => (worker_os == "windows", false),
         };
         let shared_memory = || crate::resources::shared_pc_memory(crate::resources::memory_total());
         let max_job_cpus = match take_string(env, "SHUTUP_AND_RUN_MAX_JOB_CPUS", file.max_job_cpus)
         {
             Some(raw) => Some(parse_cpus(&raw)?),
+            None if server => Some(crate::resources::SERVER_CPUS),
             None => shared_pc.then_some(crate::resources::SHARED_PC_CPUS),
         };
         let max_job_memory =
@@ -530,19 +578,63 @@ impl Settings {
                     }
                     Some(bytes)
                 }
+                None if server => Some(crate::resources::SERVER_JOB_MEMORY),
                 None => shared_pc.then(shared_memory),
             };
         let min_free_memory =
             match take_string(env, "SHUTUP_AND_RUN_MIN_FREE_MEMORY", file.min_free_memory) {
                 Some(raw) => parse_size("min_free_memory", &raw)?,
+                None if server => {
+                    crate::resources::server_min_free_memory(crate::resources::memory_total())
+                }
                 None if shared_pc => shared_memory(),
                 None => 0,
             };
         let min_free_disk =
             match take_string(env, "SHUTUP_AND_RUN_MIN_FREE_DISK", file.min_free_disk) {
                 Some(raw) => parse_size("min_free_disk", &raw)?,
+                None if server => crate::resources::SERVER_MIN_DISK,
                 None if shared_pc => crate::resources::SHARED_PC_MIN_DISK,
                 None => 0,
+            };
+        let max_starting = match take_u64(env, "SHUTUP_AND_RUN_MAX_STARTING", file.max_starting)? {
+            Some(n) if n > 256 => {
+                return Err(ConfigError(
+                    "max_starting must be between 0 (no limit) and 256".into(),
+                ))
+            }
+            Some(0) => None,
+            Some(n) => Some(n as usize),
+            None => server.then_some(crate::resources::SERVER_MAX_STARTING),
+        };
+        let max_jobs_per_key = take_u64(
+            env,
+            "SHUTUP_AND_RUN_MAX_JOBS_PER_KEY",
+            file.max_jobs_per_key,
+        )?
+        .unwrap_or(DEFAULT_JOBS_PER_KEY);
+        if !(1..=256).contains(&max_jobs_per_key) {
+            return Err(ConfigError(
+                "max_jobs_per_key must be between 1 and 256".into(),
+            ));
+        }
+        let default_job_shm =
+            match take_string(env, "SHUTUP_AND_RUN_DEFAULT_JOB_SHM", file.default_job_shm) {
+                Some(raw) => match parse_size("default_job_shm", &raw)? {
+                    0 => None,
+                    bytes => Some(bytes),
+                },
+                None => server.then_some(crate::resources::SERVER_JOB_SHM),
+            };
+        let pull_missing =
+            match take_string(env, "SHUTUP_AND_RUN_PULL_POLICY", file.pull_policy).as_deref() {
+                None | Some(PULL_ALWAYS) => false,
+                Some(PULL_MISSING) => true,
+                Some(other) => {
+                    return Err(ConfigError(format!(
+                        "pull_policy must be {PULL_ALWAYS} or {PULL_MISSING}, not {other:?}"
+                    )))
+                }
             };
         let min_idle_secs =
             take_u64(env, "SHUTUP_AND_RUN_MIN_IDLE_SECS", file.min_idle_secs)?.unwrap_or(0);
@@ -650,6 +742,11 @@ impl Settings {
             max_job_memory,
             min_free_memory,
             min_free_disk,
+            server,
+            max_starting,
+            max_jobs_per_key: max_jobs_per_key as usize,
+            default_job_shm,
+            pull_missing,
             min_idle_secs,
             lend_hours,
             lend_on_metered,
@@ -692,6 +789,11 @@ fn default_secrets_dir(history_dir: &Path) -> PathBuf {
 
 pub const PROFILE_SHARED_PC: &str = "shared-pc";
 pub const PROFILE_NONE: &str = "none";
+pub const PROFILE_SERVER: &str = "server";
+pub const PULL_ALWAYS: &str = "always";
+pub const PULL_MISSING: &str = "missing";
+/// Jobs that have not ended with the same `concurrency_key`, by default.
+const DEFAULT_JOBS_PER_KEY: u64 = 2;
 /// Docker refuses a container with less.
 const MIN_JOB_MEMORY: u64 = 6 * 1024 * 1024;
 
@@ -766,6 +868,10 @@ pub const KEYS: &[Key] = &[
     key("max_job_memory", Kind::Text, OnPage::Locked),
     key("min_free_memory", Kind::Text, OnPage::Locked),
     key("min_free_disk", Kind::Text, OnPage::Locked),
+    key("max_starting", Kind::Int, OnPage::Locked),
+    key("max_jobs_per_key", Kind::Int, OnPage::Locked),
+    key("default_job_shm", Kind::Text, OnPage::Locked),
+    key("pull_policy", Kind::Text, OnPage::Locked),
     key("min_idle_secs", Kind::Int, OnPage::Open),
     key("lend_hours", Kind::Text, OnPage::Open),
     key("lend_on_metered", Kind::Bool, OnPage::Open),
@@ -1450,6 +1556,73 @@ mod tests {
         .unwrap();
         assert!(settings.allowlist.is_empty());
         assert!(settings.poll_any_image);
+    }
+
+    #[test]
+    fn the_server_profile_is_asked_for_by_name_and_sets_its_own_defaults() {
+        use crate::resources::{memory_total, server_min_free_memory, GIB};
+        let load = |extra: &str| Settings::from_toml_and_env(&base_toml(extra), &env(&[]));
+        // Nothing changes without it: a Linux machine, a Windows one.
+        for extra in ["worker_os = \"linux\"", "worker_os = \"windows\""] {
+            let plain = load(extra).unwrap();
+            assert!(!plain.server, "{extra}");
+            assert_eq!(plain.max_starting, None);
+            assert_eq!(plain.default_job_shm, None);
+            assert!(!plain.pull_missing);
+            assert_eq!(plain.max_jobs_per_key, 2);
+            assert_eq!(plain.history_rows(), crate::launcher::MAX_HISTORY_ROWS);
+        }
+        let server = load("resource_profile = \"server\"").unwrap();
+        assert!(server.server && !server.shared_pc && server.commits_memory());
+        assert_eq!(server.max_job_cpus, Some(1.0));
+        assert_eq!(server.max_job_memory, Some(3 * GIB / 2));
+        assert_eq!(server.default_job_shm, Some(GIB));
+        assert_eq!(
+            server.min_free_memory,
+            server_min_free_memory(memory_total())
+        );
+        assert_eq!(server.min_free_disk, 10 * GIB);
+        assert_eq!(server.max_starting, Some(5));
+        assert_eq!(server.history_rows(), crate::launcher::SERVER_HISTORY_ROWS);
+        assert_eq!(server_min_free_memory(Some(128 * GIB)), 8 * GIB);
+        assert_eq!(server_min_free_memory(Some(16 * GIB)), 2 * GIB);
+        assert_eq!(crate::status::Limits::of(&server).profile, "server");
+
+        // Each figure can be set; 0 turns the start limit and the shm off.
+        let set = load(
+            "resource_profile = \"server\"\nmax_starting = 0\nmax_jobs_per_key = 1\ndefault_job_shm = \"0\"\npull_policy = \"missing\"\nmax_job_memory = \"2g\"",
+        )
+        .unwrap();
+        assert_eq!((set.max_starting, set.default_job_shm), (None, None));
+        assert_eq!(set.max_jobs_per_key, 1);
+        assert!(set.pull_missing);
+        assert_eq!(set.max_job_memory, Some(2 * GIB));
+        let from_env = Settings::from_toml_and_env(
+            &base_toml(""),
+            &env(&[
+                ("SHUTUP_AND_RUN_RESOURCE_PROFILE", "server"),
+                ("SHUTUP_AND_RUN_MAX_STARTING", "8"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!((from_env.server, from_env.max_starting), (true, Some(8)));
+
+        for (extra, message) in [
+            (
+                "worker_os = \"windows\"\nresource_profile = \"server\"",
+                "not for worker_os windows",
+            ),
+            ("max_starting = 300", "max_starting must be"),
+            ("max_jobs_per_key = 0", "max_jobs_per_key must be"),
+            ("pull_policy = \"never\"", "pull_policy must be"),
+            (
+                "default_job_shm = \"big\"",
+                "default_job_shm must be a size",
+            ),
+        ] {
+            let err = load(extra).unwrap_err().0;
+            assert!(err.contains(message), "{extra}: {err}");
+        }
     }
 
     #[test]

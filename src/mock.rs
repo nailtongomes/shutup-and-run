@@ -199,6 +199,11 @@ impl Runtime for MockRuntime {
         Ok(())
     }
 
+    /// An image a pull brought here before.
+    async fn has_image(&self, image: &str) -> bool {
+        self.inner.lock().await.pulls.iter().any(|i| i == image)
+    }
+
     async fn running_count(&self) -> Result<usize, RuntimeError> {
         let inner = self.inner.lock().await;
         if inner.fail_list {

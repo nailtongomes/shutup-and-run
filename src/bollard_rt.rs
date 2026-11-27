@@ -111,9 +111,9 @@ impl Runtime for BollardRuntime {
             return Ok(());
         }
         let creds = self.credentials_for(image).await;
-        // shortcut: pull a tag on every job so it stays current, then fall back
-        // to a local image if the registry is unreachable. Upgrade to
-        // IfNotPresent for tags when registry latency dominates.
+        // A tag is pulled on every job so it stays current, then falls back
+        // to a local image if the registry is unreachable. `pull_policy =
+        // "missing"` asks `has_image` first instead (`Launcher`).
         let mut authed_err = None;
         if creds.is_some() {
             match self.pull_once(&reference, creds, progress).await {
@@ -138,6 +138,12 @@ impl Runtime for BollardRuntime {
                 }
             }
         }
+    }
+
+    async fn has_image(&self, image: &str) -> bool {
+        let reference = pull_reference(image);
+        self.image_present(image).await
+            || (reference != image && self.image_present(&reference).await)
     }
 
     async fn running_count(&self) -> Result<usize, RuntimeError> {

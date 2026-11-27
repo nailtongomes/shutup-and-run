@@ -577,6 +577,7 @@ async fn run_one(bench: &Bench, request: LaunchRequest, checks: &mut Vec<Check>)
                 LaunchError::LowResources(short) if short.resource == "disk" => "LOW_DISK",
                 LaunchError::LowResources(_) => "LOW_MEMORY",
                 LaunchError::Committed(_) => "JOBS_MEMORY_COMMITTED",
+                LaunchError::KeyBusy(_) => "CONCURRENCY_KEY_BUSY",
                 LaunchError::UserActive(_) => "USER_ACTIVE",
                 LaunchError::NotLending(hold) => hold.code.as_str(),
                 LaunchError::AuthorizationRequired(_) => crate::safety::AUTHORIZATION_REQUIRED,
@@ -720,6 +721,7 @@ fn request(image: &str, timeout: u64) -> LaunchRequest {
         command: None,
         job_key: None,
         callback_url: None,
+        concurrency_key: None,
     }
 }
 

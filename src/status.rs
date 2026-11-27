@@ -82,8 +82,10 @@ fn local_host(headers: &HeaderMap) -> Option<&str> {
     matches!(name, "127.0.0.1" | "localhost" | "[::1]").then_some(host)
 }
 
-/// A button on the page posts with `Origin: http://<this host>`. A form on
-/// some other site the person has open posts with that site's origin.
+/// A button on the page posts with `Origin: http://<this host>`, or
+/// `https://` on a machine whose listener has TLS (a server, reached through
+/// an SSH tunnel). A form on some other site the person has open posts with
+/// that site's origin.
 pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
     let Some(host) = local_host(headers) else {
         return false;
@@ -91,7 +93,12 @@ pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
     headers
         .get(header::ORIGIN)
         .and_then(|origin| origin.to_str().ok())
-        .is_some_and(|origin| origin == format!("http://{host}"))
+        .is_some_and(|origin| {
+            origin
+                .strip_prefix("http://")
+                .or_else(|| origin.strip_prefix("https://"))
+                == Some(host)
+        })
 }
 
 /// `?for=1h`, `3h` or `day` (to midnight on the PC's clock) pauses for a
@@ -294,8 +301,8 @@ pub(crate) fn safety_view(
             "<h1>{}</h1>{note}<p>{}</p>{back}",
             lang.t("Safety of this computer", "Segurança deste computador"),
             lang.t(
-                "This machine is dedicated to jobs (resource_profile = none), so it is not assessed.",
-                "Esta máquina é dedicada a tarefas (resource_profile = none), então não é avaliada.",
+                "This machine is dedicated to jobs (resource_profile none or server), so it is not assessed.",
+                "Esta máquina é dedicada a tarefas (resource_profile none ou server), então não é avaliada.",
             )
         );
     }
@@ -1790,8 +1797,8 @@ fn field_text(name: &str, lang: Lang) -> (&'static str, &'static str) {
         "resource_profile" => (
             lang.t("Resource profile", "Perfil de recursos"),
             lang.t(
-                "shared-pc protects the person using this computer; none gives jobs the whole machine.",
-                "shared-pc protege quem usa este computador; none dá a máquina inteira às tarefas.",
+                "shared-pc protects the person using this computer; server runs many jobs on a Linux machine that does nothing else; none gives jobs the whole machine.",
+                "shared-pc protege quem usa este computador; server roda muitas tarefas num Linux que só faz isso; none dá a máquina inteira às tarefas.",
             ),
         ),
         "max_job_cpus" => (
@@ -1809,6 +1816,34 @@ fn field_text(name: &str, lang: Lang) -> (&'static str, &'static str) {
         "min_free_disk" => (
             lang.t("Free disk a new job needs", "Disco livre que uma tarefa nova exige"),
             lang.t("Like 5g. 0: not checked.", "Como 5g. 0: não confere."),
+        ),
+        "max_starting" => (
+            lang.t("Jobs starting at once", "Tarefas iniciando ao mesmo tempo"),
+            lang.t(
+                "The rest wait their turn, already accepted. 0: no limit.",
+                "As outras esperam a vez, já aceitas. 0: sem limite.",
+            ),
+        ),
+        "max_jobs_per_key" => (
+            lang.t("Jobs at once per concurrency_key", "Tarefas ao mesmo tempo por concurrency_key"),
+            lang.t(
+                "Only for jobs that name a concurrency_key; one more is refused.",
+                "Só para tarefas que dizem uma concurrency_key; mais uma é recusada.",
+            ),
+        ),
+        "default_job_shm" => (
+            lang.t("/dev/shm of each job", "/dev/shm de cada tarefa"),
+            lang.t(
+                "For a job that names no shm. Like 1g. 0: Docker's 64m.",
+                "Para a tarefa que não diz shm. Como 1g. 0: os 64m do Docker.",
+            ),
+        ),
+        "pull_policy" => (
+            lang.t("Download the image", "Baixar a imagem"),
+            lang.t(
+                "always: every job asks the registry. missing: only when the image is not here.",
+                "always: toda tarefa pergunta ao registro. missing: só quando a imagem não está aqui.",
+            ),
         ),
         "token" => (
             lang.t("API token", "Token da API"),
@@ -1866,6 +1901,10 @@ fn field_groups(lang: Lang) -> [(&'static str, &'static [&'static str]); 7] {
                 "max_job_memory",
                 "min_free_memory",
                 "min_free_disk",
+                "max_starting",
+                "max_jobs_per_key",
+                "default_job_shm",
+                "pull_policy",
             ],
         ),
         (
@@ -1899,6 +1938,18 @@ pub(crate) fn in_force(name: &str, settings: &config::Settings) -> String {
             .unwrap_or_else(|| "-".to_string()),
         "min_free_memory" => size(settings.min_free_memory),
         "min_free_disk" => size(settings.min_free_disk),
+        "max_starting" => settings.max_starting.unwrap_or(0).to_string(),
+        "max_jobs_per_key" => settings.max_jobs_per_key.to_string(),
+        "default_job_shm" => settings
+            .default_job_shm
+            .map(size)
+            .unwrap_or_else(|| "0".to_string()),
+        "pull_policy" => if settings.pull_missing {
+            config::PULL_MISSING
+        } else {
+            config::PULL_ALWAYS
+        }
+        .to_string(),
         _ => String::new(),
     }
 }
@@ -3264,7 +3315,7 @@ impl Computer {
 /// The resource limits in force, defaults filled in. No secret is in here.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Limits {
-    /// `shared-pc` or `none`.
+    /// `shared-pc`, `server` or `none`.
     pub profile: String,
     /// Per job: the most it may ask for, and what it gets when it asks for
     /// nothing. Null: no limit.
@@ -3280,6 +3331,8 @@ impl Limits {
         Self {
             profile: if settings.shared_pc {
                 crate::config::PROFILE_SHARED_PC
+            } else if settings.server {
+                crate::config::PROFILE_SERVER
             } else {
                 crate::config::PROFILE_NONE
             }

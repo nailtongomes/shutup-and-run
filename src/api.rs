@@ -30,8 +30,8 @@ fn api_router(launcher: Arc<Launcher>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
-        .route("/v1/jobs", post(create_job))
-        .route("/v1/jobs/{id}", get(job_status))
+        .route("/v1/jobs", post(create_job).get(list_jobs))
+        .route("/v1/jobs/{id}", get(job_status).delete(cancel_job))
         .route("/v1/drain", post(set_drain))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .layer(from_fn_with_state(launcher.clone(), require_auth))
@@ -150,13 +150,14 @@ async fn metrics(State(launcher): State<Arc<Launcher>>) -> Response {
                 .into_response();
         }
     };
+    let more = launcher.metrics_more().await.unwrap_or_default();
     (
         StatusCode::OK,
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        metrics_text(slots, counts),
+        format!("{}{more}", metrics_text(slots, counts)),
     )
         .into_response()
 }
@@ -208,6 +209,18 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
                 "committed_bytes": committed.committed_bytes,
                 "quota_bytes": committed.quota_bytes,
                 "needed_bytes": committed.needed_bytes,
+            })),
+        ),
+        // Too many of this caller's own: 429 like a full machine, with the
+        // key, so the caller puts this one back in its queue.
+        Err(LaunchError::KeyBusy(busy)) => error_body(
+            StatusCode::TOO_MANY_REQUESTS,
+            "concurrency key busy",
+            Some(json!({
+                "code": "CONCURRENCY_KEY_BUSY",
+                "concurrency_key": busy.concurrency_key,
+                "running": busy.running,
+                "limit": busy.limit,
             })),
         ),
         Err(LaunchError::UserActive(active)) => error_body(
@@ -272,6 +285,92 @@ async fn job_status(
         Err(LaunchError::Unavailable(msg)) => error_body(StatusCode::BAD_GATEWAY, &msg, None),
         Err(other) => error_body(StatusCode::BAD_GATEWAY, &other.to_string(), None),
     }
+}
+
+/// `DELETE /v1/jobs/{id}`: SIGTERM, SIGKILL 10 seconds later, `reason`
+/// `launcher_kill` and the callback. A job that has not started yet ends
+/// before it starts. A job that already ended is answered as it is.
+async fn cancel_job(State(launcher): State<Arc<Launcher>>, Path(id): Path<String>) -> Response {
+    if !crate::launcher::valid_container_id(&id) {
+        return not_found(&id);
+    }
+    // In managed mode every job is a managed run, stopped on the machine.
+    if launcher.managed_mode().unwrap_or(false) {
+        return error_body(
+            StatusCode::CONFLICT,
+            "managed mode",
+            Some(json!({"code": "MANAGED_MODE"})),
+        );
+    }
+    if let Err(err) = launcher.stop(&id).await {
+        return error_body(StatusCode::BAD_GATEWAY, &err.to_string(), None);
+    }
+    match launcher.job(&id, false).await {
+        Ok(Some(job)) if job.is_finished() => {
+            (StatusCode::OK, Json(job_json(&job, false))).into_response()
+        }
+        // Stopped while it waited or pulled: it ends in a moment.
+        Ok(Some(job)) => (StatusCode::ACCEPTED, Json(job_json(&job, false))).into_response(),
+        Ok(None) => not_found(&id),
+        Err(err) => error_body(StatusCode::BAD_GATEWAY, &err.to_string(), None),
+    }
+}
+
+fn not_found(id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"id": id, "status": "not_found"})),
+    )
+        .into_response()
+}
+
+/// `GET /v1/jobs?state=running`: the jobs that have not ended, oldest
+/// first, with what each used so far. `running` is the only state.
+async fn list_jobs(
+    State(launcher): State<Arc<Launcher>>,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    if !matches!(query.state.as_deref(), None | Some("running")) {
+        return error_body(StatusCode::BAD_REQUEST, "state must be running", None);
+    }
+    let slots = match launcher.slots().await {
+        Ok(slots) => slots,
+        Err(err) => return error_body(StatusCode::BAD_GATEWAY, &err.to_string(), None),
+    };
+    let rows = match launcher.unfinished().await {
+        Ok(rows) => rows,
+        Err(err) => return error_body(StatusCode::BAD_GATEWAY, &err.to_string(), None),
+    };
+    let jobs: Vec<Value> = rows
+        .iter()
+        .map(|(row, starting)| {
+            let job = &row.job;
+            json!({
+                "id": job.id,
+                "image": job.image,
+                "job_key": job.job_key,
+                "concurrency_key": row.concurrency_key,
+                "phase": if *starting { "starting" } else { "running" },
+                "started_at": job.started_at,
+                "cpu_ms": job.cpu_ms,
+                "memory_peak_bytes": job.memory_peak,
+                "network_bytes": job.network_bytes,
+                "pull_done_bytes": job.pull.map(|(done, _)| done),
+                "pull_total_bytes": job.pull.map(|(_, total)| total),
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "state": "running",
+            "slots_total": slots.total,
+            "slots_used": slots.used,
+            "slots_free": slots.free,
+            "jobs": jobs,
+        })),
+    )
+        .into_response()
 }
 
 async fn set_drain(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Response {
@@ -353,6 +452,7 @@ struct RunBody {
     command: Option<Vec<String>>,
     job_key: Option<String>,
     callback_url: Option<String>,
+    concurrency_key: Option<String>,
 }
 
 pub(crate) fn launch_request_from_slice(bytes: &[u8]) -> Result<LaunchRequest, serde_json::Error> {
@@ -371,6 +471,7 @@ pub(crate) fn launch_request_from_value(value: Value) -> Result<LaunchRequest, s
         command: parsed.command,
         job_key: parsed.job_key,
         callback_url: parsed.callback_url,
+        concurrency_key: parsed.concurrency_key,
     })
 }
 
@@ -378,6 +479,11 @@ pub(crate) fn launch_request_from_value(value: Value) -> Result<LaunchRequest, s
 #[serde(deny_unknown_fields)]
 struct DrainBody {
     draining: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ListQuery {
+    state: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -892,6 +998,7 @@ mod tests {
                 command: None,
                 job_key: None,
                 callback_url: None,
+                concurrency_key: None,
             })
             .await
             .unwrap()
@@ -1053,6 +1160,7 @@ mod tests {
                 command: None,
                 job_key: None,
                 callback_url: None,
+                concurrency_key: None,
             })
             .await
             .unwrap()
@@ -1207,6 +1315,7 @@ mod tests {
                 command: None,
                 job_key: None,
                 callback_url: None,
+                concurrency_key: None,
             })
             .await
             .unwrap()
@@ -1515,15 +1624,31 @@ mod tests {
             .is_none());
         let (_, _, page) = send("GET", "/local/config", vec![], "").await;
         assert!(page.contains("name=\"poll_interval_secs\" placeholder=\"30\" min=\"30\""));
-        // Not from another site's form.
+        // Not from another site's form, nor another port of this machine.
+        for origin in [
+            "https://evil.example",
+            "https://127.0.0.1:9999",
+            "https://127.0.0.1",
+        ] {
+            let (status, _, _) = send(
+                "POST",
+                "/local/config",
+                vec![("origin", origin.into())],
+                "max_slots=9",
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{origin}");
+        }
+        // The same page served over TLS (a server, through an SSH tunnel).
         let (status, _, _) = send(
             "POST",
             "/local/config",
-            vec![("origin", "https://evil.example".into())],
-            "max_slots=9",
+            vec![("origin", "https://127.0.0.1:8787".into())],
+            "max_slots=3",
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(crate::config::read_json(&path).unwrap()["max_slots"], 3);
 
         // A dangerous key through the open form is ignored.
         let (status, _, _) = send(
@@ -2032,5 +2157,122 @@ mod tests {
         let (status, _) = send("POST", "/local/managed", true, "action=mode_off".into()).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         assert!(!launcher.managed_mode().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_caller_lists_cancels_and_is_told_when_its_key_is_busy() {
+        let h = harness(4);
+        const T: Option<&str> = Some("test-token-value-ok");
+        let ip = [203, 0, 113, 10];
+        let call = |request| h.app.clone().oneshot(request);
+        let push = |key: &str| {
+            post(
+                &format!(
+                    r#"{{"image":"alpine","concurrency_key":"{key}","job_key":"case-{key}-{}"}}"#,
+                    rand_suffix()
+                ),
+                T,
+            )
+        };
+        let (status, first) = json_of(call(push("lawyer-0001")).await.unwrap()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (status, _) = json_of(call(push("lawyer-0001")).await.unwrap()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (status, busy) = json_of(call(push("lawyer-0001")).await.unwrap()).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            busy,
+            json!({"error": "concurrency key busy", "code": "CONCURRENCY_KEY_BUSY",
+                   "concurrency_key": "lawyer-0001", "running": 2, "limit": 2})
+        );
+        h.launcher.settled().await;
+
+        // The listing: both, with their key, oldest first.
+        let (status, listed) = json_of(
+            call(get_from("/v1/jobs?state=running", T, ip))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            (listed["slots_used"].as_u64(), listed["slots_free"].as_u64()),
+            (Some(2), Some(2))
+        );
+        let jobs = listed["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["id"], first["id"]);
+        assert_eq!(jobs[0]["concurrency_key"], "lawyer-0001");
+        assert_eq!(jobs[0]["phase"], "running");
+        let (status, _) = json_of(
+            call(get_from("/v1/jobs?state=exited", T, ip))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = json_of(call(get_from("/v1/jobs", None, ip)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Cancel: the job ends as launcher_kill, and a second DELETE answers the same.
+        let id = first["id"].as_str().unwrap().to_string();
+        let delete = |id: &str| {
+            let mut request = get_from(&format!("/v1/jobs/{id}"), T, ip);
+            *request.method_mut() = axum::http::Method::DELETE;
+            request
+        };
+        for _ in 0..2 {
+            let (status, ended) = json_of(call(delete(&id)).await.unwrap()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                (
+                    ended["status"].as_str(),
+                    ended["reason"].as_str(),
+                    ended["exit_code"].as_i64()
+                ),
+                (Some("exited"), Some("launcher_kill"), Some(137))
+            );
+        }
+        assert!(h.mock.killed().await.contains(&id));
+        let (status, _) = json_of(
+            call(delete("0123456789abcdef0123456789abcdef"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // The key has room again.
+        let (status, _) = json_of(call(push("lawyer-0001")).await.unwrap()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let response = call(get_from("/metrics", T, ip)).await.unwrap();
+        let text = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("shutup_and_run_slots_used 2"), "{text}");
+        assert!(
+            text.contains("shutup_and_run_refusals_total{reason=\"concurrency_key_busy\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("shutup_and_run_jobs_ended{reason=\"launcher_kill\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("shutup_and_run_start_seconds_count"),
+            "{text}"
+        );
+    }
+
+    fn rand_suffix() -> u64 {
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
     }
 }

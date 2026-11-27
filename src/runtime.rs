@@ -52,6 +52,12 @@ pub trait Runtime: Send + Sync {
     /// `progress` hears the bytes downloaded so far and the size of the
     /// layers known until then, now and then while a download lasts.
     async fn pull(&self, image: &str, progress: &Progress<'_>) -> Result<(), RuntimeError>;
+    /// The image is on this machine already, as named. For
+    /// `pull_policy = "missing"`; a runtime that cannot tell says no, and
+    /// the job pulls.
+    async fn has_image(&self, _image: &str) -> bool {
+        false
+    }
     async fn running_count(&self) -> Result<usize, RuntimeError>;
     /// `id` is the job id. The container is named after it, and every other
     /// call takes that same id.

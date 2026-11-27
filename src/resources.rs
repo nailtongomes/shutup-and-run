@@ -26,6 +26,26 @@ pub fn shared_pc_memory(total: Option<u64>) -> u64 {
     }
 }
 
+/// The server defaults (`resource_profile = "server"`): a Linux machine that
+/// does nothing but run jobs, many at once. Per job 1 CPU, 1.5 GiB and a
+/// 1 GiB `/dev/shm` (a browser needs it), 10 GiB of disk free for a new
+/// one, and at most 5 starting at the same time.
+pub const SERVER_CPUS: f64 = 1.0;
+pub const SERVER_JOB_MEMORY: u64 = 3 * GIB / 2;
+pub const SERVER_JOB_SHM: u64 = GIB;
+pub const SERVER_MIN_DISK: u64 = 10 * GIB;
+pub const SERVER_MAX_STARTING: usize = 5;
+
+/// The memory a server keeps for itself (the kernel, Docker, this process):
+/// a sixteenth of it, at least 2 GiB and at most 8 GiB. 8 GiB of 128.
+/// A machine that reports nothing keeps 4 GiB.
+pub fn server_min_free_memory(total: Option<u64>) -> u64 {
+    match total {
+        Some(total) => (total / 16).clamp(2 * GIB, 8 * GIB),
+        None => 4 * GIB,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Free {
     pub memory: Option<u64>,
