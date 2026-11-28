@@ -186,6 +186,7 @@ These are accepted, not a bug list. A review should confirm they are still true 
 - A client that keeps reconnecting can still hold connections on the TLS listener. It sends no token, so it is not banned. The defense is a firewall rule ([RECIPES.md](RECIPES.md)).
 - Four medium and six low findings in [REVIEW-2026-11-11.md](REVIEW-2026-11-11.md) are open. The allowlist ones are fixed.
 - `DELETE /v1/jobs/{id}` cancels a job (0.2.34; before, by decision, there was no cancel call).
+- A server (0.2.35) runs only images prepared on it (`pull_policy` `never`) and takes no poll. A prepared image's state is in memory; after a restart it is read from Docker.
 
 ## Open TODOs
 

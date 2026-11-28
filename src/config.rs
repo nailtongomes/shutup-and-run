@@ -42,6 +42,7 @@ const ENV_KEYS: &[&str] = &[
     "SHUTUP_AND_RUN_MAX_JOBS_PER_KEY",
     "SHUTUP_AND_RUN_DEFAULT_JOB_SHM",
     "SHUTUP_AND_RUN_PULL_POLICY",
+    "SHUTUP_AND_RUN_CLEANUP_HOURS",
 ];
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
@@ -128,9 +129,14 @@ pub struct Settings {
     pub max_jobs_per_key: usize,
     /// `/dev/shm` of a job that names no `shm`. None: Docker's 64 MiB.
     pub default_job_shm: Option<u64>,
-    /// `pull_policy = "missing"`: an image already on the machine is not
-    /// asked of the registry again. Off: every job pulls its tag.
-    pub pull_missing: bool,
+    /// Whether a job pulls its image: `always` (every job pulls its tag),
+    /// `missing` (only an image not on the machine) or `never` (a job whose
+    /// image is not here is refused, `IMAGE_NOT_PRESENT`; the server's
+    /// default, whose images are prepared with `POST /v1/images/pull`).
+    pub pull_policy: PullPolicy,
+    /// Server only: when the cleanup of what no job uses runs by itself,
+    /// on an idle machine. `sun 01-03` unless set.
+    pub cleanup_hours: Option<crate::lending::LendHours>,
     /// Windows only: no new job starts until the person has not touched the
     /// keyboard or mouse for this many seconds. Zero: off.
     pub min_idle_secs: u64,
@@ -223,6 +229,7 @@ struct FileConfig {
     max_jobs_per_key: Option<u64>,
     default_job_shm: Option<String>,
     pull_policy: Option<String>,
+    cleanup_hours: Option<String>,
     min_idle_secs: Option<u64>,
     lend_hours: Option<String>,
     lend_on_metered: Option<bool>,
@@ -517,6 +524,7 @@ impl Settings {
         if let Some(url) = &poll_url {
             validate_poll_url(url)?;
         }
+
         if poll_any_image && poll_url.is_none() {
             return Err(ConfigError(
                 "poll_any_image is set but poll_url is not. It only applies to tasks from poll_url.".into(),
@@ -559,6 +567,13 @@ impl Settings {
             // server unless its config says otherwise.
             None => (worker_os == "windows", false),
         };
+        // The server takes pushes only: its jobs come from the orchestrator
+        // that knows them, and a poll would be a second way in.
+        if server && poll_url.is_some() {
+            return Err(ConfigError(
+                "poll_url is not for resource_profile server: a server takes pushes only (POST /v1/jobs)".into(),
+            ));
+        }
         let shared_memory = || crate::resources::shared_pc_memory(crate::resources::memory_total());
         let max_job_cpus = match take_string(env, "SHUTUP_AND_RUN_MAX_JOB_CPUS", file.max_job_cpus)
         {
@@ -626,16 +641,34 @@ impl Settings {
                 },
                 None => server.then_some(crate::resources::SERVER_JOB_SHM),
             };
-        let pull_missing =
+        let pull_policy =
             match take_string(env, "SHUTUP_AND_RUN_PULL_POLICY", file.pull_policy).as_deref() {
-                None | Some(PULL_ALWAYS) => false,
-                Some(PULL_MISSING) => true,
+                None if server => PullPolicy::Never,
+                None | Some(PULL_ALWAYS) => PullPolicy::Always,
+                Some(PULL_MISSING) => PullPolicy::Missing,
+                Some(PULL_NEVER) => PullPolicy::Never,
                 Some(other) => {
                     return Err(ConfigError(format!(
-                        "pull_policy must be {PULL_ALWAYS} or {PULL_MISSING}, not {other:?}"
-                    )))
+                "pull_policy must be {PULL_ALWAYS}, {PULL_MISSING} or {PULL_NEVER}, not {other:?}"
+            )))
                 }
             };
+        let cleanup_hours = match take_string(env, "SHUTUP_AND_RUN_CLEANUP_HOURS", file.cleanup_hours)
+        {
+            Some(_) if !server => {
+                return Err(ConfigError(
+                    "cleanup_hours is for resource_profile server; elsewhere the cleanup runs once a day by itself".into(),
+                ))
+            }
+            Some(text) => Some(
+                crate::lending::LendHours::parse(&text)
+                    .map_err(|why| ConfigError(why.replacen("lend_hours", "cleanup_hours", 1)))?,
+            ),
+            None if server => Some(
+                crate::lending::LendHours::parse(DEFAULT_CLEANUP_HOURS).expect("a valid window"),
+            ),
+            None => None,
+        };
         let min_idle_secs =
             take_u64(env, "SHUTUP_AND_RUN_MIN_IDLE_SECS", file.min_idle_secs)?.unwrap_or(0);
         if min_idle_secs > 86_400 {
@@ -746,7 +779,8 @@ impl Settings {
             max_starting,
             max_jobs_per_key: max_jobs_per_key as usize,
             default_job_shm,
-            pull_missing,
+            pull_policy,
+            cleanup_hours,
             min_idle_secs,
             lend_hours,
             lend_on_metered,
@@ -792,6 +826,28 @@ pub const PROFILE_NONE: &str = "none";
 pub const PROFILE_SERVER: &str = "server";
 pub const PULL_ALWAYS: &str = "always";
 pub const PULL_MISSING: &str = "missing";
+pub const PULL_NEVER: &str = "never";
+/// When a server cleans up by itself: Sunday night, once it has been idle
+/// for `launcher::CLEANUP_IDLE_SECS`.
+pub const DEFAULT_CLEANUP_HOURS: &str = "sun 01-03";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullPolicy {
+    Always,
+    Missing,
+    Never,
+}
+
+impl PullPolicy {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Always => PULL_ALWAYS,
+            Self::Missing => PULL_MISSING,
+            Self::Never => PULL_NEVER,
+        }
+    }
+}
+
 /// Jobs that have not ended with the same `concurrency_key`, by default.
 const DEFAULT_JOBS_PER_KEY: u64 = 2;
 /// Docker refuses a container with less.
@@ -872,6 +928,7 @@ pub const KEYS: &[Key] = &[
     key("max_jobs_per_key", Kind::Int, OnPage::Locked),
     key("default_job_shm", Kind::Text, OnPage::Locked),
     key("pull_policy", Kind::Text, OnPage::Locked),
+    key("cleanup_hours", Kind::Text, OnPage::Locked),
     key("min_idle_secs", Kind::Int, OnPage::Open),
     key("lend_hours", Kind::Text, OnPage::Open),
     key("lend_on_metered", Kind::Bool, OnPage::Open),
@@ -1568,7 +1625,8 @@ mod tests {
             assert!(!plain.server, "{extra}");
             assert_eq!(plain.max_starting, None);
             assert_eq!(plain.default_job_shm, None);
-            assert!(!plain.pull_missing);
+            assert_eq!(plain.pull_policy, PullPolicy::Always);
+            assert!(plain.cleanup_hours.is_none());
             assert_eq!(plain.max_jobs_per_key, 2);
             assert_eq!(plain.history_rows(), crate::launcher::MAX_HISTORY_ROWS);
         }
@@ -1587,6 +1645,10 @@ mod tests {
         assert_eq!(server_min_free_memory(Some(128 * GIB)), 8 * GIB);
         assert_eq!(server_min_free_memory(Some(16 * GIB)), 2 * GIB);
         assert_eq!(crate::status::Limits::of(&server).profile, "server");
+        // Push only, images prepared ahead, a cleanup on Sunday night.
+        assert_eq!(server.pull_policy, PullPolicy::Never);
+        assert_eq!(server.cleanup_hours.as_ref().unwrap().text, "sun 01-03");
+        assert!(server.poll_url.is_none());
 
         // Each figure can be set; 0 turns the start limit and the shm off.
         let set = load(
@@ -1595,7 +1657,7 @@ mod tests {
         .unwrap();
         assert_eq!((set.max_starting, set.default_job_shm), (None, None));
         assert_eq!(set.max_jobs_per_key, 1);
-        assert!(set.pull_missing);
+        assert_eq!(set.pull_policy, PullPolicy::Missing);
         assert_eq!(set.max_job_memory, Some(2 * GIB));
         let from_env = Settings::from_toml_and_env(
             &base_toml(""),
@@ -1606,6 +1668,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!((from_env.server, from_env.max_starting), (true, Some(8)));
+        // No way to turn the poll on: from the environment either.
+        let err = Settings::from_toml_and_env(
+            &base_toml(""),
+            &env(&[
+                ("SHUTUP_AND_RUN_RESOURCE_PROFILE", "server"),
+                ("SHUTUP_AND_RUN_POLL_URL", "https://jobs.example/poll"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.0.contains("pushes only"), "{err:?}");
+        let nightly = load(
+            "resource_profile = \"server\"\ncleanup_hours = \"01-03\"\npull_policy = \"always\"",
+        )
+        .unwrap();
+        assert_eq!(nightly.cleanup_hours.unwrap().text, "01-03");
+        assert_eq!(nightly.pull_policy, PullPolicy::Always);
 
         for (extra, message) in [
             (
@@ -1614,7 +1692,19 @@ mod tests {
             ),
             ("max_starting = 300", "max_starting must be"),
             ("max_jobs_per_key = 0", "max_jobs_per_key must be"),
-            ("pull_policy = \"never\"", "pull_policy must be"),
+            ("pull_policy = \"sometimes\"", "pull_policy must be"),
+            (
+                "cleanup_hours = \"01-03\"",
+                "cleanup_hours is for resource_profile server",
+            ),
+            (
+                "resource_profile = \"server\"\ncleanup_hours = \"25-03\"",
+                "cleanup_hours \"25-03\"",
+            ),
+            (
+                "resource_profile = \"server\"\npoll_url = \"https://jobs.example/poll\"",
+                "poll_url is not for resource_profile server",
+            ),
             (
                 "default_job_shm = \"big\"",
                 "default_job_shm must be a size",

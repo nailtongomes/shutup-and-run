@@ -2,9 +2,25 @@
 
 One Linux machine that does nothing but run jobs, many at once, for one orchestrator that pushes them. For example: a Flask API with a queue for about 200 people, about 1000 jobs a day, one Selenium container per job (1 CPU, 1.5 GiB, about 5 minutes), on a 48-core, 128 GiB server with an NVMe disk and native Docker.
 
-This is the `server` resource profile (0.2.34). A client's PC (Windows, WSL2, `shared-pc`) is unchanged by it, and so is a Linux machine that does not ask for it.
+This is the `server` resource profile (0.2.34; push only, prepared images and the cleanup since 0.2.35). A client's PC (Windows, WSL2, `shared-pc`) is unchanged by it, and so is a Linux machine that does not ask for it.
 
-The orchestrator decides what runs and when, keeps the queue and retries. The server starts a container, says no at once when it cannot, and reports how each job ended. Everything below follows from that split.
+The orchestrator decides what runs and when, keeps the queue, the state and the retries. The server starts a container, says no at once when it cannot, and reports how each job ended. Everything below follows from that split. The containers are workers that know nothing of each other: one per request, it starts, runs and is removed. When the server is full, the orchestrator sends the rest elsewhere (a serverless overflow, outside this repository).
+
+## The daily cycle
+
+```text
+once a day        POST /v1/images/pull {"image": ...}     GET /v1/images/pull?image=... until "ready"
+every ~4 minutes  up to 200 x POST /v1/jobs                 202 accepted / 200 already here / 429, 409, 503 refused
+when idle         the cleanup (Sunday 01-03 by itself, or POST /v1/maintenance/cleanup)
+any time          GET /health                               slots, disk, memory, what is short, the last cleanup
+```
+
+1. **Prepare the image once a day.** `POST /v1/images/pull` starts the download and answers `202` at once. `GET /v1/images/pull?image=NAME` says `pulling`, `ready`, `failed` (with `error`) or `absent`. Under the server's `pull_policy` `never`, a job never pulls: a job whose image is not on the machine is refused with `409` `IMAGE_NOT_PRESENT`, so a burst never waits on a registry. Preparing a moving tag (`:latest`) every day is how the jobs follow it; the old version, untagged, goes at the next cleanup once no container uses it.
+2. **Bursts.** The orchestrator sends what it has queued, up to 200 pushes at once, every few minutes. Each has `image`, `env`, `job_key` (the task and its attempt) and `concurrency_key` (whose work it is: the lawyer). The server accepts while it has free slots and answers the rest at once with the reason; it keeps no queue of its own. Answers may take a moment in a burst: admission is one at a time.
+3. **The repeat is harmless.** The next burst sends the same tasks again. A `job_key` already here answers `200` with its job and starts nothing; a new attempt of a lawyer whose two jobs still run is `429` `CONCURRENCY_KEY_BUSY`; a full machine is `429` `no free slots`. Nothing is stored for a refusal.
+4. **Cleanup.** Inside `cleanup_hours` (`sun 01-03` unless set; `01-03` for every night), once per window, after 30 minutes with no job running or starting and no image being prepared: stopped containers of jobs that ended, images no job used or prepared for 30 days, untagged images, anonymous volumes no container uses, job logs older than 7 days. `POST /v1/maintenance/cleanup` does the same now, or answers `409` `JOBS_RUNNING` with nothing done.
+
+`tests` in `src/api.rs` run that day on a fake Docker: 200 concurrent pushes against 20 slots that start 5 at a time are exactly 20 accepted and 180 refused with a reason, no slot counted twice, the same burst again starts nothing, every slot comes back after the cancels, and the env values reach the container and no answer, metric, log line or callback.
 
 ## What the profile changes
 
@@ -20,8 +36,11 @@ The orchestrator decides what runs and when, keeps the queue and retries. The se
 | Jobs at once per `concurrency_key` (`max_jobs_per_key`) | 2 | 2 | 2 |
 | Finished jobs kept in the history | 500 | 500 | 50 000 |
 | Safety assessment and the owner's consent | no | yes | no: nobody uses the machine |
+| A job's image (`pull_policy`) | `always` pulled | `always` pulled | `never`: prepared ahead, else `409` |
+| Poll URL (`poll_url`) | allowed | allowed | refused: push only |
+| Cleanup | once a day, images unused for 30 days | once a day, also untagged images, then `fstrim` | `cleanup_hours` when idle, and `POST /v1/maintenance/cleanup` |
 
-Each figure is a key of its own and can be set under any profile. `pull_policy` (`always` or `missing`) is `always` under every profile.
+Each figure is a key of its own and can be set under any profile, except two: `poll_url` cannot be set on a server at all (the config is refused, from the file or the environment), and `cleanup_hours` is a server's only. `pull_policy` is `always`, `missing` (pull only what is not here) or `never`.
 
 How the numbers work on 128 GiB:
 
@@ -51,6 +70,8 @@ Ubuntu 22.04 or 24.04 (cgroup v2), root over SSH. Nothing asks a question. Every
    - `SHUTUP_AND_RUN_PORT` changes the port.
 
    Run the same line again to update the binary: it keeps `config.json`.
+
+   The server takes pushes only. A `poll_url` in its config, or `SHUTUP_AND_RUN_POLL_URL`, is refused when the config is read: there is no way to turn the poll on under this profile.
 
 2. **Check it.** All three should succeed:
 
@@ -87,6 +108,16 @@ Ubuntu 22.04 or 24.04 (cgroup v2), root over SSH. Nothing asks a question. Every
 
    Keep the token in the orchestrator's secret store, not in its code.
 
+6. **Prepare the image**, then check that it is there:
+
+   ```bash
+   TOKEN=$(sudo shutup-and-run config get token --reveal)
+   curl -s --cacert /etc/shutup-and-run/cert.pem -H "Authorization: Bearer $TOKEN" \
+     -d '{"image":"ghcr.io/nailtongomes/rpa-worker-selenium:latest"}' https://127.0.0.1:8787/v1/images/pull
+   curl -s --cacert /etc/shutup-and-run/cert.pem -H "Authorization: Bearer $TOKEN" \
+     'https://127.0.0.1:8787/v1/images/pull?image=ghcr.io/nailtongomes/rpa-worker-selenium:latest'
+   ```
+
 ### A config for 128 GiB
 
 What the installer writes, plus the keys you would most often set. The values are examples; the token and the password are generated on the machine and never leave it.
@@ -110,13 +141,14 @@ What the installer writes, plus the keys you would most often set. The values ar
   "min_free_disk": "20g",
   "max_starting": 5,
   "max_jobs_per_key": 2,
-  "pull_policy": "missing",
+  "pull_policy": "never",
+  "cleanup_hours": "sun 01-03",
   "default_timeout_secs": 900,
   "max_timeout_secs": 3600
 }
 ```
 
-`pull_policy: missing` saves a registry call on each of the thousand jobs a day, and it means a tag that moves is not followed. Push a new version tag (`:2026-11-27`) or a digest, and change the image name in the orchestrator. With `always`, every job asks the registry for its tag, and a registry that does not answer falls back to the local image.
+`pull_policy: never` (the server's default) means no job ever talks to the registry: the thousand jobs a day use what the daily preparation brought. `missing` pulls an image a job names that is not here, while the job waits holding its slot. `always` asks the registry for every job's tag, and a registry that does not answer falls back to the local image.
 
 ## Reaching the API
 
@@ -138,7 +170,17 @@ ssh -N -L 8787:127.0.0.1:8787 root@SERVER_IP
 
 The settings behind "Advanced" ask for the admin login: `admin`, and the password from `sudo shutup-and-run config get admin_password --reveal`. Change either there, or with `config set admin_user` / `config set admin_password`. Whoever has the SSH key already has the machine. The login keeps the page's dangerous settings away from someone who only has the tunnel.
 
-For a program, the same is in the API. `GET /health` answers `{"slots_total":75,"slots_used":12,"slots_free":63,...}`. `GET /v1/jobs?state=running` lists each running job.
+For a program, the same is in the API. `GET /v1/jobs?state=running` lists each running job. `GET /health` answers the slots and the machine:
+
+```json
+{"status":"ok","draining":false,"mode":"jobs","slots_total":75,"slots_used":12,"slots_free":63,
+ "machine":{"profile":"server","cpus":48,"load1":6.2,
+            "memory_total_bytes":135089553408,"memory_available_bytes":98784247808,"min_free_memory_bytes":8589934592,
+            "disk_free_bytes":512110190592,"min_free_disk_bytes":10737418240,
+            "shortage":null,"last_cleanup":{"at":1700000000,"images":2,"freed_bytes":3221225472}}}
+```
+
+`disk_free_bytes` is the disk Docker writes to. `shortage` is what blocks a new job right now (`{"resource":"disk","free_bytes":...,"needed_bytes":...}`), the same as the `503` a push would get. Alert on it, and on `disk_free_bytes` getting near `min_free_disk_bytes`.
 
 ## Pushing a job
 
@@ -165,25 +207,36 @@ n8n: an HTTP Request node with `fullResponse` and `neverError`, routing on `stat
 
 ### The answers and what the orchestrator does
 
-| Answer | Means | The orchestrator |
-| --- | --- | --- |
-| `202` | Accepted, a slot is held, the job will start (it may first wait its turn under `max_starting`). | Store `id`, mark the task leased. |
-| `200` | This `job_key` is already here. | Same as `202`; read `status`. |
-| `429` `no free slots` | Every slot is taken. | Back in the queue; try again in a few seconds. |
-| `429` `concurrency key busy`, `code` `CONCURRENCY_KEY_BUSY` | Two jobs of this key have not ended. | Back in the queue, behind the other keys. |
-| `503` `memory committed`, `code` `JOBS_MEMORY_COMMITTED` | The memory limits of the running jobs leave no room for this one's. | Back in the queue; it clears when a job ends. |
-| `503` `insufficient resources` | Memory or disk free is below the minimum now. | Back in the queue; alert if it lasts. |
-| `503` `draining` | Paused for maintenance. | Back in the queue. |
-| `400` | The request is wrong, or asks for more than the machine allows. | Do not retry it: fix the task. |
-| `403` | The image is not on the allowlist (or the address is banned). | Fix the config or the token. |
-| `401` | Wrong token. | Stop before the third. |
-| `502` | Docker or the history did not answer. | Back in the queue; alert. |
+Every refusal of `POST /v1/jobs` has `reason` (0.2.35), one stable word, the same as the label of `shutup_and_run_refusals_total`. Route on it, not on `error`'s text.
 
-Nothing is stored for a `429`, `503`, `400` or `403`. The same `job_key` can be sent again, here or elsewhere. The memory wait answers `503` like on a client's PC: a caller that treats every `429` and `503` as "not now" needs no table at all.
+| Answer | `reason` | Means | The orchestrator |
+| --- | --- | --- | --- |
+| `202` | | Accepted, a slot is held, the job will start (it may first wait its turn under `max_starting`). | Store `id`, mark the task as sent. |
+| `200` | | This `job_key` is already here (running or ended). | Same as `202`; read `status`. Nothing started. |
+| `429` | `no_slots` | Every slot is taken. | Keep it queued for the next burst, or send it to the overflow. |
+| `429` | `concurrency_key_busy` | Two jobs of this lawyer (`concurrency_key`) have not ended. | Keep it queued, behind the other lawyers. |
+| `409` | `image_not_present` | The image was not prepared (`code` `IMAGE_NOT_PRESENT`, with `image`). | Prepare it (`POST /v1/images/pull`); send it after `ready`. Alert: the daily step failed. |
+| `503` | `memory_committed` | The memory limits of the running jobs leave no room for this one's. | Keep it queued; it clears when a job ends. |
+| `503` | `low_disk`, `low_memory` | Disk or memory free is below the minimum now (`resource`, `free_bytes`, `needed_bytes`). | Keep it queued or overflow; alert: `GET /health` says how much. |
+| `503` | `draining` | Paused for maintenance. | Keep it queued or overflow. |
+| `400` | `bad_request` | The request is wrong, or asks for more than the machine allows. | Do not retry it: fix the task. |
+| `403` | `not_allowlisted` | The image is not on the allowlist. | Fix the config or the image name. |
+| `401` | | Wrong token. | Stop before the third (a ban). |
+| `502` | `unavailable` | Docker or the history did not answer. | Keep it queued; alert. |
 
-## Lease and return to the queue (in the orchestrator)
+Nothing is stored for a refusal. The same `job_key` can be sent again, here or elsewhere.
 
-The server keeps no queue. It does not retry a job or start a refused one later. So the queue's states live in the orchestrator's own database, for example:
+## State, checkpoints and the callback
+
+The server keeps no queue, no task state and no checkpoint. It does not retry a job, start a refused one later, or reconcile what it ran with what the orchestrator thinks. Those belong to the orchestrator (Flask, with Redis or its database) and to the worker inside the container:
+
+- **Checkpoints are the worker's.** A job that may be killed (timeout, cancel, a restart) writes its progress where the next attempt reads it, for example a Redis key per task (`task:1042:step`), through the `env` it got (`REDIS_URL` and a key, never a password in the image). The server neither reads nor keeps any of it.
+- **Deduplication is `job_key` and the orchestrator's.** The server only promises that one `job_key` starts at most one container while its row is in the history (`history_days`).
+- **The callback is best effort.** It is sent when the job ends and repeated until a `2xx` or for one hour, and then given up. A server restart, a network cut or a receiver down for an hour loses it. The orchestrator must not depend on it alone: a task it sent and heard nothing about is asked with `GET /v1/jobs/{id}`, or simply sent again with the same `job_key` (`200` with the job as it is).
+
+### Return to the queue (in the orchestrator)
+
+The queue's states live in the orchestrator's own database, for example:
 
 ```text
 queued ──push 202/200──▶ leased(job_id, lease_until) ──callback──▶ done | failed | queued (requeue)
@@ -282,9 +335,11 @@ SAR_URL = "https://203.0.113.10:8787"
 SAR_TOKEN = load_secret("SAR_TOKEN")
 SAR_CERT = "/etc/myapp/sar-cert.pem"        # copied from the server
 
+IMAGE = "ghcr.io/nailtongomes/rpa-worker-selenium:latest"   # prepared once a day
+
 def push(task) -> str:
     body = {
-        "image": "ghcr.io/nailtongomes/rpa-worker-selenium:2026-11-27",
+        "image": IMAGE,
         "job_key": f"req-{task.id}-attempt-{task.attempt}",
         "concurrency_key": f"account-{task.account_id}",
         "env": task.env(),
@@ -296,12 +351,21 @@ def push(task) -> str:
     if r.status_code in (200, 202):
         task.lease(job_id=r.json()["id"], secs=900 + 35 * 60)
         return "leased"
-    if r.status_code in (429, 503, 502):
-        task.requeue(delay_secs=15)         # nothing was stored on the server
-        return r.json().get("code") or r.json().get("error", "busy")
-    task.mark_failed(reason=f"refused {r.status_code}: {r.text[:200]}")
+    reason = r.json().get("reason", "") if r.headers.get("content-type", "").startswith("application/json") else ""
+    if reason == "image_not_present":
+        prepare_image(IMAGE)                # and alert: the daily step did not run
+    if r.status_code in (409, 429, 503, 502):
+        task.requeue(delay_secs=15)         # nothing was stored; the next burst sends it again
+        return reason or "busy"
+    task.mark_failed(reason=f"refused {r.status_code} {reason}")
     return "refused"
+
+def prepare_image(image: str) -> None:     # once a day, before the first burst
+    requests.post(f"{SAR_URL}/v1/images/pull", json={"image": image}, timeout=20, verify=SAR_CERT,
+                  headers={"Authorization": f"Bearer {SAR_TOKEN}"})
 ```
+
+A burst is the same function over the queued tasks, in a thread pool of, say, 20. A refusal costs a millisecond and stores nothing, so sending the whole queue every 4 minutes is fine.
 
 A push that times out may have been accepted: send the same `job_key` again before you move on. `200` or `202` both mean it is there.
 
@@ -333,9 +397,9 @@ curl -s --cacert sar-cert.pem -H "Authorization: Bearer $SAR_TOKEN" 'https://SER
 | `shutup_and_run_slots_total`, `_slots_used`, `_slots_free`, `_draining` | Slots. |
 | `shutup_and_run_jobs{state="starting"\|"running"}` | Jobs that have not ended. |
 | `shutup_and_run_jobs_ended{reason="..."}` | Ended jobs in the history, by reason. |
-| `shutup_and_run_refusals_total{reason="..."}` | Refusals since the service started: `no_slots`, `concurrency_key_busy`, `memory_committed`, `low_memory`, `low_disk`, `draining`, `bad_request`, `not_allowlisted`, `unavailable`. |
-| `shutup_and_run_pull_seconds_sum`, `_count` | Image pulls and their time. |
-| `shutup_and_run_pulls_skipped_total` | Pulls not made under `pull_policy` `missing`. |
+| `shutup_and_run_refusals_total{reason="..."}` | Refusals since the service started, by the `reason` of the answer: `no_slots`, `concurrency_key_busy`, `image_not_present`, `memory_committed`, `low_memory`, `low_disk`, `draining`, `bad_request`, `not_allowlisted`, `unavailable`. |
+| `shutup_and_run_pull_seconds_sum`, `_count` | Image pulls and their time, the preparations included. |
+| `shutup_and_run_pulls_skipped_total` | Jobs that did not pull: `pull_policy` `never`, or `missing` with the image here. |
 | `shutup_and_run_start_seconds_sum`, `_count` | From acceptance to a running container: the wait for `max_starting`, the pull, the create. |
 
 The refusal and timing counters are in memory and start again at zero when the service restarts, like any Prometheus counter.
@@ -361,7 +425,9 @@ A drain answers every push `503` `draining`, so the orchestrator keeps its tasks
 
 ## What is not in the binary, and why
 
-- **A faster or batched poll.** Polling is for a machine the orchestrator cannot reach. This one it reaches, and a push is answered in milliseconds. The 30-second minimum stays for the machines that do poll.
+- **A poll, faster or not.** Polling is for a machine the orchestrator cannot reach. This one it reaches, and a push is answered in milliseconds. A server refuses `poll_url`; the 30-second minimum stays for the machines that do poll.
+- **An allowlist by prefix.** An entry is one repository and already allows all its tags and digests (`ghcr.io/nailtongomes/rpa-worker-selenium` allows `:latest`, `:2026-11-27` and `@sha256:...`). A prefix would also allow `ghcr.io/nailtongomes/rpa-worker-selenium-evil`; list each repository instead.
+- **A guaranteed callback, reconciliation, leases.** The callback is best effort (above). The orchestrator's database is the record of what it sent; the server's history is a help for a person, not a second source of truth.
 - **A queue, retries, a later start of a refused job.** The orchestrator's queue already exists. A second one on the server would disagree with it after the first crash.
 - **Several servers, autoscaling, billing.** Out of scope. Each server is its own `job_key` namespace; which server got which task is the orchestrator's record.
 - **The status page on the network.** It edits the config. The API with its token is what the network gets; the page is reached through SSH.

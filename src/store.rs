@@ -807,6 +807,20 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(sql)
     }
 
+    /// An image prepared for jobs to come (`POST /v1/images/pull`) counts
+    /// as used now, so the cleanup keeps it.
+    pub fn touch_image(&self, image: &str, at: i64) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        note_image(&conn, image, at)
+    }
+
+    /// When the last job ended. None when no job ever did.
+    pub fn last_ended_at(&self) -> Result<Option<i64>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.query_row("SELECT MAX(ended_at) FROM jobs", [], |row| row.get(0))
+            .map_err(sql)
+    }
+
     /// An image that was removed: a later job with it is a new first use.
     pub fn forget_image(&self, image: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().expect("sqlite");

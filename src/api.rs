@@ -27,8 +27,15 @@ pub fn router(launcher: Arc<Launcher>) -> Router {
 }
 
 fn api_router(launcher: Arc<Launcher>) -> Router {
-    Router::new()
+    let mut router = Router::new();
+    // A server's own: elsewhere the cleanup runs by itself once a day, and
+    // the daemon's other images and volumes are its owner's.
+    if launcher.settings().server {
+        router = router.route("/v1/maintenance/cleanup", post(cleanup));
+    }
+    router
         .route("/health", get(health))
+        .route("/v1/images/pull", post(prepare_image).get(image_state))
         .route("/metrics", get(metrics))
         .route("/v1/jobs", post(create_job).get(list_jobs))
         .route("/v1/jobs/{id}", get(job_status).delete(cancel_job))
@@ -110,6 +117,7 @@ async fn health(State(launcher): State<Arc<Launcher>>) -> Response {
                 "slots_used": slots.used,
                 "slots_free": slots.free,
                 "mode": if launcher.managed_mode().unwrap_or(false) { "managed" } else { "jobs" },
+                "machine": launcher.machine_health(),
             })),
         )
             .into_response(),
@@ -165,7 +173,13 @@ async fn metrics(State(launcher): State<Arc<Launcher>>) -> Response {
 async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Response {
     let request = match launch_request_from_slice(&body) {
         Ok(request) => request,
-        Err(_) => return error_body(StatusCode::BAD_REQUEST, "invalid JSON", None),
+        Err(_) => {
+            return error_body(
+                StatusCode::BAD_REQUEST,
+                "invalid JSON",
+                Some(json!({"reason": "bad_request"})),
+            )
+        }
     };
     match launcher.launch(request).await {
         Ok(LaunchOutcome::Created(job)) => {
@@ -174,11 +188,24 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
         Ok(LaunchOutcome::Existing(job)) => {
             (StatusCode::OK, Json(job_json(&job, false))).into_response()
         }
-        Err(LaunchError::BadRequest(msg)) => error_body(StatusCode::BAD_REQUEST, &msg, None),
-        Err(LaunchError::Forbidden) => {
-            error_body(StatusCode::FORBIDDEN, "image is not allowlisted", None)
-        }
-        Err(LaunchError::NoSlots { total, used }) => error_body(
+        Err(err) => refusal(err),
+    }
+}
+
+/// A refused push: its status, its message, and `reason`, the stable word
+/// of each refusal (`no_slots`, `image_not_present`, ...), the label of
+/// `shutup_and_run_refusals_total`.
+fn refusal(err: LaunchError) -> Response {
+    let reason = crate::launcher::refusal_reason(&err);
+    let body = |status: StatusCode, error: &str, extra: Option<Value>| {
+        let mut extra = extra.unwrap_or_else(|| json!({}));
+        extra["reason"] = json!(reason);
+        error_body(status, error, Some(extra))
+    };
+    match err {
+        LaunchError::BadRequest(msg) => body(StatusCode::BAD_REQUEST, &msg, None),
+        LaunchError::Forbidden => body(StatusCode::FORBIDDEN, "image is not allowlisted", None),
+        LaunchError::NoSlots { total, used } => body(
             StatusCode::TOO_MANY_REQUESTS,
             "no free slots",
             Some(json!({
@@ -187,12 +214,12 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
                 "slots_free": total.saturating_sub(used),
             })),
         ),
-        Err(LaunchError::Draining) => error_body(
+        LaunchError::Draining => body(
             StatusCode::SERVICE_UNAVAILABLE,
             "draining",
             Some(json!({"draining": true})),
         ),
-        Err(LaunchError::LowResources(shortage)) => error_body(
+        LaunchError::LowResources(shortage) => body(
             StatusCode::SERVICE_UNAVAILABLE,
             "insufficient resources",
             Some(json!({
@@ -201,7 +228,7 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
                 "needed_bytes": shortage.needed_bytes,
             })),
         ),
-        Err(LaunchError::Committed(committed)) => error_body(
+        LaunchError::Committed(committed) => body(
             StatusCode::SERVICE_UNAVAILABLE,
             "memory committed",
             Some(json!({
@@ -213,7 +240,7 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
         ),
         // Too many of this caller's own: 429 like a full machine, with the
         // key, so the caller puts this one back in its queue.
-        Err(LaunchError::KeyBusy(busy)) => error_body(
+        LaunchError::KeyBusy(busy) => body(
             StatusCode::TOO_MANY_REQUESTS,
             "concurrency key busy",
             Some(json!({
@@ -223,7 +250,7 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
                 "limit": busy.limit,
             })),
         ),
-        Err(LaunchError::UserActive(active)) => error_body(
+        LaunchError::UserActive(active) => body(
             StatusCode::SERVICE_UNAVAILABLE,
             "user active",
             Some(json!({
@@ -231,19 +258,19 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
                 "needed_secs": active.needed_secs,
             })),
         ),
-        Err(LaunchError::NotLending(hold)) => error_body(
+        LaunchError::NotLending(hold) => body(
             StatusCode::SERVICE_UNAVAILABLE,
             "not lending now",
             Some(json!({"code": hold.code, "detail": hold.detail})),
         ),
         // Both are "not now, on this machine": 503, like the other waits. The
         // caller cannot lift either; the second needs a person at the machine.
-        Err(LaunchError::SafetyBlocked(reasons)) => error_body(
+        LaunchError::SafetyBlocked(reasons) => body(
             StatusCode::SERVICE_UNAVAILABLE,
             "blocked for safety",
             Some(json!({"code": "SAFETY_BLOCKED", "reasons": reasons})),
         ),
-        Err(LaunchError::AuthorizationRequired(reasons)) => error_body(
+        LaunchError::AuthorizationRequired(reasons) => body(
             StatusCode::SERVICE_UNAVAILABLE,
             "authorization required",
             Some(json!({
@@ -254,15 +281,79 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
         ),
         // Not "later": the machine was set to run its own containers, and
         // only a person at it changes that.
-        Err(LaunchError::ManagedMode) => error_body(
+        LaunchError::ManagedMode => body(
             StatusCode::CONFLICT,
             "managed mode",
             Some(json!({"code": "MANAGED_MODE"})),
         ),
-        Err(err @ (LaunchError::JobsMode | LaunchError::AlreadyRunning)) => {
-            error_body(StatusCode::BAD_GATEWAY, &err.to_string(), None)
+        err @ (LaunchError::JobsMode | LaunchError::AlreadyRunning) => {
+            body(StatusCode::BAD_GATEWAY, &err.to_string(), None)
         }
-        Err(LaunchError::Unavailable(msg)) => error_body(StatusCode::BAD_GATEWAY, &msg, None),
+        LaunchError::Unavailable(msg) => body(StatusCode::BAD_GATEWAY, &msg, None),
+        // The machine is set to run only images prepared on it, and this
+        // one is not: prepare it, then send the job again.
+        LaunchError::ImageNotPresent(image) => body(
+            StatusCode::CONFLICT,
+            "image not present",
+            Some(json!({"code": "IMAGE_NOT_PRESENT", "image": image})),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageBody {
+    image: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageQuery {
+    image: Option<String>,
+}
+
+/// `POST /v1/images/pull` `{"image": "..."}`: starts pulling an allowlisted
+/// image for the jobs to come and answers at once, `202`. Asked again
+/// while it pulls, it answers the same pull.
+async fn prepare_image(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Response {
+    let Ok(ImageBody { image }) = serde_json::from_slice::<ImageBody>(&body) else {
+        return error_body(StatusCode::BAD_REQUEST, "invalid JSON", None);
+    };
+    match launcher.prepare_image(&image) {
+        Ok(prepare) => (StatusCode::ACCEPTED, Json(json!(prepare))).into_response(),
+        Err(LaunchError::Forbidden) => {
+            error_body(StatusCode::FORBIDDEN, "image is not allowlisted", None)
+        }
+        Err(err) => error_body(StatusCode::BAD_REQUEST, &err.to_string(), None),
+    }
+}
+
+/// `GET /v1/images/pull?image=...`: `pulling`, `ready`, `failed` (with
+/// `error`) or `absent`.
+async fn image_state(
+    State(launcher): State<Arc<Launcher>>,
+    Query(query): Query<ImageQuery>,
+) -> Response {
+    let Some(image) = query.image else {
+        return error_body(StatusCode::BAD_REQUEST, "image is required", None);
+    };
+    match launcher.image_state(&image).await {
+        Ok(prepare) => (StatusCode::OK, Json(json!(prepare))).into_response(),
+        Err(err) => error_body(StatusCode::BAD_REQUEST, &err.to_string(), None),
+    }
+}
+
+/// `POST /v1/maintenance/cleanup` (server only): the cleanup, now, on an
+/// idle machine; `409` `JOBS_RUNNING` while anything runs, with nothing
+/// done. No job is admitted while it lasts.
+async fn cleanup(State(launcher): State<Arc<Launcher>>) -> Response {
+    match launcher.clean_now().await {
+        Ok(Ok(cleaned)) => (StatusCode::OK, Json(json!(cleaned))).into_response(),
+        Ok(Err(running)) => error_body(
+            StatusCode::CONFLICT,
+            "jobs running",
+            Some(json!({"code": "JOBS_RUNNING", "running": running})),
+        ),
+        Err(err) => error_body(StatusCode::BAD_GATEWAY, &err.to_string(), None),
     }
 }
 
@@ -2183,6 +2274,7 @@ mod tests {
         assert_eq!(
             busy,
             json!({"error": "concurrency key busy", "code": "CONCURRENCY_KEY_BUSY",
+                   "reason": "concurrency_key_busy",
                    "concurrency_key": "lawyer-0001", "running": 2, "limit": 2})
         );
         h.launcher.settled().await;
@@ -2274,5 +2366,486 @@ mod tests {
     fn rand_suffix() -> u64 {
         static N: AtomicU64 = AtomicU64::new(0);
         N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    // The server's day, on the mock runtime: prepare the image, bursts of
+    // pushes, the cleanup. The figures are the test's, small; the shape is
+    // the one in docs/SERVER.md.
+
+    const WORKER: &str = "ghcr.io/owner/selenium-worker:latest";
+
+    fn server_harness(slots: usize, extra: &str) -> Harness {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("shutup-and-run-server-{n}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 100m a job, so twenty fit the test machine's committed memory.
+        let settings = Settings::from_toml_and_env(
+            &format!(
+                r#"
+                token = "test-token-value-ok"
+                max_slots = {slots}
+                allowlist = ["alpine", "ghcr.io/owner/selenium-worker"]
+                history_path = '{}'
+                resource_profile = "server"
+                max_job_memory = "100m"
+                auth_failures = 30
+                {extra}
+                "#,
+                dir.join("jobs.sqlite").display()
+            ),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let mock = Arc::new(MockRuntime::new());
+        let clock = Arc::new(FakeClock::new(1_700_000_000));
+        let runtime: Arc<dyn Runtime> = mock.clone();
+        let launcher = Launcher::with_clock(settings, runtime, clock.clone()).unwrap();
+        Harness {
+            app: router(launcher.clone()),
+            launcher,
+            mock,
+            clock,
+        }
+    }
+
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {TOKEN}"));
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let request = stamp(
+            builder
+                .body(Body::from(body.unwrap_or_default().to_string()))
+                .unwrap(),
+            [203, 0, 113, 10],
+        );
+        json_of(app.clone().oneshot(request).await.unwrap()).await
+    }
+
+    async fn prepared(app: &Router, image: &str) -> Value {
+        let (status, body) = send(
+            app,
+            "POST",
+            "/v1/images/pull",
+            Some(&json!({ "image": image }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["state"], "pulling");
+        for _ in 0..200 {
+            let (status, body) =
+                send(app, "GET", &format!("/v1/images/pull?image={image}"), None).await;
+            assert_eq!(status, StatusCode::OK);
+            if body["state"] != "pulling" {
+                return body;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{image} never left pulling");
+    }
+
+    /// 200 pushes at once, from 50 lawyers, to a server with 20 slots that
+    /// starts 5 at a time.
+    async fn burst(app: &Router, round: &str) -> Vec<(StatusCode, Value)> {
+        let pushes = (0..200).map(|i| {
+            let app = app.clone();
+            let body = json!({
+                "image": WORKER,
+                "job_key": format!("{round}-case-{i:03}"),
+                "concurrency_key": format!("lawyer-{:02}", i % 50),
+                "env": {"CASE_ID": format!("fake-case-{i:03}")},
+            })
+            .to_string();
+            tokio::spawn(async move { send(&app, "POST", "/v1/jobs", Some(&body)).await })
+        });
+        let all = futures_util::future::join_all(pushes);
+        tokio::time::timeout(std::time::Duration::from_secs(30), all)
+            .await
+            .expect("a burst never hangs")
+            .into_iter()
+            .map(|answer| answer.unwrap())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_fills_the_free_slots_refuses_the_rest_and_a_repeat_starts_nothing_twice() {
+        let h = server_harness(20, "");
+        // An image that is not here yet: refused at once, nothing pulled.
+        let probe = json!({"image": WORKER, "job_key": "probe"}).to_string();
+        let (status, body) = send(&h.app, "POST", "/v1/jobs", Some(&probe)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            json!({"error": "image not present", "code": "IMAGE_NOT_PRESENT",
+                   "reason": "image_not_present", "image": WORKER})
+        );
+        assert!(h.mock.pulls().await.is_empty());
+        assert!(h.launcher.recent_jobs(10).unwrap().is_empty());
+
+        // Prepared once a day, then every job finds it.
+        assert_eq!(prepared(&h.app, WORKER).await["state"], "ready");
+
+        let first = burst(&h.app, "r1").await;
+        let accepted: Vec<&Value> = first
+            .iter()
+            .filter(|(status, _)| *status == StatusCode::ACCEPTED)
+            .map(|(_, body)| body)
+            .collect();
+        assert_eq!(accepted.len(), 20, "exactly the free slots");
+        for (status, body) in &first {
+            if *status != StatusCode::ACCEPTED {
+                assert_eq!(*status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+                let reason = body["reason"].as_str().unwrap();
+                assert!(
+                    ["no_slots", "concurrency_key_busy"].contains(&reason),
+                    "{body}"
+                );
+            }
+        }
+        // No lawyer over its two, no slot counted twice, every row there.
+        let mut per_key: HashMap<String, usize> = HashMap::new();
+        let rows = h.launcher.recent_jobs(1000).unwrap();
+        assert_eq!(rows.len(), 20);
+        for (row, _) in h.launcher.unfinished().await.unwrap() {
+            *per_key.entry(row.concurrency_key.unwrap()).or_default() += 1;
+        }
+        assert_eq!(per_key.values().sum::<usize>(), 20);
+        assert!(per_key.values().all(|n| *n <= 2), "{per_key:?}");
+        let (_, health) = send(&h.app, "GET", "/health", None).await;
+        assert_eq!(
+            (health["slots_used"].as_u64(), health["slots_free"].as_u64()),
+            (Some(20), Some(0))
+        );
+        // The ramp: five start, the fifteen others wait their turn, accepted.
+        let mock = h.mock.clone();
+        for _ in 0..200 {
+            if mock.start_count().await == 5 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(h.mock.start_count().await, 5);
+        assert_eq!(h.mock.pulls().await, [WORKER], "no pull during the burst");
+        let (_, health) = send(&h.app, "GET", "/health", None).await;
+        assert_eq!(health["slots_used"], 20);
+
+        // Four minutes later the orchestrator sends the same 200 again: the
+        // jobs it already has answer 200 with the same id, the rest are
+        // refused again, and nothing new is stored or started.
+        let ids: std::collections::BTreeSet<String> = accepted
+            .iter()
+            .map(|job| job["id"].as_str().unwrap().to_string())
+            .collect();
+        let again = burst(&h.app, "r1").await;
+        assert!(again.iter().all(|(s, _)| *s != StatusCode::ACCEPTED));
+        let same: std::collections::BTreeSet<String> = again
+            .iter()
+            .filter(|(s, _)| *s == StatusCode::OK)
+            .map(|(_, job)| job["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(same, ids);
+        assert_eq!(h.launcher.recent_jobs(1000).unwrap().len(), 20);
+        assert_eq!(h.mock.start_count().await, 5);
+        let (_, metrics) = send(&h.app, "GET", "/metrics", None).await;
+        let metrics = metrics.as_str().unwrap().to_string();
+        let refused: u64 = metrics
+            .lines()
+            .filter(|line| {
+                line.starts_with("shutup_and_run_refusals_total{reason=\"no_slots\"}")
+                    || line.starts_with(
+                        "shutup_and_run_refusals_total{reason=\"concurrency_key_busy\"}",
+                    )
+            })
+            .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+            .sum();
+        assert_eq!(refused, 180 + 180, "{metrics}");
+
+        // Every one canceled, started or waiting: every slot comes back.
+        for id in &ids {
+            let (status, _) = send(&h.app, "DELETE", &format!("/v1/jobs/{id}"), None).await;
+            assert!(
+                [StatusCode::OK, StatusCode::ACCEPTED].contains(&status),
+                "{status}"
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), h.launcher.settled())
+            .await
+            .expect("the waiting ones end");
+        let (_, health) = send(&h.app, "GET", "/health", None).await;
+        assert_eq!(health["slots_used"], 0);
+        assert!(h.launcher.unfinished().await.unwrap().is_empty());
+        assert!(h
+            .launcher
+            .recent_jobs(1000)
+            .unwrap()
+            .iter()
+            .all(|job| job.reason.as_deref() == Some("launcher_kill")));
+
+        // The next round gets the slots again.
+        let next = burst(&h.app, "r2").await;
+        let accepted = next
+            .iter()
+            .filter(|(s, _)| *s == StatusCode::ACCEPTED)
+            .count();
+        assert_eq!(accepted, 20);
+        assert_eq!(h.mock.pulls().await.len(), 1);
+    }
+
+    /// A tracing writer into memory.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Every log line of this test binary from the first call on. Global:
+    /// a subscriber set for one thread misses events while other tests
+    /// register the same call sites. Only this test reads it.
+    fn captured_logs() -> Captured {
+        static LOGS: std::sync::OnceLock<Captured> = std::sync::OnceLock::new();
+        LOGS.get_or_init(|| {
+            let logs = Captured::default();
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+            logs
+        })
+        .clone()
+    }
+
+    #[tokio::test]
+    async fn env_values_reach_the_container_and_no_answer_metric_log_or_callback() {
+        let logs = captured_logs();
+
+        // Obviously fictitious values.
+        const VALUE: &str = "fake-portal-password-0000";
+        let h = server_harness(2, "pull_policy = \"always\"");
+        let job = json!({
+            "image": "alpine",
+            "job_key": "case-env",
+            "concurrency_key": "lawyer-00",
+            "env": {"PORTAL_PASSWORD": VALUE, "CASE_ID": "fake-case-0001"},
+            "callback_url": "http://127.0.0.1:9/hook",
+        })
+        .to_string();
+        let mut seen = Vec::new();
+        let (status, accepted) = send(&h.app, "POST", "/v1/jobs", Some(&job)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        seen.push(accepted.to_string());
+        h.launcher.settled().await;
+        let id = accepted["id"].as_str().unwrap().to_string();
+        let env = &h.mock.specs().await[0].env;
+        assert!(env.contains(&format!("PORTAL_PASSWORD={VALUE}")), "{env:?}");
+
+        // Every answer about it, and the refusals that name the variable.
+        for uri in [
+            format!("/v1/jobs/{id}"),
+            "/v1/jobs?state=running".to_string(),
+            "/metrics".to_string(),
+            "/health".to_string(),
+        ] {
+            seen.push(send(&h.app, "GET", &uri, None).await.1.to_string());
+        }
+        seen.push(
+            send(&h.app, "POST", "/v1/jobs", Some(&job))
+                .await
+                .1
+                .to_string(),
+        );
+        for bad in [
+            json!({"image": "alpine", "env": {"PORTAL_PASSWORD": VALUE, "bad-name": VALUE}}),
+            json!({"image": "alpine", "env": {"PORTAL_PASSWORD": format!("{VALUE}\u{0}")}}),
+            json!({"image": "ghcr.io/someone/else", "env": {"PORTAL_PASSWORD": VALUE}}),
+        ] {
+            let (status, body) = send(&h.app, "POST", "/v1/jobs", Some(&bad.to_string())).await;
+            assert!(status.is_client_error(), "{body}");
+            seen.push(body.to_string());
+        }
+        let (status, body) = send(
+            &h.app,
+            "POST",
+            "/v1/jobs",
+            Some(r#"{"image":"alpine","env":{"PORTAL_PASSWORD":1}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        seen.push(body.to_string());
+        // Its end, and the callback it sends.
+        h.mock.stop(&id, 0).await;
+        let ended = h.launcher.job(&id, false).await.unwrap().unwrap();
+        seen.push(crate::launcher::callback_body(&ended).to_string());
+        seen.push(
+            send(&h.app, "GET", &format!("/v1/jobs/{id}"), None)
+                .await
+                .1
+                .to_string(),
+        );
+
+        for text in &seen {
+            assert!(!text.contains(VALUE), "{text}");
+        }
+        let logged = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+        assert!(logged.contains(&format!("id={id}")), "the log was captured");
+        assert!(!logged.contains(VALUE), "{logged}");
+        // Should a log line ever print the request or the container's spec
+        // whole, it has the names only.
+        let request = crate::launcher::LaunchRequest {
+            image: "alpine".into(),
+            env: HashMap::from([("PORTAL_PASSWORD".to_string(), VALUE.to_string())]),
+            timeout_secs: None,
+            cpu: None,
+            memory_bytes: None,
+            shm_bytes: None,
+            command: None,
+            job_key: None,
+            callback_url: None,
+            concurrency_key: None,
+        };
+        let spec = h.mock.specs().await[0].clone();
+        for debug in [format!("{request:?}"), format!("{spec:?}")] {
+            assert!(debug.contains("PORTAL_PASSWORD"), "{debug}");
+            assert!(!debug.contains(VALUE), "{debug}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_tells_its_disk_refuses_below_the_minimum_and_a_timeout_frees_the_slot() {
+        use crate::resources::GIB;
+        let h = server_harness(2, "min_free_disk = \"20g\"\npull_policy = \"always\"");
+        let (status, health) = send(&h.app, "GET", "/health", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let machine = &health["machine"];
+        assert_eq!(machine["profile"], "server");
+        assert_eq!(machine["disk_free_bytes"], 100 * GIB);
+        assert_eq!(machine["min_free_disk_bytes"], 20 * GIB);
+        assert_eq!(machine["memory_total_bytes"], 16 * GIB);
+        assert_eq!(machine["shortage"], Value::Null);
+        assert_eq!(machine["last_cleanup"], Value::Null);
+
+        let mut low = crate::safety::Readings::healthy();
+        low.inner.disk_free = Some(5 * GIB);
+        h.launcher.set_readings(low);
+        let job = r#"{"image":"alpine","timeout_secs":30}"#;
+        let (status, body) = send(&h.app, "POST", "/v1/jobs", Some(job)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            (body["reason"].as_str(), body["resource"].as_str()),
+            (Some("low_disk"), Some("disk"))
+        );
+        let (_, health) = send(&h.app, "GET", "/health", None).await;
+        assert_eq!(health["machine"]["shortage"]["resource"], "disk");
+        assert!(h.launcher.recent_jobs(10).unwrap().is_empty());
+
+        // Room again; a job over its time is killed and its slot is free.
+        h.launcher.set_readings(crate::safety::Readings::healthy());
+        let (status, body) = send(&h.app, "POST", "/v1/jobs", Some(job)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        h.launcher.settled().await;
+        let id = body["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            send(&h.app, "GET", "/health", None).await.1["slots_used"],
+            1
+        );
+        h.clock.set(1_700_000_000 + 31);
+        assert_eq!(
+            h.launcher.reap_once().await.unwrap(),
+            std::slice::from_ref(&id)
+        );
+        let (_, ended) = send(&h.app, "GET", &format!("/v1/jobs/{id}"), None).await;
+        assert_eq!(ended["reason"], "timeout_kill");
+        assert_eq!(h.mock.killed().await, [id]);
+        assert_eq!(
+            send(&h.app, "GET", "/health", None).await.1["slots_used"],
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_waits_for_an_idle_server_and_keeps_what_was_prepared() {
+        let h = server_harness(2, "pull_policy = \"always\"");
+        let (status, job) = send(&h.app, "POST", "/v1/jobs", Some(ALPINE)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        h.launcher.settled().await;
+        let (status, body) = send(&h.app, "POST", "/v1/maintenance/cleanup", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            json!({"error": "jobs running", "code": "JOBS_RUNNING", "running": 1})
+        );
+        assert!(h.mock.removed_images().await.is_empty());
+
+        // The job ends; a container someone left stopped; a month later the
+        // image of that job is unused, the one prepared today is not.
+        let id = job["id"].as_str().unwrap();
+        h.mock.stop(id, 0).await;
+        h.launcher.job(id, false).await.unwrap();
+        h.mock.seed_running("left-behind", 0).await;
+        h.mock.stop_unseen("left-behind", 0).await;
+        h.clock.set(1_700_000_000 + 31 * 86_400);
+        assert_eq!(prepared(&h.app, WORKER).await["state"], "ready");
+        let before = h.mock.removed().await.len();
+
+        let (status, cleaned) = send(&h.app, "POST", "/v1/maintenance/cleanup", None).await;
+        assert_eq!(status, StatusCode::OK, "{cleaned}");
+        assert_eq!(cleaned["containers"], 1);
+        assert_eq!(cleaned["images"], 1);
+        assert_eq!(h.mock.removed().await[before..], ["left-behind"]);
+        assert_eq!(h.mock.removed_images().await, ["alpine"]);
+        assert_eq!(h.mock.prunes().await, (1, 1));
+        let (_, health) = send(&h.app, "GET", "/health", None).await;
+        assert_eq!(
+            health["machine"]["last_cleanup"]["at"],
+            1_700_000_000 + 31 * 86_400
+        );
+
+        // A failed preparation says why; it is not a job.
+        h.mock.fail_pull(true).await;
+        let failed = prepared(&h.app, "alpine:3.20").await;
+        assert_eq!(failed["state"], "failed");
+        assert!(
+            failed["error"]
+                .as_str()
+                .unwrap()
+                .contains("manifest unknown"),
+            "{failed}"
+        );
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            "/v1/images/pull",
+            Some(r#"{"image":"ghcr.io/someone/else"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (_, absent) = send(&h.app, "GET", "/v1/images/pull?image=alpine:9", None).await;
+        assert_eq!(absent["state"], "absent");
+
+        // Only a server has the route.
+        let pc = harness(1);
+        let (status, _) = send(&pc.app, "POST", "/v1/maintenance/cleanup", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

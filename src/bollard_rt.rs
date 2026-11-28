@@ -526,6 +526,22 @@ impl Runtime for BollardRuntime {
             .map_err(docker_err)?;
         Ok(answer.space_reclaimed.unwrap_or(0).max(0) as u64)
     }
+
+    async fn prune_volumes(&self) -> Result<u64, RuntimeError> {
+        // `all=false` is anonymous volumes only, which is also the default
+        // since Docker 23. An older daemon, which would prune named ones
+        // too, refuses the filter, and nothing is removed.
+        let filters = HashMap::from([("all".to_string(), vec!["false".to_string()])]);
+        let options = bollard::query_parameters::PruneVolumesOptionsBuilder::new()
+            .filters(&filters)
+            .build();
+        let answer = self
+            .docker
+            .prune_volumes(Some(options))
+            .await
+            .map_err(docker_err)?;
+        Ok(answer.volumes_deleted.map_or(0, |v| v.len() as u64))
+    }
 }
 
 pub fn spawn_exit_watcher(docker: Docker, launcher: Arc<Launcher>) {

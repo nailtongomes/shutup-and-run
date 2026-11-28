@@ -167,9 +167,13 @@
     },
     "pull_policy": {
       "type": "string",
-      "enum": ["always", "missing"],
-      "default": "always",
-      "description": "always: every job asks the registry for its tag, so a pushed tag is picked up. missing: an image already on this machine is used as it is, with no registry call; pin a version tag or a digest. An image named by its digest is never asked again under either."
+      "enum": ["always", "missing", "never"],
+      "description": "always: every job asks the registry for its tag, so a pushed tag is picked up. missing: an image already on this machine is used as it is, with no registry call; pin a version tag or a digest. never (0.2.35): a job whose image is not on this machine is refused (409 IMAGE_NOT_PRESENT) and nothing is pulled for a job; images are prepared with POST /v1/images/pull. An image named by its digest is never asked again under any of them. Default: never under resource_profile server, always elsewhere."
+    },
+    "cleanup_hours": {
+      "type": "string",
+      "minLength": 1,
+      "description": "resource_profile server only (0.2.35): when the server cleans up by itself, on its own clock, in the lend_hours form ('sun 01-03', '01-03' for every night). Inside the window, once, after 30 minutes with no job running or starting: stopped containers of jobs that ended, images no job used or prepared for 30 days, untagged images, anonymous volumes no container uses, job logs older than 7 days. POST /v1/maintenance/cleanup runs it at any time. Default 'sun 01-03'."
     },
     "min_idle_secs": {
       "type": "integer",

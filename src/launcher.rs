@@ -1,7 +1,7 @@
 use crate::allowlist::{image_allowed, validate_image_name};
 use crate::callback::validate_callback_url;
 use crate::clock::{Clock, SystemClock};
-use crate::config::Settings;
+use crate::config::{PullPolicy, Settings};
 use crate::runtime::{Inspected, Runtime, RuntimeError, StartSpec};
 use crate::store::{JobRecord, NewJob, Store, StoreError};
 use crate::{
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LaunchRequest {
     pub image: String,
     pub env: HashMap<String, String>,
@@ -27,6 +27,26 @@ pub struct LaunchRequest {
     /// The caller's name for whose work this is (a person, an account):
     /// at most `max_jobs_per_key` jobs that have not ended share one.
     pub concurrency_key: Option<String>,
+}
+
+/// The names of `env`, never its values, like `StartSpec`.
+impl std::fmt::Debug for LaunchRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<&str> = self.env.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        f.debug_struct("LaunchRequest")
+            .field("image", &self.image)
+            .field("env", &names)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("cpu", &self.cpu)
+            .field("memory_bytes", &self.memory_bytes)
+            .field("shm_bytes", &self.shm_bytes)
+            .field("command", &self.command)
+            .field("job_key", &self.job_key)
+            .field("callback_url", &self.callback_url)
+            .field("concurrency_key", &self.concurrency_key)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +121,10 @@ pub enum LaunchError {
     /// This managed container already has a run that has not ended.
     #[error("already running")]
     AlreadyRunning,
+    /// `pull_policy = "never"` and the image is not on the machine. Nothing
+    /// was stored; it clears once the image is prepared.
+    #[error("image {0} is not on this machine: prepare it with POST /v1/images/pull")]
+    ImageNotPresent(String),
     #[error("{0}")]
     Unavailable(String),
 }
@@ -119,6 +143,13 @@ fn codes_of(findings: &[crate::safety::Finding]) -> String {
 pub const UNUSED_DAYS: i64 = 30;
 /// How often that is looked at.
 pub const CLEANUP_EVERY_SECS: i64 = 86_400;
+/// A server cleans up by itself only after this long with no job running
+/// or starting, and no image being prepared.
+pub const CLEANUP_IDLE_SECS: i64 = 1800;
+/// One cleanup per `cleanup_hours` window: the next waits this long.
+pub const CLEANUP_AGAIN_SECS: i64 = 6 * 3600;
+/// How often a server looks whether its cleanup is due.
+pub const CLEANUP_LOOK_SECS: u64 = 300;
 
 /// The most a job's image pull may take. A constant, apart from the job's
 /// `timeout_secs`, which counts from the container's start.
@@ -289,6 +320,39 @@ pub struct Launcher {
     /// no limit.
     starts: Option<Arc<tokio::sync::Semaphore>>,
     counters: std::sync::Mutex<Counters>,
+    /// Images asked for with `POST /v1/images/pull` since the process
+    /// started, by name: one pull each at a time.
+    prepares: std::sync::Mutex<HashMap<String, Prepare>>,
+}
+
+/// An image being prepared for jobs to come, or the last try.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Prepare {
+    pub image: String,
+    /// `pulling`, `ready` or `failed`. A name never asked for is `ready` or
+    /// `absent`, from the machine.
+    pub state: &'static str,
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub pull_done_bytes: Option<u64>,
+    pub pull_total_bytes: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// What a server's cleanup removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Cleaned {
+    pub at: i64,
+    /// Stopped containers of this worker whose job had ended.
+    pub containers: u64,
+    /// Images no job used, or that was prepared, for `UNUSED_DAYS`.
+    pub images: u64,
+    /// Anonymous volumes no container used.
+    pub volumes: u64,
+    /// Job log files older than 7 days.
+    pub logs: u64,
+    /// The disk free after, less before. Untagged images included.
+    pub freed_bytes: u64,
 }
 
 impl Launcher {
@@ -334,6 +398,7 @@ impl Launcher {
                 .max_starting
                 .map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
             counters: std::sync::Mutex::new(Counters::default()),
+            prepares: std::sync::Mutex::new(HashMap::new()),
             settings,
             runtime,
             clock,
@@ -475,6 +540,31 @@ impl Launcher {
     #[cfg(test)]
     pub fn set_readings(&self, readings: crate::safety::Readings) {
         *self.readings.lock().expect("readings") = Some(readings);
+    }
+
+    /// What `GET /health` says of the machine: its memory, the disk Docker
+    /// writes to, its CPUs and load, the minimums a new job needs, what is
+    /// short now, and the last cleanup. Small reads, fresh every time.
+    pub fn machine_health(&self) -> Value {
+        let machine = self.read_machine();
+        let inner = machine.inner;
+        let shortage = self.shortage_for(None, &machine);
+        json!({
+            "profile": crate::status::Limits::of(&self.settings).profile,
+            "cpus": inner.cpus,
+            "load1": inner.load1,
+            "memory_total_bytes": inner.memory_total,
+            "memory_available_bytes": inner.memory_available,
+            "min_free_memory_bytes": self.settings.min_free_memory,
+            "disk_free_bytes": inner.disk_free,
+            "min_free_disk_bytes": self.settings.min_free_disk,
+            "shortage": shortage.map(|s| json!({
+                "resource": s.resource,
+                "free_bytes": s.free_bytes,
+                "needed_bytes": s.needed_bytes,
+            })),
+            "last_cleanup": self.last_cleanup(),
+        })
     }
 
     /// Set when the machine has too little memory or disk for one more job.
@@ -710,25 +800,7 @@ impl Launcher {
         }
         let disk = crate::resources::disk_path(&self.settings.history_path);
         let before = crate::resources::read(&disk).disk;
-        let mut images = 0u64;
-        let cutoff = now - UNUSED_DAYS * 86_400;
-        for image in self.store.images_unused_since(cutoff).map_err(store_err)? {
-            match self.runtime.image_in_use(&image).await {
-                Ok(true) => {}
-                Ok(false) => match self.runtime.remove_image(&image).await {
-                    Ok(()) => {
-                        let _ = self.store.forget_image(&image);
-                        images += 1;
-                    }
-                    Err(err) => {
-                        tracing::warn!(%image, error = %err, "could not remove an unused image")
-                    }
-                },
-                Err(err) => {
-                    tracing::warn!(%image, error = %err, "could not tell if an image is in use")
-                }
-            }
-        }
+        let images = self.remove_unused_images(now).await?;
         let mut dangling = 0;
         if self.settings.worker_os == "windows" {
             // The distribution and its Docker are the worker's own; on a
@@ -759,6 +831,228 @@ impl Launcher {
             );
         }
         Ok(Some(cleanup))
+    }
+
+    /// Starts pulling `image` for jobs to come, unless it is being pulled
+    /// already; answers at once. The allowlist applies, as to a job. Once
+    /// there, the image counts as used now, so the cleanup keeps it.
+    pub fn prepare_image(self: &Arc<Self>, image: &str) -> Result<Prepare, LaunchError> {
+        let image = image.trim();
+        validate_image_name(image).map_err(LaunchError::BadRequest)?;
+        if !image_allowed(image, &self.settings.allowlist) {
+            return Err(LaunchError::Forbidden);
+        }
+        let mut prepares = self.prepares.lock().expect("prepares");
+        if let Some(running) = prepares.get(image).filter(|p| p.state == "pulling") {
+            return Ok(running.clone());
+        }
+        let prepare = Prepare {
+            image: image.to_string(),
+            state: "pulling",
+            started_at: Some(self.clock.now_unix() as i64),
+            ended_at: None,
+            pull_done_bytes: None,
+            pull_total_bytes: None,
+            error: None,
+        };
+        prepares.insert(image.to_string(), prepare.clone());
+        drop(prepares);
+        let launcher = self.clone();
+        let name = image.to_string();
+        tokio::spawn(async move { launcher.pull_prepared(name).await });
+        Ok(prepare)
+    }
+
+    async fn pull_prepared(&self, image: String) {
+        let progress = |done: u64, total: u64| {
+            if let Some(p) = self.prepares.lock().expect("prepares").get_mut(&image) {
+                p.pull_done_bytes = Some(done);
+                p.pull_total_bytes = Some(total);
+            }
+        };
+        let limit = std::time::Duration::from_secs(PULL_LIMIT_SECS);
+        let began = std::time::Instant::now();
+        let pulled = tokio::time::timeout(limit, self.runtime.pull(&image, &progress)).await;
+        {
+            let mut counters = self.counters.lock().expect("counters");
+            counters.pulls += 1;
+            counters.pull_secs += began.elapsed().as_secs_f64();
+        }
+        let now = self.clock.now_unix() as i64;
+        let error = match pulled {
+            Ok(Ok(())) => {
+                if let Err(err) = self.store.touch_image(&image, now) {
+                    tracing::warn!(%image, error = %err, "could not note a prepared image");
+                }
+                tracing::info!(%image, "image prepared");
+                None
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(%image, error = %err, "could not prepare an image");
+                Some(format!("failed to pull image: {err}"))
+            }
+            Err(_) => Some(format!(
+                "image pull took more than {PULL_LIMIT_SECS} seconds"
+            )),
+        };
+        if let Some(p) = self.prepares.lock().expect("prepares").get_mut(&image) {
+            p.state = if error.is_some() { "failed" } else { "ready" };
+            p.ended_at = Some(now);
+            p.error = error;
+        }
+    }
+
+    /// Where `image` is: being prepared, ready, failed, or absent. A name
+    /// not asked for since the process started is read from the machine.
+    pub async fn image_state(&self, image: &str) -> Result<Prepare, LaunchError> {
+        let image = image.trim();
+        validate_image_name(image).map_err(LaunchError::BadRequest)?;
+        let known = self.prepares.lock().expect("prepares").get(image).cloned();
+        if let Some(prepare) = known.clone().filter(|p| p.state != "ready") {
+            return Ok(prepare);
+        }
+        let present = self.runtime.has_image(image).await;
+        Ok(match known {
+            // Prepared, and still here.
+            Some(prepare) if present => prepare,
+            _ => Prepare {
+                image: image.to_string(),
+                state: if present { "ready" } else { "absent" },
+                started_at: None,
+                ended_at: None,
+                pull_done_bytes: None,
+                pull_total_bytes: None,
+                error: None,
+            },
+        })
+    }
+
+    fn preparing(&self) -> usize {
+        self.prepares
+            .lock()
+            .expect("prepares")
+            .values()
+            .filter(|p| p.state == "pulling")
+            .count()
+    }
+
+    /// A server's cleanup, now: stopped containers of jobs that ended,
+    /// images no job used or prepared for `UNUSED_DAYS` and the untagged
+    /// ones, anonymous volumes no container uses, job logs older than 7
+    /// days. Holds the slot lock, so no job is admitted meanwhile.
+    /// `Err(busy)`, with nothing done, while a job runs or starts or an
+    /// image is being prepared: `busy` is how many.
+    pub async fn clean_now(&self) -> Result<Result<Cleaned, usize>, LaunchError> {
+        let _guard = self.slots.lock().await;
+        let busy = self.used_slots().await? + self.preparing();
+        if busy > 0 {
+            return Ok(Err(busy));
+        }
+        let now = self.clock.now_unix() as i64;
+        let disk = crate::resources::disk_path(&self.settings.history_path);
+        let before = crate::resources::read(&disk).disk;
+        let mut cleaned = Cleaned {
+            at: now,
+            ..Cleaned::default()
+        };
+        for id in self.runtime.list_stopped().await.map_err(unavailable)? {
+            // A job whose end is being recorded right now keeps its
+            // container until that is done.
+            let unfinished = self
+                .store
+                .get(&id)
+                .map_err(store_err)?
+                .is_some_and(|job| !job.is_finished());
+            if unfinished {
+                continue;
+            }
+            match self.runtime.remove(&id).await {
+                Ok(()) => cleaned.containers += 1,
+                Err(err) => {
+                    tracing::warn!(%id, error = %err, "cleanup could not remove a container")
+                }
+            }
+        }
+        cleaned.images = self.remove_unused_images(now).await?;
+        let dangling = self.runtime.prune_dangling().await.unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "could not remove untagged images");
+            0
+        });
+        cleaned.volumes = self.runtime.prune_volumes().await.unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "could not remove unused volumes");
+            0
+        });
+        cleaned.logs =
+            crate::joblogs::purge(&self.settings.history_path, std::time::SystemTime::now()) as u64;
+        let after = crate::resources::read(&disk).disk;
+        cleaned.freed_bytes = match (before, after) {
+            (Some(before), Some(after)) => after.saturating_sub(before).max(dangling),
+            _ => dangling,
+        };
+        self.store
+            .set_cleanup(&crate::store::Cleanup {
+                at: now,
+                images: cleaned.images,
+                freed_bytes: cleaned.freed_bytes,
+            })
+            .map_err(store_err)?;
+        tracing::info!(
+            containers = cleaned.containers,
+            images = cleaned.images,
+            volumes = cleaned.volumes,
+            logs = cleaned.logs,
+            freed = %crate::resources::human(cleaned.freed_bytes),
+            "cleanup"
+        );
+        Ok(Ok(cleaned))
+    }
+
+    /// A server's cleanup by itself: inside `cleanup_hours` on this
+    /// machine's clock, once per window, after `CLEANUP_IDLE_SECS` with
+    /// nothing running. None when it was not due or the machine was busy.
+    pub async fn cleanup_if_due(&self) -> Result<Option<Cleaned>, LaunchError> {
+        let Some(hours) = self.settings.cleanup_hours.as_ref() else {
+            return Ok(None);
+        };
+        let now = self.clock.now_unix() as i64;
+        let local = crate::lending::Local::at(now, crate::lending::offset_secs(None, now));
+        if !hours.allows(local) {
+            return Ok(None);
+        }
+        let last = self.store.cleanup().map_err(store_err)?;
+        if last.is_some_and(|last| now - last.at < CLEANUP_AGAIN_SECS) {
+            return Ok(None);
+        }
+        let ended = self.store.last_ended_at().map_err(store_err)?;
+        if ended.is_some_and(|ended| now - ended < CLEANUP_IDLE_SECS) {
+            return Ok(None);
+        }
+        Ok(self.clean_now().await?.ok())
+    }
+
+    /// The images no job used (or that was prepared) since `UNUSED_DAYS`
+    /// before `now` and no container uses. How many went.
+    async fn remove_unused_images(&self, now: i64) -> Result<u64, LaunchError> {
+        let mut images = 0u64;
+        let cutoff = now - UNUSED_DAYS * 86_400;
+        for image in self.store.images_unused_since(cutoff).map_err(store_err)? {
+            match self.runtime.image_in_use(&image).await {
+                Ok(true) => {}
+                Ok(false) => match self.runtime.remove_image(&image).await {
+                    Ok(()) => {
+                        let _ = self.store.forget_image(&image);
+                        images += 1;
+                    }
+                    Err(err) => {
+                        tracing::warn!(%image, error = %err, "could not remove an unused image")
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(%image, error = %err, "could not tell if an image is in use")
+                }
+            }
+        }
+        Ok(images)
     }
 
     /// Resolves when a job that ran has ended since the last call.
@@ -1069,6 +1363,13 @@ impl Launcher {
             callback_url,
             concurrency_key,
         } = check_request(req, &self.settings, source)?;
+        // Before the slot lock: a burst does not wait in line for Docker's
+        // answer about the image, and nothing is pulled in the middle of it.
+        if self.settings.pull_policy == PullPolicy::Never
+            && !self.runtime.has_image(&spec.image).await
+        {
+            return Err(LaunchError::ImageNotPresent(spec.image));
+        }
 
         let guard = self.slots.lock().await;
         // The two ways of working never mix: in managed mode nothing from
@@ -1233,7 +1534,12 @@ impl Launcher {
             let _ = self.store.set_pull(&id, Some((done, total)));
         };
         let skip = stopped_early
-            || (self.settings.pull_missing && self.runtime.has_image(&spec.image).await);
+            || match self.settings.pull_policy {
+                PullPolicy::Always => false,
+                // Admission saw it here.
+                PullPolicy::Never => true,
+                PullPolicy::Missing => self.runtime.has_image(&spec.image).await,
+            };
         let pulled = if skip {
             if !stopped_early {
                 self.counters.lock().expect("counters").pulls_skipped += 1;
@@ -1772,7 +2078,15 @@ pub fn spawn_maintenance(launcher: Arc<Launcher>) {
             since_purge += step;
             since_prune += step;
             since_cleanup += step;
-            if since_cleanup >= std::time::Duration::from_secs(3600) {
+            if launcher.settings.server {
+                // A server cleans in its own window, when idle.
+                if since_cleanup >= std::time::Duration::from_secs(CLEANUP_LOOK_SECS) {
+                    since_cleanup = std::time::Duration::ZERO;
+                    if let Err(err) = launcher.cleanup_if_due().await {
+                        tracing::warn!(error = %err, "cleanup");
+                    }
+                }
+            } else if since_cleanup >= std::time::Duration::from_secs(3600) {
                 since_cleanup = std::time::Duration::ZERO;
                 if let Err(err) = launcher.clean_unused().await {
                     tracing::warn!(error = %err, "cleanup");
@@ -1989,8 +2303,8 @@ fn validate_concurrency_key(key: Option<String>) -> Result<Option<String>, Launc
     Ok(Some(key))
 }
 
-/// The label of a refusal in `/metrics`.
-fn refusal_reason(err: &LaunchError) -> &'static str {
+/// The label of a refusal in `/metrics`, and its `reason` in the answer.
+pub fn refusal_reason(err: &LaunchError) -> &'static str {
     match err {
         LaunchError::BadRequest(_) => "bad_request",
         LaunchError::Forbidden => "not_allowlisted",
@@ -2005,6 +2319,7 @@ fn refusal_reason(err: &LaunchError) -> &'static str {
         LaunchError::SafetyBlocked(_) => "safety_blocked",
         LaunchError::AuthorizationRequired(_) => "authorization_required",
         LaunchError::ManagedMode => "managed_mode",
+        LaunchError::ImageNotPresent(_) => "image_not_present",
         LaunchError::JobsMode | LaunchError::AlreadyRunning => "other",
         LaunchError::Unavailable(_) => "unavailable",
     }
@@ -3890,7 +4205,7 @@ mod tests {
     #[tokio::test]
     async fn pull_policy_missing_pulls_an_image_once_and_default_shm_fills_a_job_that_names_none() {
         let (launcher, mock) = harness_with(3, |s| {
-            s.pull_missing = true;
+            s.pull_policy = crate::config::PullPolicy::Missing;
             s.default_job_shm = Some(GIB);
         });
         started(&launcher, job("alpine", None)).await;
@@ -3916,5 +4231,59 @@ mod tests {
         started(&launcher, job("alpine", None)).await;
         assert_eq!(mock.pulls().await.len(), 2);
         assert_eq!(mock.specs().await[0].shm_bytes, None);
+    }
+
+    #[tokio::test]
+    async fn a_server_cleans_up_by_itself_only_in_its_window_after_30_idle_minutes_and_once() {
+        const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+        const NOW: u64 = 1_700_000_000;
+        let offset = crate::lending::offset_secs(None, NOW as i64);
+        let today = crate::lending::Local::at(NOW as i64, offset).weekday;
+        let server = |window: String| {
+            let mock = Arc::new(MockRuntime::new());
+            let clock = Arc::new(FakeClock::new(NOW));
+            let runtime: Arc<dyn Runtime> = mock.clone();
+            let mut settings = settings(2);
+            settings.server = true;
+            settings.cleanup_hours = Some(crate::lending::LendHours::parse(&window).unwrap());
+            let launcher = Launcher::with_clock(settings, runtime, clock.clone()).unwrap();
+            (launcher, mock, clock)
+        };
+
+        // Outside its window: nothing, however idle.
+        let (launcher, mock, _) = server(DAYS[(today + 2) % 7].to_string());
+        assert_eq!(launcher.cleanup_if_due().await.unwrap(), None);
+        assert_eq!(mock.prunes().await, (0, 0));
+
+        // Inside it (today and tomorrow, whole days).
+        let (launcher, mock, clock) = server(format!("{},{}", DAYS[today], DAYS[(today + 1) % 7]));
+        let id = started(&launcher, job("alpine", None)).await;
+        assert_eq!(launcher.cleanup_if_due().await.unwrap(), None, "a job runs");
+        mock.stop(&id, 0).await;
+        launcher.job(&id, false).await.unwrap();
+        clock.set(NOW + 29 * 60);
+        assert_eq!(
+            launcher.cleanup_if_due().await.unwrap(),
+            None,
+            "idle 29 minutes"
+        );
+        assert_eq!(mock.prunes().await, (0, 0));
+        clock.set(NOW + 31 * 60);
+        let cleaned = launcher.cleanup_if_due().await.unwrap().unwrap();
+        assert_eq!(cleaned.at, (NOW + 31 * 60) as i64);
+        assert_eq!(mock.prunes().await, (1, 1));
+        // Once per window.
+        clock.set(NOW + 60 * 60);
+        assert_eq!(launcher.cleanup_if_due().await.unwrap(), None);
+        clock.set(NOW + 31 * 60 + CLEANUP_AGAIN_SECS as u64);
+        assert!(launcher.cleanup_if_due().await.unwrap().is_some());
+        assert_eq!(mock.prunes().await, (2, 2));
+
+        // An image being prepared holds it too.
+        let (launcher, mock, _) = server(DAYS[today].to_string());
+        mock.hold_pull(1, 2).await;
+        launcher.prepare_image("alpine").unwrap();
+        assert_eq!(launcher.clean_now().await.unwrap(), Err(1));
+        mock.release_pull().await;
     }
 }

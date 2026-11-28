@@ -12,6 +12,9 @@ struct Inner {
     removed: Vec<String>,
     removed_images: Vec<String>,
     pulls: Vec<String>,
+    fail_pull: bool,
+    /// Dangling-image and volume prunes asked for.
+    prunes: (u64, u64),
     /// What a pull reports before it waits for `release_pull`.
     held_pull: Option<(u64, u64)>,
     starts: u64,
@@ -50,6 +53,8 @@ impl MockRuntime {
                 removed: Vec::new(),
                 removed_images: Vec::new(),
                 pulls: Vec::new(),
+                fail_pull: false,
+                prunes: (0, 0),
                 held_pull: None,
                 starts: 0,
                 specs: Vec::new(),
@@ -179,6 +184,20 @@ impl MockRuntime {
         self.inner.lock().await.fail_start = yes;
     }
 
+    pub async fn fail_pull(&self, yes: bool) {
+        self.inner.lock().await.fail_pull = yes;
+    }
+
+    /// How many times untagged images and anonymous volumes were pruned.
+    pub async fn prunes(&self) -> (u64, u64) {
+        self.inner.lock().await.prunes
+    }
+
+    /// Containers removed so far.
+    pub async fn removed(&self) -> Vec<String> {
+        self.inner.lock().await.removed.clone()
+    }
+
     pub async fn removed_images(&self) -> Vec<String> {
         self.inner.lock().await.removed_images.clone()
     }
@@ -187,14 +206,19 @@ impl MockRuntime {
 #[async_trait]
 impl Runtime for MockRuntime {
     async fn pull(&self, image: &str, progress: &Progress<'_>) -> Result<(), RuntimeError> {
-        let held = {
+        let (held, fail) = {
             let mut inner = self.inner.lock().await;
-            inner.pulls.push(image.to_string());
-            inner.held_pull
+            if !inner.fail_pull {
+                inner.pulls.push(image.to_string());
+            }
+            (inner.held_pull, inner.fail_pull)
         };
         if let Some((done, total)) = held {
             progress(done, total);
             self.pull_gate.notified().await;
+        }
+        if fail {
+            return Err(RuntimeError::new("manifest unknown"));
         }
         Ok(())
     }
@@ -335,6 +359,16 @@ impl Runtime for MockRuntime {
     }
 
     async fn cleanup_created(&self) -> Result<usize, RuntimeError> {
+        Ok(0)
+    }
+
+    async fn prune_dangling(&self) -> Result<u64, RuntimeError> {
+        self.inner.lock().await.prunes.0 += 1;
+        Ok(0)
+    }
+
+    async fn prune_volumes(&self) -> Result<u64, RuntimeError> {
+        self.inner.lock().await.prunes.1 += 1;
         Ok(0)
     }
 

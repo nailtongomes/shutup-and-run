@@ -516,6 +516,8 @@ if [[ -n "$server" ]]; then
   echo "  ssh -N -L 8787:127.0.0.1:${PORT} root@${ip}   then open https://127.0.0.1:8787/"
   echo "  admin login: admin / sudo ${NAME} config get admin_password --reveal"
   echo "Check it:      sudo ${NAME} doctor --json"
+  echo "Jobs run only prepared images (pull_policy never). Prepare one, once a day:"
+  echo "  curl -s --cacert ${ETC}/cert.pem -H \"Authorization: Bearer \$TOKEN\" -d '{\"image\":\"IMAGE\"}' https://127.0.0.1:${PORT}/v1/images/pull"
 fi
 echo
 echo "Pin the fingerprint, or trust ${ETC}/cert.pem."
