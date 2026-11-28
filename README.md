@@ -131,7 +131,7 @@ curl -sk -X POST https://203.0.113.10:8787/v1/jobs -H "Authorization: Bearer $SA
 curl -sk -H "Authorization: Bearer $SAR_TOKEN" "https://203.0.113.10:8787/v1/jobs/PASTE_ID?logs=true"
 ```
 
-`-k` skips certificate verification; pinning the fingerprint is in [docs/RECIPES.md](docs/RECIPES.md). A machine that only runs jobs, many at once (`SHUTUP_AND_RUN_PROFILE=server`: config.json, limits per job, a few starting at a time, a key per caller, cancel and list): [docs/SERVER.md](docs/SERVER.md). Ready-made flows: [examples/kestra-dispatch.yml](examples/kestra-dispatch.yml), [examples/n8n-dispatch.json](examples/n8n-dispatch.json), and for pull [examples/kestra-poll.yml](examples/kestra-poll.yml), [examples/n8n-poll.json](examples/n8n-poll.json).
+`-k` skips certificate verification; pinning the fingerprint is in [docs/RECIPES.md](docs/RECIPES.md). A machine that only runs jobs, many at once (`SHUTUP_AND_RUN_PROFILE=server`: push only, images prepared once a day, limits per job, a few starting at a time, a key per caller, cancel and list, a cleanup when idle): [docs/SERVER.md](docs/SERVER.md). Ready-made flows: [examples/kestra-dispatch.yml](examples/kestra-dispatch.yml), [examples/n8n-dispatch.json](examples/n8n-dispatch.json), and for pull [examples/kestra-poll.yml](examples/kestra-poll.yml), [examples/n8n-poll.json](examples/n8n-poll.json).
 
 ## First run without an orchestrator
 

@@ -442,7 +442,11 @@ async fn invalid_job_requests_are_rejected() {
     for (body, error) in &cases {
         let (status, answer) = push(&m.app, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(answer, json!({ "error": error }), "{body}");
+        assert_eq!(
+            answer,
+            json!({ "error": error, "reason": "bad_request" }),
+            "{body}"
+        );
         assert!(
             !request.is_valid(&parse(body, body)),
             "the schema accepts {body}"
@@ -450,7 +454,10 @@ async fn invalid_job_requests_are_rejected() {
     }
     let (status, answer) = push(&m.app, "not json").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(answer, json!({"error": "invalid JSON"}));
+    assert_eq!(
+        answer,
+        json!({"error": "invalid JSON", "reason": "bad_request"})
+    );
 
     // Valid by the schema, refused by this machine: limits that are its config.
     let above = r#"{"image":"alpine","timeout_secs":3601}"#;
@@ -459,13 +466,16 @@ async fn invalid_job_requests_are_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         answer,
-        json!({"error": "timeout_secs 3601 is above the maximum 3600"})
+        json!({"error": "timeout_secs 3601 is above the maximum 3600", "reason": "bad_request"})
     );
     let other = r#"{"image":"ghcr.io/someone/else"}"#;
     assert!(request.is_valid(&parse(other, other)));
     let (status, answer) = push(&m.app, other).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(answer, json!({"error": "image is not allowlisted"}));
+    assert_eq!(
+        answer,
+        json!({"error": "image is not allowlisted", "reason": "not_allowlisted"})
+    );
 
     assert_eq!(m.mock.start_count().await, 0);
     assert!(m.mock.pulls().await.is_empty());
@@ -496,7 +506,7 @@ async fn push_refusals_have_the_documented_status_and_body() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
         body,
-        json!({"error": "no free slots", "slots_total": 1, "slots_used": 1, "slots_free": 0})
+        json!({"error": "no free slots", "reason": "no_slots", "slots_total": 1, "slots_used": 1, "slots_free": 0})
     );
     m.launcher.settled().await;
 
@@ -511,7 +521,10 @@ async fn push_refusals_have_the_documented_status_and_body() {
     assert_eq!((status, body), (StatusCode::OK, json!({"draining": true})));
     let (status, body) = push(&m.app, JOB).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body, json!({"error": "draining", "draining": true}));
+    assert_eq!(
+        body,
+        json!({"error": "draining", "reason": "draining", "draining": true})
+    );
     // Drain is checked before job_key: a draining machine answers 503 even
     // for a key it already holds. Documented as a limit, pinned here.
     let held = r#"{"image":"alpine","job_key":"held"}"#;
@@ -547,7 +560,8 @@ async fn push_refusals_have_the_documented_status_and_body() {
         assert_eq!(body["resource"], resource);
         assert_eq!(body["needed_bytes"], 4_000_000u64 << 30);
         assert!(body["free_bytes"].as_u64().unwrap() < 4_000_000u64 << 30);
-        assert_eq!(body.as_object().unwrap().len(), 4);
+        assert_eq!(body["reason"], format!("low_{resource}"));
+        assert_eq!(body.as_object().unwrap().len(), 5);
         assert_eq!(m.launcher.counts().unwrap().started, 0);
     }
 
@@ -557,13 +571,13 @@ async fn push_refusals_have_the_documented_status_and_body() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         body,
-        json!({"error": "cpu 2 is above this machine's limit of 1 per job"})
+        json!({"error": "cpu 2 is above this machine's limit of 1 per job", "reason": "bad_request"})
     );
     let (status, body) = push(&limited.app, r#"{"image":"alpine","memory":"3g"}"#).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         body,
-        json!({"error": "memory 3221225472 is above this machine's limit of 2147483648 bytes per job"})
+        json!({"error": "memory 3221225472 is above this machine's limit of 2147483648 bytes per job", "reason": "bad_request"})
     );
     // The full example asks for less than that and still starts.
     let (name, text) = example!("job-request.full.json");
@@ -595,7 +609,10 @@ async fn push_refusals_have_the_documented_status_and_body() {
     m.mock.fail_lists(true).await;
     let (status, body) = push(&m.app, JOB).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(body, json!({"error": "docker is unavailable"}));
+    assert_eq!(
+        body,
+        json!({"error": "docker is unavailable", "reason": "unavailable"})
+    );
     m.mock.fail_lists(false).await;
 
     let (status, body) = call(
@@ -1067,6 +1084,7 @@ async fn the_existing_surface_did_not_move() {
         keys,
         [
             "draining",
+            "machine",
             "mode",
             "slots_free",
             "slots_total",
@@ -1310,6 +1328,7 @@ async fn a_canceled_job_and_a_busy_concurrency_key_match_the_contract() {
     assert_eq!(
         busy,
         json!({"error": "concurrency key busy", "code": "CONCURRENCY_KEY_BUSY",
+               "reason": "concurrency_key_busy",
                "concurrency_key": "account-0001", "running": 1, "limit": 1})
     );
     m.launcher.settled().await;

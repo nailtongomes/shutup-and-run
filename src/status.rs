@@ -1841,8 +1841,15 @@ fn field_text(name: &str, lang: Lang) -> (&'static str, &'static str) {
         "pull_policy" => (
             lang.t("Download the image", "Baixar a imagem"),
             lang.t(
-                "always: every job asks the registry. missing: only when the image is not here.",
-                "always: toda tarefa pergunta ao registro. missing: só quando a imagem não está aqui.",
+                "always: every job asks the registry. missing: only when the image is not here. never: a job whose image is not here is refused.",
+                "always: toda tarefa pergunta ao registro. missing: só quando a imagem não está aqui. never: a tarefa cuja imagem não está aqui é recusada.",
+            ),
+        ),
+        "cleanup_hours" => (
+            lang.t("When the server cleans up", "Quando o servidor faz a limpeza"),
+            lang.t(
+                "Like sun 01-03, after 30 idle minutes: stopped containers, unused images and volumes, old logs.",
+                "Como sun 01-03, após 30 minutos ociosa: containers parados, imagens e volumes sem uso, logs antigos.",
             ),
         ),
         "token" => (
@@ -1905,6 +1912,7 @@ fn field_groups(lang: Lang) -> [(&'static str, &'static [&'static str]); 7] {
                 "max_jobs_per_key",
                 "default_job_shm",
                 "pull_policy",
+                "cleanup_hours",
             ],
         ),
         (
@@ -1944,12 +1952,12 @@ pub(crate) fn in_force(name: &str, settings: &config::Settings) -> String {
             .default_job_shm
             .map(size)
             .unwrap_or_else(|| "0".to_string()),
-        "pull_policy" => if settings.pull_missing {
-            config::PULL_MISSING
-        } else {
-            config::PULL_ALWAYS
-        }
-        .to_string(),
+        "pull_policy" => settings.pull_policy.name().to_string(),
+        "cleanup_hours" => settings
+            .cleanup_hours
+            .as_ref()
+            .map(|hours| hours.text.clone())
+            .unwrap_or_else(|| "-".to_string()),
         _ => String::new(),
     }
 }

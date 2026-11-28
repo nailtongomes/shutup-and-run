@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::net::SocketAddr;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StartSpec {
     pub image: String,
     pub env: Vec<String>,
@@ -13,6 +13,28 @@ pub struct StartSpec {
     /// Read-only file mounts, `host:container:ro`. Only the machine's own
     /// certificate passthrough fills this. A request has no field for it.
     pub binds: Vec<String>,
+}
+
+/// The names of `env`, never its values: a job's env goes into its
+/// container and nowhere else, a log line of this included.
+impl std::fmt::Debug for StartSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self
+            .env
+            .iter()
+            .map(|pair| pair.split_once('=').map_or(pair.as_str(), |(name, _)| name))
+            .collect();
+        f.debug_struct("StartSpec")
+            .field("image", &self.image)
+            .field("env", &names)
+            .field("command", &self.command)
+            .field("deadline_unix", &self.deadline_unix)
+            .field("nano_cpus", &self.nano_cpus)
+            .field("memory_bytes", &self.memory_bytes)
+            .field("shm_bytes", &self.shm_bytes)
+            .field("binds", &self.binds)
+            .finish()
+    }
 }
 
 /// What Docker says it applied to a container.
@@ -52,9 +74,9 @@ pub trait Runtime: Send + Sync {
     /// `progress` hears the bytes downloaded so far and the size of the
     /// layers known until then, now and then while a download lasts.
     async fn pull(&self, image: &str, progress: &Progress<'_>) -> Result<(), RuntimeError>;
-    /// The image is on this machine already, as named. For
-    /// `pull_policy = "missing"`; a runtime that cannot tell says no, and
-    /// the job pulls.
+    /// The image is on this machine already, as named. For `pull_policy`
+    /// `missing` and `never`; a runtime that cannot tell says no: the job
+    /// pulls, or under `never` is refused.
     async fn has_image(&self, _image: &str) -> bool {
         false
     }
@@ -94,6 +116,12 @@ pub trait Runtime: Send + Sync {
     /// Removes images no tag points at any more (a tag pulled again leaves
     /// the old one behind) and that no container uses. The bytes it freed.
     async fn prune_dangling(&self) -> Result<u64, RuntimeError> {
+        Ok(0)
+    }
+    /// Removes the anonymous volumes no container uses (a container's own
+    /// go with it; these are what a crash or a hand left behind). Never a
+    /// named volume. How many it removed.
+    async fn prune_volumes(&self) -> Result<u64, RuntimeError> {
         Ok(0)
     }
     /// Where the page's screen view reaches a running container: its address
