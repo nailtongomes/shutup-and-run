@@ -150,6 +150,10 @@ pub const CLEANUP_IDLE_SECS: i64 = 1800;
 pub const CLEANUP_AGAIN_SECS: i64 = 6 * 3600;
 /// How often a server looks whether its cleanup is due.
 pub const CLEANUP_LOOK_SECS: u64 = 300;
+/// Under `pull_policy = "never"`, an image Docker said was here is taken
+/// as here for this long without asking again: a burst asks once. A
+/// cleanup that removes images forgets them at once.
+pub const IMAGE_SEEN_SECS: u64 = 30;
 
 /// The most a job's image pull may take. A constant, apart from the job's
 /// `timeout_secs`, which counts from the container's start.
@@ -234,6 +238,10 @@ struct Counters {
     pulls_skipped: u64,
     start_secs: f64,
     starts: u64,
+    /// When each image was last prepared (`POST /v1/images/pull`) to the end.
+    prepared: std::collections::BTreeMap<String, i64>,
+    /// Preparations that failed or ran out of time.
+    prepare_failures: u64,
 }
 
 /// Why a job waits under `min_idle_secs`. It can start later, unchanged.
@@ -323,6 +331,10 @@ pub struct Launcher {
     /// Images asked for with `POST /v1/images/pull` since the process
     /// started, by name: one pull each at a time.
     prepares: std::sync::Mutex<HashMap<String, Prepare>>,
+    /// Images Docker said were here, and when it said so
+    /// (`IMAGE_SEEN_SECS`). Held while Docker is asked, so the pushes of a
+    /// burst wait for the first answer instead of each asking.
+    seen_images: tokio::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// An image being prepared for jobs to come, or the last try.
@@ -399,6 +411,7 @@ impl Launcher {
                 .map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
             counters: std::sync::Mutex::new(Counters::default()),
             prepares: std::sync::Mutex::new(HashMap::new()),
+            seen_images: tokio::sync::Mutex::new(HashMap::new()),
             settings,
             runtime,
             clock,
@@ -881,6 +894,11 @@ impl Launcher {
         let now = self.clock.now_unix() as i64;
         let error = match pulled {
             Ok(Ok(())) => {
+                self.counters
+                    .lock()
+                    .expect("counters")
+                    .prepared
+                    .insert(image.clone(), now);
                 if let Err(err) = self.store.touch_image(&image, now) {
                     tracing::warn!(%image, error = %err, "could not note a prepared image");
                 }
@@ -895,6 +913,9 @@ impl Launcher {
                 "image pull took more than {PULL_LIMIT_SECS} seconds"
             )),
         };
+        if error.is_some() {
+            self.counters.lock().expect("counters").prepare_failures += 1;
+        }
         if let Some(p) = self.prepares.lock().expect("prepares").get_mut(&image) {
             p.state = if error.is_some() { "failed" } else { "ready" };
             p.ended_at = Some(now);
@@ -925,6 +946,27 @@ impl Launcher {
                 error: None,
             },
         })
+    }
+
+    /// Whether `image` is on the machine, asking Docker at most once per
+    /// `IMAGE_SEEN_SECS` for an image that is. An absent one is asked
+    /// every time, so a job sent the moment its preparation ends starts.
+    async fn image_here(&self, image: &str) -> bool {
+        let mut seen = self.seen_images.lock().await;
+        let fresh = std::time::Duration::from_secs(IMAGE_SEEN_SECS);
+        if seen.get(image).is_some_and(|at| at.elapsed() < fresh) {
+            return true;
+        }
+        // shortcut: an image removed by hand (docker rmi) still counts as
+        // here for up to IMAGE_SEEN_SECS; its job then fails at the start
+        // instead of a 409. Ask Docker every time if that ever matters.
+        let here = self.runtime.has_image(image).await;
+        if here {
+            seen.insert(image.to_string(), std::time::Instant::now());
+        } else {
+            seen.remove(image);
+        }
+        here
     }
 
     fn preparing(&self) -> usize {
@@ -1041,6 +1083,7 @@ impl Launcher {
                 Ok(false) => match self.runtime.remove_image(&image).await {
                     Ok(()) => {
                         let _ = self.store.forget_image(&image);
+                        self.seen_images.lock().await.remove(&image);
                         images += 1;
                     }
                     Err(err) => {
@@ -1335,6 +1378,58 @@ impl Launcher {
             "shutup_and_run_start_seconds_count {}",
             counters.starts
         );
+        let _ = writeln!(out, "# HELP shutup_and_run_image_prepared_timestamp_seconds When each image was last prepared with POST /v1/images/pull, since the process started.");
+        let _ = writeln!(
+            out,
+            "# TYPE shutup_and_run_image_prepared_timestamp_seconds gauge"
+        );
+        for (image, at) in &counters.prepared {
+            let _ = writeln!(
+                out,
+                "shutup_and_run_image_prepared_timestamp_seconds{{image=\"{image}\"}} {at}"
+            );
+        }
+        let _ = writeln!(out, "# HELP shutup_and_run_image_prepare_failures_total Preparations that failed or ran out of time since the process started.");
+        let _ = writeln!(
+            out,
+            "# TYPE shutup_and_run_image_prepare_failures_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "shutup_and_run_image_prepare_failures_total {}",
+            counters.prepare_failures
+        );
+        drop(counters);
+        // Read now, like /health: a new job needs these above their minimum.
+        let machine = self.read_machine().inner;
+        let gauges = [
+            (
+                "memory_available_bytes",
+                "Memory available on the machine now.",
+                machine.memory_available,
+            ),
+            (
+                "min_free_memory_bytes",
+                "Memory a new job leaves free (min_free_memory).",
+                Some(self.settings.min_free_memory),
+            ),
+            (
+                "disk_free_bytes",
+                "Disk free where the history is, now.",
+                machine.disk_free,
+            ),
+            (
+                "min_free_disk_bytes",
+                "Disk a new job needs free (min_free_disk).",
+                Some(self.settings.min_free_disk),
+            ),
+        ];
+        for (name, help, value) in gauges {
+            let Some(value) = value else { continue };
+            let _ = writeln!(out, "# HELP shutup_and_run_{name} {help}");
+            let _ = writeln!(out, "# TYPE shutup_and_run_{name} gauge");
+            let _ = writeln!(out, "shutup_and_run_{name} {value}");
+        }
         Ok(out)
     }
 
@@ -1365,9 +1460,7 @@ impl Launcher {
         } = check_request(req, &self.settings, source)?;
         // Before the slot lock: a burst does not wait in line for Docker's
         // answer about the image, and nothing is pulled in the middle of it.
-        if self.settings.pull_policy == PullPolicy::Never
-            && !self.runtime.has_image(&spec.image).await
-        {
+        if self.settings.pull_policy == PullPolicy::Never && !self.image_here(&spec.image).await {
             return Err(LaunchError::ImageNotPresent(spec.image));
         }
 
@@ -1654,8 +1747,15 @@ impl Launcher {
 
     /// Running containers plus jobs accepted and not started yet.
     async fn used_slots(&self) -> Result<usize, LaunchError> {
-        let running = self.runtime.running_count().await.map_err(unavailable)?;
-        Ok(running + self.starting.lock().await.len())
+        // The jobs starting first, then Docker's list. A job leaves
+        // `starting` only once its container runs, so one that finished
+        // starting in between is in the list; one in both counts once.
+        // Read the other way round, a container started during the list
+        // was in neither, and a slot looked free that was not.
+        let starting = self.starting.lock().await.clone();
+        let running = self.runtime.running_ids().await.map_err(unavailable)?;
+        let started = running.iter().filter(|id| !starting.contains(*id)).count();
+        Ok(started + starting.len())
     }
 
     /// Wait until no job is between accepted and started. Shutdown calls this
@@ -2301,6 +2401,31 @@ fn validate_concurrency_key(key: Option<String>) -> Result<Option<String>, Launc
         ));
     }
     Ok(Some(key))
+}
+
+/// The seconds a caller should wait before sending a refused job again,
+/// for `Retry-After`: short for a full machine, which frees a slot as soon
+/// as a job ends; long for a disk or a window, which do not clear by
+/// themselves soon. None for a refusal that waiting does not lift.
+pub fn retry_after_secs(err: &LaunchError) -> Option<u64> {
+    match err {
+        LaunchError::NoSlots { .. } | LaunchError::KeyBusy(_) => Some(15),
+        LaunchError::Committed(_) => Some(30),
+        LaunchError::LowResources(short) if short.resource == "disk" => Some(600),
+        LaunchError::LowResources(_) => Some(60),
+        LaunchError::UserActive(_) => Some(60),
+        LaunchError::Draining
+        | LaunchError::NotLending(_)
+        | LaunchError::SafetyBlocked(_)
+        | LaunchError::AuthorizationRequired(_) => Some(300),
+        LaunchError::BadRequest(_)
+        | LaunchError::Forbidden
+        | LaunchError::ManagedMode
+        | LaunchError::ImageNotPresent(_)
+        | LaunchError::JobsMode
+        | LaunchError::AlreadyRunning
+        | LaunchError::Unavailable(_) => None,
+    }
 }
 
 /// The label of a refusal in `/metrics`, and its `reason` in the answer.

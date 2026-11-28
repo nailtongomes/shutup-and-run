@@ -207,7 +207,7 @@ n8n: an HTTP Request node with `fullResponse` and `neverError`, routing on `stat
 
 ### The answers and what the orchestrator does
 
-Every refusal of `POST /v1/jobs` has `reason` (0.2.35), one stable word, the same as the label of `shutup_and_run_refusals_total`. Route on it, not on `error`'s text.
+Every refusal of `POST /v1/jobs` has `reason` (0.2.35), one stable word, the same as the label of `shutup_and_run_refusals_total`. Route on it, not on `error`'s text. A `429` or `503` also has `Retry-After` (0.2.36), the seconds to wait before sending that task here again: 15 for `no_slots` and `concurrency_key_busy`, 30 for `memory_committed`, 60 for `low_memory`, 600 for `low_disk`, 300 for `draining`. A `409`, `400` or `403` has none: waiting does not fix it.
 
 | Answer | `reason` | Means | The orchestrator |
 | --- | --- | --- | --- |
@@ -355,7 +355,8 @@ def push(task) -> str:
     if reason == "image_not_present":
         prepare_image(IMAGE)                # and alert: the daily step did not run
     if r.status_code in (409, 429, 503, 502):
-        task.requeue(delay_secs=15)         # nothing was stored; the next burst sends it again
+        wait = int(r.headers.get("Retry-After", "15"))
+        task.requeue(delay_secs=wait)       # nothing was stored; the next burst sends it again
         return reason or "busy"
     task.mark_failed(reason=f"refused {r.status_code} {reason}")
     return "refused"
@@ -401,8 +402,23 @@ curl -s --cacert sar-cert.pem -H "Authorization: Bearer $SAR_TOKEN" 'https://SER
 | `shutup_and_run_pull_seconds_sum`, `_count` | Image pulls and their time, the preparations included. |
 | `shutup_and_run_pulls_skipped_total` | Jobs that did not pull: `pull_policy` `never`, or `missing` with the image here. |
 | `shutup_and_run_start_seconds_sum`, `_count` | From acceptance to a running container: the wait for `max_starting`, the pull, the create. |
+| `shutup_and_run_disk_free_bytes`, `_min_free_disk_bytes` | The disk free now and the minimum below which every job is refused (0.2.36). |
+| `shutup_and_run_memory_available_bytes`, `_min_free_memory_bytes` | The same for memory (0.2.36). |
+| `shutup_and_run_image_prepared_timestamp_seconds{image="..."}` | When each image was last prepared with `POST /v1/images/pull` to the end (0.2.36). |
+| `shutup_and_run_image_prepare_failures_total` | Preparations that failed or ran out of time (0.2.36). |
 
-The refusal and timing counters are in memory and start again at zero when the service restarts, like any Prometheus counter.
+The refusal and timing counters are in memory and start again at zero when the service restarts, like any Prometheus counter; so does the preparation time, which is absent until the first preparation after a restart.
+
+Two alerts that cover the daily cycle:
+
+```yaml
+- alert: ServerDiskNearMinimum
+  expr: shutup_and_run_disk_free_bytes < 2 * shutup_and_run_min_free_disk_bytes
+- alert: ImageNotPreparedToday
+  expr: time() - max(shutup_and_run_image_prepared_timestamp_seconds) > 26 * 3600
+```
+
+`shutup-and-run doctor` says the same on the machine: `DISK_NEAR_MINIMUM` under twice `min_free_disk`, and `CLEANUP_OVERDUE` when the last cleanup is 8 days old (the server was never 30 minutes idle inside `cleanup_hours`).
 
 ## Shared memory (`/dev/shm`)
 

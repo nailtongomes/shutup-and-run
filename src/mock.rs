@@ -15,6 +15,8 @@ struct Inner {
     fail_pull: bool,
     /// Dangling-image and volume prunes asked for.
     prunes: (u64, u64),
+    /// How many times a launcher asked whether an image is here.
+    image_checks: u64,
     /// What a pull reports before it waits for `release_pull`.
     held_pull: Option<(u64, u64)>,
     starts: u64,
@@ -55,6 +57,7 @@ impl MockRuntime {
                 pulls: Vec::new(),
                 fail_pull: false,
                 prunes: (0, 0),
+                image_checks: 0,
                 held_pull: None,
                 starts: 0,
                 specs: Vec::new(),
@@ -188,6 +191,11 @@ impl MockRuntime {
         self.inner.lock().await.fail_pull = yes;
     }
 
+    /// How many times a launcher asked Docker whether an image is here.
+    pub async fn image_checks(&self) -> u64 {
+        self.inner.lock().await.image_checks
+    }
+
     /// How many times untagged images and anonymous volumes were pruned.
     pub async fn prunes(&self) -> (u64, u64) {
         self.inner.lock().await.prunes
@@ -225,15 +233,17 @@ impl Runtime for MockRuntime {
 
     /// An image a pull brought here before.
     async fn has_image(&self, image: &str) -> bool {
-        self.inner.lock().await.pulls.iter().any(|i| i == image)
+        let mut inner = self.inner.lock().await;
+        inner.image_checks += 1;
+        inner.pulls.iter().any(|i| i == image)
     }
 
-    async fn running_count(&self) -> Result<usize, RuntimeError> {
+    async fn running_ids(&self) -> Result<Vec<String>, RuntimeError> {
         let inner = self.inner.lock().await;
         if inner.fail_list {
             return Err(RuntimeError::new("list failed"));
         }
-        Ok(inner.running.len())
+        Ok(inner.running.keys().cloned().collect())
     }
 
     async fn start(&self, id: &str, spec: &StartSpec) -> Result<(), RuntimeError> {
@@ -350,11 +360,9 @@ impl Runtime for MockRuntime {
     }
 
     async fn remove_image(&self, image: &str) -> Result<(), RuntimeError> {
-        self.inner
-            .lock()
-            .await
-            .removed_images
-            .push(image.to_string());
+        let mut inner = self.inner.lock().await;
+        inner.pulls.retain(|i| i != image);
+        inner.removed_images.push(image.to_string());
         Ok(())
     }
 

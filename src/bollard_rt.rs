@@ -146,9 +146,13 @@ impl Runtime for BollardRuntime {
             || (reference != image && self.image_present(&reference).await)
     }
 
-    async fn running_count(&self) -> Result<usize, RuntimeError> {
+    async fn running_ids(&self) -> Result<Vec<String>, RuntimeError> {
         let list = self.list_labeled("running").await?;
-        Ok(list.iter().filter(|c| is_ours(&c.labels)).count())
+        Ok(list
+            .iter()
+            .filter(|c| is_ours(&c.labels))
+            .map(|c| job_id_of(c).unwrap_or_default())
+            .collect())
     }
 
     async fn start(&self, id: &str, spec: &StartSpec) -> Result<(), RuntimeError> {

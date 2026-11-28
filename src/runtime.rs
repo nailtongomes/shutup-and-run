@@ -80,7 +80,9 @@ pub trait Runtime: Send + Sync {
     async fn has_image(&self, _image: &str) -> bool {
         false
     }
-    async fn running_count(&self) -> Result<usize, RuntimeError>;
+    /// The job ids of this worker's running containers (a container not
+    /// named after a job: its Docker id), one each.
+    async fn running_ids(&self) -> Result<Vec<String>, RuntimeError>;
     /// `id` is the job id. The container is named after it, and every other
     /// call takes that same id.
     async fn start(&self, id: &str, spec: &StartSpec) -> Result<(), RuntimeError>;

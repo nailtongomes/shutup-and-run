@@ -15,7 +15,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-      - run: shellcheck scripts/*.sh tests/poll-mock/*.sh tests/internet/*.sh tests/screen/*.sh
+      - run: shellcheck scripts/*.sh tests/poll-mock/*.sh tests/internet/*.sh tests/screen/*.sh tests/server/*.sh
       - name: windows fallback launcher shape
         run: python3 scripts/windows/check-sar-launcher.py
 
@@ -377,6 +377,12 @@ jobs:
         run: |
           sudo bash tests/screen/linux.sh "${GITHUB_WORKSPACE}/target/release/shutup-and-run" \
             fake=ghcr.io/nailtongomes/shutup-and-run-selenium-probe:ci
+      # A server's daily cycle against this Docker, scaled down: a missing
+      # image refused, the image prepared, 40 pushes at once to 6 slots and
+      # the same 40 again, DELETE, and the cleanup.
+      - name: a server's burst
+        timeout-minutes: 10
+        run: sudo bash tests/server/burst.sh "${GITHUB_WORKSPACE}/target/release/shutup-and-run"
       # Internet sharing on Linux: a relay on loopback, `internet on` as a
       # systemd unit, curl through it, a pause, the relay restarted.
       - name: internet sharing, relay and PC on this runner
