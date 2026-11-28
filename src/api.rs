@@ -194,15 +194,17 @@ async fn create_job(State(launcher): State<Arc<Launcher>>, body: Bytes) -> Respo
 
 /// A refused push: its status, its message, and `reason`, the stable word
 /// of each refusal (`no_slots`, `image_not_present`, ...), the label of
-/// `shutup_and_run_refusals_total`.
+/// `shutup_and_run_refusals_total`. A refusal that clears by waiting
+/// (`429`, `503`) also has `Retry-After`, in seconds.
 fn refusal(err: LaunchError) -> Response {
     let reason = crate::launcher::refusal_reason(&err);
+    let retry = crate::launcher::retry_after_secs(&err);
     let body = |status: StatusCode, error: &str, extra: Option<Value>| {
         let mut extra = extra.unwrap_or_else(|| json!({}));
         extra["reason"] = json!(reason);
         error_body(status, error, Some(extra))
     };
-    match err {
+    let mut response = match err {
         LaunchError::BadRequest(msg) => body(StatusCode::BAD_REQUEST, &msg, None),
         LaunchError::Forbidden => body(StatusCode::FORBIDDEN, "image is not allowlisted", None),
         LaunchError::NoSlots { total, used } => body(
@@ -297,7 +299,13 @@ fn refusal(err: LaunchError) -> Response {
             "image not present",
             Some(json!({"code": "IMAGE_NOT_PRESENT", "image": image})),
         ),
+    };
+    if let Some(secs) = retry {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, header::HeaderValue::from(secs));
     }
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -2847,5 +2855,111 @@ mod tests {
         let pc = harness(1);
         let (status, _) = send(&pc.app, "POST", "/v1/maintenance/cleanup", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    /// A push and its `Retry-After`, raw.
+    async fn push_waits(app: &Router, body: &str) -> (StatusCode, Option<String>) {
+        let request = stamp(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/jobs")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            [203, 0, 113, 10],
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        let retry = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .map(|v| v.to_str().unwrap().to_string());
+        (response.status(), retry)
+    }
+
+    fn metric(metrics: &str, name: &str) -> Option<String> {
+        metrics
+            .lines()
+            .find(|line| line.starts_with(name) && line[name.len()..].starts_with(' '))
+            .map(|line| line.rsplit(' ').next().unwrap().to_string())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_asks_docker_once_and_a_full_machine_says_when_to_try_again() {
+        let h = server_harness(1, "");
+        let job = json!({"image": WORKER, "job_key": "one"}).to_string();
+        // Waiting does not bring the image: no Retry-After.
+        assert_eq!(push_waits(&h.app, &job).await, (StatusCode::CONFLICT, None));
+        assert_eq!(prepared(&h.app, WORKER).await["state"], "ready");
+
+        let asked = h.mock.image_checks().await;
+        let first = burst(&h.app, "r1").await;
+        assert_eq!(
+            first
+                .iter()
+                .filter(|(s, _)| *s == StatusCode::ACCEPTED)
+                .count(),
+            1
+        );
+        assert_eq!(
+            h.mock.image_checks().await - asked,
+            1,
+            "200 pushes, one question to Docker"
+        );
+        let (status, retry) = push_waits(&h.app, &job).await;
+        assert_eq!(
+            (status, retry.as_deref()),
+            (StatusCode::TOO_MANY_REQUESTS, Some("15"))
+        );
+
+        // What Prometheus alerts on: the disk and memory against their
+        // minimums, and when each image was last prepared.
+        let (_, metrics) = send(&h.app, "GET", "/metrics", None).await;
+        let metrics = metrics.as_str().unwrap();
+        assert_eq!(
+            metric(
+                metrics,
+                &format!("shutup_and_run_image_prepared_timestamp_seconds{{image=\"{WORKER}\"}}")
+            )
+            .as_deref(),
+            Some("1700000000")
+        );
+        assert_eq!(
+            metric(metrics, "shutup_and_run_image_prepare_failures_total").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            metric(metrics, "shutup_and_run_min_free_disk_bytes").as_deref(),
+            Some(h.launcher.settings().min_free_disk.to_string().as_str())
+        );
+        assert!(metric(metrics, "shutup_and_run_disk_free_bytes").is_some());
+        assert!(metric(metrics, "shutup_and_run_memory_available_bytes").is_some());
+        h.mock.fail_pull(true).await;
+        assert_eq!(prepared(&h.app, "alpine:3.20").await["state"], "failed");
+        let (_, metrics) = send(&h.app, "GET", "/metrics", None).await;
+        assert_eq!(
+            metric(
+                metrics.as_str().unwrap(),
+                "shutup_and_run_image_prepare_failures_total"
+            )
+            .as_deref(),
+            Some("1")
+        );
+
+        // A cleanup that removes the image forgets it at once: the next
+        // push is refused, not admitted on the remembered answer.
+        h.launcher.settled().await;
+        let running = h.launcher.unfinished().await.unwrap();
+        let id = running[0].0.job.id.clone();
+        h.mock.stop(&id, 0).await;
+        h.launcher.job(&id, false).await.unwrap();
+        h.clock.set(1_700_000_000 + 31 * 86_400);
+        let (status, cleaned) = send(&h.app, "POST", "/v1/maintenance/cleanup", None).await;
+        assert_eq!(status, StatusCode::OK, "{cleaned}");
+        assert_eq!(h.mock.removed_images().await, [WORKER]);
+        let again = json!({"image": WORKER, "job_key": "two"}).to_string();
+        assert_eq!(
+            push_waits(&h.app, &again).await,
+            (StatusCode::CONFLICT, None)
+        );
     }
 }

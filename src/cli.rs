@@ -1709,6 +1709,38 @@ pub fn memory_checks(memory: &Value) -> Vec<Check> {
 
 /// The daily pass over images no job used for 30 days: always on, so this
 /// line only says when it last ran and what it gave back.
+/// A server's cleanup that has not run for this many days: its window
+/// passed a week with the machine never 30 minutes idle in it.
+pub const CLEANUP_OVERDUE_DAYS: i64 = 8;
+
+/// On a server with `cleanup_hours`, a last cleanup older than
+/// `CLEANUP_OVERDUE_DAYS`. None before the first one: a new machine has
+/// nothing to clean yet.
+pub fn cleanup_overdue_check(
+    settings: &Settings,
+    last: Option<crate::store::Cleanup>,
+    now: i64,
+) -> Option<Check> {
+    let hours = settings
+        .cleanup_hours
+        .as_ref()
+        .filter(|_| settings.server)?;
+    let last = last?;
+    let days = (now - last.at) / 86_400;
+    (days >= CLEANUP_OVERDUE_DAYS).then(|| {
+        soft(
+            "cleanup",
+            false,
+            format!(
+                "the last cleanup was {days} days ago ({}): the machine was never 30 minutes idle inside cleanup_hours {}",
+                crate::status::unix_to_iso(last.at),
+                hours.text
+            ),
+        )
+        .coded("CLEANUP_OVERDUE")
+    })
+}
+
 pub fn cleanup_check(cleanup: &Value) -> Check {
     let days = crate::launcher::UNUSED_DAYS;
     let last = match (cleanup["at"].as_str(), cleanup["images"].as_u64()) {
@@ -1887,6 +1919,12 @@ async fn service_checks(found: &mut Found, settings: &Settings) {
         ),
         None => {}
     }
+    if settings.server && settings.history_path.exists() {
+        let last = crate::store::Store::open(&settings.history_path)
+            .ok()
+            .and_then(|store| store.cleanup().ok().flatten());
+        checks.extend(cleanup_overdue_check(settings, last, now));
+    }
     if let Some(check) = last_job_check(&settings.history_path) {
         checks.push(check);
     }
@@ -2053,6 +2091,21 @@ pub fn resources_check(
             .coded("SLOTS_EXCEED_MEMORY")
             .with(fit.to_string());
         }
+    }
+    // A server warns before its disk refuses jobs: under twice the minimum.
+    if let Some(disk) = free.disk.filter(|&disk| {
+        settings.server && settings.min_free_disk > 0 && disk < 2 * settings.min_free_disk
+    }) {
+        return soft(
+            "resources",
+            false,
+            format!(
+                "disk free {} is near min_free_disk {}: below it every job is refused. {limits}",
+                human(disk),
+                human(settings.min_free_disk)
+            ),
+        )
+        .coded("DISK_NEAR_MINIMUM");
     }
     let free_now = match (free.memory, free.disk) {
         (Some(memory), Some(disk)) => {
@@ -2287,6 +2340,37 @@ mod tests {
             "every day, the images no job used for 30 days are removed; last 2026-11-19T01:00:00Z: 2 removed, 1.5 GiB freed"
         );
         assert!(cleanup_check(&Value::Null).detail.ends_with("not run yet"));
+    }
+
+    #[test]
+    fn a_server_whose_cleanup_has_not_run_for_8_days_says_so() {
+        let mut settings = Settings::from_toml_and_env(
+            "token = \"test-token-value-ok\"\nmax_slots = 2\nresource_profile = \"server\"\nallowlist = [\"alpine\"]",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let now = 1_800_000_000;
+        let ago = |days: i64| {
+            Some(crate::store::Cleanup {
+                at: now - days * 86_400,
+                images: 0,
+                freed_bytes: 0,
+            })
+        };
+        assert!(cleanup_overdue_check(&settings, ago(7), now).is_none());
+        // Never run: a new machine.
+        assert!(cleanup_overdue_check(&settings, None, now).is_none());
+        let late = cleanup_overdue_check(&settings, ago(9), now).unwrap();
+        assert!(!late.ok && late.soft);
+        assert_eq!(late.code(), "CLEANUP_OVERDUE");
+        assert!(late.detail.starts_with("the last cleanup was 9 days ago"));
+        assert!(
+            late.detail.ends_with("cleanup_hours sun 01-03"),
+            "{}",
+            late.detail
+        );
+        settings.cleanup_hours = None;
+        assert!(cleanup_overdue_check(&settings, ago(9), now).is_none());
     }
 
     #[test]
@@ -2877,6 +2961,13 @@ mod tests {
         settings.max_slots = 75;
         let fits = resources_check(&settings, Some(128 * GIB), free(100 * GIB, 500 * GIB));
         assert!(fits.ok, "{}", fits.detail);
+        // Under twice min_free_disk (5 GiB): still taking jobs, but near.
+        let near = resources_check(&settings, Some(128 * GIB), free(100 * GIB, 9 * GIB));
+        assert!(!near.ok && near.soft);
+        assert_eq!(near.code(), "DISK_NEAR_MINIMUM");
+        assert!(near
+            .detail
+            .starts_with("disk free 9.0 GiB is near min_free_disk 5.0 GiB"));
         settings.max_slots = 90;
         let over = resources_check(&settings, Some(128 * GIB), free(100 * GIB, 500 * GIB));
         assert!(!over.ok && over.soft);

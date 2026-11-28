@@ -104,6 +104,8 @@ Content-Type: application/json
 
 From 0.2.35 every refusal body below that is JSON also has `reason`, one stable word: `bad_request` (both `400`), `not_allowlisted`, `no_slots`, `concurrency_key_busy`, `image_not_present`, `draining`, `low_memory` or `low_disk` (`insufficient resources`), `memory_committed`, `user_active`, `not_lending`, `safety_blocked`, `authorization_required`, `managed_mode`, `unavailable` (`502`). It is the label of `shutup_and_run_refusals_total`. The bodies below leave it out.
 
+From 0.2.36 a `429` or `503` refusal also has the header `Retry-After`, in seconds: when to send that task to this machine again. 15 for a full machine or a busy `concurrency_key`, 30 for committed memory, 60 for low memory or an active user, 600 for low disk, 300 for a pause, a lending window, safety or a missing authorization. It is a hint, not a promise: a slot may free sooner. Other refusals have none.
+
 | Status | Body | Meaning | What the orchestrator does |
 | --- | --- | --- | --- |
 | `202` | [JobResult](#jobresult), `status` `running` | Accepted. A slot is taken and the row is stored. | Keep `id`. Wait for the callback. |
@@ -585,6 +587,7 @@ What an orchestrator may rely on, and what `src/contract.rs` fails on if it chan
 - `503` `blocked for safety` and `503` `authorization required` were added in 0.2.13, on machines with the `shared-pc` profile only. Both are one more "not now, on this machine", and a caller that routes on `503` needs no change.
 - `503` `not lending now` was added in 0.2.19, with `lend_hours` and the battery and full-screen waits. One more "not now, on this machine": a caller that routes on `503` needs no change.
 - `503` `memory committed` (`JOBS_MEMORY_COMMITTED`) was added in 0.2.33, on machines with the `shared-pc` profile only, with the `400` for a memory limit above what the machine commits to all its jobs. One more "not now, on this machine": a caller that routes on `503` needs no change.
+- `Retry-After` on `429` and `503` refusals was added in 0.2.36. A header more; a caller that ignores it needs no change.
 - `reason` on every refusal of a push, `409` `image not present`, `machine` in `/health`, `POST`/`GET /v1/images/pull` and `POST /v1/maintenance/cleanup` were added in 0.2.35. A key more in a body a reader already parses; the `409` only on a machine with `pull_policy` `never`, which is the `server` profile's default and nobody else's.
 - `concurrency_key`, `429` `concurrency key busy`, the `reason` `launcher_kill`, `GET /v1/jobs?state=running`, `DELETE /v1/jobs/{id}` and the `server` profile were added in 0.2.34. A caller that sends no `concurrency_key` and calls neither route sees nothing new; a reader that treats a `reason` it does not know as "not succeeded" needs no change, and one that validates against the schema needs the new one.
 - Every poll answer form in [section 3](#3-poll), the bare task and the empty forms included.

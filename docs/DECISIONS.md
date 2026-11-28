@@ -784,3 +784,18 @@ Decision:
 - **Tested as a day**: 200 concurrent pushes against 20 slots starting 5 at a time, on the mock runtime. Docker in CI runs the accept script, not this burst: two hundred real containers do not fit a hosted runner.
 
 Cost: a burst answers in turn, one admission at a time, plus one Docker call per push for the image before the lock. A prepared image Docker already removed by hand reads `ready` until asked again. The cleanup can wait a whole week on a server that is never idle for 30 minutes inside its window; the manual route is the way then. The callback stays best effort, an hour of tries, and the runner never reconciles: the orchestrator's database is the record.
+
+## When to try again, what to alert on, one Docker question per burst (0.2.36)
+
+Context: after 0.2.35 a server refused a burst's surplus at once, but the orchestrator guessed how long to wait; Prometheus could alert on refusals and nothing else (the disk and memory were in `/health` only, and a failed daily preparation left no trace); each push of a burst asked Docker whether its image was there, two hundred inspects for one image; nothing warned before the disk refused jobs or when the cleanup never found its idle half hour; and the burst was tested against the mock runtime only.
+
+Decision:
+
+- **`Retry-After`** on every `429` and `503` refusal of a push, a fixed number of seconds per `reason` (`launcher::retry_after_secs`): short where a job's end lifts it, long for disk and windows. None on `409`, `400`, `403` or `502`: waiting does not lift those. Constants, not settings.
+- **Gauges in `/metrics`**: disk free and memory available now, their minimums, the time each image was last prepared and a counter of failed preparations. The preparation time lives in memory, like the other counters.
+- **The image answer is remembered for 30 seconds** (`launcher::IMAGE_SEEN_SECS`) under `pull_policy = "never"`, only when the image is there, behind one lock so the pushes of a burst wait for the first answer. An absent image is asked every time, so a job sent the moment its preparation ends is admitted. A cleanup that removes an image forgets it.
+- **Two doctor warnings on a server**: `DISK_NEAR_MINIMUM` under twice `min_free_disk`, `CLEANUP_OVERDUE` when the last cleanup is 8 days old. Soft, like the other waits; never before the first cleanup.
+- **The burst against a real Docker in CI** (`tests/server/burst.sh`, in the accept job): 40 pushes to 6 slots, the repeat, `DELETE`, the cleanup refused while busy and then removing an anonymous volume and keeping a named one. Scaled down: a hosted runner does not hold 200 containers.
+- **Slots counted by id.** That test found a 7th job admitted to 6 slots: the slots were Docker's running count, then the jobs starting, read in that order; a container that finished starting between the two reads was in neither, and a slot looked free. Now the starting set is read first and Docker's list after, by job id, and a job in both counts once (`Runtime::running_ids`, in place of a count). A job that fails to start between the reads counts for that one reading: refusing one push too many is the safe side.
+
+Cost: an image removed by hand (`docker rmi`) still reads as here for up to 30 seconds; its job then fails at the start instead of a `409`. `Retry-After` is a guess that ignores how long the running jobs have left. A server whose cleanup never ran has no `CLEANUP_OVERDUE`, whatever its age.
